@@ -1,0 +1,137 @@
+<!--
+  Machine-wide installer for HkdfGuard.Kms.Windows.v1 (WiX v5 source).
+  Built by scripts/Build-Msi.ps1 - see that script for the parameters below.
+
+  What it does:
+    - Installs HkdfGuard.Kms.Windows.v1.dll and hkdfguard-v1-initialize.exe
+      side by side into  %ProgramFiles%\HkdfGuard\Kms.Windows.v1\ .
+    - Writes that folder to
+        HKLM\Software\HkdfGuard\Kms.Windows.v1  InstallPath  (REG_SZ)
+      so consumers (e.g. a C# wrapper) can load the DLL by absolute path via
+      NativeLibrary.Load without hard-coding it.
+    - Creates the local group HkdfGuardUsers if it doesn't already exist.
+    - Registers the "HkdfGuard.Kms.Windows.v1" Application event log source,
+      using the DLL's own message table.
+
+  Security properties this layout is relied on for:
+    - The install folder lives under Program Files and inherits its ACL:
+      only Administrators, SYSTEM and TrustedInstaller can write there. That
+      is what stops a less-privileged user planting a fake
+      HkdfGuard.Kms.Windows.v1.dll next to the CLI and getting code
+      execution the next time an administrator runs the elevated
+      `provision` step. Nothing in this file loosens that ACL - do not add
+      Permission/PermissionEx elements to these directories.
+    - The install location is deliberately NOT overridable: the directory
+      ids below are not all-uppercase, so they are private properties that
+      `msiexec ... SOMEDIR=C:\Temp` cannot redirect into a user-writable
+      folder.
+    - HKLM\Software\HkdfGuard is writable only by administrators, so the
+      InstallPath value is exactly as trustworthy as the folder it names.
+
+  Lifecycle rules:
+    - Uninstall removes the files and the InstallPath value only. It never
+      touches KEKs (deleting one destroys every DEK wrapped under it) and
+      never removes the HkdfGuardUsers group: every KEK created while the
+      group existed has its SID in its ACL, and a recreated group would get
+      a new SID, silently locking its members out of those KEKs.
+    - The group must exist before a KEK is provisioned to be included in
+      that KEK's ACL (ACLs are applied only at creation) - installing this
+      MSI before running `provision` takes care of that.
+    - Major upgrades remove the previous version first
+      (Schedule="afterInstallInitialize"); bump -Version for every release.
+      A service with the DLL loaded holds it open, so stop such services
+      before upgrading, or Windows Installer will ask to close them or
+      schedule a reboot.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+
+  <Package
+      Name="HkdfGuard KMS for Windows (v1)"
+      Manufacturer="$(Manufacturer)"
+      Version="$(ProductVersion)"
+      UpgradeCode="77210BC5-3A24-48F2-8266-5642DA27ACC6"
+      Scope="perMachine"
+      InstallerVersion="500"
+      Compressed="yes">
+
+    <!-- UpgradeCode above must never change: it is how every future
+         version of this MSI finds and replaces the previous one. -->
+    <MajorUpgrade
+        Schedule="afterInstallInitialize"
+        DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
+
+    <MediaTemplate EmbedCab="yes" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="HkdfGuardRootDir" Name="HkdfGuard">
+        <Directory Id="HkdfGuardInstallDir" Name="Kms.Windows.v1" />
+      </Directory>
+    </StandardDirectory>
+
+    <ComponentGroup Id="HkdfGuardComponents" Directory="HkdfGuardInstallDir">
+      <Component Id="HkdfGuardDll">
+        <File Id="HkdfGuardDllFile" Source="$(SourceDir)\HkdfGuard.Kms.Windows.v1.dll" KeyPath="yes" />
+      </Component>
+      <Component Id="HkdfGuardCli">
+        <File Id="HkdfGuardCliFile" Source="$(SourceDir)\hkdfguard-v1-initialize.exe" KeyPath="yes" />
+      </Component>
+      <Component Id="HkdfGuardInstallPathValue">
+        <RegistryValue
+            Root="HKLM"
+            Key="Software\HkdfGuard\Kms.Windows.v1"
+            Name="InstallPath"
+            Type="string"
+            Value="[HkdfGuardInstallDir]"
+            KeyPath="yes" />
+      </Component>
+      <!--
+        Registers the Application event log source the DLL writes its audit
+        events under (src/event_log.cpp), pointing Event Viewer at the
+        message table compiled into the DLL itself. Without this the events
+        are still recorded, just shown with a "description cannot be found"
+        preamble. Removed on uninstall, after which existing events keep
+        their text in the event details but lose the clean rendering.
+      -->
+      <Component Id="HkdfGuardEventSource">
+        <RegistryKey Root="HKLM" Key="SYSTEM\CurrentControlSet\Services\EventLog\Application\HkdfGuard.Kms.Windows.v1">
+          <RegistryValue Name="EventMessageFile" Type="expandable" Value="[#HkdfGuardDllFile]" KeyPath="yes" />
+          <!-- EVENTLOG_ERROR_TYPE | EVENTLOG_WARNING_TYPE | EVENTLOG_INFORMATION_TYPE -->
+          <RegistryValue Name="TypesSupported" Type="integer" Value="7" />
+        </RegistryKey>
+      </Component>
+    </ComponentGroup>
+
+    <Feature Id="Main" Title="HkdfGuard KMS for Windows" Level="1">
+      <ComponentGroupRef Id="HkdfGuardComponents" />
+    </Feature>
+
+    <!--
+      Create the local HkdfGuardUsers group (key_acl.cpp grants it key-use
+      access on every KEK created while it exists). Deferred, not
+      impersonated, so it runs as LocalSystem inside the elevated install
+      transaction. "exists || add" makes it succeed whether or not the
+      group is already there, so Return="check" only fails the install on a
+      genuine error (e.g. the name is taken by a user account). Not run on
+      uninstall, and not undone on uninstall - see the header comment.
+    -->
+    <SetProperty
+        Id="CreateHkdfGuardUsersGroup"
+        Value="&quot;[System64Folder]cmd.exe&quot; /d /c &quot;&quot;[System64Folder]net.exe&quot; localgroup HkdfGuardUsers &gt;nul 2&gt;&amp;1 || &quot;[System64Folder]net.exe&quot; localgroup HkdfGuardUsers /add&quot;"
+        Before="CreateHkdfGuardUsersGroup"
+        Sequence="execute"
+        Condition="NOT REMOVE" />
+
+    <CustomAction
+        Id="CreateHkdfGuardUsersGroup"
+        BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"
+        DllEntry="WixQuietExec"
+        Execute="deferred"
+        Impersonate="no"
+        Return="check" />
+
+    <InstallExecuteSequence>
+      <Custom Action="CreateHkdfGuardUsersGroup" After="InstallFiles" Condition="NOT REMOVE" />
+    </InstallExecuteSequence>
+
+  </Package>
+</Wix>

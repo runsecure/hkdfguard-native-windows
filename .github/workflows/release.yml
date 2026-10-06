@@ -1,0 +1,119 @@
+# Builds HkdfGuardWin's Release artifacts for both x64 and ARM64, validates
+# each natively (ctest suite + CLI wrap / DLL unwrap round trip via
+# scripts/Build-Test-Verify.ps1, run ON that architecture, not
+# cross-compiled and merely hoped to work), then publishes one versioned
+# GitHub Release with both architectures' zips attached - so other
+# repositories (e.g. a C# wrapper) can pull a stable, versioned download URL
+# instead of an ephemeral workflow artifact.
+#
+# Triggered by pushing a version tag (vX.Y.Z). Reuses this repo's own
+# scripts/ rather than duplicating their logic here.
+#
+# The ARM64 leg runs on the "windows-11-arm" hosted runner label so it
+# builds AND runs on real ARM64 hardware - not cross-compiled from the x64
+# runner - meaning the elevated wrap/unwrap round trip in
+# Build-Test-Verify.ps1 actually executes on that architecture before its
+# output is trusted enough to publish. That runner label's availability
+# depends on your plan/repo visibility (GitHub's ARM64 Windows hosted
+# runners were newer at the time this workflow was written) - verify it's
+# available (Settings > Actions > Runners, or just watch the first run) and
+# swap in a self-hosted ARM64 runner's label here if not.
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write # required for the "Create GitHub Release" step below
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false # a failure on one architecture shouldn't hide results from the other
+      matrix:
+        include:
+          - arch: x64
+            runner: windows-2022
+          - arch: ARM64
+            runner: windows-11-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Report elevation status
+        shell: powershell
+        # Machine-wide KEK *creation* (NCRYPT_MACHINE_KEY_FLAG) requires an
+        # elevated process token, regardless of which NCrypt provider ends
+        # up serving it (see kek_store.cpp) - this is the one real
+        # precondition for the next step to pass on a hosted runner (a
+        # missing TPM is NOT a precondition: kek_store.cpp already falls
+        # back to the Software Key Storage Provider automatically, and every
+        # test asserts on that provider generically rather than requiring
+        # TPM specifically). Surfaced as its own early, clearly labeled
+        # step - via ::warning:: rather than a silent skip - so a
+        # non-elevated runner shows up as an obvious annotation in the
+        # Actions UI, not just a wall of failed checks further down.
+        run: |
+          $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+          $principal = New-Object System.Security.Principal.WindowsPrincipal($identity)
+          $isAdmin = $principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
+          Write-Host "Running as: $($identity.Name)"
+          Write-Host "Elevated (Administrator token): $isAdmin"
+          if (-not $isAdmin) {
+            Write-Host "::warning::This job's process token is not elevated - machine-wide KEK creation will fail, and the next step (Build-Test-Verify.ps1) will fail loudly because of it, not because of anything wrong with the code."
+          }
+
+      - name: Build, test, and verify CLI wrap / DLL unwrap round trip (Release, ${{ matrix.arch }})
+        shell: powershell
+        run: .\scripts\Build-Test-Verify.ps1 -Configuration Release
+
+      - name: Build the distributable artifacts (${{ matrix.arch }})
+        shell: powershell
+        run: .\scripts\Build-Dist.ps1 -Arch ${{ matrix.arch }}
+
+      - name: Package the release archive (${{ matrix.arch }})
+        id: package
+        shell: powershell
+        run: |
+          $version = "${{ github.ref_name }}"
+          $archLower = "${{ matrix.arch }}".ToLower()
+          $zipName = "HkdfGuardWin-$version-win-$archLower.zip"
+          Compress-Archive -Path "dist\win-$archLower\*" -DestinationPath $zipName -Force
+          (Get-FileHash -Algorithm SHA256 $zipName).Hash | Out-File -Encoding ascii "$zipName.sha256"
+          "zip_path=$zipName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Upload build outputs for the release job
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets-${{ matrix.arch }}
+          path: |
+            ${{ steps.package.outputs.zip_path }}
+            ${{ steps.package.outputs.zip_path }}.sha256
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: windows-2022 # only needs the `gh` CLI (preinstalled), not the build toolchain
+    steps:
+      - name: Download both architectures' artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true # flatten both matrix legs' uploads into one directory
+
+      - name: Create GitHub Release
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $files = Get-ChildItem -Path release-assets -File | Select-Object -ExpandProperty FullName
+          Write-Host "Release assets:"
+          $files | ForEach-Object { Write-Host "  $_" }
+          gh release create "${{ github.ref_name }}" $files --title "${{ github.ref_name }}" --generate-notes
