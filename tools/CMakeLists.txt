@@ -12,10 +12,6 @@
 add_executable(hkdfguard-v1-initialize hkdfguard-v1-initialize.cpp)
 target_link_libraries(hkdfguard-v1-initialize PRIVATE hkdfguard bcrypt.lib crypt32.lib advapi32.lib)
 
-# Same hardening as the DLL (see the root CMakeLists.txt): this tool runs
-# elevated and handles the plaintext DEK, so it gets stack cookies and
-# Control Flow Guard too, not just the warning level.
-if(MSVC)
-    target_compile_options(hkdfguard-v1-initialize PRIVATE /W4 /guard:cf /GS)
-    target_link_options(hkdfguard-v1-initialize PRIVATE /GUARD:CF)
-endif()
+# Same hardening as the DLL (see hkdfguard_apply_hardening in the root
+# CMakeLists.txt): this tool runs elevated and handles the plaintext DEK.
+hkdfguard_apply_hardening(hkdfguard-v1-initialize)

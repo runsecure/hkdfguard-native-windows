@@ -114,17 +114,99 @@ target_include_directories(hkdfguard
 target_link_libraries(hkdfguard PRIVATE ncrypt.lib bcrypt.lib)
 
 # MSVC-specific hardening flags, applied only when compiling with MSVC (as
-# opposed to some other compiler CMake might be configured to use).
+# opposed to some other compiler CMake might be configured to use). Defined
+# once as a function so the DLL and the CLI (tools/CMakeLists.txt) always get
+# the identical set. The linker's own defaults (/DYNAMICBASE,
+# /HIGHENTROPYVA, /NXCOMPAT - ASLR and DEP) are left on and not repeated.
+#
+#   /W4               High warning level (catches e.g. signed/unsigned mixups).
+#   /guard:cf         Control Flow Guard (compile and /GUARD:CF link halves):
+#                     indirect calls may only target validated functions.
+#   /GS               Stack-buffer-overrun detection (stack cookies).
+#   /sdl              Additional security checks: wider /GS coverage, security
+#                     warnings (uninitialized use, unsafe CRT calls) as
+#                     errors, pointer sanitization after delete, and
+#                     zero-initialized class members on new.
+#   /Qspectre         Speculation barriers (LFENCE on x64, CSDB on ARM64) where
+#                     the compiler sees a Spectre variant 1 bounds-check
+#                     pattern. The wrapping key and raw ECDH secret live in
+#                     this process. Because the runtime is linked statically
+#                     (/MT, above), the runtime itself is only mitigated if
+#                     the Spectre-mitigated libraries are linked too - see
+#                     below.
+#   /guard:ehcont     (x64) EH continuation metadata, compile and link: a
+#                     corrupted exception context cannot resume at an
+#                     arbitrary address. The library throws C++ exceptions
+#                     internally, so this applies directly.
+#   /CETCOMPAT        (x64) Marks the image compatible with CET hardware
+#                     shadow stacks, which catch overwritten return
+#                     addresses. Lets a host process that runs in strict
+#                     shadow-stack mode load the DLL at all.
+#
+# /guard:ehcont and /CETCOMPAT are applied to x64 only: CET shadow stacks are
+# an x64 hardware feature, and EH continuation metadata is only applied where
+# its toolset support is documented. ARM64 binaries get everything else.
 if(MSVC)
-    # /W4: enable a high warning level (catches many real bugs, like
-    # accidentally comparing signed and unsigned values). /guard:cf and
-    # /GUARD:CF (compile-time and link-time halves of the same feature):
-    # enable Control Flow Guard, a Windows exploit-mitigation feature that
-    # restricts indirect function calls to a validated set of targets. /GS:
-    # enables stack-buffer-overrun detection ("stack cookies").
-    target_compile_options(hkdfguard PRIVATE /W4 /guard:cf /GS)
-    target_link_options(hkdfguard PRIVATE /GUARD:CF)
+    # The Spectre-mitigated runtime libraries are a separate Visual Studio
+    # component ("MSVC ... Spectre-mitigated libs (Latest)"), installed per
+    # architecture under the toolset's lib\spectre\<arch> directory. When
+    # present, that directory is searched first so the static runtime that
+    # gets linked is the mitigated one. When absent, the build still works -
+    # /Qspectre still covers this project's own code - but says so.
+    #
+    # HKDFGUARD_REQUIRE_SPECTRE_LIBS turns the "absent" case from a warning
+    # into a configure failure. Off by default so a developer machine without
+    # the component can still build; the release workflow turns it on (via
+    # the environment variable of the same name, which seeds the option's
+    # default) so a release can never quietly ship an unmitigated runtime.
+    if("$ENV{HKDFGUARD_REQUIRE_SPECTRE_LIBS}" STREQUAL "1")
+        set(_hkdfguard_require_spectre_default ON)
+    else()
+        set(_hkdfguard_require_spectre_default OFF)
+    endif()
+    option(HKDFGUARD_REQUIRE_SPECTRE_LIBS
+        "Fail configuration if the Spectre-mitigated runtime libraries are not installed"
+        ${_hkdfguard_require_spectre_default})
+
+    get_filename_component(_hkdfguard_cl_dir "${CMAKE_CXX_COMPILER}" DIRECTORY)
+    get_filename_component(_hkdfguard_msvc_root "${_hkdfguard_cl_dir}/../../.." ABSOLUTE)
+    string(TOLOWER "${CMAKE_CXX_COMPILER_ARCHITECTURE_ID}" _hkdfguard_arch)
+    set(HKDFGUARD_SPECTRE_LIB_DIR "${_hkdfguard_msvc_root}/lib/spectre/${_hkdfguard_arch}")
+    if(EXISTS "${HKDFGUARD_SPECTRE_LIB_DIR}/libcmt.lib")
+        message(STATUS "Linking the Spectre-mitigated runtime from ${HKDFGUARD_SPECTRE_LIB_DIR}")
+        set(HKDFGUARD_HAVE_SPECTRE_LIBS TRUE)
+    elseif(HKDFGUARD_REQUIRE_SPECTRE_LIBS)
+        message(FATAL_ERROR
+            "Spectre-mitigated runtime libraries not found at ${HKDFGUARD_SPECTRE_LIB_DIR}, and "
+            "HKDFGUARD_REQUIRE_SPECTRE_LIBS is on. Install the Visual Studio component "
+            "\"MSVC Spectre-mitigated libs (Latest)\" for ${CMAKE_CXX_COMPILER_ARCHITECTURE_ID}.")
+    else()
+        message(WARNING
+            "Spectre-mitigated runtime libraries not found at ${HKDFGUARD_SPECTRE_LIB_DIR}. "
+            "/Qspectre still mitigates this project's own code, but the statically linked "
+            "runtime will be the unmitigated one. Install the Visual Studio component "
+            "\"MSVC Spectre-mitigated libs (Latest)\" for ${CMAKE_CXX_COMPILER_ARCHITECTURE_ID} "
+            "to fix this.")
+        set(HKDFGUARD_HAVE_SPECTRE_LIBS FALSE)
+    endif()
 endif()
+
+function(hkdfguard_apply_hardening target)
+    if(NOT MSVC)
+        return()
+    endif()
+    target_compile_options(${target} PRIVATE /W4 /guard:cf /GS /sdl /Qspectre)
+    target_link_options(${target} PRIVATE /GUARD:CF)
+    if(CMAKE_CXX_COMPILER_ARCHITECTURE_ID STREQUAL "x64")
+        target_compile_options(${target} PRIVATE /guard:ehcont)
+        target_link_options(${target} PRIVATE /guard:ehcont /CETCOMPAT)
+    endif()
+    if(HKDFGUARD_HAVE_SPECTRE_LIBS)
+        target_link_directories(${target} PRIVATE "${HKDFGUARD_SPECTRE_LIB_DIR}")
+    endif()
+endfunction()
+
+hkdfguard_apply_hardening(hkdfguard)
 
 # tools/CMakeLists.txt declares hkdfguard-v1-initialize, the standalone CLI
 # utility that wraps a DEK and writes it to a file - see that file for why

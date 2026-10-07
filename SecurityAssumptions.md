@@ -43,6 +43,24 @@ defended against:
   read/write, one group read-only - see the CLI's `--group`), not the
   payload format. An application that needs to refuse old DEKs must check
   that itself, after unwrapping.
+- **Anyone who can unwrap can also forge.** Wrapping needs only the KEK's
+  *public* key, which any key-use principal can export. So every principal
+  granted key use (`KeyUseGroups`, `HkdfGuardUsers`) can mint a brand-new,
+  fully valid payload for the service around a DEK of its own choosing, and
+  unwrap will accept it exactly like a genuine one. The payload is
+  authenticated as "made for this service under this KEK", never as "made
+  by the deployment step". Consequences: a key-use principal that can also
+  write the wrapped-key file can make the service run with a DEK it picked,
+  not just an older genuine one. The audit trail only partly helps: a
+  forger who calls `hkdfguard_wrap_dek` leaves a wrap event (1002) under its
+  own account, but one who builds the payload itself, from the public key,
+  leaves none - and an unwrap event (1003) whose payload SHA-256 matches no
+  wrap event by the deployment account is the sign of that.
+  The defenses are the same as for rollback: keep key-use groups narrow, and
+  keep the wrapped file writable only by the deployment account. An
+  application that must know a DEK came from its own deployment needs a
+  separate signature over the payload, made with a key the service can only
+  verify.
 - **Local Administrators and SYSTEM are fully trusted.** They always hold
   full control of every KEK, can change the registry policy, and can alter a
   key's ACL. Nothing here defends the KEK against a host administrator.
@@ -93,10 +111,22 @@ KSP's `NCryptDeriveKey` does the same. If they disagreed, every TPM-backed
 unwrap would fail authentication.
 
 **Verified how.** A full wrap (BCrypt) / unwrap (NCrypt, provider_type = 1,
-AMD fTPM) round-trip succeeded in the elevated test suite. That run predates
-the KEK-fingerprint format change; the fingerprint does not touch the KDF
-path, but the elevated suite should be re-run after any change to
-`src/ecdh_hkdf.cpp` to keep this claim current.
+AMD fTPM) round-trip succeeded in the elevated test suite, most recently on
+2026-10-06 after the curve-pinning change to `src/ecdh_hkdf.cpp`. Re-run the
+elevated suite after any change to that file to keep this claim current.
+
+**The byte order itself is pinned.** The library uses the raw secret exactly
+as `BCRYPT_KDF_RAW_SECRET` returns it - little-endian, i.e. the shared
+point's X coordinate byte-reversed - as the HKDF input. Section 29 of
+`tests/test_roundtrip.cpp` rebuilds a frozen golden payload from the
+documented construction, independently of `src/`, and checks the shipped DLL
+unwraps it to a known DEK. Any change to the IKM byte order, the HKDF salt,
+hash or info string, the AAD, or the wire layout fails that test while
+ordinary round trips still pass (verified by deliberately changing the HKDF
+context string). Note for cross-platform work: an implementation that feeds
+HKDF the conventional big-endian X coordinate derives a different key, so
+claims of matching another platform's construction hold only if that
+platform reverses the bytes too.
 
 **Residual risk.** Verified on one TPM vendor/firmware only.
 
@@ -110,7 +140,7 @@ by a check that *does* work on that provider.
 
 | Observation | Accommodation | Property still enforced by |
 |---|---|---|
-| `NCRYPT_ALGORITHM_PROPERTY` ("Algorithm Name") reports `"ECDH"`, not the curve-qualified `"ECDH_P256"` the key was created with. Software KSP reports `"ECDH_P256"`. | `VerifyAlgorithm` checks `NCRYPT_ALGORITHM_GROUP_PROPERTY` (`"ECDH"` on both). | The curve is pinned by `VerifyKeyLength` (256). |
+| `NCRYPT_ALGORITHM_PROPERTY` ("Algorithm Name") reports `"ECDH"`, not the curve-qualified `"ECDH_P256"` the key was created with. Software KSP reports `"ECDH_P256"`. | `VerifyAlgorithm` checks `NCRYPT_ALGORITHM_GROUP_PROPERTY` (`"ECDH"` on both). | The curve is pinned by `VerifyCurve`: the exported public blob must carry `BCRYPT_ECDH_PUBLIC_P256_MAGIC`, and a reported curve name must be `nistP256`. `VerifyKeyLength` (256) alone would not do it: a brainpoolP256r1 key also reports 256, but exports with the generic ECC magic. **Verified** by probe on this AMD fTPM (PCP reports `nistP256`, exports the P-256 magic) and the Software KSP (no curve-name property for an `ECDH_P256` key, exports the P-256 magic; a brainpoolP256r1 key exports the generic magic). |
 | `NCryptSetProperty(NCRYPT_KEY_USAGE_PROPERTY, NCRYPT_ALLOW_KEY_AGREEMENT_FLAG)` returns `NTE_NOT_SUPPORTED` (also for `4\|1`); the key's usage stays pinned at `NCRYPT_ALLOW_DECRYPT_FLAG` (`0x1`). | The set is best-effort; `VerifyUsage` accepts `DECRYPT` as well as `KEY_AGREEMENT`. | `VerifyAlgorithm` runs first, so only a key already proven to be ECDH can pass; an ECDH key has no distinct "decrypt" operation on CNG. **Verified** that `NCryptSecretAgreement` succeeds against such a key and yields a correct 32-byte secret - the label is a provider quirk, not a capability limit. |
 | On the creation handle, immediately after `NCryptFinalizeKey`, `NCRYPT_LENGTH_PROPERTY` reads `0`; on a freshly reopened handle it reads `256`. | Post-finalize verification runs on a freshly reopened handle. | `VerifyKeyLength` is unchanged and strict. |
 | `NCRYPT_IMPL_TYPE_PROPERTY` returns `NTE_NOT_SUPPORTED` on every *key* handle (creation or reopened); on the *provider* handle it succeeds and reports `NCRYPT_IMPL_HARDWARE_FLAG`. | `VerifyHardwareBacked` falls back to the provider handle only when the key-level query returns exactly `NTE_NOT_SUPPORTED`. | Any other failure, or a non-hardware answer from either handle, still throws. |
@@ -177,13 +207,30 @@ administrator.
   unwrap is not exercised, since that would mean changing this machine's
   HKLM policy during a test run.
 - The default `PreferTpm` fallback to software is a **design decision**:
-  the policy is the administrator's to set. It falls back only on
-  `HKDFGUARD_ERR_PROVIDER` (TPM unavailable, or a create/verify step
-  failed). `ACCESS_DENIED` and `KEK_ACL_INVALID` propagate instead, since
-  both mean a TPM KEK already exists, and creating a second, software KEK
-  beside it would split the service across two keys. `OpenKekForWrap` and
-  `KekExists` follow the same rule, so an unauthorized caller is told
-  `ACCESS_DENIED`, never `KEK_NOT_FOUND`.
+  the policy is the administrator's to set. It falls back only when the TPM
+  is provably unusable for the service: the TPM provider cannot be opened,
+  the TPM reports no device (`TBS_E_TPM_NOT_FOUND`, `NTE_DEVICE_NOT_FOUND`),
+  or the TPM key was confirmed absent (`NTE_BAD_KEYSET`) and creating it
+  failed, with the partly-created key successfully deleted. Internally these
+  are the only failures thrown as `TpmUnusableError`; the public code is
+  still `HKDFGUARD_ERR_PROVIDER`. Everything else propagates, including an
+  *existing* TPM KEK that fails property verification, any other error while
+  probing for the TPM key (a busy, locked-out or not-ready TPM), a
+  concurrent creation (`NTE_EXISTS`), `ACCESS_DENIED` and `KEK_ACL_INVALID`.
+  Each of those may sit in front of a TPM KEK that is in use, and creating a
+  second, software KEK beside it would split the service and permanently
+  route new wraps to the weaker key. `OpenKekForWrap` (which also falls back
+  on `KEK_NOT_FOUND`) and `KekExists` follow the same rule, so an
+  unauthorized caller is told `ACCESS_DENIED`, never `KEK_NOT_FOUND`.
+  **Assumed / not verified**: that a host with no TPM fails at
+  `NCryptOpenStorageProvider` or reports one of the two "no device" codes.
+  If some host instead reports a different code when probing for the key,
+  `PreferTpm` there now fails with `HKDFGUARD_ERR_PROVIDER` rather than
+  falling back. Exercise the default policy on a VM without a vTPM before
+  relying on it. The test suite simulates the provider-open failure (section
+  25c) and, through a test-only fault-injection seam, a TPM probe error, a
+  "no device" report, and an existing TPM KEK failing verification (section
+  26); it cannot show what a real TPM-less host reports.
 - If any post-finalize step fails (reopen, property verification, ACL
   verification), `CreateKekOnProvider` deletes the key *it just created*,
   on its own creation handle, before rethrowing, under every policy. That
@@ -200,10 +247,19 @@ administrator.
 `BUILTIN`, `NT AUTHORITY` or `NT SERVICE`, and its type is a group
 (`SidTypeGroup`/`SidTypeAlias`/`SidTypeWellKnownGroup`), and it is not an
 over-broad well-known principal (Everyone, Authenticated Users, Anonymous,
-NULL, INTERACTIVE/NETWORK/BATCH/SERVICE, BUILTIN\Users, BUILTIN\Guests).
+NULL, INTERACTIVE/NETWORK/BATCH/SERVICE/REMOTE INTERACTIVE LOGON,
+BUILTIN\Users, BUILTIN\Guests, Local account (S-1-5-113), This Organization
+(S-1-5-15), NT SERVICE\ALL SERVICES (S-1-5-80-0), LOCAL (S-1-2-0), CONSOLE
+LOGON (S-1-2-1)). Local account, This Organization, ALL SERVICES and REMOTE
+INTERACTIVE LOGON resolve as `SidTypeWellKnownGroup` in an accepted domain
+(`NT AUTHORITY` or `NT SERVICE`), so the denylist alone excludes them.
+Policy validation and the existing-key ACL check share one implementation
+(`IsOverBroadSid` in `src/key_acl.cpp`).
 
 **Verified how.** Tests (section 0d) cover Everyone by name and as
-`S-1-1-0`, Authenticated Users, BUILTIN\Users, a user account, an
+`S-1-1-0`, Authenticated Users, BUILTIN\Users, the six broad groups added
+above by SID string (Local account and ALL SERVICES by name too), a user
+account, an
 unresolvable name, a foreign-domain-qualified name, and every branch of
 `IsHostLocalAccountDomain`. Facts established while building it, all by
 repro on this host: well-known SIDs such as Everyone report an *empty*
@@ -230,12 +286,18 @@ use) are still granted by *name*, now restricted to local groups.
   principal it was granted. An *existing* key found by
   `hkdfguard_create_kek` is checked against policy-independent invariants
   instead: a real (non-NULL) DACL, SYSTEM and Administrators present, and
-  no grant of any kind to an over-broad principal. Failing that returns
+  no grant of any kind to an over-broad principal, whether through a plain
+  or a conditional (callback) allow ACE. An object or compound allow ACE,
+  which this library never writes, or an unreadable ACE fails the check
+  outright rather than being skipped. Failing that returns
   `HKDFGUARD_ERR_KEK_ACL_INVALID` and leaves the key untouched. This
   catches a pre-planted key or one later widened to e.g. Everyone. It does
   not catch a widening to some other specific account, and it does not run
   on wrap or unwrap, which never re-verify the ACL. **Verified** by test
-  section 25d (elevated).
+  sections 25d (plain grant to Everyone) and 28 (conditional allow ACE for
+  Everyone, grants to ALL SERVICES and Local account), elevated. Section 27
+  covers pre-planted keys that fail property verification instead: wrong
+  curve, P-384, and exportable.
 - Key-use access is granted as `GENERIC_READ` on the key object, on the
   understanding that for CNG KSP keys read access permits using the private
   key (`NCryptSecretAgreement`) while `GENERIC_WRITE`/`GENERIC_ALL` are
@@ -296,8 +358,27 @@ use) are still granted by *name*, now restricted to local groups.
   operational aid, not as evidence. The event's User field is supplied by
   the writing process and not validated by Windows, so a forged event can
   name any user.
-- Hardening flags `/SDL`, `/Qspectre` and `/CETCOMPAT` are not set. `/Qspectre`
-  is the relevant one - the wrapping key and raw ECDH secret exist
-  in-process - and requires the Spectre-mitigated libraries with `/MT`.
+- Hardening flags: the DLL and CLI are built with `/sdl`, `/Qspectre`,
+  Control Flow Guard and, on x64, `/CETCOMPAT` and `/guard:ehcont`
+  (`hkdfguard_apply_hardening` in `CMakeLists.txt`); `scripts/Build-Dist.ps1`
+  fails a release build whose binaries lack the PE markers for these. The
+  statically linked runtime is Spectre-mitigated when the Visual Studio
+  component "MSVC Spectre-mitigated libs (Latest)" is installed for the
+  target architecture; CMake links it from `lib\spectre\<arch>`, warns when
+  it is missing, and fails instead when `HKDFGUARD_REQUIRE_SPECTRE_LIBS` is
+  set. The release workflow sets it and installs both architectures'
+  components on the runner first, so a release cannot ship an unmitigated
+  runtime. Verified on the development machine for x64 and ARM64
+  (2026-10-07: the same source gains speculation barriers in the linked
+  runtime on both). The workflow's install branch has not yet run on a
+  hosted runner. ARM64 builds still get no shadow-stack or EH-continuation
+  equivalent.
 - Only one TPM vendor/firmware has been exercised (section 4); other
   Platform Crypto Provider backends may exhibit different quirks.
+- Release binaries are Authenticode-signed only when the repository has
+  the `WINDOWS_SIGNING_CERT_PFX_BASE64` and `WINDOWS_SIGNING_CERT_PASSWORD`
+  secrets; otherwise the release workflow builds them unsigned and flags
+  that with a warning. Every release does get a GitHub build provenance
+  attestation for the zip, DLL and CLI (`gh attestation verify`), which
+  needs a public repository or GitHub Enterprise Cloud. Workflow actions
+  are pinned to commit SHAs.

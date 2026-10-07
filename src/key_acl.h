@@ -31,9 +31,10 @@ namespace hkdfguard {
     // must be a group (SidTypeGroup / SidTypeAlias / SidTypeWellKnownGroup -
     // never a user or computer account), must not be an over-broad
     // principal (Everyone, Authenticated Users, BUILTIN\Users,
-    // BUILTIN\Guests, Anonymous, the NULL SID, or the logon-type groups
-    // INTERACTIVE/NETWORK/BATCH/SERVICE), and must be host-local (see
-    // IsHostLocalAccountDomain): this protection is host-specific, so domain
+    // BUILTIN\Guests, Anonymous, the NULL SID, Local account, This
+    // Organization, NT SERVICE\ALL SERVICES, LOCAL, CONSOLE LOGON, or the
+    // logon-type groups INTERACTIVE/NETWORK/BATCH/SERVICE/REMOTE INTERACTIVE
+    // LOGON), and must be host-local (see IsHostLocalAccountDomain): this protection is host-specific, so domain
     // groups are refused even on a domain-joined machine, however the entry
     // was spelled. Throws HkdfGuardError(HKDFGUARD_ERR_GROUP_INVALID) on the
     // first entry that fails. CreateKek calls this before it opens the key

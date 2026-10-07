@@ -49,8 +49,16 @@ add_test(NAME roundtrip COMMAND test_roundtrip)
 # startup. $<TARGET_FILE_DIR:hkdfguard> is a CMake "generator expression" -
 # evaluated at build-configuration time to the real output path, whatever it
 # ends up being for the chosen build type/generator.
+#
+# ENVIRONMENT is a CMake *list*, so every unescaped ';' in its value starts
+# a new list entry. Windows PATH is itself ';'-separated, so splicing
+# $ENV{PATH} in raw would leave the test with PATH set to the DLL directory
+# alone (everything after the first ';' becoming bogus separate entries) -
+# no System32, so the CLI test could not even find cmd.exe. Escaping each
+# ';' keeps the whole value as one PATH entry.
+string(REPLACE ";" "\\;" HKDFGUARD_TEST_PATH "$ENV{PATH}")
 set_tests_properties(roundtrip PROPERTIES
-    ENVIRONMENT "PATH=$<TARGET_FILE_DIR:hkdfguard>;$ENV{PATH}"
+    ENVIRONMENT "PATH=$<TARGET_FILE_DIR:hkdfguard>\\;${HKDFGUARD_TEST_PATH}"
 )
 
 # test_cli.ps1 exercises hkdfguard-v1-initialize.exe's own argument parsing,
@@ -70,5 +78,5 @@ add_test(
             -CliExePath "$<TARGET_FILE:hkdfguard-v1-initialize>"
 )
 set_tests_properties(cli PROPERTIES
-    ENVIRONMENT "PATH=$<TARGET_FILE_DIR:hkdfguard>;$ENV{PATH}"
+    ENVIRONMENT "PATH=$<TARGET_FILE_DIR:hkdfguard>\\;${HKDFGUARD_TEST_PATH}"
 )

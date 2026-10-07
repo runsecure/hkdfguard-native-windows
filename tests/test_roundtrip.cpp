@@ -13,6 +13,7 @@
 #include "key_acl.h"    // ValidateKeyUseGroups - vets the key-use policy list without touching any key
 
 #include <aclapi.h>  // SetEntriesInAclW - section 25d widens an existing KEK's ACL
+#include <sddl.h>    // ConvertStringSecurityDescriptorToSecurityDescriptorW - section 28
 #include <cstdio>
 #include <cstring>
 #include <stdexcept> // std::exception, caught in CleanupKek and CheckPolicyCreatesKek
@@ -247,6 +248,320 @@ std::wstring PickNarrowGroup() {
     return L"Administrators";
 }
 
+// ---- Helpers for sections 26-29 (fault injection, pre-planted keys, ACL ----
+//      entries, golden payload). Elevation-dependent checks in those
+//      sections print [SKIP] instead of failing when not elevated, so a
+//      non-elevated run only fails on real problems.
+
+void Skip(const char* what) {
+    std::printf("[SKIP] %s\n", what);
+}
+
+bool IsElevated() {
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return false;
+    TOKEN_ELEVATION elevation{};
+    DWORD size = 0;
+    bool elevated = GetTokenInformation(token, TokenElevation, &elevation, sizeof(elevation), &size) &&
+                    elevation.TokenIsElevated != 0;
+    CloseHandle(token);
+    return elevated;
+}
+
+// Whether the real Platform Crypto Provider opens on this machine.
+bool HasTpmProvider() {
+    NCRYPT_PROV_HANDLE prov = 0;
+    if (NCryptOpenStorageProvider(&prov, MS_PLATFORM_CRYPTO_PROVIDER, 0) != ERROR_SUCCESS) return false;
+    NCryptFreeObject(prov);
+    return true;
+}
+
+// The HKDFGUARD_* code a call produces: OK if it returns normally, the
+// HkdfGuardError's code if it throws one, a sentinel otherwise.
+template <typename F>
+int32_t CodeOf(F&& f) {
+    try {
+        f();
+        return HKDFGUARD_OK;
+    } catch (const hkdfguard::HkdfGuardError& e) {
+        return e.code();
+    } catch (...) {
+        return -9999;
+    }
+}
+
+// The persisted key name kek_store.cpp's KeyName builds for a service.
+std::wstring KekNameFor(const wchar_t* serviceWide) {
+    return std::wstring(L"hkdfguardwin_") + serviceWide + L"_v1";
+}
+
+// Whether a machine key by this name exists on `provider`, opened directly
+// rather than through the library, so the answer can't be affected by the
+// library behavior under test.
+bool MachineKeyExists(LPCWSTR provider, const std::wstring& keyName) {
+    NCRYPT_PROV_HANDLE prov = 0;
+    if (NCryptOpenStorageProvider(&prov, provider, 0) != ERROR_SUCCESS) return false;
+    NCRYPT_KEY_HANDLE key = 0;
+    SECURITY_STATUS st = NCryptOpenKey(prov, &key, keyName.c_str(), 0, NCRYPT_MACHINE_KEY_FLAG | NCRYPT_SILENT_FLAG);
+    if (key) NCryptFreeObject(key);
+    NCryptFreeObject(prov);
+    return st == ERROR_SUCCESS;
+}
+
+void DeleteMachineKeyQuiet(LPCWSTR provider, const std::wstring& keyName) {
+    NCRYPT_PROV_HANDLE prov = 0;
+    if (NCryptOpenStorageProvider(&prov, provider, 0) != ERROR_SUCCESS) return;
+    NCRYPT_KEY_HANDLE key = 0;
+    if (NCryptOpenKey(prov, &key, keyName.c_str(), 0, NCRYPT_MACHINE_KEY_FLAG | NCRYPT_SILENT_FLAG) == ERROR_SUCCESS) {
+        NCryptDeleteKey(key, 0); // frees the handle even on failure
+    }
+    NCryptFreeObject(prov);
+}
+
+// Pre-plants a machine key on the Software KSP under `keyName`, the way an
+// administrator (or an attacker with admin rights) could before the library
+// ever provisions that service. `curve` is set only for the generic "ECDH"
+// algorithm; `exportable` grants plaintext export.
+bool PlantSoftwareKey(const std::wstring& keyName, LPCWSTR algorithm, LPCWSTR curve, bool exportable) {
+    NCRYPT_PROV_HANDLE prov = 0;
+    if (NCryptOpenStorageProvider(&prov, MS_KEY_STORAGE_PROVIDER, 0) != ERROR_SUCCESS) return false;
+    NCRYPT_KEY_HANDLE key = 0;
+    bool ok = NCryptCreatePersistedKey(prov, &key, algorithm, keyName.c_str(), 0,
+                                       NCRYPT_MACHINE_KEY_FLAG | NCRYPT_SILENT_FLAG) == ERROR_SUCCESS;
+    if (ok && curve != nullptr) {
+        ok = NCryptSetProperty(key, NCRYPT_ECC_CURVE_NAME_PROPERTY,
+                               reinterpret_cast<PBYTE>(const_cast<wchar_t*>(curve)),
+                               static_cast<DWORD>((wcslen(curve) + 1) * sizeof(wchar_t)), 0) == ERROR_SUCCESS;
+    }
+    if (ok && exportable) {
+        DWORD policy = NCRYPT_ALLOW_EXPORT_FLAG | NCRYPT_ALLOW_PLAINTEXT_EXPORT_FLAG;
+        ok = NCryptSetProperty(key, NCRYPT_EXPORT_POLICY_PROPERTY, reinterpret_cast<PBYTE>(&policy),
+                               sizeof(policy), 0) == ERROR_SUCCESS;
+    }
+    if (ok) {
+        ok = NCryptFinalizeKey(key, NCRYPT_SILENT_FLAG) == ERROR_SUCCESS;
+    }
+    if (key) NCryptFreeObject(key);
+    NCryptFreeObject(prov);
+    return ok;
+}
+
+// Replaces an existing Software KSP machine key's DACL with one written in
+// SDDL, as an administrator could after creation.
+bool SetSoftwareKeyDacl(const std::wstring& keyName, const wchar_t* sddl) {
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    ULONG sdSize = 0;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, SDDL_REVISION_1, &sd, &sdSize)) return false;
+    bool ok = false;
+    NCRYPT_PROV_HANDLE prov = 0;
+    NCRYPT_KEY_HANDLE key = 0;
+    if (NCryptOpenStorageProvider(&prov, MS_KEY_STORAGE_PROVIDER, 0) == ERROR_SUCCESS &&
+        NCryptOpenKey(prov, &key, keyName.c_str(), 0, NCRYPT_MACHINE_KEY_FLAG | NCRYPT_SILENT_FLAG) == ERROR_SUCCESS) {
+        ok = NCryptSetProperty(key, NCRYPT_SECURITY_DESCR_PROPERTY, static_cast<PBYTE>(sd), sdSize,
+                               DACL_SECURITY_INFORMATION) == ERROR_SUCCESS;
+    }
+    if (key) NCryptFreeObject(key);
+    if (prov) NCryptFreeObject(prov);
+    LocalFree(sd);
+    return ok;
+}
+
+std::vector<uint8_t> FromHex(const char* hex) {
+    std::vector<uint8_t> out;
+    for (size_t i = 0; hex[i] != '\0' && hex[i + 1] != '\0'; i += 2) {
+        auto nibble = [](char c) -> uint8_t {
+            return static_cast<uint8_t>(c <= '9' ? c - '0' : (c | 0x20) - 'a' + 10);
+        };
+        out.push_back(static_cast<uint8_t>((nibble(hex[i]) << 4) | nibble(hex[i + 1])));
+    }
+    return out;
+}
+
+std::string ToHex(const std::vector<uint8_t>& bytes) {
+    static const char kDigits[] = "0123456789abcdef";
+    std::string out;
+    for (uint8_t b : bytes) {
+        out.push_back(kDigits[b >> 4]);
+        out.push_back(kDigits[b & 0x0F]);
+    }
+    return out;
+}
+
+// Fixed P-256 key pairs for the golden payload (section 29), generated once
+// with BCrypt and frozen here. Test-only keys: they protect nothing.
+constexpr char kGoldenKekX[] = "a55c04e4b2113126f3ea5244034decd0c0c9f55cd25d2e0396a365a7e265082f";
+constexpr char kGoldenKekY[] = "4ab897ae67c14350a0213b0a67d416472aa053a16992018ac4d874dc8529569d";
+constexpr char kGoldenKekD[] = "9639379738995d1017b34a6398b444cf9cd0c82acb0dc0cd5d40c91b513f4e90";
+constexpr char kGoldenEphX[] = "49558684f39417442947acb7dadc2f1fa748707d0fd67c77dac65f9b7bc83524";
+constexpr char kGoldenEphY[] = "7676693e78abc03028a6648960ed359395e403b079b2e8e46456a84ddb76116d";
+constexpr char kGoldenEphD[] = "43d28ac36869f16095e0a4e2a09b7ae147ead807317fa0299828102bd03022d0";
+constexpr char kGoldenNonce[] = "977bcd31c21caffe32bc3f6a";
+constexpr char kGoldenService[] = "hkdfguardwin.test.golden";
+constexpr wchar_t kGoldenServiceWide[] = L"hkdfguardwin.test.golden";
+
+// The golden WrappedDekV1 payload: MakeDek() wrapped under the golden KEK
+// for kGoldenService, with the golden ephemeral key and nonce. Frozen. If a
+// code change makes this stop unwrapping, that change breaks every payload
+// already deployed - fix the change, never this constant.
+constexpr char kGoldenPayloadHex[] =
+    "010200000100000049558684f39417442947acb7dadc2f1fa748707d0fd67c77dac65f9b"
+    "7bc835247676693e78abc03028a6648960ed359395e403b079b2e8e46456a84ddb76116d"
+    "977bcd31c21caffe32bc3f6a1f076220e98a1e9a444280622f6411869f972b9cbef3c705"
+    "448621c8d6b812acea664278b5976d4a6f46d3d1e59fbad038d1ef5a8d210826eeabdd24"
+    "b8676833717a7ecedb999ae3b9b3012a0d4353c4";
+
+// BCRYPT_ECCPRIVATE_BLOB for a P-256 ECDH key from hex X, Y, d.
+std::vector<uint8_t> EccPrivateBlob(const char* x, const char* y, const char* d) {
+    std::vector<uint8_t> blob(sizeof(BCRYPT_ECCKEY_BLOB));
+    auto* header = reinterpret_cast<BCRYPT_ECCKEY_BLOB*>(blob.data());
+    header->dwMagic = BCRYPT_ECDH_PRIVATE_P256_MAGIC;
+    header->cbKey = 32;
+    for (const char* part : {x, y, d}) {
+        std::vector<uint8_t> bytes = FromHex(part);
+        blob.insert(blob.end(), bytes.begin(), bytes.end());
+    }
+    return blob;
+}
+
+bool HmacSha512(const std::vector<uint8_t>& key, const std::vector<uint8_t>& data, std::vector<uint8_t>& out) {
+    out.assign(64, 0);
+    return BCRYPT_SUCCESS(BCryptHash(BCRYPT_HMAC_SHA512_ALG_HANDLE, const_cast<PUCHAR>(key.data()),
+                                     static_cast<ULONG>(key.size()), const_cast<PUCHAR>(data.data()),
+                                     static_cast<ULONG>(data.size()), out.data(), 64));
+}
+
+// Builds the golden payload from the *documented* construction, written
+// independently of src/ (no library function is called): ECDH(ephemeral d,
+// KEK public) -> raw secret -> HKDF-SHA512 (RFC 5869, salt = 64 zero bytes,
+// info = "HkdfGuardWin-DEK-Wrap-v1" || ephemeral X||Y || KEK X||Y) -> first
+// 32 bytes as the AES-256-GCM key; AAD = service || SHA-256(KEK X||Y); then
+// the WrappedDekV1 layout. Agreement with the library's own output (the
+// frozen constant, which the library must unwrap) shows the code still
+// implements this construction.
+//
+// IKM byte order: BCRYPT_KDF_RAW_SECRET returns the shared secret
+// LITTLE-endian (byte-reversed relative to the usual big-endian X
+// coordinate), and the library feeds those bytes to HKDF as they come. This
+// test uses them the same way, which pins that choice: switching to
+// big-endian would break every existing payload.
+bool BuildGoldenPayloadIndependently(std::vector<uint8_t>& payload) {
+    BCRYPT_ALG_HANDLE ecdh = BCRYPT_ECDH_P256_ALG_HANDLE;
+    std::vector<uint8_t> kekBlob = EccPrivateBlob(kGoldenKekX, kGoldenKekY, kGoldenKekD);
+    std::vector<uint8_t> ephBlob = EccPrivateBlob(kGoldenEphX, kGoldenEphY, kGoldenEphD);
+    hkdfguard::ScopedBCryptKey kek, eph;
+    if (!BCRYPT_SUCCESS(BCryptImportKeyPair(ecdh, nullptr, BCRYPT_ECCPRIVATE_BLOB, kek.put(), kekBlob.data(),
+                                            static_cast<ULONG>(kekBlob.size()), 0)) ||
+        !BCRYPT_SUCCESS(BCryptImportKeyPair(ecdh, nullptr, BCRYPT_ECCPRIVATE_BLOB, eph.put(), ephBlob.data(),
+                                            static_cast<ULONG>(ephBlob.size()), 0))) {
+        return false;
+    }
+    hkdfguard::ScopedBCryptSecret secret;
+    if (!BCRYPT_SUCCESS(BCryptSecretAgreement(eph.get(), kek.get(), secret.put(), 0))) return false;
+    std::vector<uint8_t> ikm(32);
+    ULONG got = 0;
+    if (!BCRYPT_SUCCESS(BCryptDeriveKey(secret.get(), BCRYPT_KDF_RAW_SECRET, nullptr, ikm.data(), 32, &got, 0)) ||
+        got != 32) {
+        return false;
+    }
+
+    std::vector<uint8_t> ephPub = FromHex(kGoldenEphX), kekPub = FromHex(kGoldenKekX);
+    std::vector<uint8_t> ephY = FromHex(kGoldenEphY), kekY = FromHex(kGoldenKekY);
+    ephPub.insert(ephPub.end(), ephY.begin(), ephY.end());
+    kekPub.insert(kekPub.end(), kekY.begin(), kekY.end());
+
+    const char context[] = "HkdfGuardWin-DEK-Wrap-v1";
+    std::vector<uint8_t> info(context, context + sizeof(context) - 1);
+    info.insert(info.end(), ephPub.begin(), ephPub.end());
+    info.insert(info.end(), kekPub.begin(), kekPub.end());
+
+    std::vector<uint8_t> prk, t1;
+    if (!HmacSha512(std::vector<uint8_t>(64, 0), ikm, prk)) return false;
+    std::vector<uint8_t> t1Input = info;
+    t1Input.push_back(0x01);
+    if (!HmacSha512(prk, t1Input, t1)) return false;
+    std::vector<uint8_t> aesKey(t1.begin(), t1.begin() + 32);
+
+    std::vector<uint8_t> fingerprint(32);
+    if (!BCRYPT_SUCCESS(BCryptHash(BCRYPT_SHA256_ALG_HANDLE, nullptr, 0, kekPub.data(),
+                                   static_cast<ULONG>(kekPub.size()), fingerprint.data(), 32))) {
+        return false;
+    }
+    std::vector<uint8_t> aad(kGoldenService, kGoldenService + sizeof(kGoldenService) - 1);
+    aad.insert(aad.end(), fingerprint.begin(), fingerprint.end());
+
+    hkdfguard::ScopedBCryptAlg aes;
+    hkdfguard::ScopedBCryptKey aesHandle;
+    if (!BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(aes.put(), BCRYPT_AES_ALGORITHM, nullptr, 0)) ||
+        !BCRYPT_SUCCESS(BCryptSetProperty(aes.get(), BCRYPT_CHAINING_MODE,
+                                          reinterpret_cast<PUCHAR>(const_cast<wchar_t*>(BCRYPT_CHAIN_MODE_GCM)),
+                                          sizeof(BCRYPT_CHAIN_MODE_GCM), 0)) ||
+        !BCRYPT_SUCCESS(BCryptGenerateSymmetricKey(aes.get(), aesHandle.put(), nullptr, 0, aesKey.data(), 32, 0))) {
+        return false;
+    }
+    std::vector<uint8_t> nonce = FromHex(kGoldenNonce);
+    std::vector<uint8_t> dek = MakeDek();
+    std::vector<uint8_t> ciphertext(32), tag(16);
+    BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO info_gcm;
+    BCRYPT_INIT_AUTH_MODE_INFO(info_gcm);
+    info_gcm.pbNonce = nonce.data();
+    info_gcm.cbNonce = 12;
+    info_gcm.pbTag = tag.data();
+    info_gcm.cbTag = 16;
+    info_gcm.pbAuthData = aad.data();
+    info_gcm.cbAuthData = static_cast<ULONG>(aad.size());
+    ULONG written = 0;
+    if (!BCRYPT_SUCCESS(BCryptEncrypt(aesHandle.get(), dek.data(), 32, &info_gcm, nullptr, 0, ciphertext.data(), 32,
+                                      &written, 0)) ||
+        written != 32) {
+        return false;
+    }
+
+    payload = {0x01, 0x02, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00}; // version, software provider, reserved, KeyId 1 (LE)
+    payload.insert(payload.end(), ephPub.begin(), ephPub.end());
+    payload.insert(payload.end(), nonce.begin(), nonce.end());
+    payload.insert(payload.end(), ciphertext.begin(), ciphertext.end());
+    payload.insert(payload.end(), tag.begin(), tag.end());
+    payload.insert(payload.end(), fingerprint.begin(), fingerprint.end());
+    return payload.size() == HKDFGUARD_WRAPPED_LEN;
+}
+
+// Persists the golden KEK on the Software KSP as a machine key under the
+// name the library would use for kGoldenService, non-exportable, usable for
+// key agreement - so the shipped DLL's unwrap can find and use it.
+bool ImportGoldenKek() {
+    std::vector<uint8_t> blob = EccPrivateBlob(kGoldenKekX, kGoldenKekY, kGoldenKekD);
+    std::wstring name = KekNameFor(kGoldenServiceWide);
+    NCryptBuffer nameBuffer{};
+    nameBuffer.BufferType = NCRYPTBUFFER_PKCS_KEY_NAME;
+    nameBuffer.cbBuffer = static_cast<ULONG>((name.size() + 1) * sizeof(wchar_t));
+    nameBuffer.pvBuffer = const_cast<wchar_t*>(name.c_str());
+    NCryptBufferDesc params{};
+    params.ulVersion = NCRYPTBUFFER_VERSION;
+    params.cBuffers = 1;
+    params.pBuffers = &nameBuffer;
+
+    NCRYPT_PROV_HANDLE prov = 0;
+    if (NCryptOpenStorageProvider(&prov, MS_KEY_STORAGE_PROVIDER, 0) != ERROR_SUCCESS) return false;
+    NCRYPT_KEY_HANDLE key = 0;
+    bool ok = NCryptImportKey(prov, 0, BCRYPT_ECCPRIVATE_BLOB, &params, &key, blob.data(),
+                              static_cast<DWORD>(blob.size()),
+                              NCRYPT_MACHINE_KEY_FLAG | NCRYPT_DO_NOT_FINALIZE_FLAG | NCRYPT_SILENT_FLAG) == ERROR_SUCCESS;
+    if (ok) {
+        DWORD exportPolicy = 0;
+        ok = NCryptSetProperty(key, NCRYPT_EXPORT_POLICY_PROPERTY, reinterpret_cast<PBYTE>(&exportPolicy),
+                               sizeof(exportPolicy), 0) == ERROR_SUCCESS;
+    }
+    if (ok) {
+        DWORD usage = NCRYPT_ALLOW_KEY_AGREEMENT_FLAG;
+        NCryptSetProperty(key, NCRYPT_KEY_USAGE_PROPERTY, reinterpret_cast<PBYTE>(&usage), sizeof(usage), 0);
+        ok = NCryptFinalizeKey(key, NCRYPT_SILENT_FLAG) == ERROR_SUCCESS;
+    }
+    if (key) NCryptFreeObject(key);
+    NCryptFreeObject(prov);
+    SecureZeroMemory(blob.data(), blob.size());
+    return ok;
+}
+
 } // namespace
 
 int main() {
@@ -381,6 +696,40 @@ int main() {
     Check(
         InternalCreateKekResult(kServiceUseGroupsWide) == HKDFGUARD_ERR_GROUP_INVALID,
         "create_kek rejects BUILTIN\\Users as a key-use group");
+
+    // Broad well-known groups that are reported as SidTypeWellKnownGroup in
+    // a domain IsHostLocalAccountDomain accepts, so only the over-broad
+    // denylist can stop them. Each is checked by SID string, which works
+    // whatever the display language of this machine.
+    {
+        struct BroadPrincipal {
+            const wchar_t *sid;
+            const char *label;
+        };
+        const BroadPrincipal broad[] = {
+            {L"S-1-5-113", "create_kek rejects NT AUTHORITY\\Local account (S-1-5-113)"},
+            {L"S-1-5-80-0", "create_kek rejects NT SERVICE\\ALL SERVICES (S-1-5-80-0)"},
+            {L"S-1-5-15", "create_kek rejects NT AUTHORITY\\This Organization (S-1-5-15)"},
+            {L"S-1-5-14", "create_kek rejects NT AUTHORITY\\REMOTE INTERACTIVE LOGON (S-1-5-14)"},
+            {L"S-1-2-0", "create_kek rejects LOCAL (S-1-2-0)"},
+            {L"S-1-2-1", "create_kek rejects CONSOLE LOGON (S-1-2-1)"},
+        };
+        for (const BroadPrincipal &p: broad) {
+            hkdfguard::SetTestKeyUseGroupsOverride(std::vector<std::wstring>{p.sid});
+            Check(InternalCreateKekResult(kServiceUseGroupsWide) == HKDFGUARD_ERR_GROUP_INVALID, p.label);
+        }
+    }
+
+    // And by name, for the two most likely to be typed into a policy.
+    hkdfguard::SetTestKeyUseGroupsOverride(std::vector<std::wstring>{L"NT AUTHORITY\\Local account"});
+    Check(
+        InternalCreateKekResult(kServiceUseGroupsWide) == HKDFGUARD_ERR_GROUP_INVALID,
+        "create_kek rejects NT AUTHORITY\\Local account given by name");
+
+    hkdfguard::SetTestKeyUseGroupsOverride(std::vector<std::wstring>{L"NT SERVICE\\ALL SERVICES"});
+    Check(
+        InternalCreateKekResult(kServiceUseGroupsWide) == HKDFGUARD_ERR_GROUP_INVALID,
+        "create_kek rejects NT SERVICE\\ALL SERVICES given by name");
 
     // A user account - even a perfectly real one - is not a group.
     wchar_t current_user[256] = {};
@@ -671,12 +1020,14 @@ int main() {
     int32_t tiny_buf_len = static_cast<int32_t>(tiny_buf.size());
     rc = hkdfguard_wrap_dek(kService, dek.data(), static_cast<int32_t>(dek.size()), tiny_buf.data(), &tiny_buf_len);
     Check(rc == HKDFGUARD_ERR_BUFFER_TOO_SMALL, "wrap rejects too-small output buffer");
+    Check(tiny_buf_len == HKDFGUARD_WRAPPED_LEN, "wrap reports the required size through out_len on BUFFER_TOO_SMALL");
 
     // ---- 8. Buffer too small on unwrap. ----
     std::vector<uint8_t> tiny_out(HKDFGUARD_DEK_LEN - 1);
     int32_t tiny_out_len = static_cast<int32_t>(tiny_out.size());
     rc = hkdfguard_unwrap_dek(kService, wrapped.data(), wrapped_len, tiny_out.data(), &tiny_out_len);
     Check(rc == HKDFGUARD_ERR_BUFFER_TOO_SMALL, "unwrap rejects too-small output buffer");
+    Check(tiny_out_len == HKDFGUARD_DEK_LEN, "unwrap reports the required size through out_len on BUFFER_TOO_SMALL");
 
     // ---- 9. Malformed payload (truncated). ----
     // `std::vector<uint8_t> truncated(wrapped.begin(), wrapped.begin() +
@@ -1215,6 +1566,222 @@ int main() {
         }
     }
     hkdfguard::SetTestPolicyOverride(std::nullopt);
+
+    const bool elevated = IsElevated();
+    const bool hasTpm = HasTpmProvider();
+    std::printf("    (elevated: %s, TPM provider available: %s)\n", elevated ? "yes" : "no", hasTpm ? "yes" : "no");
+
+    // ---- 26. PreferTpm falls back to software only when the TPM is ----
+    //          provably unusable (kek_store.cpp's TpmUnusableError). Faults
+    //          are injected through the test-only SetTestTpmFaults seam.
+    {
+        hkdfguard::SetTestPolicyOverride(hkdfguard::KeyStoragePolicy::PreferTpm);
+
+        // 26a. A TPM that errors while being probed (here: not ready) may
+        //      have a KEK behind it, so nothing may fall back. Before the
+        //      fix, KekExists answered "false" from software, wrap opened
+        //      the software provider, and create made a software KEK.
+        constexpr const wchar_t* kServiceProbeFault = L"hkdfguardwin.test.fallback.probefault";
+        hkdfguard::TestTpmFaults notReady;
+        notReady.openKeyStatus = NTE_DEVICE_NOT_READY;
+        hkdfguard::SetTestTpmFaults(notReady);
+        Check(CodeOf([&] { hkdfguard::KekExists(kServiceProbeFault); }) == HKDFGUARD_ERR_PROVIDER,
+              "PreferTpm, TPM probe error: KekExists fails with PROVIDER instead of answering from software");
+        Check(CodeOf([&] { hkdfguard::OpenKekForWrap(kServiceProbeFault); }) == HKDFGUARD_ERR_PROVIDER,
+              "PreferTpm, TPM probe error: wrap fails with PROVIDER instead of falling back");
+        Check(CodeOf([&] { hkdfguard::CreateKek(kServiceProbeFault); }) == HKDFGUARD_ERR_PROVIDER,
+              "PreferTpm, TPM probe error: create_kek fails with PROVIDER instead of falling back");
+        Check(!MachineKeyExists(MS_KEY_STORAGE_PROVIDER, KekNameFor(kServiceProbeFault)),
+              "PreferTpm, TPM probe error: no software KEK is created");
+        DeleteMachineKeyQuiet(MS_KEY_STORAGE_PROVIDER, KekNameFor(kServiceProbeFault));
+
+        // 26b. A TPM that reports no device does fall back.
+        constexpr const wchar_t* kServiceNoDevice = L"hkdfguardwin.test.fallback.nodevice";
+        hkdfguard::TestTpmFaults noDevice;
+        noDevice.openKeyStatus = TBS_E_TPM_NOT_FOUND;
+        hkdfguard::SetTestTpmFaults(noDevice);
+        bool noDeviceExists = true;
+        Check(CodeOf([&] { noDeviceExists = hkdfguard::KekExists(kServiceNoDevice); }) == HKDFGUARD_OK && !noDeviceExists,
+              "PreferTpm, TPM reports no device: KekExists falls back to software and reports false");
+        if (elevated) {
+            Check(CodeOf([&] { hkdfguard::CreateKek(kServiceNoDevice); }) == HKDFGUARD_OK,
+                  "PreferTpm, TPM reports no device: create_kek falls back to the software provider");
+            uint8_t openedType = 0;
+            Check(CodeOf([&] { openedType = hkdfguard::OpenKekForWrap(kServiceNoDevice).provider_type; }) ==
+                          HKDFGUARD_OK &&
+                      openedType == hkdfguard::kProviderTypeSoftware,
+                  "PreferTpm, TPM reports no device: wrap opens the software KEK");
+        } else {
+            Skip("PreferTpm, TPM reports no device: create_kek falls back (needs elevation)");
+        }
+        hkdfguard::SetTestTpmFaults({});
+        DeleteMachineKeyQuiet(MS_KEY_STORAGE_PROVIDER, KekNameFor(kServiceNoDevice));
+
+        // 26c. An existing TPM KEK that fails verification must not be
+        //      sidestepped by a software KEK. Needs a real TPM KEK.
+        constexpr const wchar_t* kServiceVerifyFault = L"hkdfguardwin.test.fallback.verifyfault";
+        if (elevated && hasTpm) {
+            bool tpmCreated = CodeOf([&] { hkdfguard::CreateKek(kServiceVerifyFault); }) == HKDFGUARD_OK &&
+                              MachineKeyExists(MS_PLATFORM_CRYPTO_PROVIDER, KekNameFor(kServiceVerifyFault));
+            Check(tpmCreated, "test setup: PreferTpm creates a real TPM KEK");
+            if (tpmCreated) {
+                hkdfguard::TestTpmFaults verifyFails;
+                verifyFails.failVerification = true;
+                hkdfguard::SetTestTpmFaults(verifyFails);
+                Check(CodeOf([&] { hkdfguard::CreateKek(kServiceVerifyFault); }) == HKDFGUARD_ERR_PROVIDER,
+                      "PreferTpm, existing TPM KEK fails verification: create_kek fails instead of falling back");
+                Check(!MachineKeyExists(MS_KEY_STORAGE_PROVIDER, KekNameFor(kServiceVerifyFault)),
+                      "PreferTpm, existing TPM KEK fails verification: no software KEK is created beside it");
+                Check(CodeOf([&] { hkdfguard::OpenKekForWrap(kServiceVerifyFault); }) == HKDFGUARD_ERR_PROVIDER,
+                      "PreferTpm, existing TPM KEK fails verification: wrap fails instead of falling back");
+                Check(MachineKeyExists(MS_PLATFORM_CRYPTO_PROVIDER, KekNameFor(kServiceVerifyFault)),
+                      "PreferTpm, existing TPM KEK fails verification: the TPM KEK is left in place");
+                hkdfguard::SetTestTpmFaults({});
+            }
+        } else {
+            Skip("PreferTpm, existing TPM KEK fails verification: no fallback (needs elevation and a TPM)");
+        }
+        hkdfguard::SetTestTpmFaults({});
+        DeleteMachineKeyQuiet(MS_PLATFORM_CRYPTO_PROVIDER, KekNameFor(kServiceVerifyFault));
+        DeleteMachineKeyQuiet(MS_KEY_STORAGE_PROVIDER, KekNameFor(kServiceVerifyFault));
+
+        hkdfguard::SetTestPolicyOverride(std::nullopt);
+    }
+
+    // ---- 27. A pre-planted key under a service's name that this library ----
+    //          would never create is refused by create and wrap, and left in
+    //          place. SoftwareOnly keeps it deterministic. Planting a
+    //          machine key needs elevation.
+    {
+        struct Planted {
+            const wchar_t* service;
+            LPCWSTR algorithm;
+            LPCWSTR curve;
+            bool exportable;
+            const char* label;
+        };
+        const Planted planted[] = {
+            {L"hkdfguardwin.test.planted.brainpool", NCRYPT_ECDH_ALGORITHM, BCRYPT_ECC_CURVE_BRAINPOOLP256R1, false,
+             "a brainpoolP256r1 key (256-bit, wrong curve)"},
+            {L"hkdfguardwin.test.planted.p384", NCRYPT_ECDH_P384_ALGORITHM, nullptr, false, "a P-384 key"},
+            {L"hkdfguardwin.test.planted.exportable", NCRYPT_ECDH_P256_ALGORITHM, nullptr, true,
+             "an exportable P-256 key"},
+        };
+        hkdfguard::SetTestPolicyOverride(hkdfguard::KeyStoragePolicy::SoftwareOnly);
+        for (const Planted& p : planted) {
+            const std::wstring name = KekNameFor(p.service);
+            const std::string label(p.label);
+            if (!elevated) {
+                Skip(("pre-planted " + label + " is refused (needs elevation)").c_str());
+                continue;
+            }
+            DeleteMachineKeyQuiet(MS_KEY_STORAGE_PROVIDER, name);
+            bool plantedOk = PlantSoftwareKey(name, p.algorithm, p.curve, p.exportable);
+            Check(plantedOk, ("test setup: plant " + label).c_str());
+            if (plantedOk) {
+                Check(CodeOf([&] { hkdfguard::CreateKek(p.service); }) == HKDFGUARD_ERR_PROVIDER,
+                      ("create_kek refuses a pre-planted " + label).c_str());
+                Check(CodeOf([&] { hkdfguard::OpenKekForWrap(p.service); }) == HKDFGUARD_ERR_PROVIDER,
+                      ("wrap refuses a pre-planted " + label).c_str());
+                Check(MachineKeyExists(MS_KEY_STORAGE_PROVIDER, name),
+                      ("a refused pre-planted " + label + " is left in place").c_str());
+            }
+            DeleteMachineKeyQuiet(MS_KEY_STORAGE_PROVIDER, name);
+        }
+        hkdfguard::SetTestPolicyOverride(std::nullopt);
+    }
+
+    // ---- 28. Re-provisioning refuses an existing KEK whose ACL grants an ----
+    //          over-broad principal through a conditional (callback) allow
+    //          ACE, or grants one of the broad groups added to the denylist.
+    //          Complements 25d, which covers a plain grant to Everyone.
+    {
+        constexpr const wchar_t* kServiceAclEntries = L"hkdfguardwin.test.aclentries";
+        const std::wstring name = KekNameFor(kServiceAclEntries);
+        struct AclCase {
+            const wchar_t* sddl;
+            const char* label;
+        };
+        const AclCase cases[] = {
+            {L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(XA;;GR;;;WD;(Member_of {SID(BA)}))",
+             "a conditional allow ACE for Everyone"},
+            {L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GR;;;S-1-5-80-0)", "a grant to NT SERVICE\\ALL SERVICES"},
+            {L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GR;;;S-1-5-113)", "a grant to NT AUTHORITY\\Local account"},
+        };
+        if (!elevated) {
+            Skip("existing-KEK ACL checks for conditional and newly denied grants (needs elevation)");
+        } else {
+            hkdfguard::SetTestPolicyOverride(hkdfguard::KeyStoragePolicy::SoftwareOnly);
+            DeleteMachineKeyQuiet(MS_KEY_STORAGE_PROVIDER, name);
+            bool created = CodeOf([&] { hkdfguard::CreateKek(kServiceAclEntries); }) == HKDFGUARD_OK;
+            Check(created, "test setup: create a KEK for the ACL-entry checks");
+            if (created) {
+                // A legitimate ACL (no over-broad grants) must still pass, so
+                // each case is a real rejection, not a broken check.
+                bool baselineSet = SetSoftwareKeyDacl(name, L"D:P(A;;GA;;;SY)(A;;GA;;;BA)");
+                Check(baselineSet && CodeOf([&] { hkdfguard::CreateKek(kServiceAclEntries); }) == HKDFGUARD_OK,
+                      "create_kek accepts an existing KEK whose ACL is just SYSTEM and Administrators");
+                for (const AclCase& c : cases) {
+                    const std::string label(c.label);
+                    bool set = SetSoftwareKeyDacl(name, c.sddl);
+                    Check(set, ("test setup: set an ACL with " + label).c_str());
+                    if (set) {
+                        Check(CodeOf([&] { hkdfguard::CreateKek(kServiceAclEntries); }) ==
+                                  HKDFGUARD_ERR_KEK_ACL_INVALID,
+                              ("create_kek rejects an existing KEK whose ACL has " + label).c_str());
+                        Check(MachineKeyExists(MS_KEY_STORAGE_PROVIDER, name),
+                              ("a KEK rejected for " + label + " is left in place").c_str());
+                    }
+                }
+            }
+            DeleteMachineKeyQuiet(MS_KEY_STORAGE_PROVIDER, name);
+            hkdfguard::SetTestPolicyOverride(std::nullopt);
+        }
+    }
+
+    // ---- 29. Golden payload: the derivation and wire format are pinned. ----
+    //          Wrap and unwrap share the library's code, so a change to the
+    //          HKDF info, hash, salt, AAD, IKM byte order or layout would
+    //          still round-trip - while silently breaking every payload
+    //          already deployed (and rollback depends on those). Two checks:
+    //          (a) the documented construction, computed independently of
+    //          src/ with fixed keys and nonce, reproduces the frozen payload;
+    //          (b) the shipped DLL unwraps the frozen payload to the known
+    //          DEK, once the golden KEK is imported (needs elevation).
+    {
+        std::vector<uint8_t> independent;
+        bool built = BuildGoldenPayloadIndependently(independent);
+        Check(built, "golden payload: the documented construction can be computed independently");
+        if (std::strlen(kGoldenPayloadHex) == 0) {
+            std::printf("    (golden payload not frozen yet; computed: %s)\n", ToHex(independent).c_str());
+            Check(false, "golden payload: kGoldenPayloadHex is frozen in the test source");
+        } else {
+            std::vector<uint8_t> golden = FromHex(kGoldenPayloadHex);
+            Check(built && independent == golden,
+                  "golden payload: the documented construction reproduces the frozen payload byte for byte");
+
+            if (elevated) {
+                DeleteMachineKeyQuiet(MS_KEY_STORAGE_PROVIDER, KekNameFor(kGoldenServiceWide));
+                bool imported = ImportGoldenKek();
+                Check(imported, "test setup: import the golden KEK as a Software KSP machine key");
+                if (imported) {
+                    std::vector<uint8_t> out(HKDFGUARD_DEK_LEN, 0xAA);
+                    int32_t outLen = static_cast<int32_t>(out.size());
+                    rc = hkdfguard_unwrap_dek(kGoldenService, golden.data(), static_cast<int32_t>(golden.size()),
+                                              out.data(), &outLen);
+                    Check(rc == HKDFGUARD_OK, "golden payload: the shipped DLL unwraps the frozen payload");
+                    if (rc != HKDFGUARD_OK) {
+                        std::printf("    (hkdfguard_unwrap_dek returned %d)\n", rc);
+                    }
+                    Check(rc == HKDFGUARD_OK && std::memcmp(out.data(), dek.data(), HKDFGUARD_DEK_LEN) == 0,
+                          "golden payload: unwrapping it recovers the known DEK");
+                }
+                DeleteMachineKeyQuiet(MS_KEY_STORAGE_PROVIDER, KekNameFor(kGoldenServiceWide));
+            } else {
+                Skip("golden payload: the shipped DLL unwraps the frozen payload (needs elevation)");
+            }
+        }
+    }
 
     // ---- Cleanup. ----
     // Remove the KEKs this test run created so they don't accumulate in the

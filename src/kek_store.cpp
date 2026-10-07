@@ -13,6 +13,9 @@ namespace hkdfguard {
         // default, so a test binary that never sets it behaves exactly like
         // the DLL.
         std::optional<std::wstring> g_testTpmProviderNameOverride;
+
+        // See SetTestTpmFaults in kek_store.h. Empty by default.
+        TestTpmFaults g_testTpmFaults;
 #endif
 
         // The NCrypt provider name used for everything "TPM" in this file.
@@ -28,6 +31,33 @@ namespace hkdfguard {
             }
 #endif
             return MS_PLATFORM_CRYPTO_PROVIDER;
+        }
+
+        // Test seam hooks (see TestTpmFaults in kek_store.h). In
+        // hkdfguard.dll these compile to "return the real status" and
+        // "never fail", so the shipped library behaves exactly as without
+        // them.
+        SECURITY_STATUS ApplyTestTpmOpenStatus(LPCWSTR providerName, SECURITY_STATUS actual)
+        {
+#if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
+            if (g_testTpmFaults.openKeyStatus.has_value() &&
+                wcscmp(providerName, TpmProviderName()) == 0)
+            {
+                return *g_testTpmFaults.openKeyStatus;
+            }
+#endif
+            (void)providerName;
+            return actual;
+        }
+
+        bool TestTpmVerificationFails(uint8_t providerType)
+        {
+#if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
+            return g_testTpmFaults.failVerification && providerType == kProviderTypeTpm;
+#else
+            (void)providerType;
+            return false;
+#endif
         }
 
         // Builds the actual name a KEK is persisted under in Windows' key storage:
@@ -73,6 +103,49 @@ namespace hkdfguard {
                         HKDFGUARD_ERR_PROVIDER,
                         "invalid provider type");
             }
+        }
+
+        // The one failure PreferTpm may answer by falling back to the
+        // software provider: the TPM cannot be used for this service at all,
+        // and no TPM KEK for it can be in use. Thrown only when
+        //
+        //   - the TPM provider cannot even be opened (no TPM/vTPM, PCP not
+        //     available),
+        //   - the TPM reports that no device exists (TBS_E_TPM_NOT_FOUND,
+        //     NTE_DEVICE_NOT_FOUND), or
+        //   - the TPM key was confirmed absent (NTE_BAD_KEYSET) and creating
+        //     it then failed, with any partly-created key already deleted.
+        //
+        // Everything else - an existing TPM KEK failing property
+        // verification, an unexpected error while probing for one, a
+        // concurrent creation - is a plain HkdfGuardError and propagates.
+        // Falling back on those would put a second, software KEK beside a
+        // TPM KEK that may be in use, permanently downgrading the service.
+        // The public status code is unchanged (HKDFGUARD_ERR_PROVIDER or
+        // HKDFGUARD_ERR_CRYPTO); only PreferTpm's fallback logic looks at
+        // the type.
+        class TpmUnusableError : public HkdfGuardError {
+        public:
+            using HkdfGuardError::HkdfGuardError;
+        };
+
+        bool IsTpmUnusable(const HkdfGuardError& e)
+        {
+            return dynamic_cast<const TpmUnusableError*>(&e) != nullptr;
+        }
+
+#ifndef TBS_E_TPM_NOT_FOUND
+#define TBS_E_TPM_NOT_FOUND ((SECURITY_STATUS)0x8028400FL)
+#endif
+
+        // Thrown when NCryptOpenStorageProvider fails. Eligible for the
+        // PreferTpm fallback (see TpmUnusableError); harmless on the software
+        // provider, where nothing catches the distinction.
+        [[noreturn]] void ThrowProviderOpenFailure()
+        {
+            throw TpmUnusableError(
+                HKDFGUARD_ERR_PROVIDER,
+                "NCryptOpenStorageProvider failed");
         }
 
         // Throws the most specific HkdfGuardError an NCrypt failure
@@ -125,6 +198,17 @@ namespace hkdfguard {
                 throw HkdfGuardError(
                     HKDFGUARD_ERR_ACCESS_DENIED,
                     "access to the KEK was denied");
+            }
+
+            // No TPM device at all: the one probe-time error that proves no
+            // TPM KEK can be in use, so PreferTpm may fall back. A TPM that
+            // is merely busy, locked out or not ready is deliberately NOT
+            // here - a TPM KEK may well exist behind it.
+            if (status == TBS_E_TPM_NOT_FOUND || status == NTE_DEVICE_NOT_FOUND)
+            {
+                throw TpmUnusableError(
+                    HKDFGUARD_ERR_PROVIDER,
+                    "no TPM device is present");
             }
 
             throw HkdfGuardError(
@@ -208,6 +292,89 @@ namespace hkdfguard {
                 throw HkdfGuardError(
                     HKDFGUARD_ERR_PROVIDER,
                     "unexpected key length");
+            }
+        }
+
+        // Pins the curve to NIST P-256 specifically. VerifyKeyLength alone
+        // does not: brainpoolP256r1, secp256k1 and other 256-bit named curves
+        // CNG supports would pass it, and VerifyAlgorithm only checks the
+        // "ECDH" family.
+        //
+        // Two checks, chosen from what both providers were observed to
+        // support (a per-user ECDH_P256 key probed on an AMD fTPM's Platform
+        // Crypto Provider and on the Software KSP):
+        //
+        //   1. The exported public blob's magic must be
+        //      BCRYPT_ECDH_PUBLIC_P256_MAGIC with 32-byte coordinates. Both
+        //      providers export a P-256 key this way; a key on any other
+        //      named curve exports with the generic ECC magic instead.
+        //      Exporting the public half is always permitted, whatever the
+        //      key's export policy.
+        //   2. If the provider reports NCRYPT_ECC_CURVE_NAME_PROPERTY, it
+        //      must be "nistP256". The PCP reports it; the Software KSP
+        //      returns NTE_NOT_FOUND for a key created with the
+        //      curve-specific ECDH_P256 algorithm, so absence is accepted
+        //      and check 1 carries the guarantee there.
+        void VerifyCurve(
+            NCRYPT_KEY_HANDLE key)
+        {
+            DWORD cb = 0;
+            SECURITY_STATUS status =
+                NCryptExportKey(key, 0, BCRYPT_ECCPUBLIC_BLOB, nullptr, nullptr, 0, &cb, 0);
+
+            if (status != ERROR_SUCCESS || cb < sizeof(BCRYPT_ECCKEY_BLOB))
+            {
+                throw HkdfGuardError(
+                    HKDFGUARD_ERR_PROVIDER,
+                    "cannot export key public blob");
+            }
+
+            std::vector<BYTE> blob(cb);
+            status =
+                NCryptExportKey(key, 0, BCRYPT_ECCPUBLIC_BLOB, nullptr, blob.data(), cb, &cb, 0);
+
+            if (status != ERROR_SUCCESS || cb < sizeof(BCRYPT_ECCKEY_BLOB))
+            {
+                throw HkdfGuardError(
+                    HKDFGUARD_ERR_PROVIDER,
+                    "cannot export key public blob");
+            }
+
+            const auto* header = reinterpret_cast<const BCRYPT_ECCKEY_BLOB*>(blob.data());
+
+            if (header->dwMagic != BCRYPT_ECDH_PUBLIC_P256_MAGIC || header->cbKey != 32)
+            {
+                throw HkdfGuardError(
+                    HKDFGUARD_ERR_PROVIDER,
+                    "key is not on the NIST P-256 curve");
+            }
+
+            wchar_t curveName[64] = {};
+            DWORD cbResult = 0;
+
+            status =
+                NCryptGetProperty(
+                    key,
+                    NCRYPT_ECC_CURVE_NAME_PROPERTY,
+                    reinterpret_cast<PBYTE>(curveName),
+                    sizeof(curveName) - sizeof(wchar_t), // keep a terminator
+                    &cbResult,
+                    0);
+
+            if (status == ERROR_SUCCESS)
+            {
+                if (wcscmp(curveName, BCRYPT_ECC_CURVE_NISTP256) != 0)
+                {
+                    throw HkdfGuardError(
+                        HKDFGUARD_ERR_PROVIDER,
+                        "key is not on the NIST P-256 curve");
+                }
+            }
+            else if (status != NTE_NOT_FOUND && status != NTE_NOT_SUPPORTED)
+            {
+                throw HkdfGuardError(
+                    HKDFGUARD_ERR_PROVIDER,
+                    "cannot query key curve name");
             }
         }
 
@@ -361,8 +528,16 @@ namespace hkdfguard {
             KeyStoragePolicy policy,
             uint8_t provider_type)
         {
+            if (TestTpmVerificationFails(provider_type))
+            {
+                throw HkdfGuardError(
+                    HKDFGUARD_ERR_PROVIDER,
+                    "injected test fault: TPM key failed verification");
+            }
+
             VerifyAlgorithm(key);
             VerifyKeyLength(key);
+            VerifyCurve(key);
             VerifyUsage(key);
             VerifyExportPolicy(key);
 
@@ -393,9 +568,7 @@ namespace hkdfguard {
 
             if (status != ERROR_SUCCESS)
             {
-                throw HkdfGuardError(
-                    HKDFGUARD_ERR_PROVIDER,
-                    "NCryptOpenStorageProvider failed");
+                ThrowProviderOpenFailure();
             }
 
             std::wstring name =
@@ -412,6 +585,8 @@ namespace hkdfguard {
                     // carried a UI-requiring protection policy - empirically
                     // confirmed accepted (not NTE_BAD_FLAGS) by NCryptOpenKey.
                     NCRYPT_MACHINE_KEY_FLAG | NCRYPT_SILENT_FLAG);
+
+            status = ApplyTestTpmOpenStatus(provider_name, status);
 
             if (status != ERROR_SUCCESS)
             {
@@ -447,9 +622,7 @@ namespace hkdfguard {
 
             if (status != ERROR_SUCCESS)
             {
-                throw HkdfGuardError(
-                    HKDFGUARD_ERR_PROVIDER,
-                    "NCryptOpenStorageProvider failed");
+                ThrowProviderOpenFailure();
             }
 
             std::wstring name =
@@ -466,6 +639,8 @@ namespace hkdfguard {
                     // See OpenKekOnProvider's identical NCryptOpenKey call
                     // above for why NCRYPT_SILENT_FLAG is added here too.
                     NCRYPT_MACHINE_KEY_FLAG | NCRYPT_SILENT_FLAG);
+
+            status = ApplyTestTpmOpenStatus(providerName, status);
 
             if (status == ERROR_SUCCESS)
             {
@@ -508,9 +683,7 @@ namespace hkdfguard {
 
             if (status != ERROR_SUCCESS)
             {
-                throw HkdfGuardError(
-                    HKDFGUARD_ERR_PROVIDER,
-                    "NCryptOpenStorageProvider failed");
+                ThrowProviderOpenFailure();
             }
 
             //
@@ -533,6 +706,8 @@ namespace hkdfguard {
                     // See OpenKekOnProvider's identical NCryptOpenKey call
                     // above for why NCRYPT_SILENT_FLAG is added here too.
                     NCRYPT_MACHINE_KEY_FLAG | NCRYPT_SILENT_FLAG);
+
+            status = ApplyTestTpmOpenStatus(providerName, status);
 
             if (status == ERROR_SUCCESS)
             {
@@ -568,6 +743,14 @@ namespace hkdfguard {
             //
             // Create missing key.
             //
+            // The key is now confirmed absent, so a failure from here on is
+            // "this provider cannot create the KEK" and is eligible for the
+            // PreferTpm fallback (TpmUnusableError) - except a concurrent
+            // creation (NTE_EXISTS: another provisioner just made it, so a
+            // KEK now exists here and falling back would split the service)
+            // and ACCESS_DENIED, which would fail on the software provider
+            // just the same.
+            //
 
             status =
                 NCryptCreatePersistedKey(
@@ -582,9 +765,16 @@ namespace hkdfguard {
                     // too.
                     NCRYPT_MACHINE_KEY_FLAG | NCRYPT_SILENT_FLAG);
 
-            if (status != ERROR_SUCCESS)
+            if (status == NTE_EXISTS)
             {
                 throw HkdfGuardError(
+                    HKDFGUARD_ERR_PROVIDER,
+                    "the KEK was created concurrently by another caller; retry");
+            }
+
+            if (status != ERROR_SUCCESS)
+            {
+                throw TpmUnusableError(
                     HKDFGUARD_ERR_PROVIDER,
                     "NCryptCreatePersistedKey failed");
             }
@@ -601,7 +791,7 @@ namespace hkdfguard {
 
             if (status != ERROR_SUCCESS)
             {
-                throw HkdfGuardError(
+                throw TpmUnusableError(
                     HKDFGUARD_ERR_PROVIDER,
                     "setting export policy failed");
             }
@@ -643,9 +833,24 @@ namespace hkdfguard {
             // in its unfinalized, "provisional" state.
             //
 
-            ApplyKeyAcl(
-                key.get(),
-                aclGroups);
+            try
+            {
+                ApplyKeyAcl(
+                    key.get(),
+                    aclGroups);
+            }
+            catch (const HkdfGuardError& e)
+            {
+                // Only the provider refusing the security descriptor is a
+                // provider-capability failure; anything else (a key-use
+                // group that stopped resolving, say) would fail on the
+                // software provider just the same.
+                if (e.code() == HKDFGUARD_ERR_PROVIDER)
+                {
+                    throw TpmUnusableError(e.code(), e.what());
+                }
+                throw;
+            }
 
             status =
                 NCryptFinalizeKey(
@@ -663,7 +868,24 @@ namespace hkdfguard {
                 // as NTE_PERM - mapped below to HKDFGUARD_ERR_ACCESS_DENIED,
                 // not the generic HKDFGUARD_ERR_PROVIDER a caller could
                 // otherwise mistake for "the TPM/KSP itself is broken."
-                ThrowForNCryptFailure(status, "NCryptFinalizeKey failed");
+                if (status == NTE_PERM ||
+                    status == static_cast<SECURITY_STATUS>(ERROR_ACCESS_DENIED))
+                {
+                    ThrowForNCryptFailure(status, "NCryptFinalizeKey failed");
+                }
+
+                if (status == NTE_EXISTS)
+                {
+                    throw HkdfGuardError(
+                        HKDFGUARD_ERR_PROVIDER,
+                        "the KEK was created concurrently by another caller; retry");
+                }
+
+                // Anything else: this provider could not create the key
+                // (for example a TPM that cannot hold an ECDH P-256 key).
+                throw TpmUnusableError(
+                    HKDFGUARD_ERR_PROVIDER,
+                    "NCryptFinalizeKey failed");
             }
 
             // From here on, a real persisted key exists that *this call*
@@ -716,14 +938,29 @@ namespace hkdfguard {
                     verifyKey.get(),
                     aclGroups);
             }
-            catch (const HkdfGuardError&)
+            catch (const HkdfGuardError& e)
             {
-                // Best effort: if the delete itself fails, the original
-                // verification error is still the one worth reporting.
                 // NCryptDeleteKey invalidates the handle even on failure, so
                 // `key` must forget it rather than also free it.
-                NCryptDeleteKey(key.get(), 0);
+                SECURITY_STATUS deleteStatus = NCryptDeleteKey(key.get(), 0);
                 key.release();
+
+                // If the unverified key could not be removed, it is still
+                // here, and a software KEK must not be created beside it.
+                // The verification error is reported, but as non-fallback.
+                if (deleteStatus != ERROR_SUCCESS)
+                {
+                    throw HkdfGuardError(e.code(), e.what());
+                }
+
+                // The key this call created is gone, so the provider simply
+                // could not produce a verifiable KEK: fallback-eligible.
+                // ACCESS_DENIED and the like stay as they are.
+                if (e.code() == HKDFGUARD_ERR_PROVIDER ||
+                    e.code() == HKDFGUARD_ERR_CRYPTO)
+                {
+                    throw TpmUnusableError(e.code(), e.what());
+                }
                 throw;
             }
 
@@ -765,23 +1002,19 @@ namespace hkdfguard {
                 catch (const HkdfGuardError& e)
                 {
                     // Mirror CreateKek's and OpenKekForWrap's PreferTpm
-                    // behavior: if the Platform Crypto Provider itself is
-                    // unavailable (no TPM/vTPM on this machine, provider not
-                    // ready), that's a reason to look at the software provider
-                    // instead, not a reason to fail the whole call - otherwise
-                    // hkdfguard_kek_exists (and so the CLI's `provision`) would
+                    // behavior: if the TPM is unusable (no TPM/vTPM on this
+                    // machine - see TpmUnusableError), that's a reason to look
+                    // at the software provider instead, not a reason to fail
+                    // the whole call - otherwise hkdfguard_kek_exists would
                     // fail outright on exactly the TPM-less hosts PreferTpm's
-                    // fallback exists for, while create and wrap on the same
-                    // host would succeed.
+                    // fallback exists for.
                     //
-                    // Only HKDFGUARD_ERR_PROVIDER falls through. Anything else -
-                    // in practice HKDFGUARD_ERR_ACCESS_DENIED, meaning a TPM key
-                    // *does* exist and this caller may not open it - must
-                    // propagate as-is: a permissions problem must never be
-                    // misreported as "no KEK provisioned" by quietly answering
-                    // from the software provider instead (see
-                    // KekExistsOnProvider's note on NTE_PERM).
-                    if (e.code() != HKDFGUARD_ERR_PROVIDER)
+                    // Anything else propagates as-is: ACCESS_DENIED means a TPM
+                    // key *does* exist and this caller may not open it, and an
+                    // unexpected probe error means one might. Answering from
+                    // the software provider in either case could report "no
+                    // KEK" for a service whose TPM KEK is in use.
+                    if (!IsTpmUnusable(e))
                     {
                         throw;
                     }
@@ -802,6 +1035,11 @@ namespace hkdfguard {
     void SetTestTpmProviderNameOverride(std::optional<std::wstring> providerName)
     {
         g_testTpmProviderNameOverride = std::move(providerName);
+    }
+
+    void SetTestTpmFaults(const TestTpmFaults &faults)
+    {
+        g_testTpmFaults = faults;
     }
 #endif
 
@@ -869,12 +1107,22 @@ namespace hkdfguard {
                 }
                 catch (const HkdfGuardError& e)
                 {
-                    // Fall back to the software provider only for
-                    // HKDFGUARD_ERR_PROVIDER - the TPM is unavailable, or a
-                    // create/verify step failed. Any key this attempt itself
-                    // created and couldn't verify has already been deleted
-                    // inside CreateKekOnProvider, so nothing unverified is
-                    // left on the TPM for a later OpenKekForWrap to find.
+                    // Fall back to the software provider only when the TPM is
+                    // genuinely unusable for this service (TpmUnusableError):
+                    // no TPM, or the TPM key was confirmed absent and creating
+                    // it failed. Any key this attempt itself created and
+                    // couldn't verify has already been deleted inside
+                    // CreateKekOnProvider (and if that delete failed, the
+                    // error is not fallback-eligible), so nothing unverified
+                    // is left on the TPM for a later OpenKekForWrap to find.
+                    //
+                    // In particular, an *existing* TPM KEK that fails property
+                    // verification, or an unexpected error while probing for
+                    // one, does NOT fall back. Either may be a transient TPM
+                    // fault or a provider quirk in front of a KEK that is in
+                    // use; creating a software KEK beside it would split the
+                    // service and permanently route new wraps to the weaker
+                    // key.
                     //
                     // This handler used to delete the TPM key itself on *any*
                     // failure. That was dangerous: CreateKekOnProvider also
@@ -890,7 +1138,7 @@ namespace hkdfguard {
                     // ACL). In both "exists" cases, quietly creating a second,
                     // software KEK beside it would split the service across
                     // two keys.
-                    if (e.code() != HKDFGUARD_ERR_PROVIDER)
+                    if (!IsTpmUnusable(e))
                     {
                         throw;
                     }
@@ -952,10 +1200,16 @@ namespace hkdfguard {
                 }
                 catch (const HkdfGuardError& e) {
                     // Fall through to the software provider only when the TPM
-                    // side genuinely has nothing usable for us: no KEK there
+                    // side genuinely has nothing for us: no KEK there
                     // (KEK_NOT_FOUND - the normal case for a PreferTpm KEK that
-                    // was created on the software fallback), or the provider
-                    // unavailable / a key that failed verification (PROVIDER).
+                    // was created on the software fallback), or no usable TPM
+                    // at all (TpmUnusableError).
+                    //
+                    // A TPM KEK that exists but fails verification, or an
+                    // unexpected error opening it, propagates. Falling back
+                    // would quietly wrap new DEKs under a software KEK (if one
+                    // exists) instead of surfacing that the service's TPM KEK
+                    // has a problem.
                     //
                     // ACCESS_DENIED - and anything else - propagates as-is: it
                     // means a TPM KEK exists and this caller may not use it.
@@ -967,7 +1221,7 @@ namespace hkdfguard {
                     // software KEK legitimately waiting for it: PreferTpm only
                     // creates one when the TPM attempt failed outright.
                     if (e.code() != HKDFGUARD_ERR_KEK_NOT_FOUND &&
-                        e.code() != HKDFGUARD_ERR_PROVIDER)
+                        !IsTpmUnusable(e))
                     {
                         throw;
                     }

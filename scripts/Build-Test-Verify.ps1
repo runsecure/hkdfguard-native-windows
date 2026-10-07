@@ -24,7 +24,8 @@
 
 .PARAMETER Group
     Local or domain group name passed to the CLI's --group flag (read-only
-    ACE on the wrapped-key file). Default: Users.
+    ACE on the wrapped-key file). Must not be an over-broad group such as
+    Users or Everyone, which the CLI refuses. Default: Administrators.
 
 .PARAMETER NoCleanup
     Skip deleting the verification KEK and wrapped-key file afterward.
@@ -32,7 +33,7 @@
 param(
     [ValidateSet("Debug", "Release")]
     [string]$Configuration = "Debug",
-    [string]$Group = "Users",
+    [string]$Group = "Administrators",
     [switch]$NoCleanup
 )
 

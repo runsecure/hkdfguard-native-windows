@@ -177,8 +177,11 @@ namespace {
         // `*out_len` dereferences the pointer to read the caller-supplied
         // buffer capacity (the "in" half of this in/out parameter - see
         // hkdfguard.h's note on this pattern). Checked before doing any real
-        // work, so a too-small buffer fails fast.
+        // work, so a too-small buffer fails fast. The required size is
+        // reported back through *out_len, so a caller can allocate exactly
+        // that and retry (the CLI's WrapDek does).
         if (*out_len < HKDFGUARD_WRAPPED_LEN) {
+            *out_len = HKDFGUARD_WRAPPED_LEN;
             return HKDFGUARD_ERR_BUFFER_TOO_SMALL;
         }
 
@@ -422,6 +425,8 @@ extern "C" HKDFGUARD_API int32_t hkdfguard_unwrap_dek(
             return fail(HKDFGUARD_ERR_INVALID_ARG);
         }
         if (capacity < HKDFGUARD_DEK_LEN) {
+            // Same contract as the wrap side: report the required size.
+            *out_len = HKDFGUARD_DEK_LEN;
             return fail(HKDFGUARD_ERR_BUFFER_TOO_SMALL);
         }
 

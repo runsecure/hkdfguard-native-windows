@@ -56,35 +56,64 @@ function Format-CliArg([string]$arg) {
 }
 
 # Runs the CLI with the given argv, returning its exit code and captured
-# stdout/stderr. When $StdIn is non-null, it's written to the child's stdin
-# (as-is, no trailing newline added) and the pipe is closed - this is how
-# "wrap --dek-stdin" scenarios below supply their base64 DEK text. $StdIn
-# left as $null (the default) leaves stdin unredirected, for subcommands/
-# scenarios that never read it.
+# stdout/stderr. The child's stdin is always redirected and then closed, so
+# a scenario can never block waiting on the console. $StdIn (text, sent as
+# ASCII) or $StdInBytes (sent exactly as given) supplies its content - this
+# is how "wrap --dek-stdin" scenarios below supply their base64 DEK. No
+# trailing newline is added.
+#
+# Bytes are written straight to the pipe, never through
+# $proc.StandardInput's text writer. On Windows PowerShell 5.1 (.NET
+# Framework) that writer uses [Console]::InputEncoding, and when that is
+# UTF-8 with a preamble it writes a byte-order mark into the pipe the moment
+# Process.Start creates it - before anything the scenario sends. So the
+# console's input encoding is switched to BOM-less UTF-8 just around
+# Process.Start, then restored, which keeps results independent of the
+# console the test happens to run in.
 function Invoke-Cli {
     param(
         [string[]]$CliArgs,
-        [string]$StdIn = $null
+        [string]$StdIn = "",
+        [byte[]]$StdInBytes = $null
     )
+    if ($null -eq $StdInBytes) {
+        $StdInBytes = [System.Text.Encoding]::ASCII.GetBytes($StdIn)
+    }
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $CliExePath
     $psi.Arguments = ($CliArgs | ForEach-Object { Format-CliArg $_ }) -join " "
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
+    $psi.RedirectStandardInput = $true
     $psi.UseShellExecute = $false
-    if ($null -ne $StdIn) {
-        $psi.RedirectStandardInput = $true
-    }
-    $proc = [System.Diagnostics.Process]::Start($psi)
-    if ($null -ne $StdIn) {
-        # The child may legitimately exit before consuming all of stdin (e.g.
-        # the oversized-input scenario), which can surface here as a broken
-        # pipe; that's the child's behavior under test, not a harness error.
-        try {
-            $proc.StandardInput.Write($StdIn)
-            $proc.StandardInput.Close()
-        } catch [System.IO.IOException] {
+    $savedInputEncoding = $null
+    try {
+        $savedInputEncoding = [Console]::InputEncoding
+        if ($savedInputEncoding.GetPreamble().Length -gt 0) {
+            [Console]::InputEncoding = New-Object System.Text.UTF8Encoding($false)
+        } else {
+            $savedInputEncoding = $null
         }
+    } catch {
+        $savedInputEncoding = $null # no console to adjust; nothing to restore
+    }
+    try {
+        $proc = [System.Diagnostics.Process]::Start($psi)
+    } finally {
+        if ($null -ne $savedInputEncoding) {
+            try { [Console]::InputEncoding = $savedInputEncoding } catch { }
+        }
+    }
+    # The child may legitimately exit before consuming all of stdin (e.g.
+    # the oversized-input scenario), which can surface here as a broken
+    # pipe; that's the child's behavior under test, not a harness error.
+    $stdinStream = $proc.StandardInput.BaseStream
+    try {
+        $stdinStream.Write($StdInBytes, 0, $StdInBytes.Length)
+        $stdinStream.Flush()
+    } catch [System.IO.IOException] {
+    } finally {
+        try { $stdinStream.Close() } catch [System.IO.IOException] { }
     }
     $stdout = $proc.StandardOutput.ReadToEnd()
     $stderr = $proc.StandardError.ReadToEnd()
@@ -97,6 +126,11 @@ New-Item -ItemType Directory -Force -Path $workDir | Out-Null
 
 try {
     $validB64 = [Convert]::ToBase64String((New-Object byte[] 32)) # 32 zero bytes - valid shape, not used for a real wrap
+
+    # The --group every scenario below passes when the group itself isn't what
+    # is under test: it must exist on every machine and must not be one of
+    # the over-broad groups the CLI refuses (scenario 7b), so Administrators.
+    $narrowGroup = "Administrators"
 
     # ---- 1. Top-level --help exits 0. ----
     $r = Invoke-Cli @("--help")
@@ -112,7 +146,7 @@ try {
 
     # ---- 4. wrap: missing a required flag (--dek-stdin). ----
     $keyFile = Join-Path $workDir "missing-dek.key"
-    $r = Invoke-Cli @("wrap", "--key-file-path", $keyFile, "--service-name", "svc", "--group", "Users")
+    $r = Invoke-Cli @("wrap", "--key-file-path", $keyFile, "--service-name", "svc", "--group", $narrowGroup)
     Check ($r.ExitCode -eq 2) "wrap missing --dek-stdin exits 2"
 
     # ---- 5. wrap: an unrecognized argument. ----
@@ -131,11 +165,30 @@ try {
     Check ($r.ExitCode -eq 1) "wrap unresolvable --group exits 1"
     Check (-not (Test-Path $bogusGroupKeyFile)) "wrap unresolvable --group does not create the key file"
 
+    # ---- 7b. wrap: an over-broad --group is refused before any file is ----
+    #          touched or any DEK is read. Anyone who can read the wrapped
+    #          file can copy it, and the payload format deliberately allows
+    #          an older payload to be swapped in, so "everybody" groups are
+    #          never acceptable. Checked on the resolved SID, so a
+    #          BUILTIN-qualified spelling is caught the same way. (English
+    #          account names; a localized Windows names these differently.)
+    $broadGroups = @(
+        "Users", "BUILTIN\Users", "Everyone", "Authenticated Users",
+        "NT AUTHORITY\Local account", "NT SERVICE\ALL SERVICES", "Guests")
+    foreach ($broad in $broadGroups) {
+        $broadKeyFile = Join-Path $workDir ("broad-" + ($broad -replace '[\\ ]', '_') + ".key")
+        $r = Invoke-Cli @(
+            "wrap", "--key-file-path", $broadKeyFile, "--service-name", "svc", "--dek-stdin",
+            "--group", $broad) -StdIn $validB64
+        Check (($r.ExitCode -eq 1) -and ($r.StdErr -match "over-broad")) "wrap refuses the over-broad --group `"$broad`""
+        Check (-not (Test-Path $broadKeyFile)) "wrap with over-broad --group `"$broad`" does not create the key file"
+    }
+
     # ---- 8. wrap: invalid base64 on stdin. ----
     $badB64KeyFile = Join-Path $workDir "bad-b64.key"
     $r = Invoke-Cli @(
         "wrap", "--key-file-path", $badB64KeyFile, "--service-name", "svc", "--dek-stdin",
-        "--group", "Users") -StdIn "not-valid-base64!!!"
+        "--group", $narrowGroup) -StdIn "not-valid-base64!!!"
     Check ($r.ExitCode -eq 1) "wrap invalid base64 on stdin exits 1"
     Check (-not (Test-Path $badB64KeyFile)) "wrap invalid base64 on stdin does not create the key file"
 
@@ -144,7 +197,7 @@ try {
     $shortB64 = [Convert]::ToBase64String((New-Object byte[] 16))
     $r = Invoke-Cli @(
         "wrap", "--key-file-path", $wrongLenKeyFile, "--service-name", "svc", "--dek-stdin",
-        "--group", "Users") -StdIn $shortB64
+        "--group", $narrowGroup) -StdIn $shortB64
     Check ($r.ExitCode -eq 1) "wrap wrong-length decoded DEK exits 1"
     Check (-not (Test-Path $wrongLenKeyFile)) "wrap wrong-length decoded DEK does not create the key file"
 
@@ -153,7 +206,7 @@ try {
     $badCharsetKeyFile = Join-Path $workDir "bad-charset.key"
     $r = Invoke-Cli @(
         "wrap", "--key-file-path", $badCharsetKeyFile, "--service-name", "hkdfguard-cli-test", "--dek-stdin",
-        "--group", "Users") -StdIn $validB64
+        "--group", $narrowGroup) -StdIn $validB64
     Check ($r.ExitCode -eq 1) "wrap: a service name containing a hyphen is rejected"
     Check (-not (Test-Path $badCharsetKeyFile)) "wrap: a rejected service name does not create the key file"
 
@@ -162,7 +215,7 @@ try {
     Set-Content -Path $existingFile -Value "pre-existing content" -NoNewline
     $r = Invoke-Cli @(
         "wrap", "--key-file-path", $existingFile, "--service-name", "svc", "--dek-stdin",
-        "--group", "Users") -StdIn $validB64
+        "--group", $narrowGroup) -StdIn $validB64
     Check ($r.ExitCode -eq 1) "wrap existing file without --force exits 1"
     Check ((Get-Content -Path $existingFile -Raw) -eq "pre-existing content") "wrap existing file without --force is left untouched"
 
@@ -182,7 +235,7 @@ try {
     $viaLinkNew = Join-Path $linkDir "new.key"
     $r = Invoke-Cli @(
         "wrap", "--key-file-path", $viaLinkNew, "--service-name", "svc", "--dek-stdin",
-        "--group", "Users") -StdIn $validB64
+        "--group", $narrowGroup) -StdIn $validB64
     Check ($r.ExitCode -eq 1) "wrap through a junction (new file) exits 1"
     Check (-not (Test-Path (Join-Path $realDir "new.key"))) "wrap through a junction does not create the file in the junction target"
     # Matched on wording that only appears in the CLI's own message, never in
@@ -198,19 +251,37 @@ try {
     $viaLinkForce = Join-Path $linkDir "target.key"
     $r = Invoke-Cli @(
         "wrap", "--key-file-path", $viaLinkForce, "--service-name", "svc", "--dek-stdin",
-        "--group", "Users", "--force") -StdIn $validB64
+        "--group", $narrowGroup, "--force") -StdIn $validB64
     Check ($r.ExitCode -eq 1) "wrap --force through a junction exits 1"
     Check ((Test-Path $realTarget) -and ((Get-Content -Path $realTarget -Raw) -eq "must survive")) "wrap --force through a junction leaves the junction target file untouched"
 
     # (c) The output path *is* the junction: refused.
     $r = Invoke-Cli @(
         "wrap", "--key-file-path", $linkDir, "--service-name", "svc", "--dek-stdin",
-        "--group", "Users", "--force") -StdIn $validB64
+        "--group", $narrowGroup, "--force") -StdIn $validB64
     Check ($r.ExitCode -eq 1) "wrap with the junction itself as the output path exits 1"
 
     # A junction must be removed as a directory entry, never recursed into
     # (that would delete the target's contents); cmd's rmdir does exactly that.
     & cmd /c rmdir "$linkDir" | Out-Null
+
+    # ---- 11d. A hard link at the output path is refused, with --force, and ----
+    #           the file it shares data with is left untouched. A hard link
+    #           is not a reparse point, so 11b's checks can't see it; without
+    #           this, --force's overwrite passes would destroy the other
+    #           file's contents. Runs unprivileged: creating a hard link to a
+    #           file this test owns needs no elevation.
+    $hardTarget = Join-Path $workDir "hardlink-target.dat"
+    $hardLink = Join-Path $workDir "hardlink.key"
+    Set-Content -Path $hardTarget -Value "must survive the hard link" -NoNewline
+    New-Item -ItemType HardLink -Path $hardLink -Target $hardTarget | Out-Null
+    $r = Invoke-Cli @(
+        "wrap", "--key-file-path", $hardLink, "--service-name", "svc", "--dek-stdin",
+        "--group", $narrowGroup, "--force") -StdIn $validB64
+    Check ($r.ExitCode -eq 1) "wrap --force onto a hard-linked file exits 1"
+    Check ($r.StdErr -match "hard links") "wrap --force onto a hard-linked file names hard links as the reason"
+    Check ((Get-Content -Path $hardTarget -Raw) -eq "must survive the hard link") "wrap --force onto a hard-linked file leaves the linked file's contents untouched"
+    Check (Test-Path $hardLink) "wrap --force onto a hard-linked file does not delete the link"
 
     # ---- 11c. Oversized stdin is refused rather than buffered without ----
     #           bound: the reader uses one fixed allocation so DEK text is
@@ -219,7 +290,7 @@ try {
     $oversizeKeyFile = Join-Path $workDir "oversize.key"
     $r = Invoke-Cli @(
         "wrap", "--key-file-path", $oversizeKeyFile, "--service-name", "svc", "--dek-stdin",
-        "--group", "Users") -StdIn ("A" * 5000)
+        "--group", $narrowGroup) -StdIn ("A" * 5000)
     Check ($r.ExitCode -eq 1) "wrap with oversized stdin exits 1"
     Check (-not (Test-Path $oversizeKeyFile)) "wrap with oversized stdin does not create the key file"
     Check ($r.StdErr -match "larger than") "wrap with oversized stdin says why"
@@ -232,12 +303,36 @@ try {
     $noKekFile = Join-Path $workDir "no-kek.key"
     $r = Invoke-Cli @(
         "wrap", "--key-file-path", $noKekFile, "--service-name", $neverProvisionedService, "--dek-stdin",
-        "--group", "Users") -StdIn $validB64
+        "--group", $narrowGroup) -StdIn $validB64
     Check ($r.ExitCode -eq 1) "wrap against a never-provisioned service exits 1"
     Check (-not (Test-Path $noKekFile)) "wrap against a never-provisioned service does not create the key file"
     # Exact library wording, not just "KEK": the output file is named
     # no-kek.key, so a looser pattern would match any error echoing the path.
     Check ($r.StdErr -match "no KEK is provisioned for this service") "wrap against a never-provisioned service reports a KEK-not-found/provision error"
+
+    # ---- 12b. A UTF-8 byte-order mark ahead of the base64 DEK is tolerated. ----
+    #           Some PowerShell/.NET consoles prepend one when piping text to
+    #           a native process. Same never-provisioned service as above, so
+    #           reaching the KEK-not-found error proves the DEK decoded.
+    $bomKeyFile = Join-Path $workDir "bom.key"
+    $bomBytes = [byte[]](0xEF, 0xBB, 0xBF) + [System.Text.Encoding]::ASCII.GetBytes($validB64 + "`r`n")
+    $r = Invoke-Cli @(
+        "wrap", "--key-file-path", $bomKeyFile, "--service-name", $neverProvisionedService, "--dek-stdin",
+        "--group", $narrowGroup) -StdInBytes $bomBytes
+    Check ($r.StdErr -notmatch "not valid base64") "wrap accepts a base64 DEK preceded by a UTF-8 byte-order mark"
+    Check ($r.StdErr -match "no KEK is provisioned for this service") "wrap with a UTF-8 byte-order mark decodes the DEK and proceeds to the KEK lookup"
+    Check (-not (Test-Path $bomKeyFile)) "wrap with a UTF-8 byte-order mark against a never-provisioned service creates no key file"
+
+    # ---- 12c. UTF-16 input is refused with a message that says so, rather ----
+    #           than a generic "not valid base64".
+    $utf16KeyFile = Join-Path $workDir "utf16.key"
+    $utf16Bytes = [byte[]](0xFF, 0xFE) + [System.Text.Encoding]::Unicode.GetBytes($validB64)
+    $r = Invoke-Cli @(
+        "wrap", "--key-file-path", $utf16KeyFile, "--service-name", $neverProvisionedService, "--dek-stdin",
+        "--group", $narrowGroup) -StdInBytes $utf16Bytes
+    Check ($r.ExitCode -eq 1) "wrap with UTF-16 stdin exits 1"
+    Check ($r.StdErr -match "UTF-16") "wrap with UTF-16 stdin names the encoding as the problem"
+    Check (-not (Test-Path $utf16KeyFile)) "wrap with UTF-16 stdin creates no key file"
 
     # Finds an event this run caused in the Application log under the
     # library's event source. Matched on the event's insertion string (the
@@ -306,7 +401,7 @@ try {
 
         $r = Invoke-Cli @(
             "wrap", "--key-file-path", $happyKeyFile, "--service-name", $serviceName, "--dek-stdin",
-            "--group", "Users", "--force") -StdIn $dekB64
+            "--group", $narrowGroup, "--force") -StdIn $dekB64
         Check ($r.ExitCode -eq 0) "full wrap via the CLI succeeds against a provisioned KEK (elevated)"
         if ($r.ExitCode -ne 0) {
             Write-Host "    exit code: $($r.ExitCode)"
@@ -334,7 +429,7 @@ try {
             $dekB64_2 = [Convert]::ToBase64String($dekBytes2)
             $r2 = Invoke-Cli @(
                 "wrap", "--key-file-path", $happyKeyFile, "--service-name", $serviceName, "--dek-stdin",
-                "--group", "Users", "--force") -StdIn $dekB64_2
+                "--group", $narrowGroup, "--force") -StdIn $dekB64_2
             Check ($r2.ExitCode -eq 0) "--force overwrites an existing wrapped-key file"
 
             $providerType = $bytes[1]

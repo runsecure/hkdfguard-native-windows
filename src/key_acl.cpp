@@ -56,6 +56,14 @@ namespace hkdfguard {
         // the machine and defeat the point of a machine-scoped, ACL-gated
         // key. BUILTIN\Users is included deliberately - on a workstation it
         // is every standard user, which is Everyone in all but name.
+        //
+        // Most of these (Authenticated Users, Local account, This
+        // Organization, ALL SERVICES, the logon-type groups) resolve as
+        // SidTypeWellKnownGroup in a domain IsHostLocalAccountDomain accepts
+        // (NT AUTHORITY or NT SERVICE), so for them this list - not the
+        // group-type or host-local checks - is the only thing standing
+        // between them and a key-use grant. This list is also the only check
+        // VerifyExistingKeyAcl applies to an existing key's ACEs.
         constexpr WELL_KNOWN_SID_TYPE kOverBroadSids[] = {
             WinNullSid,
             WinWorldSid, // Everyone
@@ -67,7 +75,50 @@ namespace hkdfguard {
             WinServiceSid,
             WinBuiltinUsersSid,
             WinBuiltinGuestsSid,
+            WinLocalAccountSid,     // S-1-5-113 "Local account": every local account
+            WinThisOrganizationSid, // S-1-5-15 "This Organization": every account in the forest
+            WinRemoteLogonIdSid,    // S-1-5-14 "REMOTE INTERACTIVE LOGON": every RDP user
+            WinLocalSid,            // S-1-2-0 "LOCAL": every locally logged-on user
+            WinConsoleLogonSid,     // S-1-2-1 "CONSOLE LOGON": every console user
         };
+
+        // tools/hkdfguard-v1-initialize.cpp keeps a copy of both lists for its
+        // --group check (it depends only on the public ABI); keep them in sync.
+        //
+        // Over-broad principals with no WELL_KNOWN_SID_TYPE constant of their
+        // own, given as SID strings instead.
+        constexpr const wchar_t *kOverBroadSidStrings[] = {
+            L"S-1-5-80-0", // NT SERVICE\ALL SERVICES: every service process
+        };
+
+        // Whether `sid` is any principal on the two lists above. The single
+        // implementation behind both policy validation (ResolveKeyUseGroupSid)
+        // and the existing-key ACL check (VerifyExistingKeyAcl), so the two
+        // can never disagree about what counts as over-broad.
+        bool IsOverBroadSid(PSID sid) {
+            for (WELL_KNOWN_SID_TYPE overBroad: kOverBroadSids) {
+                SidBuffer known = CreateWellKnownSidBuffer(overBroad);
+                if (EqualSid(sid, known.data())) {
+                    return true;
+                }
+            }
+
+            for (const wchar_t *sidString: kOverBroadSidStrings) {
+                PSID known = nullptr;
+                if (!ConvertStringSidToSidW(sidString, &known)) {
+                    throw HkdfGuardError(
+                        HKDFGUARD_ERR_PROVIDER,
+                        "ConvertStringSidToSidW failed for a built-in over-broad SID");
+                }
+                const bool match = EqualSid(sid, known) != FALSE;
+                LocalFree(known);
+                if (match) {
+                    return true;
+                }
+            }
+
+            return false;
+        }
 
         // The NetBIOS name of this machine - what LookupAccountName* report
         // as ReferencedDomainName for accounts in the local SAM.
@@ -215,13 +266,10 @@ namespace hkdfguard {
                     "key-use policy entry is not a group");
             }
 
-            for (WELL_KNOWN_SID_TYPE overBroad: kOverBroadSids) {
-                SidBuffer known = CreateWellKnownSidBuffer(overBroad);
-                if (EqualSid(sid.data(), known.data())) {
-                    throw HkdfGuardError(
-                        HKDFGUARD_ERR_GROUP_INVALID,
-                        "key-use policy entry is an over-broad principal");
-                }
+            if (IsOverBroadSid(sid.data())) {
+                throw HkdfGuardError(
+                    HKDFGUARD_ERR_GROUP_INVALID,
+                    "key-use policy entry is an over-broad principal");
             }
 
             // Checked on the resolved result rather than on how the entry
@@ -517,7 +565,7 @@ namespace hkdfguard {
         // NT AUTHORITY and NT SERVICE principals are host-local by nature
         // (logon-type SIDs, service accounts, per-service virtual accounts);
         // the over-broad ones among them are still refused by
-        // kOverBroadSids, which is checked first. Everything else must be
+        // IsOverBroadSid, which is checked first. Everything else must be
         // this machine's own SAM. On a domain controller, whose "local" SAM
         // is the domain itself, only BUILTIN/NT AUTHORITY/NT SERVICE
         // principals therefore qualify - which is the intended reading of
@@ -653,24 +701,48 @@ namespace hkdfguard {
         // Nothing may be granted to a principal this library would never
         // grant - checked against every allow ACE, whatever its mask, since
         // even read access on the KEK means the ability to unwrap.
+        //
+        // Covers conditional (callback) allow ACEs too: AccessCheck honors
+        // them, so "allow Everyone if <condition>" grants access just as
+        // surely as a plain allow ACE. Object and compound allow ACEs carry
+        // their SID at a variable offset and are never produced by this
+        // library or meaningful on a key object, so their presence alone
+        // fails the check rather than being skipped unexamined. So does an
+        // ACE that cannot be read. Deny and audit ACEs grant nothing and are
+        // ignored.
         for (DWORD i = 0; i < acl->AceCount; ++i) {
             void *ace = nullptr;
             if (!GetAce(acl, i, &ace)) {
-                continue;
+                throw HkdfGuardError(
+                    HKDFGUARD_ERR_KEK_ACL_INVALID,
+                    "existing KEK's ACL contains an unreadable entry");
             }
             auto *header = static_cast<ACE_HEADER *>(ace);
-            if (header->AceType != ACCESS_ALLOWED_ACE_TYPE) {
-                continue;
-            }
-            PSID sid = &static_cast<ACCESS_ALLOWED_ACE *>(ace)->SidStart;
 
-            for (WELL_KNOWN_SID_TYPE overBroad: kOverBroadSids) {
-                SidBuffer known = CreateWellKnownSidBuffer(overBroad);
-                if (EqualSid(sid, known.data())) {
+            PSID sid = nullptr;
+            switch (header->AceType) {
+                case ACCESS_ALLOWED_ACE_TYPE:
+                    sid = &static_cast<ACCESS_ALLOWED_ACE *>(ace)->SidStart;
+                    break;
+                case ACCESS_ALLOWED_CALLBACK_ACE_TYPE:
+                    // Same layout as ACCESS_ALLOWED_ACE up to and including
+                    // the SID; the condition follows it.
+                    sid = &static_cast<ACCESS_ALLOWED_CALLBACK_ACE *>(ace)->SidStart;
+                    break;
+                case ACCESS_ALLOWED_OBJECT_ACE_TYPE:
+                case ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE:
+                case ACCESS_ALLOWED_COMPOUND_ACE_TYPE:
                     throw HkdfGuardError(
                         HKDFGUARD_ERR_KEK_ACL_INVALID,
-                        "existing KEK's ACL grants access to an over-broad principal");
-                }
+                        "existing KEK's ACL contains an object or compound allow entry");
+                default:
+                    continue; // deny, audit, alarm, label: grants nothing
+            }
+
+            if (IsOverBroadSid(sid)) {
+                throw HkdfGuardError(
+                    HKDFGUARD_ERR_KEK_ACL_INVALID,
+                    "existing KEK's ACL grants access to an over-broad principal");
             }
         }
     }

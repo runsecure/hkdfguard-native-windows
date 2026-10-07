@@ -23,6 +23,24 @@ namespace hkdfguard {
     // never in hkdfguard.dll; not thread-safe, by design.
 #if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
     void SetTestTpmProviderNameOverride(std::optional<std::wstring> providerName);
+
+    // Test-only fault injection for the TPM provider, so PreferTpm's
+    // fallback rules (see kek_store.cpp's TpmUnusableError) can be tested
+    // without TPM hardware misbehaving on cue. Same compile-time scope and
+    // caveats as the seams above. A default-constructed value clears it.
+    struct TestTpmFaults {
+        // When set, every NCryptOpenKey against the TPM provider in
+        // KekExists / CreateKek's existence probe / OpenKekForWrap reports
+        // this status instead of its real result. Not applied to
+        // CreateKek's post-finalize reopen, or to unwrap.
+        std::optional<SECURITY_STATUS> openKeyStatus;
+
+        // When true, property verification of any TPM key (provider_type 1)
+        // fails with HKDFGUARD_ERR_PROVIDER - simulating an existing TPM KEK
+        // that a firmware quirk or fault makes fail verification.
+        bool failVerification = false;
+    };
+    void SetTestTpmFaults(const TestTpmFaults &faults);
 #endif
 
     // Every `service` parameter below is used verbatim to build the

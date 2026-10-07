@@ -132,10 +132,11 @@ HKDFGUARD_API int32_t hkdfguard_kek_exists(
  * string (e.g. "S-1-5-21-...-1234"); surrounding whitespace is ignored.
  * Each entry must resolve to a group - a user or computer account is
  * rejected - and must not be an over-broad principal: Everyone,
- * Authenticated Users, Users, Guests, Anonymous, NULL SID, or the logon-type
- * groups INTERACTIVE, NETWORK, BATCH and SERVICE. It must also be
- * host-local: a group in this machine's own SAM, or a BUILTIN, NT AUTHORITY
- * or NT SERVICE principal. This protection is host-specific, so domain
+ * Authenticated Users, Users, Guests, Anonymous, NULL SID, Local account,
+ * This Organization, ALL SERVICES, LOCAL, CONSOLE LOGON, or the logon-type
+ * groups INTERACTIVE, NETWORK, BATCH, SERVICE and REMOTE INTERACTIVE LOGON.
+ * It must also be host-local: a group in this machine's own SAM, or a
+ * BUILTIN, NT AUTHORITY or NT SERVICE principal. This protection is host-specific, so domain
  * groups are rejected even on a domain-joined machine, whether written
  * domain-qualified or not. Any entry failing these checks fails the whole
  * call with HKDFGUARD_ERR_GROUP_INVALID before any key is created. A
@@ -189,7 +190,9 @@ HKDFGUARD_API int32_t hkdfguard_create_kek(
  * out       - caller-owned output buffer.
  * out_len   - in: capacity of out, in bytes.
  *             out: on success, the number of bytes written (always
- *             HKDFGUARD_WRAPPED_LEN).
+ *             HKDFGUARD_WRAPPED_LEN). On HKDFGUARD_ERR_BUFFER_TOO_SMALL,
+ *             the required capacity (HKDFGUARD_WRAPPED_LEN). Left
+ *             unchanged on every other failure.
  *
  * Returns HKDFGUARD_OK on success, or a negative HKDFGUARD_ERR_* code -
  * notably HKDFGUARD_ERR_KEK_NOT_FOUND if hkdfguard_create_kek has not yet
@@ -214,7 +217,9 @@ HKDFGUARD_API int32_t hkdfguard_wrap_dek(
  * out         - caller-owned output buffer.
  * out_len     - in: capacity of out, in bytes (must be >= HKDFGUARD_DEK_LEN).
  *               out: on success, the number of plaintext bytes written
- *               (always HKDFGUARD_DEK_LEN).
+ *               (always HKDFGUARD_DEK_LEN). On
+ *               HKDFGUARD_ERR_BUFFER_TOO_SMALL, the required capacity
+ *               (HKDFGUARD_DEK_LEN). Left unchanged on every other failure.
  *
  * Returns HKDFGUARD_OK on success, or a negative HKDFGUARD_ERR_* code.
  * HKDFGUARD_ERR_MALFORMED covers both a structurally invalid payload and a
@@ -235,6 +240,12 @@ HKDFGUARD_API int32_t hkdfguard_unwrap_dek(
     const uint8_t* wrapped, int32_t wrapped_len,
     uint8_t* out, int32_t* out_len);
 
+/*
+ * Generates a fresh random 32-byte DEK and wraps it, in one call; the
+ * plaintext DEK never leaves the library. `service`, `out` and `out_len`
+ * behave exactly as on hkdfguard_wrap_dek, including the required capacity
+ * reported on HKDFGUARD_ERR_BUFFER_TOO_SMALL.
+ */
 HKDFGUARD_API int32_t hkdfguard_generate_and_wrap_dek(
     const char* service,
     uint8_t* out, int32_t* out_len);

@@ -110,10 +110,15 @@ namespace hkdfguard {
             // struct laid directly over that memory - this only works because CNG
             // guarantees that's exactly the byte layout it wrote there.
             const auto *header = reinterpret_cast<const BCRYPT_ECCKEY_BLOB *>(blob.data());
-            // Sanity-check this is really a P-256 key (32-byte coordinates) with
-            // enough bytes for the header plus both 32-byte coordinates (64 total,
-            // == kEphemeralPubLen) before trusting the memory layout any further.
-            if (header->cbKey != 32 || blob.size() < sizeof(BCRYPT_ECCKEY_BLOB) + kEphemeralPubLen) {
+            // Sanity-check this is really a P-256 ECDH key (the P-256 magic, not
+            // the generic magic another 256-bit curve would export with, and
+            // 32-byte coordinates) with enough bytes - as actually written by
+            // the second call, `cb` - for the header plus both coordinates (64
+            // total, == kEphemeralPubLen) before trusting the memory layout any
+            // further. kek_store.cpp's VerifyCurve applies the same rule when
+            // the KEK is opened.
+            if (header->dwMagic != BCRYPT_ECDH_PUBLIC_P256_MAGIC || header->cbKey != 32 ||
+                cb < sizeof(BCRYPT_ECCKEY_BLOB) + kEphemeralPubLen) {
                 throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO, "unexpected ECC public key blob format");
             }
             // Copy just the X||Y coordinate bytes (skipping the header) out into

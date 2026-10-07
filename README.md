@@ -19,7 +19,10 @@ error and fails every call with `HKDFGUARD_ERR_INVALID_POLICY` - it is deliberat
 *not* treated as the default, since a typo'd value most likely intended the stricter
 setting. The `PreferTpm` fallback is intentional and administrator-chosen: the
 `provider_type` byte in every payload records which provider actually protected it,
-so a consumer that needs to know can check.
+so a consumer that needs to know can check. It applies only when the TPM is
+unusable for the service (no TPM, or the TPM key is absent and could not be created).
+An existing TPM KEK that fails verification, or a TPM that errors while being probed,
+fails the call instead of quietly creating or using a software KEK beside it.
 
 **Deployment model**: the KEK is created with `NCRYPT_MACHINE_KEY_FLAG`, not tied to
 the account that created it, and is meant to be long-lived - there is no key-rotation
@@ -42,7 +45,8 @@ not something either the creating tool or a caller chooses: SYSTEM and
 registry value `HKLM\Software\Policies\HkdfGuard\KeyUseGroups` is granted use (unwrap)
 access when the KEK is created - each entry must resolve to a real, host-local group
 (this machine's own SAM, `BUILTIN`, `NT AUTHORITY`, or `NT SERVICE`; domain groups are
-rejected even on a domain-joined machine, and broad principals like `Everyone` or
+rejected even on a domain-joined machine, and broad principals like `Everyone`,
+`NT AUTHORITY\Local account`, `NT SERVICE\ALL SERVICES` or
 `BUILTIN\Users` are refused outright) - see `include/hkdfguard.h` for the exact rules.
 This is a deliberate trade-off: any principal an administrator has explicitly listed is
 able to use the key, in exchange for wrap and unwrap not needing to be the same account.
@@ -134,14 +138,23 @@ wrapper around the ABI above with two subcommands:
   `--group|-g` sets the wrapped **file's** Windows ACL (owner read/write, that group
   read-only, no one else) - it has nothing to do with the KEK's own ACL, which is
   governed entirely by machine policy (see "Deployment model" above), not by anything
-  passed on this command line.
+  passed on this command line. Name a dedicated group for the service that will read
+  the file, for example a local group `App_1234` whose only member is that service's
+  account. The group must already exist. Over-broad groups are refused, because anyone
+  who can read the file can copy it, and the payload format deliberately allows an
+  older payload to be swapped in (see above). Refused groups are `Everyone`,
+  `Authenticated Users`, `BUILTIN\Users`, `BUILTIN\Guests`, `NT AUTHORITY\Local account`,
+  `NT SERVICE\ALL SERVICES`, `This Organization`, the logon-type groups and the
+  anonymous and NULL principals - the same set refused as a KEK key-use group.
 
   `--key-file-path` must be a real local file reached through real directories. A
   symbolic link, junction, or other reparse point at the path or anywhere above it
   is refused, never followed, with or without `--force` - so a link planted in the
   output directory cannot redirect a (possibly elevated) `wrap --force` at some other
   file. Paths through a SUBST or mapped network drive are refused for the same
-  reason; put the file on a real local path.
+  reason; put the file on a real local path. An existing file with more than one
+  hard link is refused too, so `--force` cannot overwrite a file at some other path
+  that shares its data.
 
 Example, from an elevated PowerShell prompt - provisioning a KEK once, then wrapping a
 freshly-generated DEK under it on every later release:
@@ -150,6 +163,10 @@ freshly-generated DEK under it on every later release:
 # One-time, elevated: create the KEK for this service if it doesn't already exist.
 .\hkdfguard-v1-initialize.exe provision --service-name myapp
 
+# One-time: a dedicated local group for the account that will read the wrapped file.
+net localgroup App_1234 /add
+net localgroup App_1234 "NT SERVICE\MyAppService" /add
+
 # Every release: mint a random 32-byte DEK and wrap it, piping the base64 DEK to the
 # tool's stdin rather than passing it as an argument.
 $dekBytes = New-Object byte[] 32
@@ -157,7 +174,7 @@ $dekBytes = New-Object byte[] 32
 $dekBase64 = [Convert]::ToBase64String($dekBytes)
 $dekBase64 | .\hkdfguard-v1-initialize.exe wrap `
     --key-file-path C:\secrets\myapp.v1.key --service-name myapp `
-    --dek-stdin --group Users --force
+    --dek-stdin --group App_1234 --force
 ```
 
 `--help`/`-h` at the top level, or after either subcommand, prints usage for that
@@ -188,7 +205,7 @@ from an *already*-elevated shell (it checks for Administrator itself and refuses
 proceed otherwise) if you'd rather skip the UAC prompt:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts\Build-Test-Verify.ps1 -Configuration Debug -Group Users
+powershell -ExecutionPolicy Bypass -File scripts\Build-Test-Verify.ps1 -Configuration Debug -Group App_1234
 ```
 
 It locates the MSVC/CMake/Ninja toolchain from the Visual Studio Build Tools install,
@@ -200,9 +217,11 @@ an external caller, not just by the CLI itself. Parameters:
 
 - **`-Configuration`** (`Debug` or `Release`, default `Debug`) - the CMake build
   configuration to use.
-- **`-Group`** (default `Users`) - the group passed to the verification wrap's
-  `--group`, i.e. who gets read-only access to the throwaway wrapped-key file it
-  produces.
+- **`-Group`** (default `Administrators`) - the group passed to the verification
+  wrap's `--group`, i.e. who gets read-only access to the throwaway wrapped-key file
+  it produces. It must be an existing group that `--group` accepts, so not an
+  over-broad one such as `Users`; the default is used because it exists on every
+  machine.
 - **`-NoCleanup`** - skip deleting the verification KEK and wrapped-key file
   afterward, if you want to inspect them.
 

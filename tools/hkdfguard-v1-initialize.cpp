@@ -73,6 +73,7 @@
 #include <windows.h>
 #include <bcrypt.h>
 #include <wincrypt.h>
+#include <sddl.h> // ConvertStringSidToSidA - over-broad --group check
 
 #include <algorithm>
 #include <cstdint>
@@ -341,18 +342,49 @@ namespace {
     // crates/packages. CRYPT_STRING_BASE64 tolerates embedded whitespace
     // (spaces, tabs, CR, LF), so a trailing newline from how `input` was
     // produced (e.g. piped from a shell) needs no separate trimming here.
+    //
+    // A leading UTF-8 byte-order mark (EF BB BF) is skipped: some PowerShell
+    // and .NET configurations prepend one when piping a string to a native
+    // process's stdin (whenever [Console]::InputEncoding is UTF-8 with a
+    // preamble), and CRYPT_STRING_BASE64 would otherwise reject the whole
+    // input as invalid. It is skipped by offset, not erased from `input`:
+    // erasing would shift the DEK text left inside the same buffer and leave
+    // stale copies of its last bytes past the new end, out of reach of the
+    // caller's wipe. A UTF-16 byte-order mark is reported as such rather
+    // than as "not valid base64", since the fix there is on the sending side.
     std::vector<BYTE> Base64Decode(const std::string &input) {
+        const char *text = input.data();
+        size_t textLen = input.size();
+
+        if (textLen >= 3 &&
+            static_cast<unsigned char>(text[0]) == 0xEF &&
+            static_cast<unsigned char>(text[1]) == 0xBB &&
+            static_cast<unsigned char>(text[2]) == 0xBF) {
+            text += 3;
+            textLen -= 3;
+        } else if (textLen >= 2 &&
+                   ((static_cast<unsigned char>(text[0]) == 0xFF && static_cast<unsigned char>(text[1]) == 0xFE) ||
+                    (static_cast<unsigned char>(text[0]) == 0xFE && static_cast<unsigned char>(text[1]) == 0xFF))) {
+            throw CliError(
+                "DEK on stdin is UTF-16 encoded; send it as ASCII or UTF-8 base64 text "
+                "(for example, set [Console]::OutputEncoding or $OutputEncoding to UTF-8 in PowerShell)");
+        }
+
         DWORD size = 0;
         if (!CryptStringToBinary(
-            input.c_str(), static_cast<DWORD>(input.size()), CRYPT_STRING_BASE64, nullptr, &size, nullptr,
+            text, static_cast<DWORD>(textLen), CRYPT_STRING_BASE64, nullptr, &size, nullptr,
             nullptr)) {
             throw CliError("DEK is not valid base64: " + FormatWin32Error(GetLastError()));
         }
         std::vector<BYTE> out(size);
         if (!CryptStringToBinary(
-            input.c_str(), static_cast<DWORD>(input.size()), CRYPT_STRING_BASE64, out.data(), &size, nullptr,
+            text, static_cast<DWORD>(textLen), CRYPT_STRING_BASE64, out.data(), &size, nullptr,
             nullptr)) {
-            throw CliError("DEK is not valid base64: " + FormatWin32Error(GetLastError()));
+            DWORD err = GetLastError();
+            // A partial decode may already be in `out`; wipe it before it is
+            // freed, since the caller's DekGuard never sees this vector.
+            SecureZeroMemory(out.data(), out.size());
+            throw CliError("DEK is not valid base64: " + FormatWin32Error(err));
         }
         out.resize(size);
         return out;
@@ -560,10 +592,69 @@ namespace {
         return sid;
     }
 
-    // Resolves `groupName` (a local or domain group name, e.g. "Administrators"
+    // Principals --group must never name: each is effectively "everybody" on
+    // the host (or every user of a logon type, every local account, every
+    // service), so granting it read access to the wrapped-key file would let
+    // almost any process replace a DEK the service will unwrap - see the
+    // rollback note in README.md - or copy the file elsewhere. The same set
+    // the DLL refuses as a KEK key-use group (src/key_acl.cpp's
+    // kOverBroadSids/kOverBroadSidStrings), duplicated here because this tool
+    // deliberately depends only on the public C ABI, nothing from src/. Keep
+    // the two lists in sync.
+    constexpr WELL_KNOWN_SID_TYPE kOverBroadGroupSids[] = {
+        WinNullSid,
+        WinWorldSid, // Everyone
+        WinAnonymousSid,
+        WinAuthenticatedUserSid,
+        WinInteractiveSid,
+        WinNetworkSid,
+        WinBatchSid,
+        WinServiceSid,
+        WinBuiltinUsersSid,
+        WinBuiltinGuestsSid,
+        WinLocalAccountSid,     // S-1-5-113 "Local account"
+        WinThisOrganizationSid, // S-1-5-15 "This Organization"
+        WinRemoteLogonIdSid,    // S-1-5-14 "REMOTE INTERACTIVE LOGON"
+        WinLocalSid,            // S-1-2-0 "LOCAL"
+        WinConsoleLogonSid,     // S-1-2-1 "CONSOLE LOGON"
+    };
+
+    constexpr const char *kOverBroadGroupSidStrings[] = {
+        "S-1-5-80-0", // NT SERVICE\ALL SERVICES
+    };
+
+    bool IsOverBroadGroupSid(PSID sid) {
+        for (WELL_KNOWN_SID_TYPE type: kOverBroadGroupSids) {
+            BYTE known[SECURITY_MAX_SID_SIZE];
+            DWORD knownSize = sizeof(known);
+            if (!CreateWellKnownSid(type, nullptr, known, &knownSize)) {
+                throw CliError("CreateWellKnownSid failed: " + FormatWin32Error(GetLastError()));
+            }
+            if (EqualSid(sid, known)) {
+                return true;
+            }
+        }
+        for (const char *sidString: kOverBroadGroupSidStrings) {
+            PSID known = nullptr;
+            if (!ConvertStringSidToSidA(sidString, &known)) {
+                throw CliError("ConvertStringSidToSid failed: " + FormatWin32Error(GetLastError()));
+            }
+            const bool match = EqualSid(sid, known) != FALSE;
+            LocalFree(known);
+            if (match) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Resolves `groupName` (a local or domain group name, e.g. "App_1234"
     // or "MYDOMAIN\SomeGroup") to its SID, rejecting anything that isn't
     // actually a group account (a plain user name, for instance) so a typo
-    // doesn't silently grant read access to the wrong kind of principal.
+    // doesn't silently grant read access to the wrong kind of principal, and
+    // rejecting an over-broad group (Everyone, Users, Authenticated Users,
+    // ... - see kOverBroadGroupSids above). The over-broad check is on the
+    // resolved SID, so it can't be dodged by spelling (e.g. "BUILTIN\Users").
     std::vector<BYTE> ResolveGroupSid(const std::string &groupName) {
         DWORD sidSize = 0;
         DWORD domainSize = 0;
@@ -583,6 +674,12 @@ namespace {
         }
         if (sidType != SidTypeGroup && sidType != SidTypeAlias && sidType != SidTypeWellKnownGroup) {
             throw CliError("--group \"" + groupName + "\" does not name a group account");
+        }
+        if (IsOverBroadGroupSid(sid.data())) {
+            throw CliError(
+                "--group \"" + groupName + "\" is an over-broad group (it covers essentially every account or "
+                "process on this host); name a dedicated group for the service that unwraps this key, such as "
+                "a local group created for it");
         }
         return sid;
     }
@@ -684,7 +781,7 @@ namespace {
     // and deleting an arbitrary file, or a plain `wrap` into creating one
     // somewhere it never meant to (CREATE_NEW happily follows a *dangling*
     // symlink and creates its target). So: refuse, don't tolerate. The
-    // helpers below enforce that three ways, all on handles already open
+    // helpers below enforce that four ways, all on handles already open
     // (never by re-querying a path that could be swapped underneath):
     //
     //   1. The object itself must not carry FILE_ATTRIBUTE_REPARSE_POINT -
@@ -698,6 +795,9 @@ namespace {
     //      long-name form of what the caller typed - which is what catches a
     //      junction or symlink in a *parent* component, where flag (1) on the
     //      leaf can't see it.
+    //   4. The file must have exactly one name (no hard links), since
+    //      neither (1) nor (3) can tell that a file is also reachable at
+    //      another path, and overwriting it would change that file too.
     //
     // A consequence of (3) worth knowing: a path through a SUBST drive or a
     // mapped network drive resolves to a different canonical form and is
@@ -813,7 +913,7 @@ namespace {
         return p;
     }
 
-    // Checks (1)-(3) above against an already-open handle. `expected` is the
+    // Checks (1)-(4) above against an already-open handle. `expected` is the
     // FullLongPath form the handle is supposed to be sitting at;
     // `allowDirectory` is set only for the parent-directory pre-check in
     // ValidateOutputPathIsReal, never for the wrapped-key file itself.
@@ -830,6 +930,20 @@ namespace {
         }
         if (!allowDirectory && (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
             throw CliError(path + " is a directory, not a file");
+        }
+        // (4) A hard link is not a reparse point, so (1) cannot see it, and
+        // GetFinalPathNameByHandle reports whichever name the handle was
+        // opened by, so (3) cannot either. But a file with more than one
+        // name is the same data under another path: --force's overwrite
+        // passes would destroy that other file's contents. A wrapped-key
+        // file never legitimately has a second name, so refuse it. (Creating
+        // a hard link needs write access to the target on current Windows,
+        // which limits who could plant one, but this check costs nothing.)
+        if (!allowDirectory && info.nNumberOfLinks != 1) {
+            throw CliError(
+                path + " has " + std::to_string(info.nNumberOfLinks) +
+                " hard links; the wrapped-key path must be a file with exactly one name, so that "
+                "overwriting it cannot alter a file at some other path");
         }
 
         std::string actual = TrimTrailingSeparators(FinalPathOfHandle(file, path));

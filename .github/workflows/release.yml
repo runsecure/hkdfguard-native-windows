@@ -25,8 +25,15 @@ on:
     tags:
       - "v*.*.*"
 
+# Least privilege by default; each job asks for exactly what it needs below.
 permissions:
-  contents: write # required for the "Create GitHub Release" step below
+  contents: read
+
+# Third-party actions are pinned to full commit SHAs, not tags: a tag can be
+# moved to different code after the fact, a commit SHA cannot. The trailing
+# comment names the release each SHA corresponds to. To update one, look up
+# the new tag's commit (git ls-remote https://github.com/<action> refs/tags/<tag>)
+# and replace both.
 
 concurrency:
   group: release-${{ github.ref_name }}
@@ -43,9 +50,24 @@ jobs:
           - arch: ARM64
             runner: windows-11-arm
     runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      id-token: write     # build provenance attestation (OIDC identity)
+      attestations: write # build provenance attestation (storage)
+    env:
+      # The hardening flags (/sdl, /Qspectre, CFG, and on x64 /CETCOMPAT and
+      # /guard:ehcont) come from CMakeLists.txt's hkdfguard_apply_hardening,
+      # so every build below gets them with no workflow-specific flags. This
+      # variable makes CMake refuse to configure if the Spectre-mitigated
+      # runtime libraries are missing, instead of only warning - a release
+      # must never ship with the unmitigated static runtime. The step
+      # "Ensure Spectre-mitigated runtime libraries" installs them first.
+      HKDFGUARD_REQUIRE_SPECTRE_LIBS: "1"
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false # nothing later in this job pushes
 
       - name: Report elevation status
         shell: powershell
@@ -70,6 +92,63 @@ jobs:
             Write-Host "::warning::This job's process token is not elevated - machine-wide KEK creation will fail, and the next step (Build-Test-Verify.ps1) will fail loudly because of it, not because of anything wrong with the code."
           }
 
+      # /Qspectre only covers this project's own code; the statically linked
+      # C/C++ runtime is mitigated only if the Spectre-mitigated runtime
+      # libraries are linked (CMake picks them up from the toolset's
+      # lib\spectre\<arch> directory). Hosted runner images don't promise
+      # them, so this checks the toolset every build script will use - the
+      # newest Visual Studio with the C++ tools, as the scripts select it -
+      # and installs both architectures' libraries if either is missing.
+      # Both, on both runners: Build-Test-Verify.ps1 builds x64 even on the
+      # ARM64 runner, and Build-Dist.ps1 builds the runner's own architecture.
+      - name: Ensure Spectre-mitigated runtime libraries
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $installerDir = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer"
+          $vswhere = Join-Path $installerDir "vswhere.exe"
+          $setup = Join-Path $installerDir "setup.exe"
+          $components = @(
+            "Microsoft.VisualStudio.Component.VC.Runtimes.x86.x64.Spectre",
+            "Microsoft.VisualStudio.Component.VC.Runtimes.ARM64.Spectre")
+
+          # The same selection the build scripts make (Build-Test-Verify.ps1
+          # requires the x64 tools; Build-Dist.ps1 requires the target's).
+          $toolComponent = if ("${{ matrix.arch }}" -eq "ARM64") {
+            "Microsoft.VisualStudio.Component.VC.Tools.ARM64" } else {
+            "Microsoft.VisualStudio.Component.VC.Tools.x86.x64" }
+          $installs = @(
+            & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+            & $vswhere -latest -products * -requires $toolComponent -property installationPath
+          ) | Where-Object { $_ } | Select-Object -Unique
+          if (-not $installs) { throw "no Visual Studio installation with the C++ build tools was found" }
+
+          function Get-MissingSpectreLibs([string]$vs) {
+            $version = (Get-Content (Join-Path $vs "VC\Auxiliary\Build\Microsoft.VCToolsVersion.default.txt")).Trim()
+            $lib = Join-Path $vs "VC\Tools\MSVC\$version\lib\spectre"
+            return @("x64", "arm64" | Where-Object { -not (Test-Path (Join-Path $lib "$_\libcmt.lib")) } |
+              ForEach-Object { "$version $_" })
+          }
+
+          foreach ($vs in $installs) {
+            $missing = Get-MissingSpectreLibs $vs
+            if ($missing.Count -eq 0) {
+              Write-Host "Spectre-mitigated runtime present (x64, arm64) in $vs"
+              continue
+            }
+            Write-Host "Missing in ${vs}: $($missing -join ', ') - installing $($components -join ', ')"
+            $installerArgs = @("modify", "--installPath", "`"$vs`"", "--quiet", "--norestart", "--nocache")
+            foreach ($c in $components) { $installerArgs += @("--add", $c) }
+            $proc = Start-Process -FilePath $setup -ArgumentList $installerArgs -Wait -PassThru
+            # 3010 = success, reboot recommended; the libraries are usable now.
+            if ($proc.ExitCode -ne 0 -and $proc.ExitCode -ne 3010) {
+              throw "Visual Studio Installer exited with $($proc.ExitCode)"
+            }
+            $missing = Get-MissingSpectreLibs $vs
+            if ($missing.Count -ne 0) { throw "still missing after install: $($missing -join ', ')" }
+            Write-Host "Installed the Spectre-mitigated runtime (x64, arm64) into $vs"
+          }
+
       - name: Build, test, and verify CLI wrap / DLL unwrap round trip (Release, ${{ matrix.arch }})
         shell: powershell
         run: .\scripts\Build-Test-Verify.ps1 -Configuration Release
@@ -77,6 +156,56 @@ jobs:
       - name: Build the distributable artifacts (${{ matrix.arch }})
         shell: powershell
         run: .\scripts\Build-Dist.ps1 -Arch ${{ matrix.arch }}
+
+      # Authenticode signing. Consumers are told (README, "Consuming from
+      # other languages") to verify the DLL's signature before loading it,
+      # so a release should ship signed binaries. Enabled by two repository
+      # secrets:
+      #   WINDOWS_SIGNING_CERT_PFX_BASE64  - the code-signing .pfx, base64
+      #   WINDOWS_SIGNING_CERT_PASSWORD    - its password
+      # Without them the release is still built, but unsigned, and the run
+      # carries a warning annotation saying so.
+      - name: Check signing configuration
+        id: signing
+        shell: powershell
+        env:
+          SIGNING_PFX: ${{ secrets.WINDOWS_SIGNING_CERT_PFX_BASE64 }}
+        run: |
+          if ([string]::IsNullOrEmpty($env:SIGNING_PFX)) {
+            Write-Host "::warning::WINDOWS_SIGNING_CERT_PFX_BASE64 is not set - this release's DLL and CLI will be UNSIGNED. Consumers cannot verify an Authenticode signature before loading them."
+            "enabled=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          } else {
+            "enabled=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          }
+
+      - name: Authenticode-sign the binaries (${{ matrix.arch }})
+        if: steps.signing.outputs.enabled == 'true'
+        shell: powershell
+        env:
+          SIGNING_PFX: ${{ secrets.WINDOWS_SIGNING_CERT_PFX_BASE64 }}
+          SIGNING_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERT_PASSWORD }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $archLower = "${{ matrix.arch }}".ToLower()
+          $files = @(
+            "dist\win-$archLower\HkdfGuard.Kms.Windows.v1.dll",
+            "dist\win-$archLower\hkdfguard-v1-initialize.exe")
+          # x64 signtool also runs (emulated) on the ARM64 runner.
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
+            Sort-Object { [version]($_.Directory.Parent.Name) } -Descending |
+            Select-Object -First 1 -ExpandProperty FullName
+          if (-not $signtool) { throw "signtool.exe not found under Windows Kits 10" }
+          $pfx = Join-Path $env:RUNNER_TEMP "signing.pfx"
+          try {
+            [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:SIGNING_PFX))
+            & $signtool sign /fd SHA256 /f $pfx /p $env:SIGNING_PASSWORD `
+              /tr http://timestamp.digicert.com /td SHA256 $files
+            if ($LASTEXITCODE -ne 0) { throw "signtool sign failed (exit $LASTEXITCODE)" }
+            & $signtool verify /pa $files
+            if ($LASTEXITCODE -ne 0) { throw "signtool verify failed (exit $LASTEXITCODE)" }
+          } finally {
+            Remove-Item -Force -ErrorAction SilentlyContinue $pfx
+          }
 
       - name: Package the release archive (${{ matrix.arch }})
         id: package
@@ -88,9 +217,25 @@ jobs:
           Compress-Archive -Path "dist\win-$archLower\*" -DestinationPath $zipName -Force
           (Get-FileHash -Algorithm SHA256 $zipName).Hash | Out-File -Encoding ascii "$zipName.sha256"
           "zip_path=$zipName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "dist_dir=dist/win-$archLower" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      # Signed, verifiable statement that these exact files (by SHA-256) were
+      # built by this workflow, from this commit, in this repository. The
+      # .sha256 sidecar alone proves nothing about origin - anyone who can
+      # replace the zip can replace it too. Verify a download with:
+      #   gh attestation verify <file> --repo <owner>/<repo>
+      # Attestations need a public repository, or GitHub Enterprise Cloud
+      # for a private one.
+      - name: Attest build provenance (${{ matrix.arch }})
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: |
+            ${{ steps.package.outputs.zip_path }}
+            ${{ steps.package.outputs.dist_dir }}/HkdfGuard.Kms.Windows.v1.dll
+            ${{ steps.package.outputs.dist_dir }}/hkdfguard-v1-initialize.exe
 
       - name: Upload build outputs for the release job
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-assets-${{ matrix.arch }}
           path: |
@@ -101,9 +246,11 @@ jobs:
   publish:
     needs: build
     runs-on: windows-2022 # only needs the `gh` CLI (preinstalled), not the build toolchain
+    permissions:
+      contents: write # required for the "Create GitHub Release" step below
     steps:
       - name: Download both architectures' artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: release-assets
           merge-multiple: true # flatten both matrix legs' uploads into one directory

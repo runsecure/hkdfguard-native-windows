@@ -169,6 +169,30 @@ foreach ($bin in $dllPath, $cliPath) {
     Write-Ok "$name is $Arch ($($machineLine.ToString().Trim()))"
 }
 
+# ---- Verify the exploit mitigations made it into the binaries -------------
+# The flags are set by hkdfguard_apply_hardening in CMakeLists.txt; this
+# checks what the linker actually produced, so a dropped flag fails the
+# release build instead of shipping silently. /CETCOMPAT and /guard:ehcont
+# are x64-only (see CMakeLists.txt), so ARM64 is checked for the rest.
+# /sdl and /Qspectre leave no marker in the PE headers and can't be checked
+# here.
+Write-Section "Verifying exploit mitigations"
+$requiredHeaderMarks = @("Dynamic base", "High Entropy Virtual Addresses", "NX compatible", "Control Flow Guard")
+if ($Arch -eq "x64") { $requiredHeaderMarks += "CET compatible" }
+foreach ($bin in $dllPath, $cliPath) {
+    $name = Split-Path -Leaf $bin
+    $headers = (dumpbin /headers $bin) -join "`n"
+    $missing = @($requiredHeaderMarks | Where-Object { $headers -notmatch [regex]::Escape($_) })
+    if ($Arch -eq "x64") {
+        $loadConfig = (dumpbin /loadconfig $bin) -join "`n"
+        if ($loadConfig -notmatch "EH Continuation table present") { $missing += "EH continuation table (/guard:ehcont)" }
+    }
+    if ($missing.Count -gt 0) {
+        throw "$name is missing exploit mitigations: $($missing -join ', ')"
+    }
+    Write-Ok "$name has: $($requiredHeaderMarks -join ', ')$(if ($Arch -eq 'x64') { ', EH continuation table' })"
+}
+
 # ---- Stage the dist folder --------------------------------------------------
 Write-Section "Staging $DistDir"
 New-Item -ItemType Directory -Force -Path $distPath | Out-Null
