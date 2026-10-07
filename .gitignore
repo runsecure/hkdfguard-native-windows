@@ -23,6 +23,7 @@
 *.dll
 *.so.*
 
+
 # Fortran module files
 *.mod
 *.smod
@@ -42,6 +43,7 @@
 build/
 Build/
 build-*/
+out/
 
 # CMake generated files
 CMakeFiles/
@@ -66,3 +68,49 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+
+# Visual Studio
+.vs/
+*.sln
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+*.suo
+*.user
+*.userosscache
+*.sdf
+*.opensdf
+*.VC.db
+*.VC.VC.opendb
+*.opendb
+*.aps
+ipch/
+[Dd]ebug/
+[Dd]ebugPublic/
+[Rr]elease/
+[Rr]eleases/
+x64/
+x86/
+[Bb]in/
+[Oo]bj/
+CMakeSettings.json
+.vsconfig
+
+# JetBrains (CLion/Rider) & VS Code
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# Windows shell
+Thumbs.db
+ehthumbs.db
+desktop.ini
+$RECYCLE.BIN/
+
+# Distribution Folder
+dist/
+
+# WiX extension cache (restored by scripts/Build-Msi.ps1 from the version
+# pinned there; the WiX tool itself is pinned in dotnet-tools.json)
+.wix/
+*.wixpdb
