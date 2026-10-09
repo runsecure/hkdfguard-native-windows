@@ -124,7 +124,7 @@ void CleanupKek(const wchar_t* service_wide, uint8_t provider_type, const char* 
 // call (via the test-only SetTestPolicyOverride seam - see policy.h), then
 // exercises CreateKek/KekExists/OpenKekForWrap directly against the
 // internal kek_store API - the same internal API CleanupKek's DeleteKek
-// call above uses, bypassing hkdfguard.dll entirely - so this test can
+// call above uses, bypassing HkdfGuardV1.dll entirely - so this test can
 // cover all three KeyStoragePolicy branches deterministically, regardless
 // of this machine's actual registry policy or TPM/vTPM availability.
 // Cleans up whatever it creates before returning, and always clears the
@@ -586,7 +586,7 @@ int main() {
 
 #if defined(_MSC_VER)
     // ---- -1. The DLL carries the event log message table. ----
-    // The MSI registers HkdfGuard.Kms.Windows.v1.dll as the event source's
+    // The MSI registers HkdfGuardV1.dll as the event source's
     // EventMessageFile, so Event Viewer renders each event by looking its ID
     // up in the DLL's message table. Missing IDs would show as "the
     // description for Event ID ... cannot be found". Checked against the
@@ -594,7 +594,7 @@ int main() {
     // event_log.cpp writes. Needs no elevation and no KEK. MSVC builds
     // only: other toolchains don't compile the message table at all.
     {
-        HMODULE dll = GetModuleHandleW(L"HkdfGuard.Kms.Windows.v1.dll");
+        HMODULE dll = GetModuleHandleW(L"HkdfGuardV1.dll");
         Check(dll != nullptr, "the HkdfGuard DLL is loaded in this test process");
         const DWORD ids[] = {1000, 1001, 1002, 1003, 2000, 2002, 2003, 2004, 2005};
         bool allPresent = dll != nullptr;
@@ -1354,8 +1354,8 @@ int main() {
     //          availability (see policy.h's SetTestPolicyOverride and
     //          CheckPolicyCreatesKek above). Every check above this point
     //          already exercises the real, registry-reading
-    //          LoadEffectivePolicy() inside hkdfguard.dll on every wrap/
-    //          unwrap/create_kek call - hkdfguard.dll never calls
+    //          LoadEffectivePolicy() inside HkdfGuardV1.dll on every wrap/
+    //          unwrap/create_kek call - HkdfGuardV1.dll never calls
     //          SetTestPolicyOverride itself, and the override lives in a
     //          separate copy of policy.cpp's state compiled directly into
     //          this .exe (see tests/CMakeLists.txt), so it has no way to
@@ -1428,7 +1428,7 @@ int main() {
     //           provider. Simulated by redirecting the "TPM" provider name
     //           at one no provider is registered under (see kek_store.h's
     //           SetTestTpmProviderNameOverride - a test-only seam, absent
-    //           from hkdfguard.dll), so this is deterministic on hardware
+    //           from HkdfGuardV1.dll), so this is deterministic on hardware
     //           that does have a TPM. Guards against the regression where
     //           KekExists threw HKDFGUARD_ERR_PROVIDER here while CreateKek
     //           and OpenKekForWrap on the same host happily fell back -
@@ -1438,7 +1438,7 @@ int main() {
     //           TPM, "exists?" must fail closed with PROVIDER rather than
     //           answer from the software provider.
     constexpr const wchar_t* kServiceNoTpmWide = L"hkdfguardwin.test.policy.notpm";
-    hkdfguard::SetTestTpmProviderNameOverride(L"HkdfGuardWin Test: No Such Provider");
+    hkdfguard::SetTestTpmProviderNameOverride(L"hkdfguard-native-windows test: no such provider");
 
     hkdfguard::SetTestPolicyOverride(hkdfguard::KeyStoragePolicy::PreferTpm);
     bool no_tpm_exists_is_false = false;

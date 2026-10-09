@@ -3,7 +3,7 @@
   Built by scripts/Build-Msi.ps1 - see that script for the parameters below.
 
   What it does:
-    - Installs HkdfGuard.Kms.Windows.v1.dll and hkdfguard-v1-initialize.exe
+    - Installs HkdfGuardV1.dll and hkdfguard-v1-initialize.exe
       side by side into  %ProgramFiles%\HkdfGuard\Kms.Windows.v1\ .
     - Writes that folder to
         HKLM\Software\HkdfGuard\Kms.Windows.v1  InstallPath  (REG_SZ)
@@ -17,7 +17,7 @@
     - The install folder lives under Program Files and inherits its ACL:
       only Administrators, SYSTEM and TrustedInstaller can write there. That
       is what stops a less-privileged user planting a fake
-      HkdfGuard.Kms.Windows.v1.dll next to the CLI and getting code
+      HkdfGuardV1.dll next to the CLI and getting code
       execution the next time an administrator runs the elevated
       `provision` step. Nothing in this file loosens that ACL - do not add
       Permission/PermissionEx elements to these directories.
@@ -70,7 +70,7 @@
 
     <ComponentGroup Id="HkdfGuardComponents" Directory="HkdfGuardInstallDir">
       <Component Id="HkdfGuardDll">
-        <File Id="HkdfGuardDllFile" Source="$(SourceDir)\HkdfGuard.Kms.Windows.v1.dll" KeyPath="yes" />
+        <File Id="HkdfGuardDllFile" Source="$(SourceDir)\HkdfGuardV1.dll" KeyPath="yes" />
       </Component>
       <Component Id="HkdfGuardCli">
         <File Id="HkdfGuardCliFile" Source="$(SourceDir)\hkdfguard-v1-initialize.exe" KeyPath="yes" />

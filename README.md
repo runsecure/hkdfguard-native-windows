@@ -1,4 +1,4 @@
-# HkdfGuardWin
+# hkdfguard-native-windows
 
 Windows-native Key Wrapper.
 Wraps and unwraps a 32-byte key using a persistent, machine-wide scoped, non-exportable
@@ -238,7 +238,7 @@ creates a machine-wide KEK (`NCRYPT_MACHINE_KEY_FLAG`) the first time a given se
 name is used, and that creation step fails outright without elevation - see "Deployment
 model" above.
 
-This produces `build/HkdfGuard.Kms.Windows.v1.dll` (+ its `.lib` import library) and
+This produces `build/HkdfGuardV1.dll` (+ its `.lib` import library) and
 `build/tools/hkdfguard-v1-initialize.exe`, and registers two tests with `ctest`:
 
 - **`roundtrip`** (`tests/test_roundtrip.cpp`, built to `build/tests/test_roundtrip.exe`)
@@ -413,18 +413,50 @@ The DLL and CLI are installed machine-wide by an MSI, not shipped inside applica
 packages (NuGet or otherwise). Each machine gets exactly one copy, in a folder only
 administrators can change, and applications load it from there.
 
-**Building the MSI** (no elevation needed):
+**Building signed distributables** (no elevation needed). One command builds both
+architectures, signs everything, and with `-Msi` also builds the signed installers:
 
 ```
-scripts\build-msi.bat -Arch x64 -Version 1.0.0 -SignCertThumbprint <thumbprint>
+scripts\build-dist-signed.bat
+scripts\build-dist-signed.bat -Msi -Version 1.0.0
 ```
 
-`scripts\Build-Msi.ps1` clean-builds Release via `Build-Dist.ps1`, Authenticode-signs both
-binaries *before* packaging and then the MSI itself, and writes
+`scripts\Build-Dist-Signed.ps1` checks the signing setup first, then runs `Build-Dist.ps1
+-Sign` (or `Build-Msi.ps1 -Sign` with `-Msi`) for x64 and ARM64. Afterwards it verifies
+that every artifact has a valid, timestamped signature and prints each one's SHA-256. Use
+`-Arch x64` or `-Arch ARM64` for one architecture. `Build-Dist.ps1` and `Build-Msi.ps1`
+also take `-Sign` on their own.
+
+Signing uses [Azure Artifact Signing](https://learn.microsoft.com/azure/artifact-signing/)
+through `scripts\ArtifactSigning.ps1`. The signing machine needs:
+
+- The Windows SDK's signtool, version 10.0.22621 or later. The scripts pick the newest x64
+  copy automatically.
+- The Artifact Signing client tools, which provide the signtool plugin:
+  `winget install -e --id Microsoft.Azure.ArtifactSigningClientTools`. They need .NET 8 or
+  later.
+- `scripts\signing\metadata.json`, which names the account's regional endpoint, the
+  account and the certificate profile. It holds no secrets. The endpoint must match the
+  account's region, or signing fails with a 403.
+- An Azure CLI sign-in (`az login`) for an account holding the **Artifact Signing
+  Certificate Profile Signer** role.
+
+Artifact Signing certificates are valid for three days, so every signature is
+timestamped, and the scripts fail on any signature that isn't. The certificate key never
+leaves Microsoft's HSMs, so there is no certificate file or thumbprint to manage.
+
+**Building the MSI on its own** (no elevation needed):
+
+```
+scripts\build-msi.bat -Arch x64 -Version 1.0.0 -Sign
+```
+
+`scripts\Build-Msi.ps1` clean-builds Release via `Build-Dist.ps1`, signs both binaries
+*before* packaging and then the MSI itself, and writes
 `dist\HkdfGuard.Kms.Windows.v1-<version>-win-<arch>.msi`. `-Arch` is `x64` or `ARM64`.
 `-Version` must increase with every release, or the upgrade won't replace the installed
-copy. Omitting `-SignCertThumbprint` produces an unsigned MSI, which is for local testing
-only. Afterwards the script reads the built MSI's own tables back and fails if the
+copy. Omitting `-Sign` produces an unsigned MSI, which is for local testing only.
+Afterwards the script reads the built MSI's own tables back and fails if the
 package doesn't install exactly what's described below. The WiX toolset (5.0.2) is
 pinned in `dotnet-tools.json` and restored automatically; only the .NET SDK is required.
 
@@ -477,10 +509,10 @@ already manages machine policy (Group Policy, Intune, SCCM).
 
 This repository only implements the native Windows library and its C ABI. To call it
 from C#, Python, Java, Go, or Node, install the MSI above and bind to the installed
-`HkdfGuard.Kms.Windows.v1.dll` with the platform's standard FFI mechanism.
+`HkdfGuardV1.dll` with the platform's standard FFI mechanism.
 
 **Load it by its full, known path - never by a bare filename.** Every binding below that
-accepts just a name (`"hkdfguard.dll"`, `Native.load("hkdfguard", ...)`, a bare-name
+accepts just a name (`"HkdfGuardV1.dll"`, `Native.load("HkdfGuardV1", ...)`, a bare-name
 `[DllImport]`, ...) resolves it through the operating system's standard DLL search order,
 which - depending on the host process's configuration - can include the current working
 directory or other locations a lower-privileged or otherwise unexpected file could
@@ -508,17 +540,17 @@ loading it.
   using var key = hklm.OpenSubKey(@"Software\HkdfGuard\Kms.Windows.v1")
       ?? throw new InvalidOperationException("HkdfGuard KMS is not installed");
   string dir = (string)key.GetValue("InstallPath")!;
-  IntPtr lib = NativeLibrary.Load(Path.Combine(dir, "HkdfGuard.Kms.Windows.v1.dll"));
+  IntPtr lib = NativeLibrary.Load(Path.Combine(dir, "HkdfGuardV1.dll"));
   ```
-- **Python**: `ctypes.WinDLL(r"<absolute-path>\HkdfGuard.Kms.Windows.v1.dll")`
+- **Python**: `ctypes.WinDLL(r"<absolute-path>\HkdfGuardV1.dll")`
 - **Java**: JNA's `NativeLibrary.getInstance("<absolute-path>")`, or a thin JNI shim that
   calls `LoadLibraryW` with an absolute path
-- **Go**: `cgo` linking against `HkdfGuard.Kms.Windows.v1.lib` (resolved at link time, not
+- **Go**: `cgo` linking against `HkdfGuardV1.lib` (resolved at link time, not
   a runtime search - the safest option of all here), or, for dynamic loading,
   `golang.org/x/sys/windows.LoadLibraryEx(absPath, 0,
   LOAD_LIBRARY_SEARCH_APPLICATION_DIR)`
 - **Node**: `ffi-napi`/`koffi` given an absolute path, or a native addon (N-API) linking
-  `HkdfGuard.Kms.Windows.v1.lib`
+  `HkdfGuardV1.lib`
 
 All five bindings map directly onto the five exported functions
 (`hkdfguard_kek_exists`, `hkdfguard_create_kek`, `hkdfguard_wrap_dek`,
@@ -527,4 +559,4 @@ All five bindings map directly onto the five exported functions
 
 ## License
 
-Apache License 2.0 - see [LICENSE](LICENSE).
+Mozilla Public License 2.0 (MPL-2.0) - see [LICENSE](LICENSE).

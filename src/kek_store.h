@@ -20,7 +20,7 @@ namespace hkdfguard {
     // clears it. Same scope and caveats as policy.h's SetTestPolicyOverride:
     // compiled in only when HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE is defined
     // (tests/CMakeLists.txt, for test_roundtrip's own copy of kek_store.cpp),
-    // never in hkdfguard.dll; not thread-safe, by design.
+    // never in HkdfGuardV1.dll; not thread-safe, by design.
 #if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
     void SetTestTpmProviderNameOverride(std::optional<std::wstring> providerName);
 

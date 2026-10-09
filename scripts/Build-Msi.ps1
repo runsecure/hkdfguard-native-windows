@@ -5,13 +5,15 @@
 .DESCRIPTION
     1. Runs Build-Dist.ps1 for -Arch (clean Release build, staged into
        dist\win-<arch>) unless -SkipBuild is passed.
-    2. If -SignCertThumbprint is given, Authenticode-signs the staged DLL and
-       CLI (SHA-256, RFC 3161 timestamp) *before* packaging, so the files the
-       MSI installs are the signed ones.
+    2. With -Sign, the staged DLL and CLI are Authenticode-signed through
+       Azure Artifact Signing (scripts\ArtifactSigning.ps1) *before*
+       packaging, so the files the MSI installs are the signed ones. Build-Dist
+       does that signing when it runs; with -SkipBuild, staged binaries that
+       aren't already validly signed and timestamped are signed here.
     3. Restores the repo-pinned WiX toolset (dotnet-tools.json, WiX 5.0.2)
        and its Util extension, then builds installer\HkdfGuard.Kms.Windows.v1.wxs
        into dist\HkdfGuard.Kms.Windows.v1-<version>-win-<arch>.msi.
-    4. If -SignCertThumbprint is given, signs the MSI itself too.
+    4. With -Sign, signs the MSI itself too.
     5. Reads the built MSI's own tables back (File, Directory, Registry,
        CustomAction) and checks they contain exactly what the installer is
        supposed to install, so a packaging mistake fails here rather than on
@@ -34,14 +36,19 @@
 .PARAMETER Manufacturer
     Manufacturer shown in Apps & Features. Default: HkdfGuard.
 
-.PARAMETER SignCertThumbprint
-    Thumbprint of a code-signing certificate in the current user's or local
-    machine's certificate store. When omitted, nothing is signed and a
-    warning is printed - fine for local testing, not for deployment.
+.PARAMETER Sign
+    Sign the binaries and the MSI through Azure Artifact Signing, and verify
+    every signature is valid and timestamped. The signing setup is checked
+    before anything is built. When omitted, nothing is signed and a warning
+    is printed - fine for local testing, not for deployment.
 
-.PARAMETER TimestampUrl
-    RFC 3161 timestamp server used when signing.
-    Default: http://timestamp.digicert.com
+.PARAMETER SigningMetadata
+    Artifact Signing metadata JSON. Default: scripts\signing\metadata.json
+    (or the HKDFGUARD_SIGNING_METADATA environment variable).
+
+.PARAMETER SigningDlib
+    Path to the x64 Azure.CodeSigning.Dlib.dll. Default: the Artifact Signing
+    client tools' install location (or HKDFGUARD_SIGNING_DLIB).
 
 .PARAMETER SkipBuild
     Package whatever is already staged in dist\win-<arch> instead of
@@ -53,8 +60,9 @@ param(
     [ValidatePattern('^\d{1,3}\.\d{1,3}\.\d{1,5}$')]
     [string]$Version = "1.0.0",
     [string]$Manufacturer = "HkdfGuard",
-    [string]$SignCertThumbprint,
-    [string]$TimestampUrl = "http://timestamp.digicert.com",
+    [switch]$Sign,
+    [string]$SigningMetadata,
+    [string]$SigningDlib,
     [switch]$SkipBuild
 )
 
@@ -72,7 +80,7 @@ $StageDir = Join-Path $RepoRoot "dist\win-$ArchLower"
 $WixArch = if ($Arch -eq "ARM64") { "arm64" } else { "x64" }
 $MsiPath = Join-Path $RepoRoot "dist\HkdfGuard.Kms.Windows.v1-$Version-win-$ArchLower.msi"
 $WxsPath = Join-Path $RepoRoot "installer\HkdfGuard.Kms.Windows.v1.wxs"
-$Binaries = "HkdfGuard.Kms.Windows.v1.dll", "hkdfguard-v1-initialize.exe"
+$Binaries = "HkdfGuardV1.dll", "hkdfguard-v1-initialize.exe"
 
 function Write-Section($title) {
     Write-Host ""
@@ -80,10 +88,24 @@ function Write-Section($title) {
 }
 function Write-Ok($msg) { Write-Host "[OK]   $msg" -ForegroundColor Green }
 
+# ---- Signing preflight (only with -Sign) ----------------------------------
+# Checked before the build, so a signing misconfiguration fails in seconds.
+if ($Sign) {
+    Write-Section "Checking the Artifact Signing setup"
+    . (Join-Path $PSScriptRoot "ArtifactSigning.ps1")
+    $signingConfig = Initialize-ArtifactSigning -MetadataPath $SigningMetadata -DlibPath $SigningDlib
+    Write-Ok "signing setup is ready"
+}
+
 # ---- 1. Release build -------------------------------------------------------
 if (-not $SkipBuild) {
     Write-Section "Release build ($Arch) via Build-Dist.ps1"
-    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "Build-Dist.ps1") -Arch $Arch
+    $distArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", (Join-Path $PSScriptRoot "Build-Dist.ps1"), "-Arch", $Arch)
+    if ($Sign) {
+        $distArgs += "-Sign"
+        if ($signingConfig) { $distArgs += @("-SigningMetadata", $signingConfig.Metadata.Path, "-SigningDlib", $signingConfig.Dlib) }
+    }
+    & powershell @distArgs
     if ($LASTEXITCODE -ne 0) { throw "Build-Dist.ps1 failed (exit $LASTEXITCODE)" }
 }
 foreach ($b in $Binaries) {
@@ -91,28 +113,18 @@ foreach ($b in $Binaries) {
 }
 Write-Ok "staged binaries present in $StageDir"
 
-# ---- Signing helper -----------------------------------------------------------
-function Get-SignTool {
-    $candidates = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" -ErrorAction SilentlyContinue |
-        Sort-Object { [version]($_.Directory.Parent.Name) } -Descending
-    if (-not $candidates) { throw "signtool.exe not found under Windows Kits 10 - install the Windows SDK signing tools." }
-    return $candidates[0].FullName
-}
-function Invoke-Sign([string[]]$files) {
-    $signtool = Get-SignTool
-    & $signtool sign /fd SHA256 /sha1 $SignCertThumbprint /tr $TimestampUrl /td SHA256 $files
-    if ($LASTEXITCODE -ne 0) { throw "signtool sign failed (exit $LASTEXITCODE)" }
-    & $signtool verify /pa $files
-    if ($LASTEXITCODE -ne 0) { throw "signtool verify failed (exit $LASTEXITCODE)" }
-}
-
-# ---- 2. Sign the binaries before packaging -------------------------------------
-if ($SignCertThumbprint) {
-    Write-Section "Signing staged binaries"
-    Invoke-Sign ($Binaries | ForEach-Object { Join-Path $StageDir $_ })
-    Write-Ok "binaries signed and verified"
+# ---- 2. The binaries must be signed before packaging ---------------------------
+$stagedFiles = @($Binaries | ForEach-Object { Join-Path $StageDir $_ })
+if ($Sign) {
+    Write-Section "Checking the staged binaries' signatures"
+    $unsigned = @($stagedFiles | Where-Object { -not (Test-ArtifactSignature -File $_) })
+    if ($unsigned.Count -gt 0) {
+        Write-Host "Signing $($unsigned.Count) staged binary(ies) that aren't validly signed yet..."
+        Invoke-ArtifactSigning -Files $unsigned -Config $signingConfig
+    }
+    Assert-ArtifactSignature -Files $stagedFiles -Config $signingConfig
 } else {
-    Write-Host "[WARN] -SignCertThumbprint not given: binaries and MSI will be UNSIGNED (local testing only)" -ForegroundColor Yellow
+    Write-Host "[WARN] -Sign not given: binaries and MSI will be UNSIGNED (local testing only)" -ForegroundColor Yellow
 }
 
 # ---- 3. Build the MSI ------------------------------------------------------------
@@ -137,10 +149,9 @@ Remove-Item -Force -ErrorAction SilentlyContinue ([IO.Path]::ChangeExtension($Ms
 Write-Ok "built $MsiPath"
 
 # ---- 4. Sign the MSI ---------------------------------------------------------------
-if ($SignCertThumbprint) {
+if ($Sign) {
     Write-Section "Signing the MSI"
-    Invoke-Sign @($MsiPath)
-    Write-Ok "MSI signed and verified"
+    Invoke-ArtifactSigning -Files @($MsiPath) -Config $signingConfig
 }
 
 # ---- 5. Verify what the MSI actually contains --------------------------------------

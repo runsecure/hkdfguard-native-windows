@@ -1,5 +1,5 @@
 # hkdfguard-v1-initialize: a standalone command-line utility that wraps a
-# caller-supplied DEK and writes it to a file, using hkdfguard.dll purely
+# caller-supplied DEK and writes it to a file, using HkdfGuardV1.dll purely
 # through its public C ABI (include/hkdfguard.h) - deliberately not linked
 # against anything in src/, matching this project's macOS and Linux
 # equivalents (which also only ever go through their platform's public C

@@ -20,7 +20,7 @@
        silently keep old settings baked into an incrementally-reused build
        directory. Each architecture gets its own build directory so
        building both doesn't clobber the other's cached CMake config.
-    3. Copies HkdfGuard.Kms.Windows.v1.dll and hkdfguard-v1-initialize.exe
+    3. Copies HkdfGuardV1.dll and hkdfguard-v1-initialize.exe
        (which needs that DLL sitting next to it - Windows won't find it
        across directories) into dist\win-<arch>\, ready to hand to a C#
        wrapper or copy to another machine.
@@ -46,11 +46,30 @@
 .PARAMETER DistDir
     Where the two artifacts are staged, relative to the repo root.
     Default: dist\win-<arch lowercased>.
+
+.PARAMETER Sign
+    Authenticode-sign the two staged binaries through Azure Artifact Signing
+    (scripts\ArtifactSigning.ps1), then verify each has a valid, timestamped
+    signature. The signing setup - signtool, the Artifact Signing plugin,
+    the metadata file and the Azure sign-in - is checked before the build
+    starts, so a misconfiguration fails in seconds rather than after it.
+    Without -Sign the binaries are unsigned (local testing only).
+
+.PARAMETER SigningMetadata
+    Artifact Signing metadata JSON. Default: scripts\signing\metadata.json
+    (or the HKDFGUARD_SIGNING_METADATA environment variable).
+
+.PARAMETER SigningDlib
+    Path to the x64 Azure.CodeSigning.Dlib.dll. Default: the Artifact Signing
+    client tools' install location (or HKDFGUARD_SIGNING_DLIB).
 #>
 param(
     [ValidateSet("x64", "ARM64")]
     [string]$Arch = "x64",
-    [string]$DistDir
+    [string]$DistDir,
+    [switch]$Sign,
+    [string]$SigningMetadata,
+    [string]$SigningDlib
 )
 
 $ErrorActionPreference = "Stop"
@@ -66,6 +85,14 @@ function Write-Section($title) {
     Write-Host "==== $title ====" -ForegroundColor Cyan
 }
 function Write-Ok($msg) { Write-Host "[OK]   $msg" -ForegroundColor Green }
+
+# ---- Signing preflight (only with -Sign) ----------------------------------
+if ($Sign) {
+    Write-Section "Checking the Artifact Signing setup"
+    . (Join-Path $PSScriptRoot "ArtifactSigning.ps1")
+    $signingConfig = Initialize-ArtifactSigning -MetadataPath $SigningMetadata -DlibPath $SigningDlib
+    Write-Ok "signing setup is ready"
+}
 
 # ---- Locate and enter the VS Build Tools developer environment --------
 Write-Section "Locating MSVC / CMake / Ninja (target: $Arch)"
@@ -146,7 +173,7 @@ cmake --build $BuildDirName --config Release
 if ($LASTEXITCODE -ne 0) { throw "build failed (exit $LASTEXITCODE)" }
 Write-Ok "build succeeded"
 
-$dllPath = Join-Path $RepoRoot "$BuildDirName\HkdfGuard.Kms.Windows.v1.dll"
+$dllPath = Join-Path $RepoRoot "$BuildDirName\HkdfGuardV1.dll"
 $cliPath = Join-Path $RepoRoot "$BuildDirName\tools\hkdfguard-v1-initialize.exe"
 foreach ($p in $dllPath, $cliPath) {
     if (-not (Test-Path $p)) { throw "expected Release build output missing: $p" }
@@ -220,5 +247,18 @@ if ($offendingDeps) {
     Write-Ok "no MSVC/UCRT redistributable dependencies - both binaries are self-contained"
 }
 
+# ---- Sign the staged binaries (only with -Sign) ---------------------------
+# Signs the copies in the dist folder - the files that ship - after every
+# check above has passed on them, so nothing modifies them afterwards.
+$stagedBinaries = @(
+    (Join-Path $distPath (Split-Path -Leaf $dllPath)),
+    (Join-Path $distPath (Split-Path -Leaf $cliPath)))
+if ($Sign) {
+    Write-Section "Signing with Azure Artifact Signing"
+    Invoke-ArtifactSigning -Files $stagedBinaries -Config $signingConfig
+} else {
+    Write-Host "[WARN] -Sign not given: the staged binaries are UNSIGNED (local testing only)" -ForegroundColor Yellow
+}
+
 Write-Section "Done"
-Write-Host "Artifacts staged in: $distPath"
+Write-Host "Artifacts staged in: $distPath$(if ($Sign) { ' (signed)' })"

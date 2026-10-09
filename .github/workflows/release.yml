@@ -1,4 +1,4 @@
-# Builds HkdfGuardWin's Release artifacts for both x64 and ARM64, validates
+# Builds hkdfguard-native-windows's Release artifacts for both x64 and ARM64, validates
 # each natively (ctest suite + CLI wrap / DLL unwrap round trip via
 # scripts/Build-Test-Verify.ps1, run ON that architecture, not
 # cross-compiled and merely hoped to work), then publishes one versioned
@@ -188,7 +188,7 @@ jobs:
           $ErrorActionPreference = "Stop"
           $archLower = "${{ matrix.arch }}".ToLower()
           $files = @(
-            "dist\win-$archLower\HkdfGuard.Kms.Windows.v1.dll",
+            "dist\win-$archLower\HkdfGuardV1.dll",
             "dist\win-$archLower\hkdfguard-v1-initialize.exe")
           # x64 signtool also runs (emulated) on the ARM64 runner.
           $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
@@ -213,7 +213,7 @@ jobs:
         run: |
           $version = "${{ github.ref_name }}"
           $archLower = "${{ matrix.arch }}".ToLower()
-          $zipName = "HkdfGuardWin-$version-win-$archLower.zip"
+          $zipName = "hkdfguard-native-windows-$version-win-$archLower.zip"
           Compress-Archive -Path "dist\win-$archLower\*" -DestinationPath $zipName -Force
           (Get-FileHash -Algorithm SHA256 $zipName).Hash | Out-File -Encoding ascii "$zipName.sha256"
           "zip_path=$zipName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
@@ -231,7 +231,7 @@ jobs:
         with:
           subject-path: |
             ${{ steps.package.outputs.zip_path }}
-            ${{ steps.package.outputs.dist_dir }}/HkdfGuard.Kms.Windows.v1.dll
+            ${{ steps.package.outputs.dist_dir }}/HkdfGuardV1.dll
             ${{ steps.package.outputs.dist_dir }}/hkdfguard-v1-initialize.exe
 
       - name: Upload build outputs for the release job
