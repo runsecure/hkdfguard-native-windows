@@ -308,7 +308,7 @@ any new quirks) back into that section.
 ## Audit logging
 
 The DLL writes security-relevant events to the Windows **Application** event log, source
-`HkdfGuard.Kms.Windows.v1`. The MSI registers that source; without it the events are
+`hkdfguard-native-windows`. The MSI registers that source; without it the events are
 still recorded, just shown in Event Viewer with a "description cannot be found"
 preamble. Each event's text names the API call, the service, the `HKDFGUARD_ERR_*`
 code, and the calling process. The event's User field is the calling account,
@@ -360,7 +360,7 @@ writes a burst of these events, since the tests exercise the failure paths on pu
 To list recent events from PowerShell:
 
 ```powershell
-Get-WinEvent -LogName Application -FilterXPath "*[System[Provider[@Name='HkdfGuard.Kms.Windows.v1']]]" -MaxEvents 50 |
+Get-WinEvent -LogName Application -FilterXPath "*[System[Provider[@Name='hkdfguard-native-windows']]]" -MaxEvents 50 |
     Format-Table TimeCreated, Id, LevelDisplayName, UserId, Message -Wrap
 ```
 
@@ -453,7 +453,7 @@ scripts\build-msi.bat -Arch x64 -Version 1.0.0 -Sign
 
 `scripts\Build-Msi.ps1` clean-builds Release via `Build-Dist.ps1`, signs both binaries
 *before* packaging and then the MSI itself, and writes
-`dist\HkdfGuard.Kms.Windows.v1-<version>-win-<arch>.msi`. `-Arch` is `x64` or `ARM64`.
+`dist\hkdfguard-native-windows-<version>-win-<arch>.msi`. `-Arch` is `x64` or `ARM64`.
 `-Version` must increase with every release, or the upgrade won't replace the installed
 copy. Omitting `-Sign` produces an unsigned MSI, which is for local testing only.
 Afterwards the script reads the built MSI's own tables back and fails if the
@@ -463,20 +463,20 @@ pinned in `dotnet-tools.json` and restored automatically; only the .NET SDK is r
 **Installing** (elevated; deployable as-is through Intune, SCCM or Group Policy):
 
 ```
-msiexec /i HkdfGuard.Kms.Windows.v1-1.0.0-win-x64.msi /qn /l*v install.log
+msiexec /i hkdfguard-native-windows-1.0.0-win-x64.msi /qn /l*v install.log
 ```
 
 The MSI does four things:
 
-- **Installs both files** to `C:\Program Files\HkdfGuard\Kms.Windows.v1\`. That folder
+- **Installs both files** to `C:\Program Files\HkdfGuard\v1\`. That folder
   inherits the Program Files ACL, where only Administrators, SYSTEM and TrustedInstaller
   can write. This is what stops a less-privileged user from planting a fake DLL next to
   the CLI and getting code execution the next time an administrator runs the elevated
   `provision` step. The location is deliberately not overridable from the `msiexec`
   command line, so nobody can redirect the install into a user-writable folder.
-- **Records the folder** in `HKLM\Software\HkdfGuard\Kms.Windows.v1`, value `InstallPath`
+- **Records the folder** in `HKLM\Software\hkdfguard-native-windows`, value `InstallPath`
   (`REG_SZ`, with a trailing backslash). Only administrators can change it.
-- **Registers the event log source** `HkdfGuard.Kms.Windows.v1`, so the audit events
+- **Registers the event log source** `hkdfguard-native-windows`, so the audit events
   described under "Audit logging" render cleanly in Event Viewer.
 - **Creates the local group `HkdfGuardUsers`** if it doesn't already exist. KEKs created
   while the group exists grant it use access, so add the accounts that need to wrap or
@@ -486,7 +486,7 @@ The MSI does four things:
 Then, once per service, elevated:
 
 ```
-"C:\Program Files\HkdfGuard\Kms.Windows.v1\hkdfguard-v1-initialize.exe" provision --service-name myapp
+"C:\Program Files\HkdfGuard\v1\hkdfguard-v1-initialize.exe" provision --service-name myapp
 ```
 
 **Upgrades** remove the previous version before installing the new one. A service with
@@ -537,8 +537,8 @@ loading it.
 
   ```csharp
   using var hklm = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Registry64);
-  using var key = hklm.OpenSubKey(@"Software\HkdfGuard\Kms.Windows.v1")
-      ?? throw new InvalidOperationException("HkdfGuard KMS is not installed");
+  using var key = hklm.OpenSubKey(@"Software\hkdfguard-native-windows")
+      ?? throw new InvalidOperationException("hkdfguard-native-windows is not installed");
   string dir = (string)key.GetValue("InstallPath")!;
   IntPtr lib = NativeLibrary.Load(Path.Combine(dir, "HkdfGuardV1.dll"));
   ```

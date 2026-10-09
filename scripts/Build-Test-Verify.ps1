@@ -242,7 +242,7 @@ public static class HkdfGuardNative {
     $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
     $sinceUtc = $auditStart.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
     foreach ($check in @(@{ Id = 1002; What = "wrap" }, @{ Id = 1003; What = "unwrap" })) {
-        $xpath = "*[System[Provider[@Name='HkdfGuard.Kms.Windows.v1'] and EventID=$($check.Id) and TimeCreated[@SystemTime>='$sinceUtc']]]"
+        $xpath = "*[System[Provider[@Name='hkdfguard-native-windows'] and EventID=$($check.Id) and TimeCreated[@SystemTime>='$sinceUtc']]]"
         $events = @()
         try { $events = @(Get-WinEvent -LogName Application -FilterXPath $xpath -ErrorAction Stop) } catch { }
         $match = @($events | Where-Object {

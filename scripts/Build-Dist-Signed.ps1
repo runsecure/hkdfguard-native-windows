@@ -99,7 +99,7 @@ foreach ($a in $archs) {
     $lower = $a.ToLower()
     $artifacts += Join-Path $RepoRoot "dist\win-$lower\HkdfGuardV1.dll"
     $artifacts += Join-Path $RepoRoot "dist\win-$lower\hkdfguard-v1-initialize.exe"
-    if ($Msi) { $artifacts += Join-Path $RepoRoot "dist\HkdfGuard.Kms.Windows.v1-$Version-win-$lower.msi" }
+    if ($Msi) { $artifacts += Join-Path $RepoRoot "dist\hkdfguard-native-windows-$Version-win-$lower.msi" }
 }
 foreach ($file in $artifacts) {
     if (-not (Test-Path $file)) { throw "expected artifact missing: $file" }

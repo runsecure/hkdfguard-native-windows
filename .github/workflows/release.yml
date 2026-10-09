@@ -300,7 +300,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path release-assets | Out-Null
           foreach ($dist in "win-x64", "win-arm64") {
             Compress-Archive -Path "dist\$dist\*" -DestinationPath "release-assets\hkdfguard-native-windows-$tag-$dist.zip" -Force
-            Copy-Item "dist\HkdfGuard.Kms.Windows.v1-$version-$dist.msi" release-assets\
+            Copy-Item "dist\hkdfguard-native-windows-$version-$dist.msi" release-assets\
           }
           foreach ($file in Get-ChildItem release-assets -File) {
             (Get-FileHash -Algorithm SHA256 $file.FullName).Hash.ToLower() |

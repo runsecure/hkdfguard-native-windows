@@ -58,7 +58,7 @@ add_library(hkdfguard SHARED
 # Event log message table: mc.exe (Windows SDK) compiles
 # src/event_messages.mc into a resource script, which is linked into the
 # DLL so the DLL itself can be registered (by the MSI) as the
-# "HkdfGuard.Kms.Windows.v1" event source's EventMessageFile. Without a
+# "hkdfguard-native-windows" event source's EventMessageFile. Without a
 # message table Event Viewer still records every event, but renders it with
 # a "description cannot be found" preamble. MSVC builds only - other
 # toolchains (e.g. a MinGW dev build) simply skip the resource; the logging
@@ -83,8 +83,8 @@ endif()
 
 # Names the actual output files HkdfGuardV1.dll and its companion
 # HkdfGuardV1.lib import library - "V1" being the wire-format/wrap-protocol
-# version they implement. (HkdfGuard.Kms.Windows.v1, the event log source
-# and the MSI's product/install name, is a separate identifier - see
+# version they implement. (The event log source and the MSI's product
+# name, hkdfguard-native-windows, are separate identifiers - see
 # installer/.) Only
 # changes what lands on disk - the CMake target itself is still named
 # "hkdfguard" everywhere else in this file and in tests/CMakeLists.txt

@@ -352,7 +352,7 @@ use) are still granted by *name*, now restricted to local groups.
 ## 12. Known gaps (not yet addressed)
 
 - The audit trail (Application event log, source
-  `HkdfGuard.Kms.Windows.v1`; see README.md "Audit logging") is best
+  `hkdfguard-native-windows`; see README.md "Audit logging") is best
   effort and not tamper-evident. Any local user can write events under
   that source name, and an administrator can clear the log. Treat it as an
   operational aid, not as evidence. The event's User field is supplied by

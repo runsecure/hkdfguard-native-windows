@@ -1,7 +1,7 @@
 #pragma once
 
 // Audit events written to the Windows Application event log under the
-// source "HkdfGuard.Kms.Windows.v1" - see event_log.cpp for exactly what is
+// source "hkdfguard-native-windows" - see event_log.cpp for exactly what is
 // and isn't logged, and src/event_messages.mc for the event IDs.
 //
 // Every function here is noexcept and best-effort: a failure to log (no

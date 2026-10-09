@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Builds the machine-wide MSI installer for HkdfGuard.Kms.Windows.v1.
+    Builds the machine-wide MSI installer for hkdfguard-native-windows.
 
 .DESCRIPTION
     1. Runs Build-Dist.ps1 for -Arch (clean Release build, staged into
@@ -11,8 +11,8 @@
        does that signing when it runs; with -SkipBuild, staged binaries that
        aren't already validly signed and timestamped are signed here.
     3. Restores the repo-pinned WiX toolset (dotnet-tools.json, WiX 5.0.2)
-       and its Util extension, then builds installer\HkdfGuard.Kms.Windows.v1.wxs
-       into dist\HkdfGuard.Kms.Windows.v1-<version>-win-<arch>.msi.
+       and its Util extension, then builds installer\hkdfguard-native-windows.wxs
+       into dist\hkdfguard-native-windows-<version>-win-<arch>.msi.
     4. With -Sign, signs the MSI itself too.
     5. Reads the built MSI's own tables back (File, Directory, Registry,
        CustomAction) and checks they contain exactly what the installer is
@@ -78,8 +78,8 @@ if ($parts[0] -gt 255 -or $parts[1] -gt 255 -or $parts[2] -gt 65535) {
 $ArchLower = $Arch.ToLower()
 $StageDir = Join-Path $RepoRoot "dist\win-$ArchLower"
 $WixArch = if ($Arch -eq "ARM64") { "arm64" } else { "x64" }
-$MsiPath = Join-Path $RepoRoot "dist\HkdfGuard.Kms.Windows.v1-$Version-win-$ArchLower.msi"
-$WxsPath = Join-Path $RepoRoot "installer\HkdfGuard.Kms.Windows.v1.wxs"
+$MsiPath = Join-Path $RepoRoot "dist\hkdfguard-native-windows-$Version-win-$ArchLower.msi"
+$WxsPath = Join-Path $RepoRoot "installer\hkdfguard-native-windows.wxs"
 $Binaries = "HkdfGuardV1.dll", "hkdfguard-v1-initialize.exe"
 
 function Write-Section($title) {
@@ -195,21 +195,22 @@ Expect ((($files | Sort-Object) -join ',') -eq (($Binaries | Sort-Object) -join 
 $dirs = Get-Rows "SELECT ``Directory``, ``Directory_Parent``, ``DefaultDir`` FROM ``Directory``" 3
 $installDir = $dirs | Where-Object { $_[0] -eq 'HkdfGuardInstallDir' }
 $rootDir = $dirs | Where-Object { $_[0] -eq 'HkdfGuardRootDir' }
-Expect ($installDir -and $installDir[1] -eq 'HkdfGuardRootDir' -and $installDir[2] -match 'Kms\.Windows\.v1$') "install folder is ...\HkdfGuard\Kms.Windows.v1"
-Expect ($rootDir -and $rootDir[1] -eq 'ProgramFiles64Folder') "under the native Program Files folder"
+# DefaultDir is either "LongName" or "SHORT~1|LongName"; match the long name.
+Expect ($installDir -and $installDir[1] -eq 'HkdfGuardRootDir' -and $installDir[2] -match '(^|\|)v1$') "install folder is ...\HkdfGuard\v1"
+Expect ($rootDir -and $rootDir[1] -eq 'ProgramFiles64Folder' -and $rootDir[2] -match '(^|\|)HkdfGuard$') "under the native Program Files folder, in HkdfGuard"
 # A public (all-uppercase) directory id could be redirected from the
 # msiexec command line into a user-writable folder, undoing the ACL
 # protection the install location exists for.
 Expect (-not ($dirs | Where-Object { $_[0] -like 'HkdfGuard*' -and $_[0] -ceq $_[0].ToUpperInvariant() })) "install location is not overridable from the msiexec command line"
 
 $reg = Get-Rows "SELECT ``Root``, ``Key``, ``Name``, ``Value`` FROM ``Registry``" 4
-$installPathRow = $reg | Where-Object { $_[0] -eq '2' -and $_[1] -eq 'Software\HkdfGuard\Kms.Windows.v1' -and $_[2] -eq 'InstallPath' -and $_[3] -eq '[HkdfGuardInstallDir]' }
-Expect ($null -ne $installPathRow) "writes HKLM\Software\HkdfGuard\Kms.Windows.v1\InstallPath"
-$eventSourceKey = 'SYSTEM\CurrentControlSet\Services\EventLog\Application\HkdfGuard.Kms.Windows.v1'
+$installPathRow = $reg | Where-Object { $_[0] -eq '2' -and $_[1] -eq 'Software\hkdfguard-native-windows' -and $_[2] -eq 'InstallPath' -and $_[3] -eq '[HkdfGuardInstallDir]' }
+Expect ($null -ne $installPathRow) "writes HKLM\Software\hkdfguard-native-windows\InstallPath"
+$eventSourceKey = 'SYSTEM\CurrentControlSet\Services\EventLog\Application\hkdfguard-native-windows'
 # Registry.Value encodes the type in a prefix: "#%" = REG_EXPAND_SZ, "#" = REG_DWORD.
 $msgFileRow = $reg | Where-Object { $_[0] -eq '2' -and $_[1] -eq $eventSourceKey -and $_[2] -eq 'EventMessageFile' -and $_[3] -eq '#%[#HkdfGuardDllFile]' }
 $typesRow = $reg | Where-Object { $_[0] -eq '2' -and $_[1] -eq $eventSourceKey -and $_[2] -eq 'TypesSupported' -and $_[3] -eq '#7' }
-Expect ($null -ne $msgFileRow -and $null -ne $typesRow) "registers the HkdfGuard.Kms.Windows.v1 event source with the DLL as its message file"
+Expect ($null -ne $msgFileRow -and $null -ne $typesRow) "registers the hkdfguard-native-windows event source with the DLL as its message file"
 
 $ca = Get-Rows "SELECT ``Action``, ``Type`` FROM ``CustomAction`` WHERE ``Action``='CreateHkdfGuardUsersGroup'" 2
 # msidbCustomActionTypeInScript (0x400) + NoImpersonate (0x800) = deferred,

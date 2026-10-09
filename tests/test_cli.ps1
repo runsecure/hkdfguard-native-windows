@@ -347,7 +347,7 @@ try {
     # events found" as an error, hence the try/catch.
     function Find-HkdfEvent([datetime]$Since, [int]$Id, [string]$Needle) {
         $sinceUtc = $Since.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
-        $xpath = "*[System[Provider[@Name='HkdfGuard.Kms.Windows.v1'] and EventID=$Id and TimeCreated[@SystemTime>='$sinceUtc']]]"
+        $xpath = "*[System[Provider[@Name='hkdfguard-native-windows'] and EventID=$Id and TimeCreated[@SystemTime>='$sinceUtc']]]"
         try {
             $events = Get-WinEvent -LogName Application -FilterXPath $xpath -ErrorAction Stop
         } catch {
