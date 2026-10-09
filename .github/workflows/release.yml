@@ -1,23 +1,42 @@
-# Builds hkdfguard-native-windows's Release artifacts for both x64 and ARM64, validates
-# each natively (ctest suite + CLI wrap / DLL unwrap round trip via
+# Builds hkdfguard-native-windows's Release artifacts for both x64 and ARM64,
+# validates each natively (ctest suite + CLI wrap / DLL unwrap round trip via
 # scripts/Build-Test-Verify.ps1, run ON that architecture, not
-# cross-compiled and merely hoped to work), then publishes one versioned
-# GitHub Release with both architectures' zips attached - so other
+# cross-compiled and merely hoped to work), signs everything through Azure
+# Artifact Signing, then publishes one versioned GitHub Release - so other
 # repositories (e.g. a C# wrapper) can pull a stable, versioned download URL
 # instead of an ephemeral workflow artifact.
 #
 # Triggered by pushing a version tag (vX.Y.Z). Reuses this repo's own
-# scripts/ rather than duplicating their logic here.
+# scripts/ rather than duplicating their logic here. Three jobs:
+#
+#   build    per architecture: build, test, stage the UNSIGNED binaries.
+#            Holds no signing access at all.
+#   sign     one x64 job, in the "release" environment: signs all four
+#            binaries with scripts/ArtifactSigning.ps1 (the same code as a
+#            local `scripts\build-dist-signed.bat`), builds and signs both
+#            MSIs, zips, and attests provenance of the signed files.
+#   publish  creates the GitHub Release from the sign job's output.
+#
+# Signing setup this workflow depends on (Azure and GitHub, not code):
+#   - Repository secrets AZURE_CLIENT_ID (the Entra app GitHub signs in as),
+#     AZURE_TENANT_ID and AZURE_SUBSCRIPTION_ID.
+#   - That app holds "Artifact Signing Certificate Profile Signer" on the
+#     signing account named in scripts/signing/metadata.json.
+#   - The app has a federated credential trusting this repository's
+#     "release" environment. The sign job runs in that environment, so the
+#     OIDC subject GitHub presents is
+#       repo:<owner>/hkdfguard-native-windows:environment:release
+#     (in this repository's ID-qualified form). A credential for a branch or
+#     tag does not match a job that runs in an environment.
+#   - Recommended: restrict the "release" environment (Settings >
+#     Environments) to tags matching v*, so only a release can sign.
 #
 # The ARM64 leg runs on the "windows-11-arm" hosted runner label so it
 # builds AND runs on real ARM64 hardware - not cross-compiled from the x64
-# runner - meaning the elevated wrap/unwrap round trip in
-# Build-Test-Verify.ps1 actually executes on that architecture before its
-# output is trusted enough to publish. That runner label's availability
-# depends on your plan/repo visibility (GitHub's ARM64 Windows hosted
-# runners were newer at the time this workflow was written) - verify it's
-# available (Settings > Actions > Runners, or just watch the first run) and
-# swap in a self-hosted ARM64 runner's label here if not.
+# runner. That runner label's availability depends on your plan/repo
+# visibility - verify it's available (Settings > Actions > Runners, or just
+# watch the first run) and swap in a self-hosted ARM64 runner's label here
+# if not.
 name: Release
 
 on:
@@ -32,8 +51,8 @@ permissions:
 # Third-party actions are pinned to full commit SHAs, not tags: a tag can be
 # moved to different code after the fact, a commit SHA cannot. The trailing
 # comment names the release each SHA corresponds to. To update one, look up
-# the new tag's commit (git ls-remote https://github.com/<action> refs/tags/<tag>)
-# and replace both.
+# the new tag's commit (git ls-remote https://github.com/<action> refs/tags/<tag>;
+# for an annotated tag use the ^{} line) and replace both.
 
 concurrency:
   group: release-${{ github.ref_name }}
@@ -46,14 +65,14 @@ jobs:
       matrix:
         include:
           - arch: x64
+            dist: win-x64
             runner: windows-2022
           - arch: ARM64
+            dist: win-arm64
             runner: windows-11-arm
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
-      id-token: write     # build provenance attestation (OIDC identity)
-      attestations: write # build provenance attestation (storage)
     env:
       # The hardening flags (/sdl, /Qspectre, CFG, and on x64 /CETCOMPAT and
       # /guard:ehcont) come from CMakeLists.txt's hkdfguard_apply_hardening,
@@ -153,107 +172,178 @@ jobs:
         shell: powershell
         run: .\scripts\Build-Test-Verify.ps1 -Configuration Release
 
-      - name: Build the distributable artifacts (${{ matrix.arch }})
+      # Unsigned here on purpose: signing happens once, in the sign job, so
+      # build jobs never hold signing access and the ARM64 runner never has
+      # to run the x64 signing plugin under emulation.
+      - name: Build the distributable artifacts (${{ matrix.arch }}, unsigned)
         shell: powershell
         run: .\scripts\Build-Dist.ps1 -Arch ${{ matrix.arch }}
 
-      # Authenticode signing. Consumers are told (README, "Consuming from
-      # other languages") to verify the DLL's signature before loading it,
-      # so a release should ship signed binaries. Enabled by two repository
-      # secrets:
-      #   WINDOWS_SIGNING_CERT_PFX_BASE64  - the code-signing .pfx, base64
-      #   WINDOWS_SIGNING_CERT_PASSWORD    - its password
-      # Without them the release is still built, but unsigned, and the run
-      # carries a warning annotation saying so.
-      - name: Check signing configuration
-        id: signing
-        shell: powershell
-        env:
-          SIGNING_PFX: ${{ secrets.WINDOWS_SIGNING_CERT_PFX_BASE64 }}
-        run: |
-          if ([string]::IsNullOrEmpty($env:SIGNING_PFX)) {
-            Write-Host "::warning::WINDOWS_SIGNING_CERT_PFX_BASE64 is not set - this release's DLL and CLI will be UNSIGNED. Consumers cannot verify an Authenticode signature before loading them."
-            "enabled=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-          } else {
-            "enabled=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-          }
+      - name: Upload the unsigned binaries for the sign job
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: unsigned-${{ matrix.dist }}
+          path: dist/${{ matrix.dist }}/
+          if-no-files-found: error
+          retention-days: 1
 
-      - name: Authenticode-sign the binaries (${{ matrix.arch }})
-        if: steps.signing.outputs.enabled == 'true'
+  sign:
+    needs: build
+    runs-on: windows-2022
+    # The Entra app's federated credential trusts this environment (see the
+    # header). Restrict the environment to v* tags in the repository settings.
+    environment: release
+    permissions:
+      contents: read
+      id-token: write     # Azure sign-in (OIDC) and build provenance attestation
+      attestations: write # build provenance attestation (storage)
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Download the unsigned x64 binaries
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: unsigned-win-x64
+          path: dist/win-x64
+
+      - name: Download the unsigned ARM64 binaries
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: unsigned-win-arm64
+          path: dist/win-arm64
+
+      # The MSI ProductVersion is the tag without its "v"; it must fit MSI's
+      # major.minor.build limits.
+      - name: Determine the release version
+        id: version
         shell: powershell
-        env:
-          SIGNING_PFX: ${{ secrets.WINDOWS_SIGNING_CERT_PFX_BASE64 }}
-          SIGNING_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERT_PASSWORD }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          if ($tag -notmatch '^v(\d{1,3})\.(\d{1,3})\.(\d{1,5})$' -or
+              [int]$Matches[1] -gt 255 -or [int]$Matches[2] -gt 255 -or [int]$Matches[3] -gt 65535) {
+            throw "Tag '$tag' is not vMAJOR.MINOR.BUILD within MSI limits (major, minor <= 255; build <= 65535)."
+          }
+          "version=$($tag.Substring(1))" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      # Federated (OIDC) sign-in: GitHub's short-lived token is exchanged for
+      # an Azure token for AZURE_CLIENT_ID - no stored Azure secret. Leaves
+      # the Azure CLI signed in, which the signing plugin uses.
+      - name: Sign in to Azure
+        uses: azure/login@7184910d9eb2b1c5e48f7073824a90609bb9b6d6 # v2.3.1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # The signtool plugin for Artifact Signing. The installer is fetched
+      # from Microsoft's documented download URL and must carry a valid
+      # Microsoft Authenticode signature before it is run.
+      - name: Install the Artifact Signing client tools
+        shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
-          $archLower = "${{ matrix.arch }}".ToLower()
-          $files = @(
-            "dist\win-$archLower\HkdfGuardV1.dll",
-            "dist\win-$archLower\hkdfguard-v1-initialize.exe")
-          # x64 signtool also runs (emulated) on the ARM64 runner.
-          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
-            Sort-Object { [version]($_.Directory.Parent.Name) } -Descending |
-            Select-Object -First 1 -ExpandProperty FullName
-          if (-not $signtool) { throw "signtool.exe not found under Windows Kits 10" }
-          $pfx = Join-Path $env:RUNNER_TEMP "signing.pfx"
-          try {
-            [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:SIGNING_PFX))
-            & $signtool sign /fd SHA256 /f $pfx /p $env:SIGNING_PASSWORD `
-              /tr http://timestamp.digicert.com /td SHA256 $files
-            if ($LASTEXITCODE -ne 0) { throw "signtool sign failed (exit $LASTEXITCODE)" }
-            & $signtool verify /pa $files
-            if ($LASTEXITCODE -ne 0) { throw "signtool verify failed (exit $LASTEXITCODE)" }
-          } finally {
-            Remove-Item -Force -ErrorAction SilentlyContinue $pfx
+          $msi = Join-Path $env:RUNNER_TEMP "ArtifactSigningClientTools.msi"
+          Invoke-WebRequest -UseBasicParsing -Uri "https://download.microsoft.com/download/70ad2c3b-761f-4aa9-a9de-e7405aa2b4c1/ArtifactSigningClientTools.msi" -OutFile $msi
+          $sig = Get-AuthenticodeSignature -FilePath $msi
+          if ($sig.Status -ne "Valid" -or $sig.SignerCertificate.Subject -notmatch "O=Microsoft Corporation") {
+            throw "The downloaded client tools installer is not validly signed by Microsoft ($($sig.Status): $($sig.SignerCertificate.Subject))."
           }
+          $proc = Start-Process msiexec.exe -ArgumentList @("/i", "`"$msi`"", "/quiet", "/norestart") -Wait -PassThru
+          if ($proc.ExitCode -ne 0 -and $proc.ExitCode -ne 3010) { throw "client tools install failed (msiexec exit $($proc.ExitCode))" }
+          # The installer may install per-user or per-machine; find the x64
+          # plugin either way and hand its location to the signing helper.
+          $dlib = @(
+            (Join-Path $env:LOCALAPPDATA "Microsoft\MicrosoftArtifactSigningClientTools\Azure.CodeSigning.Dlib.dll")
+            Get-ChildItem -Path $env:LOCALAPPDATA, $env:ProgramFiles, ${env:ProgramFiles(x86)} -Recurse -Filter Azure.CodeSigning.Dlib.dll -ErrorAction SilentlyContinue |
+              Select-Object -ExpandProperty FullName
+          ) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+          if (-not $dlib) { throw "Azure.CodeSigning.Dlib.dll not found after installing the client tools" }
+          Write-Host "Artifact Signing plugin: $dlib"
+          "HKDFGUARD_SIGNING_DLIB=$dlib" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-      - name: Package the release archive (${{ matrix.arch }})
-        id: package
+      # Same helper and metadata (scripts/signing/metadata.json) as local
+      # signing. Fails unless every file ends up validly signed AND
+      # timestamped - there is no unsigned fallback for a release.
+      - name: Sign the binaries (x64 and ARM64)
         shell: powershell
         run: |
-          $version = "${{ github.ref_name }}"
-          $archLower = "${{ matrix.arch }}".ToLower()
-          $zipName = "hkdfguard-native-windows-$version-win-$archLower.zip"
-          Compress-Archive -Path "dist\win-$archLower\*" -DestinationPath $zipName -Force
-          (Get-FileHash -Algorithm SHA256 $zipName).Hash | Out-File -Encoding ascii "$zipName.sha256"
-          "zip_path=$zipName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-          "dist_dir=dist/win-$archLower" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          $ErrorActionPreference = "Stop"
+          . .\scripts\ArtifactSigning.ps1
+          $config = Initialize-ArtifactSigning
+          Invoke-ArtifactSigning -Config $config -Files @(
+            "dist\win-x64\HkdfGuardV1.dll",
+            "dist\win-x64\hkdfguard-v1-initialize.exe",
+            "dist\win-arm64\HkdfGuardV1.dll",
+            "dist\win-arm64\hkdfguard-v1-initialize.exe")
+
+      # Packages the signed binaries (already signed, so not re-signed), then
+      # signs each MSI and checks its contents.
+      - name: Build and sign the MSI installers
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          foreach ($arch in "x64", "ARM64") {
+            & powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\Build-Msi.ps1 `
+              -Arch $arch -Version "${{ steps.version.outputs.version }}" -SkipBuild -Sign
+            if ($LASTEXITCODE -ne 0) { throw "Build-Msi.ps1 -Arch $arch failed (exit $LASTEXITCODE)" }
+          }
+
+      - name: Package the release assets
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tag = "${{ github.ref_name }}"
+          $version = "${{ steps.version.outputs.version }}"
+          New-Item -ItemType Directory -Force -Path release-assets | Out-Null
+          foreach ($dist in "win-x64", "win-arm64") {
+            Compress-Archive -Path "dist\$dist\*" -DestinationPath "release-assets\hkdfguard-native-windows-$tag-$dist.zip" -Force
+            Copy-Item "dist\HkdfGuard.Kms.Windows.v1-$version-$dist.msi" release-assets\
+          }
+          foreach ($file in Get-ChildItem release-assets -File) {
+            (Get-FileHash -Algorithm SHA256 $file.FullName).Hash.ToLower() |
+              Out-File -Encoding ascii "$($file.FullName).sha256"
+          }
+          Get-ChildItem release-assets -File | ForEach-Object { Write-Host "  $($_.Name)" }
 
       # Signed, verifiable statement that these exact files (by SHA-256) were
-      # built by this workflow, from this commit, in this repository. The
-      # .sha256 sidecar alone proves nothing about origin - anyone who can
-      # replace the zip can replace it too. Verify a download with:
+      # built by this workflow, from this commit, in this repository - made
+      # after signing, so it covers the files that ship. The .sha256
+      # sidecars alone prove nothing about origin. Verify a download with:
       #   gh attestation verify <file> --repo <owner>/<repo>
       # Attestations need a public repository, or GitHub Enterprise Cloud
       # for a private one.
-      - name: Attest build provenance (${{ matrix.arch }})
+      - name: Attest build provenance
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
           subject-path: |
-            ${{ steps.package.outputs.zip_path }}
-            ${{ steps.package.outputs.dist_dir }}/HkdfGuardV1.dll
-            ${{ steps.package.outputs.dist_dir }}/hkdfguard-v1-initialize.exe
+            release-assets/*.zip
+            release-assets/*.msi
+            dist/win-x64/HkdfGuardV1.dll
+            dist/win-x64/hkdfguard-v1-initialize.exe
+            dist/win-arm64/HkdfGuardV1.dll
+            dist/win-arm64/hkdfguard-v1-initialize.exe
 
-      - name: Upload build outputs for the release job
+      - name: Upload the signed release assets
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: release-assets-${{ matrix.arch }}
-          path: |
-            ${{ steps.package.outputs.zip_path }}
-            ${{ steps.package.outputs.zip_path }}.sha256
+          name: release-assets
+          path: release-assets/
           if-no-files-found: error
 
   publish:
-    needs: build
+    needs: sign
     runs-on: windows-2022 # only needs the `gh` CLI (preinstalled), not the build toolchain
     permissions:
       contents: write # required for the "Create GitHub Release" step below
     steps:
-      - name: Download both architectures' artifacts
+      - name: Download the signed release assets
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
+          name: release-assets
           path: release-assets
-          merge-multiple: true # flatten both matrix legs' uploads into one directory
 
       - name: Create GitHub Release
         shell: powershell
@@ -263,4 +353,4 @@ jobs:
           $files = Get-ChildItem -Path release-assets -File | Select-Object -ExpandProperty FullName
           Write-Host "Release assets:"
           $files | ForEach-Object { Write-Host "  $_" }
-          gh release create "${{ github.ref_name }}" $files --title "${{ github.ref_name }}" --generate-notes
+          gh release create "${{ github.ref_name }}" $files --title "${{ github.ref_name }}" --generate-notes --repo "${{ github.repository }}"
