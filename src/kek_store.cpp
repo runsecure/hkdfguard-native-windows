@@ -19,7 +19,7 @@ namespace hkdfguard {
 #endif
 
         // The NCrypt provider name used for everything "TPM" in this file.
-        // Always MS_PLATFORM_CRYPTO_PROVIDER in hkdfguard.dll; a test build
+        // Always MS_PLATFORM_CRYPTO_PROVIDER in HkdfGuardV1.dll; a test build
         // may point it at a nonexistent provider to exercise the "no TPM on
         // this machine" paths deterministically on hardware that has one.
         LPCWSTR TpmProviderName()
@@ -34,7 +34,7 @@ namespace hkdfguard {
         }
 
         // Test seam hooks (see TestTpmFaults in kek_store.h). In
-        // hkdfguard.dll these compile to "return the real status" and
+        // HkdfGuardV1.dll these compile to "return the real status" and
         // "never fail", so the shipped library behaves exactly as without
         // them.
         SECURITY_STATUS ApplyTestTpmOpenStatus(LPCWSTR providerName, SECURITY_STATUS actual)
@@ -75,6 +75,12 @@ namespace hkdfguard {
         // before it ever reaches this function - so the fully-assembled name
         // is lowercase end to end, not just the caller-supplied portion of
         // it.
+        //
+        // FROZEN - do not rename the "hkdfguardwin_" prefix. It comes from
+        // this project's former name, but it is the persisted name of every
+        // KEK already provisioned on every host: changing it makes the
+        // library look for keys that don't exist, so every existing KEK -
+        // and every DEK wrapped under it - becomes unreachable.
         std::wstring KeyName(const std::wstring &service, uint32_t key_id) {
             return L"hkdfguardwin_" + service + L"_v" + std::to_wstring(key_id);
         }

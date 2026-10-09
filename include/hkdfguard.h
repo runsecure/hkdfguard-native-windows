@@ -54,7 +54,7 @@ extern "C" {
 #endif
 
 /*
- * HkdfGuardWin - Windows-native DEK wrapper.
+ * hkdfguard-native-windows - Windows-native DEK wrapper.
  *
  * Wraps and unwraps a 32-byte Data Encryption Key (DEK) using a persistent,
  * machine-wide-scoped, non-exportable P-256 Key Encryption Key (KEK) held by

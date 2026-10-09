@@ -37,6 +37,12 @@ namespace hkdfguard {
         // C-style character array; `sizeof(kHkdfContext) - 1` (used below) is the
         // standard idiom for "the string's length, not counting the automatic
         // trailing '\0' the compiler appends to every string literal."
+        //
+        // FROZEN - do not rename. "HkdfGuardWin" is this project's former
+        // name, but this string is cryptographic input, not a label: every
+        // wrapped payload ever produced was derived with it, so changing it
+        // makes every existing payload undecryptable. The golden-payload
+        // test (tests/test_roundtrip.cpp section 29) fails if it changes.
         constexpr char kHkdfContext[] = "HkdfGuardWin-DEK-Wrap-v1";
         constexpr size_t kSharedSecretLen = 32; // P-256 ECDH shared secret (X-coordinate)
 

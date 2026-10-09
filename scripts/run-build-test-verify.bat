@@ -1,9 +1,9 @@
 @echo off
 rem Elevates itself (UAC prompt) if not already running as Administrator,
 rem then runs Build-Test-Verify.ps1 next to this file: configures + builds
-rem HkdfGuardWin, runs its ctest suite, and does an end-to-end check that
+rem hkdfguard-native-windows, runs its ctest suite, and does an end-to-end check that
 rem wraps a random 32-byte DEK with the CLI and independently unwraps it via
-rem hkdfguard.dll. Elevation is required because creating the machine-wide
+rem HkdfGuardV1.dll. Elevation is required because creating the machine-wide
 rem KEK on first use needs Administrator rights - see README.md.
 
 setlocal

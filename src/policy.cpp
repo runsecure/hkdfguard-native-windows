@@ -130,7 +130,7 @@ namespace hkdfguard {
 
         // KEY_WOW64_64KEY: makes this read the "real" 64-bit view of HKLM
         // regardless of whether this process itself is 32- or 64-bit, so a
-        // 32-bit and a 64-bit hkdfguard.dll on the same machine are
+        // 32-bit and a 64-bit HkdfGuardV1.dll on the same machine are
         // guaranteed to see the identical policy rather than one of them
         // silently reading a WOW64-redirected Software\WOW6432Node copy.
         // (Software\Policies specifically is documented by Microsoft as

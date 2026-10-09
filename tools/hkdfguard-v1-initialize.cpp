@@ -22,7 +22,7 @@
 //       via a command-line/process listing (e.g. a WMI query) for the life
 //       of this process, unlike a plain --dek=<value> argument would be.
 //
-// Calls into hkdfguard.dll through its stable C ABI - hkdfguard_kek_exists,
+// Calls into HkdfGuardV1.dll through its stable C ABI - hkdfguard_kek_exists,
 // hkdfguard_create_kek, and hkdfguard_wrap_dek - the same interface any
 // other-language caller uses; this tool links only against
 // include/hkdfguard.h and the hkdfguard import library, nothing from src/.
@@ -456,7 +456,7 @@ namespace {
             case HKDFGUARD_ERR_CRYPTO: return "a cryptographic operation failed";
             case HKDFGUARD_ERR_AUTH_FAILED: return "AES-GCM authentication failed";
             case HKDFGUARD_ERR_MALFORMED: return "wrapped payload is not valid";
-            case HKDFGUARD_ERR_INTERNAL: return "an internal error occurred in hkdfguard.dll";
+            case HKDFGUARD_ERR_INTERNAL: return "an internal error occurred in HkdfGuardV1.dll";
             case HKDFGUARD_ERR_SERVICE_NAME_INVALID: return "service name is malformed (ASCII letters, digits and '.' only, 1-128 bytes)";
             case HKDFGUARD_ERR_INVALID_POLICY: return "invalid key storage policy";
             case HKDFGUARD_ERR_GROUP_INVALID: return "a KeyUseGroups policy entry is unresolvable, not a group, over-broad, or not host-local";

@@ -2,13 +2,13 @@
 cmake_minimum_required(VERSION 3.20)
 # Declares the project name and that it's a C++ project (as opposed to C,
 # which CMake also supports enabling separately).
-project(HkdfGuardWin CXX)
+project(hkdfguard-native-windows CXX)
 
 # This library depends on Windows-only APIs (CNG/NCrypt), so fail loudly and
 # immediately rather than producing confusing compiler errors later if
 # someone tries to configure it on Linux/macOS.
 if(NOT WIN32)
-    message(FATAL_ERROR "HkdfGuardWin is Windows-only (requires CNG/NCrypt).")
+    message(FATAL_ERROR "hkdfguard-native-windows is Windows-only (requires CNG/NCrypt).")
 endif()
 
 # Require C++17 (the language standard used throughout src/, e.g. inline
@@ -24,7 +24,7 @@ set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS OFF)
 
 # Statically link the MSVC/UCRT runtime (/MT, /MTd for Debug) into every
 # binary this project produces, instead of the CMake/MSVC default of
-# dynamically linking it (/MD, /MDd). Without this, hkdfguard.dll and
+# dynamically linking it (/MD, /MDd). Without this, HkdfGuardV1.dll and
 # hkdfguard-v1-initialize.exe depend on MSVCP140.dll/VCRUNTIME140*.dll/the
 # api-ms-win-crt-*.dll forwarders at load time, none of which ship with a
 # bare Windows install - a machine without the Visual C++ Redistributable
@@ -81,15 +81,16 @@ if(MSVC)
     target_include_directories(hkdfguard PRIVATE ${HKDFGUARD_MC_OUT})
 endif()
 
-# Names the actual output files (the .dll and its companion .lib import
-# library) after this platform and the wire-format/wrap-protocol version
-# they implement, matching the same HkdfGuard.Kms.<platform>.v1 naming
-# convention this project's macOS and Linux build outputs use. Only
+# Names the actual output files HkdfGuardV1.dll and its companion
+# HkdfGuardV1.lib import library - "V1" being the wire-format/wrap-protocol
+# version they implement. (HkdfGuard.Kms.Windows.v1, the event log source
+# and the MSI's product/install name, is a separate identifier - see
+# installer/.) Only
 # changes what lands on disk - the CMake target itself is still named
 # "hkdfguard" everywhere else in this file and in tests/CMakeLists.txt
 # (e.g. target_link_libraries, $<TARGET_FILE_DIR:hkdfguard>), so nothing
 # else needs to change when this name does.
-set_target_properties(hkdfguard PROPERTIES OUTPUT_NAME "HkdfGuard.Kms.Windows.v1")
+set_target_properties(hkdfguard PROPERTIES OUTPUT_NAME "HkdfGuardV1")
 
 # PRIVATE compile definitions apply only while compiling hkdfguard's own
 # .cpp files, not to anything that later links against it. HKDFGUARD_EXPORTS
@@ -102,7 +103,7 @@ target_compile_definitions(hkdfguard PRIVATE HKDFGUARD_EXPORTS UNICODE _UNICODE)
 # PUBLIC include dirs are inherited by anything that links against this
 # target (like the test_roundtrip executable in tests/) - here, that's
 # include/, so consumers can #include "hkdfguard.h". PRIVATE include dirs
-# (src/) are only visible while building hkdfguard.dll's own sources, kept
+# (src/) are only visible while building HkdfGuardV1.dll's own sources, kept
 # private since e.g. wire_format.h's byte-offset constants are internal
 # implementation detail, not part of the public ABI contract.
 target_include_directories(hkdfguard

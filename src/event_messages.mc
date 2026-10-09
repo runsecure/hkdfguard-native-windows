@@ -1,6 +1,6 @@
 ; // Message table for the "HkdfGuard.Kms.Windows.v1" Application event log
 ; // source. Compiled by mc.exe into a resource linked into
-; // HkdfGuard.Kms.Windows.v1.dll (see CMakeLists.txt); the MSI registers
+; // HkdfGuardV1.dll (see CMakeLists.txt); the MSI registers
 ; // that DLL as the source's EventMessageFile so Event Viewer can render
 ; // these. Every message is just "%1": event_log.cpp builds the full text,
 ; // and the event *type* passed to ReportEventW sets the level.

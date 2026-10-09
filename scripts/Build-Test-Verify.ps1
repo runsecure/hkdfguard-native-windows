@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
     Configures, builds, tests, and does an end-to-end CLI+DLL verification
-    of HkdfGuardWin.
+    of hkdfguard-native-windows.
 
 .DESCRIPTION
     1. Locates the MSVC/CMake/Ninja toolchain from the Visual Studio Build
@@ -10,7 +10,7 @@
     3. Runs the project's own ctest suite (roundtrip).
     4. Generates a random 32-byte DEK, wraps it with the CLI tool
        (tools/hkdfguard-v1-initialize.exe), then independently unwraps the
-       resulting file via a direct P/Invoke call into hkdfguard.dll's public
+       resulting file via a direct P/Invoke call into HkdfGuardV1.dll's public
        hkdfguard_unwrap_dek and confirms the recovered bytes match the
        original DEK - i.e. verifies the CLI's wrap output is unwrappable by
        the DLL, not just by the CLI itself.
@@ -99,7 +99,7 @@ cmake --build build --config $Configuration
 if ($LASTEXITCODE -ne 0) { throw "build failed (exit $LASTEXITCODE)" }
 Write-Ok "build succeeded"
 
-$dllPath = Join-Path $RepoRoot "build\HkdfGuard.Kms.Windows.v1.dll"
+$dllPath = Join-Path $RepoRoot "build\HkdfGuardV1.dll"
 $cliPath = Join-Path $RepoRoot "build\tools\hkdfguard-v1-initialize.exe"
 foreach ($p in $dllPath, $cliPath) {
     if (-not (Test-Path $p)) { throw "expected build output missing: $p" }
@@ -136,7 +136,7 @@ $auditStart = (Get-Date).AddSeconds(-2)
 
 if (Test-Path $keyFile) { Remove-Item -Force $keyFile }
 
-# hkdfguard-v1-initialize.exe (build\tools\) links against hkdfguard.dll
+# hkdfguard-v1-initialize.exe (build\tools\) links against HkdfGuardV1.dll
 # (build\), a different directory - Windows won't find the DLL by default,
 # so prepend its directory to PATH for both calls below, same as
 # tests/CMakeLists.txt already does for ctest via ENVIRONMENT PATH.
@@ -197,7 +197,7 @@ if ($cliExit -eq 0) {
 
     # P/Invoke straight into the built DLL's public hkdfguard_unwrap_dek -
     # deliberately not reusing the CLI (which only wraps) or ctest (which
-    # links the DLL at build time) - this calls the *exact* hkdfguard.dll
+    # links the DLL at build time) - this calls the *exact* HkdfGuardV1.dll
     # the CLI just used, dynamically, the same way any external consumer
     # (C#, Python, etc. - see README.md) would.
     Add-Type -TypeDefinition @"

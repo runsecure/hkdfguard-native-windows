@@ -2,7 +2,7 @@
 Exercises hkdfguard-v1-initialize.exe's own behavior - subcommand dispatch,
 argument parsing, base64/length validation, --group resolution, and the
 "don't touch an existing file without --force" guarantee - none of which is
-covered by test_roundtrip.exe (which only calls into hkdfguard.dll directly,
+covered by test_roundtrip.exe (which only calls into HkdfGuardV1.dll directly,
 never spawns the CLI). Registered as ctest's "cli" test; see
 tests/CMakeLists.txt.
 
@@ -13,7 +13,7 @@ an already-provisioned KEK; the DEK is fed to it as base64 text on stdin via
 
 Most scenarios below are reachable without ever creating a machine-wide KEK
 (each one fails - by design - before RunWrap()/RunProvision() in
-hkdfguard-v1-initialize.cpp ever calls into hkdfguard.dll), so this test
+hkdfguard-v1-initialize.cpp ever calls into HkdfGuardV1.dll), so this test
 passes whether or not the process is elevated. This includes "wrap" against a
 service that was never provisioned - opening a nonexistent key fails
 (NTE_BAD_KEYSET -> HKDFGUARD_ERR_KEK_NOT_FOUND) regardless of privilege

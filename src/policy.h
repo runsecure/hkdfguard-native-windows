@@ -58,7 +58,7 @@ namespace hkdfguard {
 //
 // Compiled in only when HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE is defined -
 // tests/CMakeLists.txt defines it for test_roundtrip's own copy of this
-// file only. hkdfguard.dll's own build (the top-level CMakeLists.txt) never
+// file only. HkdfGuardV1.dll's own build (the top-level CMakeLists.txt) never
 // defines it, so this function - and the override state it would control -
 // does not exist at all in the shipped DLL; there is no runtime flag or
 // code path in release code that could ever activate it. Not thread-safe,
@@ -100,7 +100,7 @@ namespace hkdfguard {
 
     // Test-only seam for LoadKeyUseGroupsPolicy(), with exactly the same
     // scope and caveats as SetTestPolicyOverride above: compiled in only
-    // for test binaries, absent from hkdfguard.dll. std::nullopt clears it.
+    // for test binaries, absent from HkdfGuardV1.dll. std::nullopt clears it.
 #if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
     void SetTestKeyUseGroupsOverride(std::optional<std::vector<std::wstring>> groups);
 #endif
