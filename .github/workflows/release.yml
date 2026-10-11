@@ -9,13 +9,19 @@
 # Triggered by pushing a version tag (vX.Y.Z). Reuses this repo's own
 # scripts/ rather than duplicating their logic here. Three jobs:
 #
-#   build    per architecture: build, test, stage the UNSIGNED binaries.
+#   build    build.yml, the same reusable workflow ci.yml runs: per
+#            architecture, build, test, stage the UNSIGNED binaries.
 #            Holds no signing access at all.
 #   sign     one x64 job, in the "release" environment: signs all four
 #            binaries with scripts/ArtifactSigning.ps1 (the same code as a
 #            local `scripts\build-dist-signed.bat`), builds and signs both
 #            MSIs, zips, and attests provenance of the signed files.
 #   publish  creates the GitHub Release from the sign job's output.
+#
+# To cut a release: git tag v0.9.0; git push origin v0.9.0
+# Any v0.x.y tag is published as a GitHub pre-release (pre-release testing);
+# v1.0.0 and later as normal releases. The version must increase with every
+# release, or the MSI upgrade won't replace the installed one.
 #
 # Signing setup this workflow depends on (Azure and GitHub, not code):
 #   - Repository secrets AZURE_CLIENT_ID (the Entra app GitHub signs in as),
@@ -31,12 +37,7 @@
 #   - Recommended: restrict the "release" environment (Settings >
 #     Environments) to tags matching v*, so only a release can sign.
 #
-# The ARM64 leg runs on the "windows-11-arm" hosted runner label so it
-# builds AND runs on real ARM64 hardware - not cross-compiled from the x64
-# runner. That runner label's availability depends on your plan/repo
-# visibility - verify it's available (Settings > Actions > Runners, or just
-# watch the first run) and swap in a self-hosted ARM64 runner's label here
-# if not.
+# See build.yml for the ARM64 runner-label caveat.
 name: Release
 
 on:
@@ -59,133 +60,12 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Build and test both architectures natively; uploads unsigned-win-x64
+  # and unsigned-win-arm64. The same workflow ci.yml runs on every push.
   build:
-    strategy:
-      fail-fast: false # a failure on one architecture shouldn't hide results from the other
-      matrix:
-        include:
-          - arch: x64
-            dist: win-x64
-            runner: windows-2022
-          - arch: ARM64
-            dist: win-arm64
-            runner: windows-11-arm
-    runs-on: ${{ matrix.runner }}
+    uses: ./.github/workflows/build.yml
     permissions:
       contents: read
-    env:
-      # The hardening flags (/sdl, /Qspectre, CFG, and on x64 /CETCOMPAT and
-      # /guard:ehcont) come from CMakeLists.txt's hkdfguard_apply_hardening,
-      # so every build below gets them with no workflow-specific flags. This
-      # variable makes CMake refuse to configure if the Spectre-mitigated
-      # runtime libraries are missing, instead of only warning - a release
-      # must never ship with the unmitigated static runtime. The step
-      # "Ensure Spectre-mitigated runtime libraries" installs them first.
-      HKDFGUARD_REQUIRE_SPECTRE_LIBS: "1"
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          persist-credentials: false # nothing later in this job pushes
-
-      - name: Report elevation status
-        shell: powershell
-        # Machine-wide KEK *creation* (NCRYPT_MACHINE_KEY_FLAG) requires an
-        # elevated process token, regardless of which NCrypt provider ends
-        # up serving it (see kek_store.cpp) - this is the one real
-        # precondition for the next step to pass on a hosted runner (a
-        # missing TPM is NOT a precondition: kek_store.cpp already falls
-        # back to the Software Key Storage Provider automatically, and every
-        # test asserts on that provider generically rather than requiring
-        # TPM specifically). Surfaced as its own early, clearly labeled
-        # step - via ::warning:: rather than a silent skip - so a
-        # non-elevated runner shows up as an obvious annotation in the
-        # Actions UI, not just a wall of failed checks further down.
-        run: |
-          $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
-          $principal = New-Object System.Security.Principal.WindowsPrincipal($identity)
-          $isAdmin = $principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
-          Write-Host "Running as: $($identity.Name)"
-          Write-Host "Elevated (Administrator token): $isAdmin"
-          if (-not $isAdmin) {
-            Write-Host "::warning::This job's process token is not elevated - machine-wide KEK creation will fail, and the next step (Build-Test-Verify.ps1) will fail loudly because of it, not because of anything wrong with the code."
-          }
-
-      # /Qspectre only covers this project's own code; the statically linked
-      # C/C++ runtime is mitigated only if the Spectre-mitigated runtime
-      # libraries are linked (CMake picks them up from the toolset's
-      # lib\spectre\<arch> directory). Hosted runner images don't promise
-      # them, so this checks the toolset every build script will use - the
-      # newest Visual Studio with the C++ tools, as the scripts select it -
-      # and installs both architectures' libraries if either is missing.
-      # Both, on both runners: Build-Test-Verify.ps1 builds x64 even on the
-      # ARM64 runner, and Build-Dist.ps1 builds the runner's own architecture.
-      - name: Ensure Spectre-mitigated runtime libraries
-        shell: powershell
-        run: |
-          $ErrorActionPreference = "Stop"
-          $installerDir = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer"
-          $vswhere = Join-Path $installerDir "vswhere.exe"
-          $setup = Join-Path $installerDir "setup.exe"
-          $components = @(
-            "Microsoft.VisualStudio.Component.VC.Runtimes.x86.x64.Spectre",
-            "Microsoft.VisualStudio.Component.VC.Runtimes.ARM64.Spectre")
-
-          # The same selection the build scripts make (Build-Test-Verify.ps1
-          # requires the x64 tools; Build-Dist.ps1 requires the target's).
-          $toolComponent = if ("${{ matrix.arch }}" -eq "ARM64") {
-            "Microsoft.VisualStudio.Component.VC.Tools.ARM64" } else {
-            "Microsoft.VisualStudio.Component.VC.Tools.x86.x64" }
-          $installs = @(
-            & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
-            & $vswhere -latest -products * -requires $toolComponent -property installationPath
-          ) | Where-Object { $_ } | Select-Object -Unique
-          if (-not $installs) { throw "no Visual Studio installation with the C++ build tools was found" }
-
-          function Get-MissingSpectreLibs([string]$vs) {
-            $version = (Get-Content (Join-Path $vs "VC\Auxiliary\Build\Microsoft.VCToolsVersion.default.txt")).Trim()
-            $lib = Join-Path $vs "VC\Tools\MSVC\$version\lib\spectre"
-            return @("x64", "arm64" | Where-Object { -not (Test-Path (Join-Path $lib "$_\libcmt.lib")) } |
-              ForEach-Object { "$version $_" })
-          }
-
-          foreach ($vs in $installs) {
-            $missing = Get-MissingSpectreLibs $vs
-            if ($missing.Count -eq 0) {
-              Write-Host "Spectre-mitigated runtime present (x64, arm64) in $vs"
-              continue
-            }
-            Write-Host "Missing in ${vs}: $($missing -join ', ') - installing $($components -join ', ')"
-            $installerArgs = @("modify", "--installPath", "`"$vs`"", "--quiet", "--norestart", "--nocache")
-            foreach ($c in $components) { $installerArgs += @("--add", $c) }
-            $proc = Start-Process -FilePath $setup -ArgumentList $installerArgs -Wait -PassThru
-            # 3010 = success, reboot recommended; the libraries are usable now.
-            if ($proc.ExitCode -ne 0 -and $proc.ExitCode -ne 3010) {
-              throw "Visual Studio Installer exited with $($proc.ExitCode)"
-            }
-            $missing = Get-MissingSpectreLibs $vs
-            if ($missing.Count -ne 0) { throw "still missing after install: $($missing -join ', ')" }
-            Write-Host "Installed the Spectre-mitigated runtime (x64, arm64) into $vs"
-          }
-
-      - name: Build, test, and verify CLI wrap / DLL unwrap round trip (Release, ${{ matrix.arch }})
-        shell: powershell
-        run: .\scripts\Build-Test-Verify.ps1 -Configuration Release
-
-      # Unsigned here on purpose: signing happens once, in the sign job, so
-      # build jobs never hold signing access and the ARM64 runner never has
-      # to run the x64 signing plugin under emulation.
-      - name: Build the distributable artifacts (${{ matrix.arch }}, unsigned)
-        shell: powershell
-        run: .\scripts\Build-Dist.ps1 -Arch ${{ matrix.arch }}
-
-      - name: Upload the unsigned binaries for the sign job
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: unsigned-${{ matrix.dist }}
-          path: dist/${{ matrix.dist }}/
-          if-no-files-found: error
-          retention-days: 1
 
   sign:
     needs: build
@@ -353,4 +233,13 @@ jobs:
           $files = Get-ChildItem -Path release-assets -File | Select-Object -ExpandProperty FullName
           Write-Host "Release assets:"
           $files | ForEach-Object { Write-Host "  $_" }
-          gh release create "${{ github.ref_name }}" $files --title "${{ github.ref_name }}" --generate-notes --repo "${{ github.repository }}"
+          # A 0.x version is pre-release testing: published as a GitHub
+          # pre-release, so it is never shown as "Latest" or picked up as
+          # the stable download. 1.0.0 and later publish as normal releases.
+          $extra = @()
+          if ("${{ github.ref_name }}" -like "v0.*") {
+            $extra += "--prerelease"
+            Write-Host "Publishing as a pre-release (0.x version)"
+          }
+          gh release create "${{ github.ref_name }}" $files --title "${{ github.ref_name }}" --generate-notes @extra --repo "${{ github.repository }}"
+          if ($LASTEXITCODE -ne 0) { throw "gh release create failed (exit $LASTEXITCODE)" }

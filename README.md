@@ -418,7 +418,7 @@ architectures, signs everything, and with `-Msi` also builds the signed installe
 
 ```
 scripts\build-dist-signed.bat
-scripts\build-dist-signed.bat -Msi -Version 1.0.0
+scripts\build-dist-signed.bat -Msi -Version 0.9.0
 ```
 
 `scripts\Build-Dist-Signed.ps1` checks the signing setup first, then runs `Build-Dist.ps1
@@ -448,7 +448,7 @@ leaves Microsoft's HSMs, so there is no certificate file or thumbprint to manage
 **Building the MSI on its own** (no elevation needed):
 
 ```
-scripts\build-msi.bat -Arch x64 -Version 1.0.0 -Sign
+scripts\build-msi.bat -Arch x64 -Version 0.9.0 -Sign
 ```
 
 `scripts\Build-Msi.ps1` clean-builds Release via `Build-Dist.ps1`, signs both binaries
@@ -463,7 +463,7 @@ pinned in `dotnet-tools.json` and restored automatically; only the .NET SDK is r
 **Installing** (elevated; deployable as-is through Intune, SCCM or Group Policy):
 
 ```
-msiexec /i hkdfguard-native-windows-1.0.0-win-x64.msi /qn /l*v install.log
+msiexec /i hkdfguard-native-windows-0.9.0-win-x64.msi /qn /l*v install.log
 ```
 
 The MSI does four things:

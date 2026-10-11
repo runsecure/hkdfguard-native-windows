@@ -38,7 +38,7 @@
 
 .EXAMPLE
     scripts\build-dist-signed.bat
-    scripts\build-dist-signed.bat -Msi -Version 1.0.0
+    scripts\build-dist-signed.bat -Msi -Version 0.9.0
     powershell -File scripts\Build-Dist-Signed.ps1 -Arch x64
 #>
 param(
