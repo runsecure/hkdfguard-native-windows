@@ -409,6 +409,11 @@ Get-WinEvent -LogName Application -FilterXPath "*[System[Provider[@Name='hkdfgua
 
 ## Installing on target machines
 
+> Administrators deploying a release: see the
+> [Installation and Administration Guide](docs/admin-guide.md) for downloading,
+> verifying, installing, provisioning services, policy settings and troubleshooting.
+> This section covers building the installer.
+
 The DLL and CLI are installed machine-wide by an MSI, not shipped inside application
 packages (NuGet or otherwise). Each machine gets exactly one copy, in a folder only
 administrators can change, and applications load it from there.
