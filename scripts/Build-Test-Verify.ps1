@@ -137,6 +137,22 @@ if ($LASTEXITCODE -eq 0) {
     Write-Ok "ctest: all tests passed"
 } else {
     Write-Bad "ctest: one or more tests failed (exit $LASTEXITCODE) - see output above"
+    # Each failed check prints "[FAIL] <what>" somewhere in hundreds of lines
+    # of test output; collect them from ctest's full log so they are listed
+    # together here - and, under GitHub Actions, raised as error annotations
+    # on the run's summary page.
+    $ctestLog = Join-Path $RepoRoot "build\Testing\Temporary\LastTest.log"
+    if (Test-Path $ctestLog) {
+        $failedChecks = @(Select-String -Path $ctestLog -Pattern '^\[FAIL\] (.*)$' |
+            ForEach-Object { $_.Matches[0].Groups[1].Value.Trim() })
+        Write-Host "Failed checks reported by the tests ($($failedChecks.Count)):"
+        foreach ($check in $failedChecks) {
+            Write-Host "  [FAIL] $check" -ForegroundColor Red
+            if ($env:GITHUB_ACTIONS -eq "true") {
+                Write-Host "::error title=ctest check failed ($env:PROCESSOR_ARCHITECTURE)::$check"
+            }
+        }
+    }
 }
 
 # ---- CLI provision + wrap + independent DLL unwrap verification ----------
