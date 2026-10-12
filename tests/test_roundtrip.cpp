@@ -1581,18 +1581,28 @@ int main() {
         //      have a KEK behind it, so nothing may fall back. Before the
         //      fix, KekExists answered "false" from software, wrap opened
         //      the software provider, and create made a software KEK.
+        //      The fault is injected at NCryptOpenKey, which is only reached
+        //      once the TPM provider itself has opened. Without one (e.g. a
+        //      hosted CI runner), opening the provider fails first - which is
+        //      correctly treated as "no TPM" and falls back - so the injected
+        //      fault is never hit and this scenario can't be staged.
         constexpr const wchar_t* kServiceProbeFault = L"hkdfguardwin.test.fallback.probefault";
-        hkdfguard::TestTpmFaults notReady;
-        notReady.openKeyStatus = NTE_DEVICE_NOT_READY;
-        hkdfguard::SetTestTpmFaults(notReady);
-        Check(CodeOf([&] { hkdfguard::KekExists(kServiceProbeFault); }) == HKDFGUARD_ERR_PROVIDER,
-              "PreferTpm, TPM probe error: KekExists fails with PROVIDER instead of answering from software");
-        Check(CodeOf([&] { hkdfguard::OpenKekForWrap(kServiceProbeFault); }) == HKDFGUARD_ERR_PROVIDER,
-              "PreferTpm, TPM probe error: wrap fails with PROVIDER instead of falling back");
-        Check(CodeOf([&] { hkdfguard::CreateKek(kServiceProbeFault); }) == HKDFGUARD_ERR_PROVIDER,
-              "PreferTpm, TPM probe error: create_kek fails with PROVIDER instead of falling back");
-        Check(!MachineKeyExists(MS_KEY_STORAGE_PROVIDER, KekNameFor(kServiceProbeFault)),
-              "PreferTpm, TPM probe error: no software KEK is created");
+        if (hasTpm) {
+            hkdfguard::TestTpmFaults notReady;
+            notReady.openKeyStatus = NTE_DEVICE_NOT_READY;
+            hkdfguard::SetTestTpmFaults(notReady);
+            Check(CodeOf([&] { hkdfguard::KekExists(kServiceProbeFault); }) == HKDFGUARD_ERR_PROVIDER,
+                  "PreferTpm, TPM probe error: KekExists fails with PROVIDER instead of answering from software");
+            Check(CodeOf([&] { hkdfguard::OpenKekForWrap(kServiceProbeFault); }) == HKDFGUARD_ERR_PROVIDER,
+                  "PreferTpm, TPM probe error: wrap fails with PROVIDER instead of falling back");
+            Check(CodeOf([&] { hkdfguard::CreateKek(kServiceProbeFault); }) == HKDFGUARD_ERR_PROVIDER,
+                  "PreferTpm, TPM probe error: create_kek fails with PROVIDER instead of falling back");
+            Check(!MachineKeyExists(MS_KEY_STORAGE_PROVIDER, KekNameFor(kServiceProbeFault)),
+                  "PreferTpm, TPM probe error: no software KEK is created");
+        } else {
+            Skip("PreferTpm, TPM probe error: no fallback (needs the TPM provider to open on this machine)");
+        }
+        hkdfguard::SetTestTpmFaults({});
         DeleteMachineKeyQuiet(MS_KEY_STORAGE_PROVIDER, KekNameFor(kServiceProbeFault));
 
         // 26b. A TPM that reports no device does fall back.

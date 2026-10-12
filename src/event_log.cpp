@@ -55,7 +55,7 @@
 
 namespace hkdfguard {
     namespace {
-        constexpr wchar_t kEventSource[] = L"HkdfGuard.Kms.Windows.v1";
+        constexpr wchar_t kEventSource[] = L"hkdfguard-native-windows";
 
         // Must match src/event_messages.mc.
         constexpr DWORD kEvtKekCreated = 1000;

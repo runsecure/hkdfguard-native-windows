@@ -1,4 +1,4 @@
-; // Message table for the "HkdfGuard.Kms.Windows.v1" Application event log
+; // Message table for the "hkdfguard-native-windows" Application event log
 ; // source. Compiled by mc.exe into a resource linked into
 ; // HkdfGuardV1.dll (see CMakeLists.txt); the MSI registers
 ; // that DLL as the source's EventMessageFile so Event Viewer can render

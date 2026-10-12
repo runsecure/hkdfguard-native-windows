@@ -1,16 +1,16 @@
 <!--
-  Machine-wide installer for HkdfGuard.Kms.Windows.v1 (WiX v5 source).
+  Machine-wide installer for hkdfguard-native-windows (WiX v5 source).
   Built by scripts/Build-Msi.ps1 - see that script for the parameters below.
 
   What it does:
     - Installs HkdfGuardV1.dll and hkdfguard-v1-initialize.exe
-      side by side into  %ProgramFiles%\HkdfGuard\Kms.Windows.v1\ .
+      side by side into  %ProgramFiles%\HkdfGuard\v1\ .
     - Writes that folder to
-        HKLM\Software\HkdfGuard\Kms.Windows.v1  InstallPath  (REG_SZ)
+        HKLM\Software\hkdfguard-native-windows  InstallPath  (REG_SZ)
       so consumers (e.g. a C# wrapper) can load the DLL by absolute path via
       NativeLibrary.Load without hard-coding it.
     - Creates the local group HkdfGuardUsers if it doesn't already exist.
-    - Registers the "HkdfGuard.Kms.Windows.v1" Application event log source,
+    - Registers the "hkdfguard-native-windows" Application event log source,
       using the DLL's own message table.
 
   Security properties this layout is relied on for:
@@ -46,7 +46,7 @@
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
 
   <Package
-      Name="HkdfGuard KMS for Windows (v1)"
+      Name="hkdfguard-native-windows"
       Manufacturer="$(Manufacturer)"
       Version="$(ProductVersion)"
       UpgradeCode="77210BC5-3A24-48F2-8266-5642DA27ACC6"
@@ -64,7 +64,7 @@
 
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="HkdfGuardRootDir" Name="HkdfGuard">
-        <Directory Id="HkdfGuardInstallDir" Name="Kms.Windows.v1" />
+        <Directory Id="HkdfGuardInstallDir" Name="v1" />
       </Directory>
     </StandardDirectory>
 
@@ -78,7 +78,7 @@
       <Component Id="HkdfGuardInstallPathValue">
         <RegistryValue
             Root="HKLM"
-            Key="Software\HkdfGuard\Kms.Windows.v1"
+            Key="Software\hkdfguard-native-windows"
             Name="InstallPath"
             Type="string"
             Value="[HkdfGuardInstallDir]"
@@ -93,7 +93,7 @@
         their text in the event details but lose the clean rendering.
       -->
       <Component Id="HkdfGuardEventSource">
-        <RegistryKey Root="HKLM" Key="SYSTEM\CurrentControlSet\Services\EventLog\Application\HkdfGuard.Kms.Windows.v1">
+        <RegistryKey Root="HKLM" Key="SYSTEM\CurrentControlSet\Services\EventLog\Application\hkdfguard-native-windows">
           <RegistryValue Name="EventMessageFile" Type="expandable" Value="[#HkdfGuardDllFile]" KeyPath="yes" />
           <!-- EVENTLOG_ERROR_TYPE | EVENTLOG_WARNING_TYPE | EVENTLOG_INFORMATION_TYPE -->
           <RegistryValue Name="TypesSupported" Type="integer" Value="7" />
@@ -101,7 +101,7 @@
       </Component>
     </ComponentGroup>
 
-    <Feature Id="Main" Title="HkdfGuard KMS for Windows" Level="1">
+    <Feature Id="Main" Title="hkdfguard-native-windows" Level="1">
       <ComponentGroupRef Id="HkdfGuardComponents" />
     </Feature>
 
