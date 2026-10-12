@@ -5,7 +5,9 @@
 
 .DESCRIPTION
     1. Locates the MSVC/CMake/Ninja toolchain from the Visual Studio Build
-       Tools install and puts them on PATH for this process.
+       Tools install and puts them on PATH for this process - the native
+       toolchain for this process's architecture (x64 or ARM64), since
+       everything built here is also run here.
     2. Configures and builds the project (cmake -G Ninja).
     3. Runs the project's own ctest suite (roundtrip).
     4. Generates a random 32-byte DEK, wraps it with the CLI tool
@@ -68,25 +70,37 @@ if (-not (Test-Path $vswhere)) {
 }
 $env:PATH = "$env:PATH;$installerDir"
 
-$vsInstallPath = & $vswhere -latest -products * `
-    -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
-    -property installationPath
-if (-not $vsInstallPath) {
-    throw "No Visual Studio / Build Tools install with the C++ (VC.Tools.x86.x64) component was found."
+# Builds for the architecture of *this PowerShell process*, natively: the
+# tests below have to run what was built, and the DLL unwrap check loads
+# HkdfGuardV1.dll into this very process via P/Invoke, which only works when
+# the two architectures match. On ARM64 Windows that means ARM64 binaries
+# from a native ARM64 powershell.exe (an x64 powershell.exe running under
+# emulation reports AMD64 and gets x64 binaries, which it can load).
+$hostArchMap = @{ "AMD64" = "amd64"; "ARM64" = "arm64" }
+$vsArch = $hostArchMap[$env:PROCESSOR_ARCHITECTURE]
+if (-not $vsArch) { throw "Unsupported process architecture '$env:PROCESSOR_ARCHITECTURE' (expected AMD64 or ARM64)." }
+$requiredComponent = if ($vsArch -eq "arm64") {
+    "Microsoft.VisualStudio.Component.VC.Tools.ARM64"
+} else {
+    "Microsoft.VisualStudio.Component.VC.Tools.x86.x64"
 }
-Write-Host "Using VS install: $vsInstallPath"
+$vsInstallPath = & $vswhere -latest -products * -requires $requiredComponent -property installationPath
+if (-not $vsInstallPath) {
+    throw "No Visual Studio / Build Tools install with the C++ $vsArch build tools component ($requiredComponent) was found."
+}
+Write-Host "Using VS install: $vsInstallPath (native $vsArch toolchain)"
 
 $devShell = Join-Path $vsInstallPath "Common7\Tools\Launch-VsDevShell.ps1"
 if (-not (Test-Path $devShell)) {
     throw "Launch-VsDevShell.ps1 not found under $vsInstallPath"
 }
-& $devShell -Arch amd64 -HostArch amd64 -SkipAutomaticLocation | Out-Null
+& $devShell -Arch $vsArch -HostArch $vsArch -SkipAutomaticLocation | Out-Null
 
-foreach ($tool in "cl", "cmake", "ninja") {
+foreach ($tool in "cl", "cmake", "ninja", "dumpbin") {
     $found = Get-Command $tool -ErrorAction SilentlyContinue
     if (-not $found) { throw "$tool not found on PATH after entering the VS dev shell." }
 }
-Write-Ok "cl, cmake, ninja resolved"
+Write-Ok "cl, cmake, ninja, dumpbin resolved"
 
 # ---- Configure + build --------------------------------------------------
 Write-Section "Configuring (cmake -G Ninja)"
@@ -105,6 +119,17 @@ foreach ($p in $dllPath, $cliPath) {
     if (-not (Test-Path $p)) { throw "expected build output missing: $p" }
 }
 
+# What the linker actually targeted, so a CI leg can't report a pass for an
+# architecture it never ran.
+$expectedMachine = if ($vsArch -eq "arm64") { "ARM64" } else { "x64" }
+foreach ($bin in $dllPath, $cliPath) {
+    $machineLine = dumpbin /headers $bin | Select-String -Pattern "machine \("
+    if ($machineLine -notmatch [regex]::Escape($expectedMachine)) {
+        throw "$(Split-Path -Leaf $bin) was not built for $expectedMachine - dumpbin reports: $($machineLine.ToString().Trim())"
+    }
+    Write-Ok "$(Split-Path -Leaf $bin) is $expectedMachine, running natively"
+}
+
 # ---- ctest --------------------------------------------------------------
 Write-Section "Running ctest (roundtrip)"
 ctest --test-dir build -C $Configuration --output-on-failure
@@ -112,6 +137,22 @@ if ($LASTEXITCODE -eq 0) {
     Write-Ok "ctest: all tests passed"
 } else {
     Write-Bad "ctest: one or more tests failed (exit $LASTEXITCODE) - see output above"
+    # Each failed check prints "[FAIL] <what>" somewhere in hundreds of lines
+    # of test output; collect them from ctest's full log so they are listed
+    # together here - and, under GitHub Actions, raised as error annotations
+    # on the run's summary page.
+    $ctestLog = Join-Path $RepoRoot "build\Testing\Temporary\LastTest.log"
+    if (Test-Path $ctestLog) {
+        $failedChecks = @(Select-String -Path $ctestLog -Pattern '^\[FAIL\] (.*)$' |
+            ForEach-Object { $_.Matches[0].Groups[1].Value.Trim() })
+        Write-Host "Failed checks reported by the tests ($($failedChecks.Count)):"
+        foreach ($check in $failedChecks) {
+            Write-Host "  [FAIL] $check" -ForegroundColor Red
+            if ($env:GITHUB_ACTIONS -eq "true") {
+                Write-Host "::error title=ctest check failed ($env:PROCESSOR_ARCHITECTURE)::$check"
+            }
+        }
+    }
 }
 
 # ---- CLI provision + wrap + independent DLL unwrap verification ----------

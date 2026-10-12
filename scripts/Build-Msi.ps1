@@ -31,7 +31,7 @@
 .PARAMETER Version
     MSI ProductVersion, major.minor.build (major and minor at most 255, build
     at most 65535). Must increase for every release, or the major upgrade
-    will not replace the installed version. Default: 1.0.0.
+    will not replace the installed version. Default: 0.9.0.
 
 .PARAMETER Manufacturer
     Manufacturer shown in Apps & Features. Default: HkdfGuard.
@@ -58,7 +58,7 @@ param(
     [ValidateSet("x64", "ARM64")]
     [string]$Arch = "x64",
     [ValidatePattern('^\d{1,3}\.\d{1,3}\.\d{1,5}$')]
-    [string]$Version = "1.0.0",
+    [string]$Version = "0.9.0",
     [string]$Manufacturer = "HkdfGuard",
     [switch]$Sign,
     [string]$SigningMetadata,
