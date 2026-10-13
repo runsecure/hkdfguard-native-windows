@@ -250,12 +250,36 @@ public static class HkdfGuardNative {
         [MarshalAs(UnmanagedType.LPStr)] string service,
         byte[] wrapped, int wrapped_len,
         byte[] out_buf, ref int out_len);
+
+    // path is passed as null-terminated UTF-8 bytes: UnmanagedType.LPUTF8Str
+    // isn't available to Windows PowerShell 5.1 on every .NET Framework.
+    [DllImport(@"$dllPath", CallingConvention = CallingConvention.Cdecl)]
+    public static extern int hkdfguard_open_file(
+        byte[] path,
+        byte[] out_buf, ref int out_len);
 }
 "@
 
+    # Read the CLI's file back through the DLL's own hkdfguard_open_file, the
+    # way a consumer would, and unwrap *those* bytes: CLI wrap -> file ->
+    # open_file -> unwrap, end to end.
+    $pathBytes = [System.Text.Encoding]::UTF8.GetBytes($keyFile + [char]0)
+    $fromFile = New-Object byte[] 164
+    $fromFileLen = 164
+    $rc = [HkdfGuardNative]::hkdfguard_open_file($pathBytes, $fromFile, [ref]$fromFileLen)
+    if ($rc -ne 0) {
+        Write-Bad "hkdfguard_open_file returned status $rc (expected 0/HKDFGUARD_OK)"
+    } elseif ($fromFileLen -ne 164) {
+        Write-Bad "hkdfguard_open_file reported $fromFileLen bytes, expected 164"
+    } elseif ([Convert]::ToBase64String($fromFile) -ne [Convert]::ToBase64String($wrapped)) {
+        Write-Bad "hkdfguard_open_file returned different bytes than the file holds"
+    } else {
+        Write-Ok "hkdfguard_open_file read the CLI's wrapped file: 164 bytes, still wrapped, identical to the file"
+    }
+
     $outBuf = New-Object byte[] 32
     $outLen = 32
-    $rc = [HkdfGuardNative]::hkdfguard_unwrap_dek($service, $wrapped, $wrapped.Length, $outBuf, [ref]$outLen)
+    $rc = [HkdfGuardNative]::hkdfguard_unwrap_dek($service, $fromFile, $fromFileLen, $outBuf, [ref]$outLen)
 
     if ($rc -ne 0) {
         Write-Bad "hkdfguard_unwrap_dek returned status $rc (expected 0/HKDFGUARD_OK)"

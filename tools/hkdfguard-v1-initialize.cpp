@@ -464,6 +464,12 @@ namespace {
             case HKDFGUARD_ERR_KEK_NOT_FOUND: return "no KEK is provisioned for this service";
             case HKDFGUARD_ERR_ACCESS_DENIED: return "this KEK exists, but this account is not authorized to use it";
             case HKDFGUARD_ERR_KEK_ACL_INVALID: return "a KEK already exists under this service name, but its ACL is missing, lacks SYSTEM/Administrators, or grants an over-broad principal - it was left untouched; investigate it, or provision under a new (versioned) service name";
+            case HKDFGUARD_ERR_FILE_NOT_FOUND: return "the wrapped-key file does not exist";
+            case HKDFGUARD_ERR_FILE_ACCESS_DENIED: return "this account may not read the wrapped-key file";
+            case HKDFGUARD_ERR_FILE_IO: return "the wrapped-key file is not a regular file, is open for writing, or could not be read";
+            case HKDFGUARD_ERR_FILE_TOO_SHORT: return "the wrapped-key file is shorter than a wrapped key";
+            case HKDFGUARD_ERR_FILE_TOO_LONG: return "the wrapped-key file is longer than a wrapped key";
+            case HKDFGUARD_ERR_FILE_PLAINTEXT_KEY: return "the file is exactly the size of an unwrapped 32-byte key - it may hold a plaintext key; treat it as exposed";
             default: return "unknown status code " + std::to_string(code);
         }
     }

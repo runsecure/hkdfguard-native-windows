@@ -268,6 +268,165 @@ namespace {
         return HKDFGUARD_OK;
     }
 
+    // Longest path hkdfguard_open_file reads from its `path` argument, in
+    // bytes: the Win32 limit of 32,767 UTF-16 code units, each at most three
+    // UTF-8 bytes. Bounds the strnlen below the same way kMaxServiceLen does
+    // for a service name.
+    constexpr size_t kMaxPathBytes = 32767 * 3;
+
+    // Owns a Win32 file HANDLE. Not handle_traits.h's ScopedHandle: that
+    // treats 0 as "no handle", but CreateFileW reports failure as
+    // INVALID_HANDLE_VALUE.
+    class ScopedFile {
+    public:
+        explicit ScopedFile(HANDLE h) : handle_(h) {
+        }
+
+        ~ScopedFile() {
+            if (valid()) {
+                CloseHandle(handle_);
+            }
+        }
+
+        ScopedFile(const ScopedFile &) = delete;
+
+        ScopedFile &operator=(const ScopedFile &) = delete;
+
+        bool valid() const { return handle_ != INVALID_HANDLE_VALUE && handle_ != nullptr; }
+        HANDLE get() const { return handle_; }
+
+    private:
+        HANDLE handle_;
+    };
+
+    // UTF-8 path -> UTF-16 for CreateFileW. Unlike a service name, a path may
+    // legitimately contain any Unicode character, so it is converted rather
+    // than restricted to a charset - but never with replacement characters,
+    // which could silently open a different file than the one named.
+    std::wstring PathToWide(const char *path) {
+        size_t len = strnlen(path, kMaxPathBytes + 1);
+        if (len == 0 || len > kMaxPathBytes) {
+            throw HkdfGuardError(HKDFGUARD_ERR_INVALID_ARG, "path is empty or too long");
+        }
+        int wide_len = MultiByteToWideChar(
+            CP_UTF8, MB_ERR_INVALID_CHARS, path, static_cast<int>(len), nullptr, 0);
+        if (wide_len <= 0) {
+            throw HkdfGuardError(HKDFGUARD_ERR_INVALID_ARG, "path is not valid UTF-8");
+        }
+        std::wstring wide(static_cast<size_t>(wide_len), L'\0');
+        MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, static_cast<int>(len), wide.data(), wide_len);
+        return wide;
+    }
+
+    // Maps why CreateFileW failed onto the three file-error codes.
+    int32_t FileOpenErrorCode(DWORD error) noexcept {
+        switch (error) {
+            case ERROR_FILE_NOT_FOUND:
+            case ERROR_PATH_NOT_FOUND:
+            case ERROR_INVALID_DRIVE:
+            case ERROR_BAD_NETPATH:
+            case ERROR_BAD_NET_NAME:
+                return HKDFGUARD_ERR_FILE_NOT_FOUND;
+            case ERROR_ACCESS_DENIED:
+                return HKDFGUARD_ERR_FILE_ACCESS_DENIED;
+            default:
+                // Sharing violations (a writer has it open), invalid names,
+                // and anything else.
+                return HKDFGUARD_ERR_FILE_IO;
+        }
+    }
+
+    // Reads exactly kTotalLen bytes of a wrapped-key file into `out` and
+    // validates them - see hkdfguard_open_file in hkdfguard.h for the
+    // contract. Throws HkdfGuardError on every failure; the caller zeroes
+    // `out`.
+    void ReadWrappedKeyFile(const char *path, uint8_t *out) {
+        std::wstring wide_path = PathToWide(path);
+
+        // A directory can't be opened without FILE_FLAG_BACKUP_SEMANTICS, so
+        // CreateFileW would report one as ERROR_ACCESS_DENIED - checked first
+        // only so that case reads as "not a regular file" rather than as a
+        // permissions problem. The handle checks below are what's
+        // authoritative.
+        DWORD attributes = GetFileAttributesW(wide_path.c_str());
+        if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY)) {
+            throw HkdfGuardError(HKDFGUARD_ERR_FILE_IO, "path is a directory");
+        }
+
+        // FILE_SHARE_READ only: while this handle is open nobody can write
+        // the file, and if a writer already has it open this fails with a
+        // sharing violation instead of reading a half-written payload.
+        ScopedFile file(CreateFileW(
+            wide_path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr));
+        if (!file.valid()) {
+            throw HkdfGuardError(FileOpenErrorCode(GetLastError()), "CreateFileW failed");
+        }
+
+        // Only a regular on-disk file. A pipe, console or other device
+        // (\\.\pipe\..., CON, NUL, COM1, ...) is refused before any ReadFile,
+        // since reading one could block indefinitely or return arbitrary data.
+        if (GetFileType(file.get()) != FILE_TYPE_DISK) {
+            throw HkdfGuardError(HKDFGUARD_ERR_FILE_IO, "path is not a regular file");
+        }
+        BY_HANDLE_FILE_INFORMATION info{};
+        if (!GetFileInformationByHandle(file.get(), &info)) {
+            throw HkdfGuardError(HKDFGUARD_ERR_FILE_IO, "GetFileInformationByHandle failed");
+        }
+        if (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            throw HkdfGuardError(HKDFGUARD_ERR_FILE_IO, "path is a directory");
+        }
+
+        // Decided on the size alone, before reading a byte. In particular a
+        // DEK-sized file is never read at all: if it really is a plaintext
+        // key, it never enters this process's memory.
+        LARGE_INTEGER size{};
+        if (!GetFileSizeEx(file.get(), &size)) {
+            throw HkdfGuardError(HKDFGUARD_ERR_FILE_IO, "GetFileSizeEx failed");
+        }
+        if (size.QuadPart == HKDFGUARD_DEK_LEN) {
+            throw HkdfGuardError(HKDFGUARD_ERR_FILE_PLAINTEXT_KEY, "file is the size of a plaintext DEK");
+        }
+        if (size.QuadPart < static_cast<LONGLONG>(kTotalLen)) {
+            throw HkdfGuardError(HKDFGUARD_ERR_FILE_TOO_SHORT, "file is shorter than a wrapped payload");
+        }
+        if (size.QuadPart > static_cast<LONGLONG>(kTotalLen)) {
+            throw HkdfGuardError(HKDFGUARD_ERR_FILE_TOO_LONG, "file is longer than a wrapped payload");
+        }
+
+        // ReadFile may return fewer bytes than asked for, so loop until the
+        // payload is complete or the file runs out.
+        DWORD total = 0;
+        while (total < kTotalLen) {
+            DWORD got = 0;
+            if (!ReadFile(file.get(), out + total, static_cast<DWORD>(kTotalLen - total), &got, nullptr)) {
+                throw HkdfGuardError(HKDFGUARD_ERR_FILE_IO, "ReadFile failed");
+            }
+            if (got == 0) {
+                throw HkdfGuardError(HKDFGUARD_ERR_FILE_TOO_SHORT, "file ended before a full wrapped payload");
+            }
+            total += got;
+        }
+        // The size was checked above and nobody can write while this handle
+        // is open, so this should always hit end of file - confirmed rather
+        // than assumed, so "exactly kTotalLen bytes" is a fact about what was
+        // read, not just about what GetFileSizeEx reported.
+        uint8_t extra = 0;
+        DWORD got_extra = 0;
+        if (!ReadFile(file.get(), &extra, 1, &got_extra, nullptr)) {
+            throw HkdfGuardError(HKDFGUARD_ERR_FILE_IO, "ReadFile failed");
+        }
+        if (got_extra != 0) {
+            throw HkdfGuardError(HKDFGUARD_ERR_FILE_TOO_LONG, "file is longer than a wrapped payload");
+        }
+
+        // The checks hkdfguard_unwrap_dek makes before it touches a KEK: the
+        // payload's structure, then its ephemeral public key is a real P-256
+        // point. Both throw HKDFGUARD_ERR_MALFORMED.
+        ParsedWrappedDek parsed = ParseWrappedDek(out, static_cast<int32_t>(kTotalLen));
+        ValidateEphemeralPublicKey(parsed.ephemeral_pub);
+    }
+
 } // namespace
 
 // `extern "C"` here (repeated at each function, rather than wrapping all of
@@ -518,5 +677,47 @@ extern "C" HKDFGUARD_API int32_t hkdfguard_unwrap_dek(
         return Audit(AuditOp::Unwrap, service, fail(e.code()));
     } catch (...) {
         return Audit(AuditOp::Unwrap, service, fail(HKDFGUARD_ERR_INTERNAL));
+    }
+}
+
+extern "C" HKDFGUARD_API int32_t hkdfguard_open_file(
+    const char *path,
+    uint8_t *out, int32_t *out_len) {
+    if (out_len == nullptr) {
+        return HKDFGUARD_ERR_INVALID_ARG;
+    }
+
+    // Same shape as hkdfguard_unwrap_dek: remember the caller's capacity,
+    // and on any failure zero that much of `out` and report 0 bytes read,
+    // so a rejected file never leaves partial or malformed bytes behind.
+    const int32_t capacity = *out_len;
+    auto fail = [&](int32_t code) {
+        if (out != nullptr && capacity > 0) {
+            SecureZero(out, static_cast<size_t>(capacity));
+        }
+        *out_len = 0;
+        return code;
+    };
+
+    // Not audited: the event log records failures against a service's KEK,
+    // and a file read involves neither. A caller that finds
+    // HKDFGUARD_ERR_FILE_PLAINTEXT_KEY should raise it in its own logging.
+    try {
+        if (path == nullptr || out == nullptr) {
+            return fail(HKDFGUARD_ERR_INVALID_ARG);
+        }
+        if (capacity < HKDFGUARD_WRAPPED_LEN) {
+            fail(HKDFGUARD_ERR_BUFFER_TOO_SMALL);
+            *out_len = HKDFGUARD_WRAPPED_LEN;
+            return HKDFGUARD_ERR_BUFFER_TOO_SMALL;
+        }
+
+        ReadWrappedKeyFile(path, out);
+        *out_len = HKDFGUARD_WRAPPED_LEN;
+        return HKDFGUARD_OK;
+    } catch (const HkdfGuardError &e) {
+        return fail(e.code());
+    } catch (...) {
+        return fail(HKDFGUARD_ERR_INTERNAL);
     }
 }

@@ -14,6 +14,7 @@
 
 #include <aclapi.h>  // SetEntriesInAclW - section 25d widens an existing KEK's ACL
 #include <sddl.h>    // ConvertStringSecurityDescriptorToSecurityDescriptorW - section 28
+#include <algorithm> // std::equal - section 24c
 #include <cstdio>
 #include <cstring>
 #include <stdexcept> // std::exception, caught in CleanupKek and CheckPolicyCreatesKek
@@ -363,6 +364,26 @@ bool SetSoftwareKeyDacl(const std::wstring& keyName, const wchar_t* sddl) {
     if (key) NCryptFreeObject(key);
     if (prov) NCryptFreeObject(prov);
     LocalFree(sd);
+    return ok;
+}
+
+// Helpers for section 24c (hkdfguard_open_file). The ABI takes UTF-8 paths,
+// while the test builds them with the wide Win32 APIs.
+std::string ToUtf8(const std::wstring& wide) {
+    int len = WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), static_cast<int>(wide.size()), nullptr, 0, nullptr, nullptr);
+    std::string out(static_cast<size_t>(len), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), static_cast<int>(wide.size()), out.data(), len, nullptr, nullptr);
+    return out;
+}
+
+bool WriteTestFile(const std::wstring& path, const std::vector<uint8_t>& bytes) {
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return false;
+    DWORD written = 0;
+    bool ok = bytes.empty() ||
+              (WriteFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &written, nullptr) &&
+               written == bytes.size());
+    CloseHandle(file);
     return ok;
 }
 
@@ -1347,6 +1368,265 @@ int main() {
         out_for_bad_point.data(), &bad_point_out_len);
     Check(rc == HKDFGUARD_ERR_MALFORMED, "unwrap rejects a payload whose ephemeral public key is not on P-256");
     Check(AllZero(out_for_bad_point.data(), out_for_bad_point.size()), "output buffer zeroed after invalid-ephemeral-point failure");
+
+    // ---- 24c. hkdfguard_open_file: reads a wrapped-key file's bytes - ----
+    //          still wrapped - checking size and structure, never
+    //          unwrapping. Files are written to a scratch folder under %TEMP%.
+    {
+        wchar_t temp[MAX_PATH + 1] = {};
+        GetTempPathW(MAX_PATH + 1, temp);
+        const std::wstring dir = std::wstring(temp) + L"hkdfguard-openfile-" + std::to_wstring(GetCurrentProcessId());
+        CreateDirectoryW(dir.c_str(), nullptr);
+        std::vector<std::wstring> created;
+        auto fileFor = [&](const wchar_t* name, const std::vector<uint8_t>& bytes) {
+            std::wstring path = dir + L"\\" + name;
+            Check(WriteTestFile(path, bytes), ("test setup: write " + ToUtf8(name)).c_str());
+            created.push_back(path);
+            return ToUtf8(path);
+        };
+        // Calls hkdfguard_open_file into a buffer pre-filled with 0xAA, so
+        // a failure that doesn't zero it is visible.
+        struct OpenResult {
+            int32_t rc;
+            int32_t len;
+            std::vector<uint8_t> out;
+        };
+        auto open = [](const std::string& path, int32_t capacity = HKDFGUARD_WRAPPED_LEN) {
+            // A negative capacity is passed through as-is, over a 1-byte
+            // buffer, so the library's handling of it is what's tested.
+            OpenResult r{0, capacity, std::vector<uint8_t>(static_cast<size_t>(capacity > 0 ? capacity : 1), 0xAA)};
+            r.rc = hkdfguard_open_file(path.c_str(), r.out.data(), &r.len);
+            return r;
+        };
+        auto expectFailure = [&](const std::string& path, int32_t code, const std::string& what) {
+            OpenResult r = open(path);
+            Check(r.rc == code, ("open_file: " + what).c_str());
+            if (r.rc != code) std::printf("    (hkdfguard_open_file returned %d)\n", r.rc);
+            Check(r.len == 0 && AllZero(r.out.data(), r.out.size()),
+                  ("open_file: " + what + " - output zeroed and 0 bytes reported").c_str());
+        };
+
+        // The happy path: exactly the wrapped bytes, unchanged...
+        const std::string good = fileFor(L"good.key", wrapped);
+        OpenResult r = open(good);
+        Check(r.rc == HKDFGUARD_OK, "open_file reads a valid wrapped-key file");
+        Check(r.len == HKDFGUARD_WRAPPED_LEN, "open_file reports HKDFGUARD_WRAPPED_LEN bytes read");
+        Check(r.out == wrapped, "open_file returns the wrapped bytes exactly as stored (not unwrapped)");
+        // ...which a later, separate unwrap call accepts.
+        std::vector<uint8_t> from_file_dek(HKDFGUARD_DEK_LEN);
+        int32_t from_file_dek_len = static_cast<int32_t>(from_file_dek.size());
+        rc = hkdfguard_unwrap_dek(kService, r.out.data(), r.len, from_file_dek.data(), &from_file_dek_len);
+        Check(rc == HKDFGUARD_OK && std::memcmp(from_file_dek.data(), dek.data(), HKDFGUARD_DEK_LEN) == 0,
+              "bytes from open_file unwrap to the original DEK in a separate unwrap call");
+
+        // Plaintext-key size, and the sizes either side of it.
+        expectFailure(fileFor(L"plain.key", std::vector<uint8_t>(HKDFGUARD_DEK_LEN, 0x42)),
+                      HKDFGUARD_ERR_FILE_PLAINTEXT_KEY, "a DEK-sized (32-byte) file is reported as a plaintext key");
+        expectFailure(fileFor(L"len31.key", std::vector<uint8_t>(31, 0x42)),
+                      HKDFGUARD_ERR_FILE_TOO_SHORT, "a 31-byte file is too short (not a plaintext key)");
+        expectFailure(fileFor(L"len33.key", std::vector<uint8_t>(33, 0x42)),
+                      HKDFGUARD_ERR_FILE_TOO_SHORT, "a 33-byte file is too short (not a plaintext key)");
+        expectFailure(fileFor(L"empty.key", {}), HKDFGUARD_ERR_FILE_TOO_SHORT, "an empty file is too short");
+        expectFailure(fileFor(L"len163.key", std::vector<uint8_t>(wrapped.begin(), wrapped.end() - 1)),
+                      HKDFGUARD_ERR_FILE_TOO_SHORT, "a file one byte short of a payload is too short");
+        std::vector<uint8_t> longer = wrapped;
+        longer.push_back(0x00);
+        expectFailure(fileFor(L"len165.key", longer), HKDFGUARD_ERR_FILE_TOO_LONG,
+                      "a valid payload with one trailing byte is too long");
+        expectFailure(fileFor(L"len4096.key", std::vector<uint8_t>(4096, 0x00)), HKDFGUARD_ERR_FILE_TOO_LONG,
+                      "a 4096-byte file is too long");
+
+        // Right size, wrong contents.
+        std::vector<uint8_t> bad_version = wrapped;
+        bad_version[hkdfguard::kVersionOffset] ^= 0xFF;
+        expectFailure(fileFor(L"badversion.key", bad_version), HKDFGUARD_ERR_MALFORMED,
+                      "a payload-sized file with a corrupted version byte is malformed");
+        expectFailure(fileFor(L"badpoint.key", bad_point_payload), HKDFGUARD_ERR_MALFORMED,
+                      "a payload-sized file whose ephemeral key is not on P-256 is malformed");
+        expectFailure(fileFor(L"zeros.key", std::vector<uint8_t>(HKDFGUARD_WRAPPED_LEN, 0x00)),
+                      HKDFGUARD_ERR_MALFORMED, "164 zero bytes are malformed");
+
+        // Opening problems.
+        expectFailure(ToUtf8(dir + L"\\missing.key"), HKDFGUARD_ERR_FILE_NOT_FOUND, "a missing file is not found");
+        expectFailure(ToUtf8(dir + L"\\nosuchdir\\x.key"), HKDFGUARD_ERR_FILE_NOT_FOUND,
+                      "a file in a missing folder is not found");
+        expectFailure(ToUtf8(dir), HKDFGUARD_ERR_FILE_IO, "a directory is refused");
+        expectFailure("NUL", HKDFGUARD_ERR_FILE_IO, "a device (NUL) is refused without reading from it");
+
+        {
+            // A writer holding the file open: refused rather than read mid-write.
+            HANDLE writer = CreateFileW((dir + L"\\good.key").c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+                                        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            Check(writer != INVALID_HANDLE_VALUE, "test setup: hold good.key open for writing");
+            expectFailure(good, HKDFGUARD_ERR_FILE_IO, "a file open for writing elsewhere is refused");
+            if (writer != INVALID_HANDLE_VALUE) CloseHandle(writer);
+        }
+
+        {
+            // A file this account may not read. Everyone is denied read
+            // first; Administrators and SYSTEM keep everything else so the
+            // test can still delete it.
+            const std::string denied = fileFor(L"denied.key", wrapped);
+            PSECURITY_DESCRIPTOR sd = nullptr;
+            bool set = ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                           L"D:P(D;;FR;;;WD)(A;;FA;;;BA)(A;;FA;;;SY)", SDDL_REVISION_1, &sd, nullptr) &&
+                       SetFileSecurityW((dir + L"\\denied.key").c_str(), DACL_SECURITY_INFORMATION, sd);
+            if (sd) LocalFree(sd);
+            Check(set, "test setup: deny read access on denied.key");
+            expectFailure(denied, HKDFGUARD_ERR_FILE_ACCESS_DENIED, "an unreadable file is access denied");
+        }
+
+        // A non-ASCII path is passed through as UTF-8.
+        const std::string unicode = fileFor(L"clé-ключ.key", wrapped);
+        r = open(unicode);
+        Check(r.rc == HKDFGUARD_OK && r.out == wrapped, "open_file reads a file whose name is non-ASCII UTF-8");
+
+        // Argument checks.
+        int32_t len = HKDFGUARD_WRAPPED_LEN;
+        std::vector<uint8_t> buf(HKDFGUARD_WRAPPED_LEN);
+        Check(hkdfguard_open_file(nullptr, buf.data(), &len) == HKDFGUARD_ERR_INVALID_ARG, "open_file rejects a null path");
+        len = HKDFGUARD_WRAPPED_LEN;
+        Check(hkdfguard_open_file(good.c_str(), nullptr, &len) == HKDFGUARD_ERR_INVALID_ARG, "open_file rejects a null out");
+        Check(hkdfguard_open_file(good.c_str(), buf.data(), nullptr) == HKDFGUARD_ERR_INVALID_ARG, "open_file rejects a null out_len");
+        expectFailure("", HKDFGUARD_ERR_INVALID_ARG, "an empty path is rejected");
+        expectFailure("bad\xC3\x28.key", HKDFGUARD_ERR_INVALID_ARG, "a path that is not valid UTF-8 is rejected");
+        r = open(good, HKDFGUARD_WRAPPED_LEN - 1);
+        Check(r.rc == HKDFGUARD_ERR_BUFFER_TOO_SMALL && r.len == HKDFGUARD_WRAPPED_LEN,
+              "open_file reports BUFFER_TOO_SMALL with the required size");
+        Check(AllZero(r.out.data(), r.out.size()), "open_file zeroes a too-small buffer");
+        r = open(good, -1);
+        Check(r.rc == HKDFGUARD_ERR_BUFFER_TOO_SMALL && r.len == HKDFGUARD_WRAPPED_LEN,
+              "open_file treats a negative capacity as too small");
+
+        // A larger buffer: exactly 164 bytes are written and reported, and
+        // nothing past them is touched.
+        r = open(good, HKDFGUARD_WRAPPED_LEN + 36);
+        Check(r.rc == HKDFGUARD_OK && r.len == HKDFGUARD_WRAPPED_LEN, "open_file into a larger buffer reports 164 bytes");
+        Check(std::equal(wrapped.begin(), wrapped.end(), r.out.begin()), "open_file into a larger buffer writes the payload at the start");
+        bool tail_untouched = true;
+        for (size_t i = HKDFGUARD_WRAPPED_LEN; i < r.out.size(); ++i) tail_untouched &= (r.out[i] == 0xAA);
+        Check(tail_untouched, "open_file leaves bytes past the payload untouched");
+
+        // Every structural rule ParseWrappedDek enforces, one at a time.
+        {
+            struct Corruption {
+                const wchar_t* file;
+                size_t offset;
+                uint8_t value;
+                const char* what;
+            };
+            const Corruption corruptions[] = {
+                {L"provider0.key", hkdfguard::kProviderTypeOffset, 0, "a provider type of 0 is malformed"},
+                {L"provider3.key", hkdfguard::kProviderTypeOffset, 3, "a provider type of 3 is malformed"},
+                {L"reserved.key", hkdfguard::kReservedOffset, 1, "a non-zero reserved byte is malformed"},
+                {L"reserved2.key", hkdfguard::kReservedOffset + 1, 0x80, "a non-zero second reserved byte is malformed"},
+                {L"keyid.key", hkdfguard::kKeyIdOffset, 2, "a KeyId other than 1 is malformed"},
+                {L"keyidhigh.key", hkdfguard::kKeyIdOffset + 3, 1, "a KeyId with a high byte set is malformed"},
+            };
+            for (const Corruption& c : corruptions) {
+                std::vector<uint8_t> bytes = wrapped;
+                bytes[c.offset] = c.value;
+                expectFailure(fileFor(c.file, bytes), HKDFGUARD_ERR_MALFORMED, c.what);
+            }
+        }
+
+        // More sizes.
+        expectFailure(fileFor(L"len1.key", std::vector<uint8_t>(1, 0x01)), HKDFGUARD_ERR_FILE_TOO_SHORT, "a 1-byte file is too short");
+        std::vector<uint8_t> doubled = wrapped;
+        doubled.insert(doubled.end(), wrapped.begin(), wrapped.end());
+        expectFailure(fileFor(L"doubled.key", doubled), HKDFGUARD_ERR_FILE_TOO_LONG,
+                      "two valid payloads back to back are too long");
+
+        // open_file never touches a KEK: a payload with a wrong KEK
+        // fingerprint is still well-formed, so it opens fine; it is the
+        // later, separate unwrap that rejects it.
+        {
+            std::vector<uint8_t> other_kek = wrapped;
+            other_kek[hkdfguard::kFingerprintOffset] ^= 0x01;
+            OpenResult o = open(fileFor(L"otherkek.key", other_kek));
+            Check(o.rc == HKDFGUARD_OK && o.out == other_kek,
+                  "open_file returns a well-formed payload without checking it against any KEK");
+            std::vector<uint8_t> dek_out(HKDFGUARD_DEK_LEN);
+            int32_t dek_out_len = static_cast<int32_t>(dek_out.size());
+            rc = hkdfguard_unwrap_dek(kService, o.out.data(), o.len, dek_out.data(), &dek_out_len);
+            Check(rc == HKDFGUARD_ERR_KEK_MISMATCH, "...and the later unwrap is what rejects it (KEK_MISMATCH)");
+        }
+
+        // Sharing: other readers are fine; any writer blocks the read, and
+        // the file reads again once the writer is gone.
+        {
+            const std::wstring goodWide = dir + L"\\good.key";
+            HANDLE reader = CreateFileW(goodWide.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                        FILE_ATTRIBUTE_NORMAL, nullptr);
+            Check(reader != INVALID_HANDLE_VALUE, "test setup: hold good.key open for reading");
+            r = open(good);
+            Check(r.rc == HKDFGUARD_OK && r.out == wrapped, "open_file succeeds while another process only reads the file");
+            if (reader != INVALID_HANDLE_VALUE) CloseHandle(reader);
+
+            HANDLE sharedWriter = CreateFileW(goodWide.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                              nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            Check(sharedWriter != INVALID_HANDLE_VALUE, "test setup: hold good.key open for writing, sharing read and write");
+            expectFailure(good, HKDFGUARD_ERR_FILE_IO, "a file open for writing is refused even when the writer shares access");
+            if (sharedWriter != INVALID_HANDLE_VALUE) CloseHandle(sharedWriter);
+
+            r = open(good);
+            Check(r.rc == HKDFGUARD_OK && r.out == wrapped, "open_file succeeds again once the writer closes the file");
+        }
+
+        // Read-only, hidden files are ordinary files to read.
+        {
+            const std::string ro = fileFor(L"readonly-hidden.key", wrapped);
+            SetFileAttributesW((dir + L"\\readonly-hidden.key").c_str(), FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_HIDDEN);
+            r = open(ro);
+            Check(r.rc == HKDFGUARD_OK && r.out == wrapped, "open_file reads a read-only, hidden file");
+        }
+
+        // Path spellings.
+        {
+            std::string slashes = ToUtf8(dir) + "/good.key";
+            r = open(slashes);
+            Check(r.rc == HKDFGUARD_OK && r.out == wrapped, "open_file accepts forward slashes in the path");
+
+            r = open("\\\\?\\" + ToUtf8(dir) + "\\good.key");
+            Check(r.rc == HKDFGUARD_OK && r.out == wrapped, "open_file accepts a \\\\?\\-prefixed path");
+
+            wchar_t saved_cwd[MAX_PATH + 1] = {};
+            GetCurrentDirectoryW(MAX_PATH + 1, saved_cwd);
+            if (SetCurrentDirectoryW(dir.c_str())) {
+                r = open("good.key");
+                Check(r.rc == HKDFGUARD_OK && r.out == wrapped, "open_file resolves a relative path against the current directory");
+                SetCurrentDirectoryW(saved_cwd);
+            } else {
+                Check(false, "test setup: change into the scratch folder");
+            }
+
+            expectFailure(std::string(32767 * 3 + 1, 'a'), HKDFGUARD_ERR_INVALID_ARG,
+                          "a path longer than the Win32 limit is rejected before any file access");
+        }
+
+        // Reading is read-only: the file is unchanged afterwards, and every
+        // read returns the same bytes.
+        {
+            const std::wstring goodWide = dir + L"\\good.key";
+            WIN32_FILE_ATTRIBUTE_DATA before{};
+            GetFileAttributesExW(goodWide.c_str(), GetFileExInfoStandard, &before);
+            OpenResult first = open(good);
+            OpenResult second = open(good);
+            WIN32_FILE_ATTRIBUTE_DATA after{};
+            GetFileAttributesExW(goodWide.c_str(), GetFileExInfoStandard, &after);
+            Check(first.rc == HKDFGUARD_OK && second.rc == HKDFGUARD_OK && first.out == second.out,
+                  "repeated open_file calls return identical bytes");
+            Check(CompareFileTime(&before.ftLastWriteTime, &after.ftLastWriteTime) == 0 &&
+                      before.nFileSizeLow == after.nFileSizeLow,
+                  "open_file does not modify the file");
+        }
+
+        for (const std::wstring& path : created) {
+            SetFileAttributesW(path.c_str(), FILE_ATTRIBUTE_NORMAL);
+            DeleteFileW(path.c_str());
+        }
+        RemoveDirectoryW(dir.c_str());
+    }
 
     // ---- 25. KeyStoragePolicy is honored for all three values, forced via ----
     //          a test-only override so this doesn't depend on this

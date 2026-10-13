@@ -54,7 +54,7 @@ If you need per-user isolation instead, that means leaving `NCRYPT_MACHINE_KEY_F
 unset (current-user scope) - not offered as a build option here, since this project
 targets the shared-service deployment model above.
 
-The library exposes a small, stable C ABI (`include/hkdfguard.h`) with five functions.
+The library exposes a small, stable C ABI (`include/hkdfguard.h`) with six functions.
 No Windows handle, CNG/NCrypt type, or COM interface crosses that boundary, and no C++
 exception ever escapes it - every call returns an integer status code.
 
@@ -78,6 +78,10 @@ int32_t hkdfguard_unwrap_dek(
 
 int32_t hkdfguard_generate_and_wrap_dek(
     const char* service,
+    uint8_t* out, int32_t* out_len);
+
+int32_t hkdfguard_open_file(
+    const char* path,
     uint8_t* out, int32_t* out_len);
 ```
 
@@ -107,6 +111,21 @@ See `include/hkdfguard.h` for the full set of `HKDFGUARD_ERR_*` status codes.
 Ephemeral Data Protection Key - the plaintext DEK never crosses back out to the caller;
 it's zeroed internally the moment it's wrapped. Recover it later via
 `hkdfguard_unwrap_dek` on the resulting payload, with the same `service`.
+
+`hkdfguard_open_file` reads a wrapped-key file, such as one written by the CLI's `wrap`,
+and returns its 164 bytes **still wrapped**, ready for a later, separate
+`hkdfguard_unwrap_dek` call. It never unwraps, opens no KEK, and needs only read access to
+the file. `path` is UTF-8. It checks the file's size before reading anything, and fails
+with `HKDFGUARD_ERR_FILE_PLAINTEXT_KEY` for a file of exactly 32 bytes (the size of an
+*unwrapped* DEK, so probably a plaintext key written to disk - treat it as exposed; its
+contents are never read), `HKDFGUARD_ERR_FILE_TOO_SHORT` for any other size under 164, and
+`HKDFGUARD_ERR_FILE_TOO_LONG` for anything over. A 164-byte file must also pass the same
+structural and P-256 point checks unwrap applies, or it fails with
+`HKDFGUARD_ERR_MALFORMED`. `HKDFGUARD_ERR_FILE_NOT_FOUND`,
+`HKDFGUARD_ERR_FILE_ACCESS_DENIED` and `HKDFGUARD_ERR_FILE_IO` cover a file that can't be
+opened or read; directories, pipes and devices are refused, and so is a file another
+process has open for writing. On any failure the output buffer is zeroed and `*out_len`
+is 0.
 
 ## Command-line tool
 
@@ -402,7 +421,7 @@ Get-WinEvent -LogName Application -FilterXPath "*[System[Provider[@Name='hkdfgua
 - **Memory security**: `src/secure_buffer.h` (RAII `SecureZeroMemory` wrapper) and
   `src/handle_traits.h` (RAII closers for every NCrypt/BCrypt handle type) ensure key
   material and handles are wiped/closed on every exit path, including exceptions. All
-  five ABI entry points in `src/hkdfguard.cpp` catch every exception; `hkdfguard_unwrap_dek`
+  six ABI entry points in `src/hkdfguard.cpp` catch every exception; `hkdfguard_unwrap_dek`
   additionally zeros the caller's output buffer on any failure (it calls into a CNG
   function - `BCryptDecrypt` - that can write unauthenticated plaintext before reporting
   a tag mismatch).
@@ -557,9 +576,9 @@ loading it.
 - **Node**: `ffi-napi`/`koffi` given an absolute path, or a native addon (N-API) linking
   `HkdfGuardV1.lib`
 
-All five bindings map directly onto the five exported functions
+All five bindings map directly onto the six exported functions
 (`hkdfguard_kek_exists`, `hkdfguard_create_kek`, `hkdfguard_wrap_dek`,
-`hkdfguard_unwrap_dek`, `hkdfguard_generate_and_wrap_dek`) and the status codes in
+`hkdfguard_unwrap_dek`, `hkdfguard_generate_and_wrap_dek`, `hkdfguard_open_file`) and the status codes in
 `include/hkdfguard.h`; none of them need to know anything about TPMs, CNG, or NCrypt.
 
 ## License

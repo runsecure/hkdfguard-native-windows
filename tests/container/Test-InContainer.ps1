@@ -100,6 +100,60 @@ Write-Section "test_cli.ps1 (installed CLI)"
 $cliExit = $LASTEXITCODE
 Check ($cliExit -eq 0) "test_cli.ps1 exits 0 (got $cliExit)"
 
+# ---- 3b. Installed CLI wrap -> installed DLL open_file -> unwrap ----------------
+# The consumer's path end to end: the installed CLI writes a wrapped-key
+# file, and code loading the installed DLL by full path reads it back with
+# hkdfguard_open_file (still wrapped) and unwraps it in a separate call.
+Write-Section "CLI wrap -> hkdfguard_open_file -> hkdfguard_unwrap_dek (installed binaries)"
+$cli = Join-Path $InstallDir "hkdfguard-v1-initialize.exe"
+$dll = Join-Path $InstallDir "HkdfGuardV1.dll"
+$chainService = "hkdfguardcontainerchain"
+$keyFile = Join-Path $work "chain.key"
+& $cli provision --service-name $chainService *> "$Out\chain-provision.log"
+Check ($LASTEXITCODE -eq 0) "installed CLI provisions a KEK"
+$dek = New-Object byte[] 32
+[Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($dek)
+[Convert]::ToBase64String($dek) | & $cli wrap --key-file-path $keyFile --service-name $chainService `
+    --dek-stdin --group Administrators --force *> "$Out\chain-wrap.log"
+Check ($LASTEXITCODE -eq 0) "installed CLI wraps a DEK to a file"
+
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class InstalledHkdfGuard {
+    [DllImport(@"$dll", CallingConvention = CallingConvention.Cdecl)]
+    public static extern int hkdfguard_open_file(byte[] path, byte[] out_buf, ref int out_len);
+    [DllImport(@"$dll", CallingConvention = CallingConvention.Cdecl)]
+    public static extern int hkdfguard_unwrap_dek(
+        [MarshalAs(UnmanagedType.LPStr)] string service, byte[] wrapped, int wrapped_len, byte[] out_buf, ref int out_len);
+}
+"@
+function Open-WrappedFile([string]$path) {
+    $buf = New-Object byte[] 164
+    $len = 164
+    $rc = [InstalledHkdfGuard]::hkdfguard_open_file([Text.Encoding]::UTF8.GetBytes($path + [char]0), $buf, [ref]$len)
+    return [PSCustomObject]@{ Rc = $rc; Len = $len; Bytes = $buf }
+}
+
+$opened = Open-WrappedFile $keyFile
+$onDisk = [IO.File]::ReadAllBytes($keyFile)
+Check ($opened.Rc -eq 0 -and $opened.Len -eq 164) "hkdfguard_open_file reads the CLI's file (rc $($opened.Rc), $($opened.Len) bytes)"
+Check ([Convert]::ToBase64String($opened.Bytes) -eq [Convert]::ToBase64String($onDisk)) "hkdfguard_open_file returns the file's wrapped bytes unchanged"
+$plain = New-Object byte[] 32
+$plainLen = 32
+$rc = [InstalledHkdfGuard]::hkdfguard_unwrap_dek($chainService, $opened.Bytes, $opened.Len, $plain, [ref]$plainLen)
+Check ($rc -eq 0 -and [Convert]::ToBase64String($plain) -eq [Convert]::ToBase64String($dek)) "a separate hkdfguard_unwrap_dek call recovers the original DEK"
+[Array]::Clear($plain, 0, $plain.Length)
+[Array]::Clear($dek, 0, $dek.Length)
+
+# A 32-byte file - the size of a plaintext DEK - is flagged, not read.
+$plainFile = Join-Path $work "plain.key"
+[IO.File]::WriteAllBytes($plainFile, (New-Object byte[] 32))
+$opened = Open-WrappedFile $plainFile
+Check ($opened.Rc -eq -20 -and $opened.Len -eq 0) "hkdfguard_open_file reports a 32-byte file as HKDFGUARD_ERR_FILE_PLAINTEXT_KEY (rc $($opened.Rc))"
+
+Remove-Item -Force $keyFile, $plainFile -ErrorAction SilentlyContinue
+
 # ---- 4. Audit events render through the registered source -------------------------
 Write-Section "Event log"
 $events = @(Get-WinEvent -FilterHashtable @{ LogName = "Application"; ProviderName = "hkdfguard-native-windows"; StartTime = $testStart } -ErrorAction SilentlyContinue)

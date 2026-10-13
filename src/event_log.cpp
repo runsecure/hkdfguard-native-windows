@@ -85,6 +85,12 @@ namespace hkdfguard {
                 case HKDFGUARD_ERR_KEK_NOT_FOUND: return L"HKDFGUARD_ERR_KEK_NOT_FOUND";
                 case HKDFGUARD_ERR_ACCESS_DENIED: return L"HKDFGUARD_ERR_ACCESS_DENIED";
                 case HKDFGUARD_ERR_KEK_ACL_INVALID: return L"HKDFGUARD_ERR_KEK_ACL_INVALID";
+                case HKDFGUARD_ERR_FILE_NOT_FOUND: return L"HKDFGUARD_ERR_FILE_NOT_FOUND";
+                case HKDFGUARD_ERR_FILE_ACCESS_DENIED: return L"HKDFGUARD_ERR_FILE_ACCESS_DENIED";
+                case HKDFGUARD_ERR_FILE_IO: return L"HKDFGUARD_ERR_FILE_IO";
+                case HKDFGUARD_ERR_FILE_TOO_SHORT: return L"HKDFGUARD_ERR_FILE_TOO_SHORT";
+                case HKDFGUARD_ERR_FILE_TOO_LONG: return L"HKDFGUARD_ERR_FILE_TOO_LONG";
+                case HKDFGUARD_ERR_FILE_PLAINTEXT_KEY: return L"HKDFGUARD_ERR_FILE_PLAINTEXT_KEY";
                 default: return L"(unknown code)";
             }
         }
