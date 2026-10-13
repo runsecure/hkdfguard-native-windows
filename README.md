@@ -115,7 +115,13 @@ it's zeroed internally the moment it's wrapped. Recover it later via
 `hkdfguard_open_file` reads a wrapped-key file, such as one written by the CLI's `wrap`,
 and returns its 164 bytes **still wrapped**, ready for a later, separate
 `hkdfguard_unwrap_dek` call. It never unwraps, opens no KEK, and needs only read access to
-the file. `path` is UTF-8. It checks the file's size before reading anything, and fails
+the file. `path` is UTF-8, absolute or relative to the current directory, and follows the
+same rules as the CLI's `--key-file-path`: it must be a real file on a local drive, reached
+through real directories. A symbolic link, junction or other reparse point at the path or
+anywhere above it is refused, never followed, and so are UNC paths, mapped and SUBST
+drives and device paths - all with `HKDFGUARD_ERR_FILE_PATH_REJECTED`, and before anything
+is opened, so the process never connects to a server named in a path. It checks the file's
+size before reading anything, and fails
 with `HKDFGUARD_ERR_FILE_PLAINTEXT_KEY` for a file of exactly 32 bytes (the size of an
 *unwrapped* DEK, so probably a plaintext key written to disk - treat it as exposed; its
 contents are never read), `HKDFGUARD_ERR_FILE_TOO_SHORT` for any other size under 164, and
@@ -124,8 +130,8 @@ structural and P-256 point checks unwrap applies, or it fails with
 `HKDFGUARD_ERR_MALFORMED`. `HKDFGUARD_ERR_FILE_NOT_FOUND`,
 `HKDFGUARD_ERR_FILE_ACCESS_DENIED` and `HKDFGUARD_ERR_FILE_IO` cover a file that can't be
 opened or read; directories, pipes and devices are refused, and so is a file another
-process has open for writing. On any failure the output buffer is zeroed and `*out_len`
-is 0.
+process has open for writing. On any failure the output buffer is zeroed; `*out_len` is
+left unchanged except on `HKDFGUARD_ERR_BUFFER_TOO_SMALL`, as with wrap and unwrap.
 
 ## Command-line tool
 

@@ -470,6 +470,7 @@ namespace {
             case HKDFGUARD_ERR_FILE_TOO_SHORT: return "the wrapped-key file is shorter than a wrapped key";
             case HKDFGUARD_ERR_FILE_TOO_LONG: return "the wrapped-key file is longer than a wrapped key";
             case HKDFGUARD_ERR_FILE_PLAINTEXT_KEY: return "the file is exactly the size of an unwrapped 32-byte key - it may hold a plaintext key; treat it as exposed";
+            case HKDFGUARD_ERR_FILE_PATH_REJECTED: return "the wrapped-key path is, or passes through, a symbolic link, junction or other reparse point, or is not on a local drive (UNC, mapped or SUBST drive, device)";
             default: return "unknown status code " + std::to_string(code);
         }
     }

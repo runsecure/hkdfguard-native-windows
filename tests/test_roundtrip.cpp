@@ -13,6 +13,7 @@
 #include "key_acl.h"    // ValidateKeyUseGroups - vets the key-use policy list without touching any key
 
 #include <aclapi.h>  // SetEntriesInAclW - section 25d widens an existing KEK's ACL
+#include <winioctl.h> // FSCTL_SET_REPARSE_POINT - section 24c plants a junction
 #include <sddl.h>    // ConvertStringSecurityDescriptorToSecurityDescriptorW - section 28
 #include <algorithm> // std::equal - section 24c
 #include <cstdio>
@@ -384,6 +385,51 @@ bool WriteTestFile(const std::wstring& path, const std::vector<uint8_t>& bytes) 
               (WriteFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &written, nullptr) &&
                written == bytes.size());
     CloseHandle(file);
+    return ok;
+}
+
+// Creates an NTFS junction (mount-point reparse point) at `junction`
+// pointing at the directory `target`, the way `mklink /J` does. Junctions
+// are the link type a non-administrator can create, so section 24c uses one
+// to show a planted link in the key folder is refused.
+bool CreateJunction(const std::wstring& junction, const std::wstring& target) {
+    // The mount-point form of REPARSE_DATA_BUFFER, which only the driver
+    // kit's ntifs.h declares.
+    struct MountPointReparse {
+        ULONG ReparseTag;
+        USHORT ReparseDataLength;
+        USHORT Reserved;
+        USHORT SubstituteNameOffset;
+        USHORT SubstituteNameLength;
+        USHORT PrintNameOffset;
+        USHORT PrintNameLength;
+        WCHAR PathBuffer[1];
+    };
+    const std::wstring substitute = L"\\??\\" + target; // NT object-manager form
+    const size_t names_bytes = (substitute.size() + 1 + target.size() + 1) * sizeof(WCHAR);
+    std::vector<uint8_t> buffer(offsetof(MountPointReparse, PathBuffer) + names_bytes);
+    auto* data = reinterpret_cast<MountPointReparse*>(buffer.data());
+    data->ReparseTag = IO_REPARSE_TAG_MOUNT_POINT;
+    data->ReparseDataLength = static_cast<USHORT>(8 + names_bytes); // the four USHORTs + names
+    data->SubstituteNameOffset = 0;
+    data->SubstituteNameLength = static_cast<USHORT>(substitute.size() * sizeof(WCHAR));
+    data->PrintNameOffset = static_cast<USHORT>((substitute.size() + 1) * sizeof(WCHAR));
+    data->PrintNameLength = static_cast<USHORT>(target.size() * sizeof(WCHAR));
+    std::memcpy(data->PathBuffer, substitute.c_str(), (substitute.size() + 1) * sizeof(WCHAR));
+    std::memcpy(data->PathBuffer + substitute.size() + 1, target.c_str(), (target.size() + 1) * sizeof(WCHAR));
+
+    if (!CreateDirectoryW(junction.c_str(), nullptr)) return false;
+    HANDLE handle = CreateFileW(junction.c_str(), GENERIC_WRITE, 0, nullptr, OPEN_EXISTING,
+                                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) {
+        RemoveDirectoryW(junction.c_str());
+        return false;
+    }
+    DWORD returned = 0;
+    const bool ok = DeviceIoControl(handle, FSCTL_SET_REPARSE_POINT, buffer.data(), static_cast<DWORD>(buffer.size()),
+                                    nullptr, 0, &returned, nullptr) != FALSE;
+    CloseHandle(handle);
+    if (!ok) RemoveDirectoryW(junction.c_str());
     return ok;
 }
 
@@ -1402,8 +1448,8 @@ int main() {
             OpenResult r = open(path);
             Check(r.rc == code, ("open_file: " + what).c_str());
             if (r.rc != code) std::printf("    (hkdfguard_open_file returned %d)\n", r.rc);
-            Check(r.len == 0 && AllZero(r.out.data(), r.out.size()),
-                  ("open_file: " + what + " - output zeroed and 0 bytes reported").c_str());
+            Check(r.len == HKDFGUARD_WRAPPED_LEN && AllZero(r.out.data(), r.out.size()),
+                  ("open_file: " + what + " - output zeroed and out_len left unchanged").c_str());
         };
 
         // The happy path: exactly the wrapped bytes, unchanged...
@@ -1451,7 +1497,14 @@ int main() {
         expectFailure(ToUtf8(dir + L"\\nosuchdir\\x.key"), HKDFGUARD_ERR_FILE_NOT_FOUND,
                       "a file in a missing folder is not found");
         expectFailure(ToUtf8(dir), HKDFGUARD_ERR_FILE_IO, "a directory is refused");
-        expectFailure("NUL", HKDFGUARD_ERR_FILE_IO, "a device (NUL) is refused without reading from it");
+        // Device and network paths are refused before anything is opened -
+        // so these are deterministic with no pipe server and no network.
+        expectFailure("NUL", HKDFGUARD_ERR_FILE_PATH_REJECTED, "a DOS device name (NUL) is refused");
+        expectFailure("\\\\.\\pipe\\hkdfguard-no-such-pipe", HKDFGUARD_ERR_FILE_PATH_REJECTED, "a named-pipe path is refused");
+        expectFailure("\\\\?\\GLOBALROOT\\Device\\Null", HKDFGUARD_ERR_FILE_PATH_REJECTED, "a device-namespace path is refused");
+        expectFailure("\\\\localhost\\C$\\Windows\\hkdfguard.key", HKDFGUARD_ERR_FILE_PATH_REJECTED, "a UNC path is refused");
+        expectFailure("\\\\?\\UNC\\localhost\\C$\\Windows\\hkdfguard.key", HKDFGUARD_ERR_FILE_PATH_REJECTED,
+                      "an extended-prefix UNC path is refused");
 
         {
             // A writer holding the file open: refused rather than read mid-write.
@@ -1602,6 +1655,80 @@ int main() {
 
             expectFailure(std::string(32767 * 3 + 1, 'a'), HKDFGUARD_ERR_INVALID_ARG,
                           "a path longer than the Win32 limit is rejected before any file access");
+
+            // 8.3 short names spell the same file, and must be accepted (the
+            // expected path is expanded before it's compared with the
+            // handle's). Skipped on a volume without short names.
+            wchar_t short_buf[MAX_PATH + 1] = {};
+            DWORD short_len = GetShortPathNameW((dir + L"\\good.key").c_str(), short_buf, MAX_PATH + 1);
+            if (short_len > 0 && short_len <= MAX_PATH &&
+                CompareStringOrdinal(short_buf, -1, (dir + L"\\good.key").c_str(), -1, TRUE) != CSTR_EQUAL) {
+                r = open(ToUtf8(short_buf));
+                Check(r.rc == HKDFGUARD_OK && r.out == wrapped, "open_file accepts an 8.3 short-name spelling of the path");
+            } else {
+                Skip("open_file accepts an 8.3 short-name spelling (this volume has no short names)");
+            }
+        }
+
+        // Links are refused, never followed - at the file, and anywhere
+        // above it. A junction needs no privilege to create (so it's the
+        // tool a non-admin would plant); symbolic links need
+        // SeCreateSymbolicLinkPrivilege, which an elevated process has.
+        {
+            const std::wstring junction = dir + L"\\junction";
+            if (CreateJunction(junction, dir)) {
+                expectFailure(ToUtf8(junction + L"\\good.key"), HKDFGUARD_ERR_FILE_PATH_REJECTED,
+                              "a file reached through a junction is refused");
+                RemoveDirectoryW(junction.c_str());
+            } else {
+                Check(false, "test setup: create a junction");
+            }
+
+            const std::wstring file_link = dir + L"\\link.key";
+            if (CreateSymbolicLinkW(file_link.c_str(), (dir + L"\\good.key").c_str(), 0)) {
+                expectFailure(ToUtf8(file_link), HKDFGUARD_ERR_FILE_PATH_REJECTED,
+                              "a file symbolic link is refused, not followed");
+                DeleteFileW(file_link.c_str());
+            } else if (GetLastError() == ERROR_PRIVILEGE_NOT_HELD) {
+                Skip("a file symbolic link is refused (needs SeCreateSymbolicLinkPrivilege)");
+            } else {
+                Check(false, "test setup: create a file symbolic link");
+            }
+
+            const std::wstring dir_link = dir + L"\\dirlink";
+            if (CreateSymbolicLinkW(dir_link.c_str(), dir.c_str(), SYMBOLIC_LINK_FLAG_DIRECTORY)) {
+                expectFailure(ToUtf8(dir_link + L"\\good.key"), HKDFGUARD_ERR_FILE_PATH_REJECTED,
+                              "a file reached through a directory symbolic link is refused");
+                RemoveDirectoryW(dir_link.c_str());
+            } else if (GetLastError() == ERROR_PRIVILEGE_NOT_HELD) {
+                Skip("a file reached through a directory symbolic link is refused (needs SeCreateSymbolicLinkPrivilege)");
+            } else {
+                Check(false, "test setup: create a directory symbolic link");
+            }
+
+            // A SUBST drive aliases a directory; the handle's canonical path
+            // is the real directory, so it's refused too.
+            DWORD drives = GetLogicalDrives();
+            wchar_t letter = 0;
+            for (wchar_t c = L'Z'; c >= L'D'; --c) {
+                if (!(drives & (1u << (c - L'A')))) { letter = c; break; }
+            }
+            if (letter == 0) {
+                Skip("a file reached through a SUBST drive is refused (no free drive letter)");
+            } else {
+                const std::wstring device = std::wstring(1, letter) + L":";
+                if (DefineDosDeviceW(0, device.c_str(), dir.c_str())) {
+                    expectFailure(ToUtf8(device + L"\\good.key"), HKDFGUARD_ERR_FILE_PATH_REJECTED,
+                                  "a file reached through a SUBST drive is refused");
+                    DefineDosDeviceW(DDD_REMOVE_DEFINITION | DDD_EXACT_MATCH_ON_REMOVE, device.c_str(), dir.c_str());
+                } else {
+                    Check(false, "test setup: define a SUBST drive");
+                }
+            }
+
+            // The real file at the real path still opens after all that.
+            r = open(good);
+            Check(r.rc == HKDFGUARD_OK && r.out == wrapped, "open_file still reads the real file at its real path");
         }
 
         // Reading is read-only: the file is unchanged afterwards, and every

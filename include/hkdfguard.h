@@ -103,6 +103,7 @@ extern "C" {
 #define HKDFGUARD_ERR_FILE_TOO_SHORT  (-18) /* hkdfguard_open_file: file is shorter than HKDFGUARD_WRAPPED_LEN */
 #define HKDFGUARD_ERR_FILE_TOO_LONG   (-19) /* hkdfguard_open_file: file is longer than HKDFGUARD_WRAPPED_LEN */
 #define HKDFGUARD_ERR_FILE_PLAINTEXT_KEY (-20) /* hkdfguard_open_file: file is exactly HKDFGUARD_DEK_LEN bytes - likely an unwrapped key */
+#define HKDFGUARD_ERR_FILE_PATH_REJECTED (-21) /* hkdfguard_open_file: path is, or passes through, a symbolic link, junction or other reparse point, or is not on a local drive (UNC, mapped or SUBST drive, device) */
 
 /*
  * Reports whether a persistent KEK already exists for `service`, without
@@ -266,17 +267,31 @@ HKDFGUARD_API int32_t hkdfguard_generate_and_wrap_dek(
  * step (hkdfguard_unwrap_dek on the returned bytes), typically by other
  * code.
  *
- * path    - null-terminated UTF-8 path to the file. Must name a regular file;
- *           directories, pipes and devices are refused before anything is
- *           read. Opened read-only, sharing read access only, so a file that
- *           another process has open for writing is refused rather than read
+ * path    - null-terminated UTF-8 path to the file: absolute, or relative to
+ *           the process's current directory. The same rules as the CLI's
+ *           --key-file-path apply, and fail with
+ *           HKDFGUARD_ERR_FILE_PATH_REJECTED: it must be a real file on a
+ *           local drive ("C:\..."), reached through real directories. A
+ *           symbolic link, junction, volume mount point or other reparse
+ *           point at the path or anywhere above it is refused, never
+ *           followed - so a link planted in the key folder cannot redirect
+ *           a privileged reader to some other file. (Files on volumes with
+ *           Data Deduplication enabled, and cloud placeholder files, are
+ *           reparse points too and are refused for the same reason.) UNC
+ *           paths, mapped and SUBST drives, and device paths (\\.\pipe\...,
+ *           NUL) are refused before anything is opened, so this process
+ *           never connects or authenticates to a server named in a path.
+ *           Must also name a regular file: directories are refused. Opened
+ *           read-only, sharing read access only, so a file that another
+ *           process has open for writing is refused rather than read
  *           mid-write.
  * out     - caller-owned output buffer.
  * out_len - in: capacity of out, in bytes (must be >= HKDFGUARD_WRAPPED_LEN).
  *           out: on success, the number of bytes read (always
  *           HKDFGUARD_WRAPPED_LEN). On HKDFGUARD_ERR_BUFFER_TOO_SMALL, the
- *           required capacity (HKDFGUARD_WRAPPED_LEN). 0 on every other
- *           failure.
+ *           required capacity (HKDFGUARD_WRAPPED_LEN). Left unchanged on
+ *           every other failure - the same contract as hkdfguard_wrap_dek
+ *           and hkdfguard_unwrap_dek.
  *
  * The file's size is checked before any of it is read:
  *   HKDFGUARD_ERR_FILE_PLAINTEXT_KEY - exactly HKDFGUARD_DEK_LEN (32) bytes:
@@ -290,14 +305,16 @@ HKDFGUARD_API int32_t hkdfguard_generate_and_wrap_dek(
  * A file of exactly HKDFGUARD_WRAPPED_LEN bytes is then read and validated
  * as hkdfguard_unwrap_dek would before touching a KEK - version, provider
  * type, reserved bytes, KeyId, and that the ephemeral public key is a valid
- * P-256 point - failing with HKDFGUARD_ERR_MALFORMED otherwise.
- * HKDFGUARD_ERR_FILE_NOT_FOUND, HKDFGUARD_ERR_FILE_ACCESS_DENIED and
- * HKDFGUARD_ERR_FILE_IO report why the file couldn't be opened or read.
+ * P-256 point - failing with HKDFGUARD_ERR_MALFORMED otherwise (or
+ * HKDFGUARD_ERR_CRYPTO if the software ECDH provider needed for the point
+ * check cannot be opened at all - an infrastructure failure, not a verdict
+ * on the file). HKDFGUARD_ERR_FILE_NOT_FOUND, HKDFGUARD_ERR_FILE_ACCESS_DENIED
+ * and HKDFGUARD_ERR_FILE_IO report why the file couldn't be opened or read.
  *
  * Returns HKDFGUARD_OK on success, or a negative HKDFGUARD_ERR_* code -
- * HKDFGUARD_ERR_INVALID_ARG for a null argument, or a path that is empty or
- * not valid UTF-8. On any failure, the output buffer is zeroed before
- * returning.
+ * HKDFGUARD_ERR_INVALID_ARG for a null argument, or a path that is empty,
+ * not valid UTF-8, or longer than Windows allows (32,767 characters). On
+ * any failure, the output buffer is zeroed before returning.
  */
 HKDFGUARD_API int32_t hkdfguard_open_file(
     const char* path,

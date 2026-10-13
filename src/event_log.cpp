@@ -91,6 +91,7 @@ namespace hkdfguard {
                 case HKDFGUARD_ERR_FILE_TOO_SHORT: return L"HKDFGUARD_ERR_FILE_TOO_SHORT";
                 case HKDFGUARD_ERR_FILE_TOO_LONG: return L"HKDFGUARD_ERR_FILE_TOO_LONG";
                 case HKDFGUARD_ERR_FILE_PLAINTEXT_KEY: return L"HKDFGUARD_ERR_FILE_PLAINTEXT_KEY";
+                case HKDFGUARD_ERR_FILE_PATH_REJECTED: return L"HKDFGUARD_ERR_FILE_PATH_REJECTED";
                 default: return L"(unknown code)";
             }
         }

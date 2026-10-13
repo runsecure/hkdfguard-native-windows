@@ -150,7 +150,7 @@ Check ($rc -eq 0 -and [Convert]::ToBase64String($plain) -eq [Convert]::ToBase64S
 $plainFile = Join-Path $work "plain.key"
 [IO.File]::WriteAllBytes($plainFile, (New-Object byte[] 32))
 $opened = Open-WrappedFile $plainFile
-Check ($opened.Rc -eq -20 -and $opened.Len -eq 0) "hkdfguard_open_file reports a 32-byte file as HKDFGUARD_ERR_FILE_PLAINTEXT_KEY (rc $($opened.Rc))"
+Check ($opened.Rc -eq -20 -and $opened.Len -eq 164) "hkdfguard_open_file reports a 32-byte file as HKDFGUARD_ERR_FILE_PLAINTEXT_KEY (rc $($opened.Rc)), out_len unchanged"
 
 Remove-Item -Force $keyFile, $plainFile -ErrorAction SilentlyContinue
 

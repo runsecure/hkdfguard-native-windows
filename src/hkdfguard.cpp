@@ -336,12 +336,109 @@ namespace {
         }
     }
 
+    // Drops the "\\?\" extended-length prefix (and turns "\\?\UNC\server"
+    // back into "\\server"), so a path spelled with the prefix and the
+    // prefixed form GetFinalPathNameByHandle always returns both compare
+    // against the plain spelling.
+    std::wstring StripExtendedPrefix(std::wstring p) {
+        if (p.rfind(L"\\\\?\\UNC\\", 0) == 0) {
+            return L"\\\\" + p.substr(8);
+        }
+        if (p.rfind(L"\\\\?\\", 0) == 0) {
+            return p.substr(4);
+        }
+        return p;
+    }
+
+    // The fully-qualified path the caller actually spelled - relative paths
+    // resolved against the current directory, 8.3 short names expanded where
+    // the file exists - with no link followed. This is what the opened
+    // handle's own path is compared against in ReadWrappedKeyFile: any
+    // difference means the open went somewhere other than where the caller
+    // pointed. The same construction as the CLI's FullLongPath.
+    std::wstring ExpectedFullPath(const std::wstring &path) {
+        DWORD needed = GetFullPathNameW(path.c_str(), 0, nullptr, nullptr);
+        if (needed == 0) {
+            throw HkdfGuardError(HKDFGUARD_ERR_INVALID_ARG, "GetFullPathName failed");
+        }
+        std::wstring full(needed, L'\0');
+        DWORD written = GetFullPathNameW(path.c_str(), needed, full.data(), nullptr);
+        if (written == 0 || written >= needed) {
+            throw HkdfGuardError(HKDFGUARD_ERR_INVALID_ARG, "GetFullPathName failed");
+        }
+        full.resize(written);
+
+        // GetLongPathName walks the path component by component with the
+        // directory listing, so it expands "PROGRA~1" but reports a link by
+        // its own name, never its target. It fails if the file doesn't
+        // exist; CreateFileW reports that case precisely, so the
+        // unexpanded form is used then.
+        needed = GetLongPathNameW(full.c_str(), nullptr, 0);
+        if (needed != 0) {
+            std::wstring long_form(needed, L'\0');
+            written = GetLongPathNameW(full.c_str(), long_form.data(), needed);
+            if (written != 0 && written < needed) {
+                long_form.resize(written);
+                return long_form;
+            }
+        }
+        return full;
+    }
+
+    // Only "<letter>:\..." on a local drive is allowed, decided before
+    // anything is opened. Refused: UNC paths (\\server\share, \\?\UNC\...),
+    // the device namespace (\\.\pipe\..., \\.\PhysicalDrive0, and DOS device
+    // names such as NUL or CON, which GetFullPathName turns into \\.\NUL),
+    // and mapped network drives. Opening a path on a server would make this
+    // process connect and authenticate to that server - a credential leak if
+    // the path is attacker-influenced - before any later check could refuse
+    // the result.
+    void RequireLocalDrivePath(const std::wstring &full) {
+        const bool drive_path =
+                full.size() >= 3 &&
+                ((full[0] >= L'A' && full[0] <= L'Z') || (full[0] >= L'a' && full[0] <= L'z')) &&
+                full[1] == L':' && full[2] == L'\\';
+        if (!drive_path) {
+            throw HkdfGuardError(HKDFGUARD_ERR_FILE_PATH_REJECTED, "path is not a local drive path");
+        }
+        if (GetDriveTypeW(full.substr(0, 3).c_str()) == DRIVE_REMOTE) {
+            throw HkdfGuardError(HKDFGUARD_ERR_FILE_PATH_REJECTED, "path is on a network drive");
+        }
+    }
+
+    // The kernel's canonical DOS path for an open handle - reflecting every
+    // reparse point traversed to reach it, which is the point - with the
+    // extended prefix stripped so it compares against ExpectedFullPath.
+    // Sized by retrying: grows to whatever the call last reported, plus one.
+    std::wstring FinalPathOfHandle(HANDLE file) {
+        std::wstring final(MAX_PATH, L'\0');
+        for (int attempt = 0; attempt < 4; ++attempt) {
+            DWORD written = GetFinalPathNameByHandleW(
+                file, final.data(), static_cast<DWORD>(final.size()), FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+            if (written == 0) {
+                // ERROR_PATH_NOT_FOUND here means the file's volume has no
+                // drive letter - reachable only through a volume mount point.
+                throw HkdfGuardError(
+                    GetLastError() == ERROR_PATH_NOT_FOUND ? HKDFGUARD_ERR_FILE_PATH_REJECTED : HKDFGUARD_ERR_FILE_IO,
+                    "GetFinalPathNameByHandle failed");
+            }
+            if (written < final.size()) {
+                final.resize(written);
+                return StripExtendedPrefix(final);
+            }
+            final.assign(static_cast<size_t>(written) + 1, L'\0');
+        }
+        throw HkdfGuardError(HKDFGUARD_ERR_FILE_IO, "GetFinalPathNameByHandle could not size its result");
+    }
+
     // Reads exactly kTotalLen bytes of a wrapped-key file into `out` and
     // validates them - see hkdfguard_open_file in hkdfguard.h for the
     // contract. Throws HkdfGuardError on every failure; the caller zeroes
     // `out`.
     void ReadWrappedKeyFile(const char *path, uint8_t *out) {
         std::wstring wide_path = PathToWide(path);
+        std::wstring expected = StripExtendedPrefix(ExpectedFullPath(wide_path));
+        RequireLocalDrivePath(expected);
 
         // A directory can't be opened without FILE_FLAG_BACKUP_SEMANTICS, so
         // CreateFileW would report one as ERROR_ACCESS_DENIED - checked first
@@ -356,16 +453,22 @@ namespace {
         // FILE_SHARE_READ only: while this handle is open nobody can write
         // the file, and if a writer already has it open this fails with a
         // sharing violation instead of reading a half-written payload.
+        // FILE_FLAG_OPEN_REPARSE_POINT: a symbolic link at the path opens as
+        // the link itself, so the reparse check below sees it instead of
+        // the open silently following it. SECURITY_IDENTIFICATION: should a
+        // path ever reach a named pipe despite the checks above, its server
+        // could identify this process but not impersonate it.
         ScopedFile file(CreateFileW(
             wide_path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr));
+            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
+            nullptr));
         if (!file.valid()) {
             throw HkdfGuardError(FileOpenErrorCode(GetLastError()), "CreateFileW failed");
         }
 
-        // Only a regular on-disk file. A pipe, console or other device
-        // (\\.\pipe\..., CON, NUL, COM1, ...) is refused before any ReadFile,
-        // since reading one could block indefinitely or return arbitrary data.
+        // Only a regular on-disk file. A pipe, console or other device is
+        // refused before any ReadFile, since reading one could block
+        // indefinitely or return arbitrary data.
         if (GetFileType(file.get()) != FILE_TYPE_DISK) {
             throw HkdfGuardError(HKDFGUARD_ERR_FILE_IO, "path is not a regular file");
         }
@@ -373,8 +476,25 @@ namespace {
         if (!GetFileInformationByHandle(file.get(), &info)) {
             throw HkdfGuardError(HKDFGUARD_ERR_FILE_IO, "GetFileInformationByHandle failed");
         }
+        // The object at the path itself must not be a link (or any other
+        // reparse point - dedup'd and cloud placeholder files included, since
+        // their real contents aren't what this handle would read).
+        if (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
+            throw HkdfGuardError(HKDFGUARD_ERR_FILE_PATH_REJECTED, "path is a symbolic link or other reparse point");
+        }
         if (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
             throw HkdfGuardError(HKDFGUARD_ERR_FILE_IO, "path is a directory");
+        }
+        // And nothing above it may be one either: FILE_FLAG_OPEN_REPARSE_POINT
+        // only covers the final component, so a junction or directory
+        // symbolic link in a parent folder is still followed by the open.
+        // The handle's canonical path reflects that; if it isn't the path
+        // the caller spelled, something redirected the open. (Also catches
+        // SUBST drives, whose canonical path is the directory they alias.)
+        // Case-insensitive, like the file system.
+        std::wstring actual = FinalPathOfHandle(file.get());
+        if (CompareStringOrdinal(actual.c_str(), -1, expected.c_str(), -1, TRUE) != CSTR_EQUAL) {
+            throw HkdfGuardError(HKDFGUARD_ERR_FILE_PATH_REJECTED, "path resolves through a link, junction or SUBST drive");
         }
 
         // Decided on the size alone, before reading a byte. In particular a
@@ -688,14 +808,15 @@ extern "C" HKDFGUARD_API int32_t hkdfguard_open_file(
     }
 
     // Same shape as hkdfguard_unwrap_dek: remember the caller's capacity,
-    // and on any failure zero that much of `out` and report 0 bytes read,
-    // so a rejected file never leaves partial or malformed bytes behind.
+    // and on any failure zero that much of `out`, so a rejected file never
+    // leaves partial or malformed bytes behind. *out_len is left as the
+    // caller set it, as wrap and unwrap do; only BUFFER_TOO_SMALL (the
+    // required size) and success (the bytes read) write to it.
     const int32_t capacity = *out_len;
     auto fail = [&](int32_t code) {
         if (out != nullptr && capacity > 0) {
             SecureZero(out, static_cast<size_t>(capacity));
         }
-        *out_len = 0;
         return code;
     };
 
@@ -707,9 +828,8 @@ extern "C" HKDFGUARD_API int32_t hkdfguard_open_file(
             return fail(HKDFGUARD_ERR_INVALID_ARG);
         }
         if (capacity < HKDFGUARD_WRAPPED_LEN) {
-            fail(HKDFGUARD_ERR_BUFFER_TOO_SMALL);
             *out_len = HKDFGUARD_WRAPPED_LEN;
-            return HKDFGUARD_ERR_BUFFER_TOO_SMALL;
+            return fail(HKDFGUARD_ERR_BUFFER_TOO_SMALL);
         }
 
         ReadWrappedKeyFile(path, out);
