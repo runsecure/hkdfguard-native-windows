@@ -97,7 +97,7 @@ namespace hkdfguard {
             // key blob starts with (see below); if the reported size isn't even
             // big enough to hold that header, something is already wrong.
             if (status != ERROR_SUCCESS || cb <= sizeof(BCRYPT_ECCKEY_BLOB)) {
-                throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO, "NCryptExportKey (size query) failed");
+                throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO_ERROR, "NCryptExportKey (size query) failed");
             }
 
             // Second call: now that we know the required size, allocate a
@@ -105,7 +105,7 @@ namespace hkdfguard {
             std::vector<uint8_t> blob(cb);
             status = NCryptExportKey(key, 0, BCRYPT_ECCPUBLIC_BLOB, nullptr, blob.data(), cb, &cb, 0);
             if (status != ERROR_SUCCESS) {
-                throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO, "NCryptExportKey failed");
+                throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO_ERROR, "NCryptExportKey failed");
             }
 
             // A BCRYPT_ECCPUBLIC_BLOB is a small fixed header (BCRYPT_ECCKEY_BLOB:
@@ -125,7 +125,7 @@ namespace hkdfguard {
             // the KEK is opened.
             if (header->dwMagic != BCRYPT_ECDH_PUBLIC_P256_MAGIC || header->cbKey != 32 ||
                 cb < sizeof(BCRYPT_ECCKEY_BLOB) + kEphemeralPubLen) {
-                throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO, "unexpected ECC public key blob format");
+                throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO_ERROR, "unexpected ECC public key blob format");
             }
             // Copy just the X||Y coordinate bytes (skipping the header) out into
             // the caller's fixed 64-byte buffer.
@@ -153,7 +153,7 @@ namespace hkdfguard {
                 ecdh_alg, nullptr, BCRYPT_ECCPUBLIC_BLOB, key.put(),
                 blob.data(), static_cast<ULONG>(blob.size()), 0);
             if (!BCRYPT_SUCCESS(status)) {
-                throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO, "BCryptImportKeyPair failed");
+                throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO_ERROR, "BCryptImportKeyPair failed");
             }
             return key;
         }
@@ -171,7 +171,7 @@ namespace hkdfguard {
                 secret, BCRYPT_KDF_RAW_SECRET, nullptr,
                 out.data(), static_cast<ULONG>(out.size()), &result_len, 0);
             if (!BCRYPT_SUCCESS(status) || result_len != out.size()) {
-                throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO, "BCryptDeriveKey(raw secret) failed");
+                throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO_ERROR, "BCryptDeriveKey(raw secret) failed");
             }
         }
 
@@ -185,7 +185,7 @@ namespace hkdfguard {
                 secret, BCRYPT_KDF_RAW_SECRET, nullptr,
                 out.data(), static_cast<DWORD>(out.size()), &result_len, 0);
             if (status != ERROR_SUCCESS || result_len != out.size()) {
-                throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO, "NCryptDeriveKey(raw secret) failed");
+                throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO_ERROR, "NCryptDeriveKey(raw secret) failed");
             }
         }
 
@@ -203,7 +203,7 @@ namespace hkdfguard {
             NTSTATUS status = BCryptOpenAlgorithmProvider(
                 alg.put(), BCRYPT_SHA512_ALGORITHM, nullptr, BCRYPT_ALG_HANDLE_HMAC_FLAG);
             if (!BCRYPT_SUCCESS(status)) {
-                throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO, "open HMAC-SHA512 provider failed");
+                throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO_ERROR, "open HMAC-SHA512 provider failed");
             }
 
             // CNG hash/HMAC operations need a caller-supplied scratch buffer
@@ -217,7 +217,7 @@ namespace hkdfguard {
                 alg.get(), BCRYPT_OBJECT_LENGTH,
                 reinterpret_cast<PUCHAR>(&hash_object_len), sizeof(hash_object_len), &cb_result, 0);
             if (!BCRYPT_SUCCESS(status)) {
-                throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO, "query HMAC object length failed");
+                throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO_ERROR, "query HMAC object length failed");
             }
 
             // Allocate that scratch buffer, and create the actual hash/HMAC object.
@@ -233,7 +233,7 @@ namespace hkdfguard {
                 alg.get(), hash.put(), hash_object.data(), hash_object_len,
                 const_cast<PUCHAR>(key), static_cast<ULONG>(key_len), 0);
             if (!BCRYPT_SUCCESS(status)) {
-                throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO, "BCryptCreateHash(HMAC) failed");
+                throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO_ERROR, "BCryptCreateHash(HMAC) failed");
             }
 
             // Feeds `data` into the hash/HMAC's running state. CNG's hashing API is
@@ -243,7 +243,7 @@ namespace hkdfguard {
             // time here.
             status = BCryptHashData(hash.get(), const_cast<PUCHAR>(data), static_cast<ULONG>(data_len), 0);
             if (!BCRYPT_SUCCESS(status)) {
-                throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO, "BCryptHashData failed");
+                throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO_ERROR, "BCryptHashData failed");
             }
 
             // Finalizes the computation and writes the 64-byte HMAC-SHA512 result
@@ -256,7 +256,7 @@ namespace hkdfguard {
             // path out of this function, success or failure alike.
             SecureZero(hash_object.data(), hash_object.size());
             if (!BCRYPT_SUCCESS(status)) {
-                throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO, "BCryptFinishHash failed");
+                throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO_ERROR, "BCryptFinishHash failed");
             }
             // `alg` and `hash` (both RAII handles) are closed automatically here as
             // the function returns.
@@ -343,9 +343,9 @@ namespace hkdfguard {
 #endif
         if (!BCRYPT_SUCCESS(status)) {
             // Infrastructure failure (can't even open the software provider),
-            // not a verdict on the point - reported as CRYPTO, not MALFORMED,
+            // not a verdict on the point - reported as CRYPTO_ERROR, not PAYLOAD_MALFORMED,
             // so a caller can't mistake it for "the payload is bad."
-            throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO, "open ECDH provider failed");
+            throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO_ERROR, "open ECDH provider failed");
         }
         try {
             // The import itself is the validation: the software provider
@@ -355,7 +355,7 @@ namespace hkdfguard {
             // accept/reject verdict is wanted here.
             ImportBCryptEccPublicKey(ecdh_alg.get(), pub);
         } catch (const HkdfGuardError &) {
-            throw HkdfGuardError(HKDFGUARD_ERR_MALFORMED, "ephemeral public key is not a valid P-256 point");
+            throw HkdfGuardError(HKDFGUARD_ERR_PAYLOAD_MALFORMED, "ephemeral public key is not a valid P-256 point");
         }
     }
 
@@ -368,7 +368,7 @@ namespace hkdfguard {
         ScopedBCryptAlg alg;
         NTSTATUS status = BCryptOpenAlgorithmProvider(alg.put(), BCRYPT_SHA256_ALGORITHM, nullptr, 0);
         if (!BCRYPT_SUCCESS(status)) {
-            throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO, "open SHA-256 provider failed");
+            throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO_ERROR, "open SHA-256 provider failed");
         }
 
         DWORD hash_object_len = 0, cb_result = 0;
@@ -376,24 +376,24 @@ namespace hkdfguard {
             alg.get(), BCRYPT_OBJECT_LENGTH,
             reinterpret_cast<PUCHAR>(&hash_object_len), sizeof(hash_object_len), &cb_result, 0);
         if (!BCRYPT_SUCCESS(status)) {
-            throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO, "query SHA-256 object length failed");
+            throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO_ERROR, "query SHA-256 object length failed");
         }
 
         std::vector<uint8_t> hash_object(hash_object_len);
         ScopedBCryptHash hash;
         status = BCryptCreateHash(alg.get(), hash.put(), hash_object.data(), hash_object_len, nullptr, 0, 0);
         if (!BCRYPT_SUCCESS(status)) {
-            throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO, "BCryptCreateHash(SHA-256) failed");
+            throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO_ERROR, "BCryptCreateHash(SHA-256) failed");
         }
 
         status = BCryptHashData(hash.get(), kek_pub, static_cast<ULONG>(kEphemeralPubLen), 0);
         if (!BCRYPT_SUCCESS(status)) {
-            throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO, "BCryptHashData(SHA-256) failed");
+            throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO_ERROR, "BCryptHashData(SHA-256) failed");
         }
 
         status = BCryptFinishHash(hash.get(), out, static_cast<ULONG>(kFingerprintLen), 0);
         if (!BCRYPT_SUCCESS(status)) {
-            throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO, "BCryptFinishHash(SHA-256) failed");
+            throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO_ERROR, "BCryptFinishHash(SHA-256) failed");
         }
         // Nothing here is secret (a public key and its public hash), so no
         // zeroing is needed beyond the RAII handles closing themselves.
@@ -418,7 +418,7 @@ namespace hkdfguard {
         ScopedBCryptAlg ecdh_alg;
         NTSTATUS status = BCryptOpenAlgorithmProvider(ecdh_alg.put(), BCRYPT_ECDH_P256_ALGORITHM, nullptr, 0);
         if (!BCRYPT_SUCCESS(status)) {
-            throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO, "open ECDH provider failed");
+            throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO_ERROR, "open ECDH provider failed");
         }
 
         // BCryptGenerateKeyPair creates the key pair "in progress" (some
@@ -428,11 +428,11 @@ namespace hkdfguard {
         ScopedBCryptKey ephemeral_key;
         status = BCryptGenerateKeyPair(ecdh_alg.get(), ephemeral_key.put(), 256, 0);
         if (!BCRYPT_SUCCESS(status)) {
-            throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO, "generate ephemeral key pair failed");
+            throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO_ERROR, "generate ephemeral key pair failed");
         }
         status = BCryptFinalizeKeyPair(ephemeral_key.get(), 0);
         if (!BCRYPT_SUCCESS(status)) {
-            throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO, "finalize ephemeral key pair failed");
+            throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO_ERROR, "finalize ephemeral key pair failed");
         }
 
         // Export the ephemeral key's *public* half (X||Y bytes) so it can be
@@ -444,13 +444,13 @@ namespace hkdfguard {
         DWORD cb = 0;
         status = BCryptExportKey(ephemeral_key.get(), nullptr, BCRYPT_ECCPUBLIC_BLOB, nullptr, 0, &cb, 0);
         if (!BCRYPT_SUCCESS(status) || cb <= sizeof(BCRYPT_ECCKEY_BLOB)) {
-            throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO, "BCryptExportKey (size query) failed");
+            throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO_ERROR, "BCryptExportKey (size query) failed");
         }
         std::vector<uint8_t> ephemeral_blob(cb);
         status = BCryptExportKey(ephemeral_key.get(), nullptr, BCRYPT_ECCPUBLIC_BLOB, ephemeral_blob.data(), cb, &cb,
                                  0);
         if (!BCRYPT_SUCCESS(status)) {
-            throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO, "BCryptExportKey failed");
+            throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO_ERROR, "BCryptExportKey failed");
         }
         // Skip past the blob's header to copy out just the X||Y coordinate
         // bytes into the caller's output parameter.
@@ -476,7 +476,7 @@ namespace hkdfguard {
         // computed, so it's disposed of the instant the agreement is computed.
         ephemeral_key.reset();
         if (!BCRYPT_SUCCESS(status)) {
-            throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO, "BCryptSecretAgreement failed");
+            throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO_ERROR, "BCryptSecretAgreement failed");
         }
 
         // Step 5: pull the raw shared-secret bytes out of the opaque
@@ -567,7 +567,7 @@ namespace hkdfguard {
             provider, 0, BCRYPT_ECCPUBLIC_BLOB, nullptr, ephemeral_ncrypt_key.put(),
             ephemeral_blob.data(), static_cast<DWORD>(ephemeral_blob.size()), NCRYPT_SILENT_FLAG);
         if (status != ERROR_SUCCESS) {
-            throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO, "NCryptImportKey(ephemeral public) failed");
+            throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO_ERROR, "NCryptImportKey(ephemeral public) failed");
         }
 
         ScopedNCryptSecret secret;
@@ -580,7 +580,7 @@ namespace hkdfguard {
         // it's released promptly rather than left open until function return.
         ephemeral_ncrypt_key.reset();
         if (status != ERROR_SUCCESS) {
-            throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO, "NCryptSecretAgreement failed");
+            throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO_ERROR, "NCryptSecretAgreement failed");
         }
 
         SecureBuffer<kSharedSecretLen> raw_secret;

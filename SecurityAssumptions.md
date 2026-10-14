@@ -163,8 +163,8 @@ succeed regardless of elevation.
 
 **Verified how.** Standalone repro, non-elevated, Software KSP.
 
-**Consequence.** That failure is reported as `HKDFGUARD_ERR_ACCESS_DENIED`
-(not the generic `HKDFGUARD_ERR_PROVIDER`), and the CLI's "requires an
+**Consequence.** That failure is reported as `HKDFGUARD_ERR_KEK_ACCESS_DENIED`
+(not the generic `HKDFGUARD_ERR_PROVIDER_ERROR`), and the CLI's "requires an
 elevated process" hint keys on that code. Opening and using an existing
 key does not require elevation - only the key's ACL governs it.
 
@@ -194,7 +194,7 @@ administrator.
 - A missing `KeyStoragePolicy` value means "never configured" and yields the
   default (`PreferTpm`). A value that is present but unrecognized yields
   `KeyStoragePolicy::Invalid`, and every reader fails closed with
-  `HKDFGUARD_ERR_INVALID_POLICY`. **Verified** by test
+  `HKDFGUARD_ERR_POLICY_INVALID`. **Verified** by test
   (`test_roundtrip.cpp` section 25b) via the test-only override.
 - `KeyUseGroups` read failures of any kind yield an empty list (no
   additional principals), never an exception. Entries are trimmed; a bad
@@ -213,19 +213,19 @@ administrator.
   or the TPM key was confirmed absent (`NTE_BAD_KEYSET`) and creating it
   failed, with the partly-created key successfully deleted. Internally these
   are the only failures thrown as `TpmUnusableError`; the public code is
-  still `HKDFGUARD_ERR_PROVIDER`. Everything else propagates, including an
+  still `HKDFGUARD_ERR_PROVIDER_ERROR`. Everything else propagates, including an
   *existing* TPM KEK that fails property verification, any other error while
   probing for the TPM key (a busy, locked-out or not-ready TPM), a
-  concurrent creation (`NTE_EXISTS`), `ACCESS_DENIED` and `KEK_ACL_INVALID`.
+  concurrent creation (`NTE_EXISTS`), `KEK_ACCESS_DENIED` and `KEK_INVALID`.
   Each of those may sit in front of a TPM KEK that is in use, and creating a
   second, software KEK beside it would split the service and permanently
   route new wraps to the weaker key. `OpenKekForWrap` (which also falls back
   on `KEK_NOT_FOUND`) and `KekExists` follow the same rule, so an
-  unauthorized caller is told `ACCESS_DENIED`, never `KEK_NOT_FOUND`.
+  unauthorized caller is told `KEK_ACCESS_DENIED`, never `KEK_NOT_FOUND`.
   **Assumed / not verified**: that a host with no TPM fails at
   `NCryptOpenStorageProvider` or reports one of the two "no device" codes.
   If some host instead reports a different code when probing for the key,
-  `PreferTpm` there now fails with `HKDFGUARD_ERR_PROVIDER` rather than
+  `PreferTpm` there now fails with `HKDFGUARD_ERR_PROVIDER_ERROR` rather than
   falling back. Exercise the default policy on a VM without a vTPM before
   relying on it. The test suite simulates the provider-open failure (section
   25c) and, through a test-only fault-injection seam, a TPM probe error, a
@@ -281,7 +281,7 @@ use) are still granted by *name*, now restricted to local groups.
 
 - The KEK's ACL is applied once, at creation, and never re-verified on open:
   the OS enforces the DACL on every use, so an unauthorized caller gets
-  `NTE_PERM` (surfaced as `HKDFGUARD_ERR_ACCESS_DENIED`). **Design
+  `NTE_PERM` (surfaced as `HKDFGUARD_ERR_KEK_ACCESS_DENIED`). **Design
   decision.** A fresh key's ACL is checked for the presence of every
   principal it was granted. An *existing* key found by
   `hkdfguard_create_kek` is checked against policy-independent invariants
@@ -290,7 +290,7 @@ use) are still granted by *name*, now restricted to local groups.
   or a conditional (callback) allow ACE. An object or compound allow ACE,
   which this library never writes, or an unreadable ACE fails the check
   outright rather than being skipped. Failing that returns
-  `HKDFGUARD_ERR_KEK_ACL_INVALID` and leaves the key untouched. This
+  `HKDFGUARD_ERR_KEK_INVALID` and leaves the key untouched. This
   catches a pre-planted key or one later widened to e.g. Everyone. It does
   not catch a widening to some other specific account, and it does not run
   on wrap or unwrap, which never re-verify the ACL. **Verified** by test
@@ -307,7 +307,7 @@ use) are still granted by *name*, now restricted to local groups.
   the CLI and unwrapped it via a direct call into the DLL, with no
   elevation, on the strength of that `GENERIC_READ` grant alone. The same
   account's attempt to *provision* a brand-new KEK failed as expected
-  (`HKDFGUARD_ERR_ACCESS_DENIED`, elevation required), confirming creation
+  (`HKDFGUARD_ERR_KEK_ACCESS_DENIED`, elevation required), confirming creation
   and use are genuinely governed by separate mechanisms (elevation vs.
   ACL). Both the KEK and the test account/group were removed afterward.
 
@@ -316,7 +316,7 @@ use) are still granted by *name*, now restricted to local groups.
 - AES-256-GCM authenticates `normalized service name || SHA-256(KEK public
   key, raw X||Y)`. The fingerprint also travels in the payload and is
   compared, before any ECDH, against the fingerprint of the KEK the
-  payload's routing fields select; mismatch is `HKDFGUARD_ERR_KEK_MISMATCH`.
+  payload's routing fields select; mismatch is `HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH`.
   It is a check on the selected key, never a lookup - searching for a key
   matching an attacker-supplied fingerprint would let the payload steer
   key selection. **Verified** by tests for the mismatch path (elevated).

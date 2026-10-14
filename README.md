@@ -15,7 +15,7 @@ existing KEK is *looked for* on. Under `RequireTpm` a payload that routes to a
 software-backed KEK is refused on unwrap as well (`VerifyKeyProperties` demands
 hardware backing), so the policy is enforced end to end, not just at creation. A value
 that is present but not one of `0`/`1`/`2` (or not a `REG_DWORD`) is a configuration
-error and fails every call with `HKDFGUARD_ERR_INVALID_POLICY` - it is deliberately
+error and fails every call with `HKDFGUARD_ERR_POLICY_INVALID` - it is deliberately
 *not* treated as the default, since a typo'd value most likely intended the stricter
 setting. The `PreferTpm` fallback is intentional and administrator-chosen: the
 `provider_type` byte in every payload records which provider actually protected it,
@@ -106,7 +106,14 @@ after unwrapping.
 `dek_len` must be exactly 32 (`HKDFGUARD_DEK_LEN`). A wrapped payload is always exactly
 164 bytes (`HKDFGUARD_WRAPPED_LEN`) - a fixed size regardless of which KEK provider
 produced it - so callers can allocate output buffers without a size-query round trip.
-See `include/hkdfguard.h` for the full set of `HKDFGUARD_ERR_*` status codes.
+See `include/hkdfguard.h` for the full set of `HKDFGUARD_ERR_*` status codes. The table
+is shared number for number with the Linux and macOS builds of this ABI: general codes
+(-1..-7), service name and policy (-8, -9), wrapped payload (-10..-12), KEK and process
+(-16..-20) and key file (-32..-39), then platform bands (Windows -64..-79, Linux -80..-95,
+macOS -96..-111). Every platform-band code refines a common one and can be treated as it;
+the only Windows-specific code is `HKDFGUARD_ERR_WIN_GROUP_INVALID` (-64), a refinement of
+`HKDFGUARD_ERR_POLICY_INVALID`. A NULL, empty, over-long or badly formed `service` fails
+with `HKDFGUARD_ERR_INVALID_SERVICE_NAME` on every call.
 
 `hkdfguard_generate_and_wrap_dek` generates its own cryptographically random 32-byte DEK
 (via `BCryptGenRandom`) and wraps it in one call, for callers minting a brand new
@@ -122,7 +129,7 @@ same rules as the CLI's `--key-file-path`: it must be a real file on a local dri
 through real directories. A symbolic link, junction or other reparse point at the path or
 anywhere above it is refused, never followed, and so are 8.3 short names (`PROGRA~1`),
 UNC paths, mapped and SUBST drives and device paths - all with
-`HKDFGUARD_ERR_FILE_PATH_REJECTED`, and the network and device cases before anything
+`HKDFGUARD_ERR_FILE_UNTRUSTED`, and the network and device cases before anything
 is opened, so the process never connects to a server named in a path. Configure key-file
 paths as full long paths, and don't build them from `%TEMP%` or other environment variables
 without first expanding them with `GetLongPathNameW`: Windows can set those variables with
@@ -134,7 +141,7 @@ with `HKDFGUARD_ERR_FILE_PLAINTEXT_KEY` for a file of exactly 32 bytes (the size
 contents are never read), `HKDFGUARD_ERR_FILE_TOO_SHORT` for any other size under 164, and
 `HKDFGUARD_ERR_FILE_TOO_LONG` for anything over. A 164-byte file must also pass the same
 structural and P-256 point checks unwrap applies, or it fails with
-`HKDFGUARD_ERR_MALFORMED`. `HKDFGUARD_ERR_FILE_NOT_FOUND`,
+`HKDFGUARD_ERR_FILE_MALFORMED` (an unrecognized version included). `HKDFGUARD_ERR_FILE_NOT_FOUND`,
 `HKDFGUARD_ERR_FILE_ACCESS_DENIED` and `HKDFGUARD_ERR_FILE_IO` cover a file that can't be
 opened or read; directories, pipes and devices are refused, and so is a file another
 process has open for writing. On any failure the output buffer is zeroed; `*out_len` is
@@ -147,7 +154,7 @@ wrapper around the ABI above with two subcommands:
 
 - **`provision`** - always calls `hkdfguard_create_kek`, which creates the KEK if it
   is missing and otherwise re-verifies the existing key's properties and ACL (failing
-  with `HKDFGUARD_ERR_KEK_ACL_INVALID` on a pre-planted or widened key). Never wraps a
+  with `HKDFGUARD_ERR_KEK_INVALID` on a pre-planted or widened key). Never wraps a
   DEK, never touches a file. This is the *only* subcommand that can create a KEK. Run
   it elevated: creating a KEK requires elevation (see "Deployment model" above), and
   verifying an existing one reads its ACL, which a key-use-only account cannot do.
@@ -363,11 +370,11 @@ including the impersonated client when a service acts on someone's behalf.
 | 1001 | Warning | A KEK was created on the software provider because `PreferTpm`'s TPM attempt failed, so it isn't hardware-protected. |
 | 1002 | Information | A DEK was wrapped (`hkdfguard_wrap_dek` or `hkdfguard_generate_and_wrap_dek`). |
 | 1003 | Information | A DEK was unwrapped. |
-| 2000 | Warning | `ACCESS_DENIED` on any call: use of a KEK by an unauthorized account, or provisioning without elevation. |
-| 2002 | Error | `KEK_ACL_INVALID`: an existing KEK under the service name has an ACL this library would never create. Investigate it. |
-| 2003 | Warning | `AUTH_FAILED`, `KEK_MISMATCH` or `MALFORMED` on unwrap: a tampered, corrupted, or misdirected payload. |
-| 2004 | Error | `INVALID_POLICY` or `GROUP_INVALID`: the registry policy is misconfigured, so calls fail closed. |
-| 2005 | Error | `PROVIDER`, `CRYPTO` or `INTERNAL`: the key storage provider or crypto layer failed. |
+| 2000 | Warning | `KEK_ACCESS_DENIED` on any call: use of a KEK by an unauthorized account, or provisioning without elevation. |
+| 2002 | Error | `KEK_INVALID`: an existing KEK under the service name has an ACL this library would never create. Investigate it. |
+| 2003 | Warning | `PAYLOAD_AUTH_FAILED`, `KEK_FINGERPRINT_MISMATCH`, `PAYLOAD_MALFORMED` or `PAYLOAD_UNSUPPORTED` on unwrap: a tampered, corrupted, misdirected or unknown-version payload. |
+| 2004 | Error | `POLICY_INVALID` or `WIN_GROUP_INVALID`: the registry policy is misconfigured, so calls fail closed. |
+| 2005 | Error | `PROVIDER_ERROR`, `CRYPTO_ERROR` or `INTERNAL_ERROR`: the key storage provider or crypto layer failed. |
 | 2006 | Error | `hkdfguard_open_file` refused a file of exactly 32 bytes - the size of an unwrapped DEK, so possibly a plaintext key on disk. Names the file; its contents were not read. Investigate it. |
 
 The wrap and unwrap events also record the KEK's fingerprint and a SHA-256 of the
@@ -378,8 +385,8 @@ older payload visible, which matters because the format deliberately allows roll
 (see the note on what a payload is bound to). To compute a wrapped file's hash for
 comparison: `(Get-FileHash <file> -Algorithm SHA256).Hash.ToLower()`.
 
-Deliberately not logged: caller mistakes (`INVALID_ARG`, `BUFFER_TOO_SMALL`,
-`SERVICE_NAME_INVALID`) and `KEK_NOT_FOUND`. `hkdfguard_open_file` writes only event 2006;
+Deliberately not logged: caller mistakes (`INVALID_ARGUMENT`, `BUFFER_TOO_SMALL`,
+`INVALID_SERVICE_NAME`) and `KEK_NOT_FOUND`. `hkdfguard_open_file` writes only event 2006;
 its other failures (a missing, unreadable, wrong-sized or malformed file, or a rejected
 path) involve no KEK and are reported to the caller alone. No key material is ever logged. Every
 successful wrap and unwrap writes one event, which suits deployment-time wrapping and
@@ -424,8 +431,8 @@ Get-WinEvent -LogName Application -FilterXPath "*[System[Provider[@Name='hkdfgua
   `src/hkdfguard.cpp`) - binding a wrapped payload to both the exact service and the
   specific KEK it was wrapped under. The fingerprint also travels in the payload and is
   checked against the opened KEK before any ECDH or decryption, so "wrong KEK"
-  (`HKDFGUARD_ERR_KEK_MISMATCH`) is distinguishable from tampering
-  (`HKDFGUARD_ERR_AUTH_FAILED`). Matches the construction this project's macOS and
+  (`HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH`) is distinguishable from tampering
+  (`HKDFGUARD_ERR_PAYLOAD_AUTH_FAILED`). Matches the construction this project's macOS and
   Linux implementations use.
 - **Wire format**: `src/wire_format.h` documents the exact 164-byte `WrappedDekV1`
   layout (version, provider type, key id, ephemeral public key, AES-GCM nonce/
@@ -436,7 +443,7 @@ Get-WinEvent -LogName Application -FilterXPath "*[System[Provider[@Name='hkdfgua
   also applies the `KeyUseGroups`-driven ACL and is idempotent - safe to call again for
   an already-provisioned service, which just re-verifies it - including that the existing
   key's ACL is a real DACL with SYSTEM and Administrators on it and grants nothing to an
-  over-broad principal such as Everyone (`HKDFGUARD_ERR_KEK_ACL_INVALID` otherwise; the
+  over-broad principal such as Everyone (`HKDFGUARD_ERR_KEK_INVALID` otherwise; the
   key is left untouched). `hkdfguard_wrap_dek` and `hkdfguard_unwrap_dek` only ever *open*
   an existing KEK, never create one; unwrap opens the exact provider/key recorded in the
   payload. Every create/open/delete call passes `NCRYPT_MACHINE_KEY_FLAG` (and

@@ -80,30 +80,78 @@ extern "C" {
 // exact one if they care. The parentheses around the negative numbers, e.g.
 // (-1), are just defensive style: they stop the macro from being
 // misinterpreted if it's ever substituted next to another operator in a
-// caller's expression, e.g. `x - HKDFGUARD_ERR_INVALID_ARG` — with no
+// caller's expression, e.g. `x - HKDFGUARD_ERR_INVALID_ARGUMENT` — with no
 // parens that would textually become `x - -1`.
-#define HKDFGUARD_OK                    0
-#define HKDFGUARD_ERR_INVALID_ARG      (-1) /* null pointer, wrong dek length, bad service, etc. */
-#define HKDFGUARD_ERR_BUFFER_TOO_SMALL (-2) /* *out_len on input is too small for the result */
-#define HKDFGUARD_ERR_PROVIDER         (-3) /* KEK provider/key open or create failed */
-#define HKDFGUARD_ERR_CRYPTO           (-4) /* ECDH/HKDF/AES operation failed (non-auth) */
-#define HKDFGUARD_ERR_AUTH_FAILED      (-5) /* AES-GCM authentication tag verification failed */
-#define HKDFGUARD_ERR_MALFORMED        (-6) /* wrapped payload is not a valid WrappedDekV1 */
-#define HKDFGUARD_ERR_INTERNAL         (-7) /* unexpected internal failure */
-#define HKDFGUARD_ERR_SERVICE_NAME_INVALID (-8) /* Service Name is malformed or invalid */
-#define HKDFGUARD_ERR_INVALID_POLICY   (-9) /* Invalid Key Storage Policy Flag */
-#define HKDFGUARD_ERR_GROUP_INVALID   (-10) /* KeyUseGroups policy entry is unresolvable, not a group, or over-broad */
-#define HKDFGUARD_ERR_KEK_MISMATCH    (-11) /* payload's KEK fingerprint does not match the KEK it routes to */
-#define HKDFGUARD_ERR_KEK_NOT_FOUND   (-12) /* no KEK is provisioned for this service (call hkdfguard_create_kek first) */
-#define HKDFGUARD_ERR_ACCESS_DENIED   (-13) /* this KEK exists, but the calling account is not authorized to use it */
-#define HKDFGUARD_ERR_KEK_ACL_INVALID (-14) /* an existing KEK's ACL is missing, lacks SYSTEM/Administrators, or grants an over-broad principal */
-#define HKDFGUARD_ERR_FILE_NOT_FOUND  (-15) /* hkdfguard_open_file: the file (or a folder in its path) does not exist */
-#define HKDFGUARD_ERR_FILE_ACCESS_DENIED (-16) /* hkdfguard_open_file: the calling account may not read the file */
-#define HKDFGUARD_ERR_FILE_IO         (-17) /* hkdfguard_open_file: not a regular file, in use by a writer, or a read failed */
-#define HKDFGUARD_ERR_FILE_TOO_SHORT  (-18) /* hkdfguard_open_file: file is shorter than HKDFGUARD_WRAPPED_LEN */
-#define HKDFGUARD_ERR_FILE_TOO_LONG   (-19) /* hkdfguard_open_file: file is longer than HKDFGUARD_WRAPPED_LEN */
-#define HKDFGUARD_ERR_FILE_PLAINTEXT_KEY (-20) /* hkdfguard_open_file: file is exactly HKDFGUARD_DEK_LEN bytes - likely an unwrapped key */
-#define HKDFGUARD_ERR_FILE_PATH_REJECTED (-21) /* hkdfguard_open_file: path is, or passes through, a symbolic link, junction or other reparse point, uses an 8.3 short name, or is not on a local drive (UNC, mapped or SUBST drive, device) */
+//
+// This table is shared, number for number, by all three implementations of
+// this C ABI (hkdfguard-native-windows, -linux and -macos), so a caller - or
+// a managed wrapper sitting above all three - can interpret a status code
+// the same way on every platform. Every code is #define'd here, including
+// ones only another platform returns (marked "not returned on Windows"), so
+// portable code can name them without #ifdef'ing per platform. The numbers
+// are grouped into bands, with gaps left reserved so each band can grow
+// without renumbering anything:
+//
+//     0           success
+//    -1 ..  -7    general: argument, buffer, provider, crypto, internal
+//    -8 ..  -9    service name and machine policy
+//   -10 .. -15    wrapped payload (malformed / auth failed / unsupported)
+//   -16 .. -31    KEK (fingerprint, existence, access, integrity) and
+//                 process hardening
+//   -32 .. -63    hkdfguard_open_file's key-file checks, then reserved for
+//                 future common codes
+//   -64 .. -79    Windows-specific
+//   -80 .. -95    Linux-specific (none defined yet)
+//   -96 .. -111   macOS-specific
+//
+// A code in a platform band is always a more precise *refinement* of one of
+// the common codes above it (each one's comment names which). A caller that
+// only wants portable handling may treat any code in a platform band exactly
+// as the common code it refines - e.g. HKDFGUARD_ERR_WIN_GROUP_INVALID as
+// HKDFGUARD_ERR_POLICY_INVALID.
+#define HKDFGUARD_OK                              0
+// ---- General (-1..-7) ----
+#define HKDFGUARD_ERR_INVALID_ARGUMENT           (-1) /* null pointer, wrong dek length, bad path argument, etc. */
+#define HKDFGUARD_ERR_BUFFER_TOO_SMALL           (-2) /* *out_len on input is too small for the result */
+#define HKDFGUARD_ERR_PROVIDER_UNAVAILABLE       (-3) /* no key storage provider could be used at all; not returned on Windows (a KSP failure is HKDFGUARD_ERR_PROVIDER_ERROR) */
+#define HKDFGUARD_ERR_PROVIDER_ERROR             (-4) /* KEK provider/key open or create failed */
+#define HKDFGUARD_ERR_CRYPTO_ERROR               (-5) /* ECDH/HKDF/AES/RNG operation failed (not an authentication failure) */
+#define HKDFGUARD_ERR_INTERNAL_ERROR             (-6) /* unexpected internal failure */
+/* -7 reserved */
+// ---- Service name and policy (-8..-9) ----
+#define HKDFGUARD_ERR_INVALID_SERVICE_NAME       (-8) /* service is null, empty, too long, not valid UTF-8, or contains a disallowed character */
+#define HKDFGUARD_ERR_POLICY_INVALID             (-9) /* a machine policy value (HKLM\Software\Policies\HkdfGuard) is invalid */
+// ---- Wrapped payload (-10..-15) ----
+#define HKDFGUARD_ERR_PAYLOAD_MALFORMED         (-10) /* wrapped payload is not a valid WrappedDekV1: wrong length, nonzero reserved bytes, unknown provider type or key id, or an ephemeral public key that is not a valid P-256 point */
+#define HKDFGUARD_ERR_PAYLOAD_AUTH_FAILED       (-11) /* AES-GCM authentication tag verification failed */
+#define HKDFGUARD_ERR_PAYLOAD_UNSUPPORTED       (-12) /* wrapped payload's version (or suite) is not one this build understands */
+/* -13..-15 reserved */
+// ---- KEK and process (-16..-31) ----
+#define HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH  (-16) /* payload's KEK fingerprint does not match the KEK it routes to */
+#define HKDFGUARD_ERR_KEK_NOT_FOUND             (-17) /* no KEK is provisioned for this service (call hkdfguard_create_kek first) */
+#define HKDFGUARD_ERR_KEK_ACCESS_DENIED         (-18) /* this KEK exists, but the calling account is not authorized to use it (or, for a new KEK, the process is not elevated) */
+#define HKDFGUARD_ERR_KEK_INVALID               (-19) /* an existing KEK is unusable as found: on Windows, its ACL is missing, lacks SYSTEM/Administrators, or grants an over-broad principal */
+#define HKDFGUARD_ERR_PROCESS_HARDENING_FAILED  (-20) /* the library could not harden the calling process; not returned on Windows */
+/* -21..-31 reserved */
+// ---- Key file, hkdfguard_open_file (-32..-39) ----
+#define HKDFGUARD_ERR_FILE_NOT_FOUND            (-32) /* hkdfguard_open_file: the file (or a folder in its path) does not exist */
+#define HKDFGUARD_ERR_FILE_ACCESS_DENIED        (-33) /* hkdfguard_open_file: the calling account may not read the file */
+#define HKDFGUARD_ERR_FILE_IO                   (-34) /* hkdfguard_open_file: not a regular file, in use by a writer, or a read failed */
+#define HKDFGUARD_ERR_FILE_TOO_SHORT            (-35) /* hkdfguard_open_file: file is shorter than HKDFGUARD_WRAPPED_LEN */
+#define HKDFGUARD_ERR_FILE_TOO_LONG             (-36) /* hkdfguard_open_file: file is longer than HKDFGUARD_WRAPPED_LEN */
+#define HKDFGUARD_ERR_FILE_PLAINTEXT_KEY        (-37) /* hkdfguard_open_file: file is exactly HKDFGUARD_DEK_LEN bytes - likely an unwrapped key */
+#define HKDFGUARD_ERR_FILE_MALFORMED            (-38) /* hkdfguard_open_file: file is the right size but its contents are not a valid WrappedDekV1 payload (including an unknown version) */
+#define HKDFGUARD_ERR_FILE_UNTRUSTED            (-39) /* hkdfguard_open_file: path is, or passes through, a symbolic link, junction or other reparse point, uses an 8.3 short name, or is not on a local drive (UNC, mapped or SUBST drive, device) */
+/* -40..-63 reserved for future common codes */
+// ---- Windows-specific (-64..-79) ----
+#define HKDFGUARD_ERR_WIN_GROUP_INVALID         (-64) /* refines HKDFGUARD_ERR_POLICY_INVALID: a KeyUseGroups policy entry is unresolvable, not a group, not host-local, or over-broad */
+// ---- Linux-specific (-80..-95): none defined yet ----
+// ---- macOS-specific (-96..-111); each refines HKDFGUARD_ERR_PROVIDER_ERROR, none returned on Windows ----
+#define HKDFGUARD_ERR_MAC_ACCESS_CONTROL_CREATION_FAILED  (-96) /* macOS: creating the KEK's keychain access-control object failed; not returned on Windows */
+#define HKDFGUARD_ERR_MAC_KEY_GENERATION_FAILED           (-97) /* macOS: generating the KEK failed; not returned on Windows */
+#define HKDFGUARD_ERR_MAC_KEYCHAIN_WRITE_FAILED           (-98) /* macOS: storing the KEK in the keychain failed; not returned on Windows */
+#define HKDFGUARD_ERR_MAC_KEK_VERIFICATION_FAILED         (-99) /* macOS: verifying an existing KEK's properties failed; not returned on Windows */
+#define HKDFGUARD_ERR_MAC_KEYCHAIN_READ_FAILED           (-100) /* macOS: reading the KEK from the keychain failed; not returned on Windows */
 
 /*
  * Reports whether a persistent KEK already exists for `service`, without
@@ -114,7 +162,7 @@ extern "C" {
  *               0 otherwise.
  *
  * Returns HKDFGUARD_OK on success, or a negative HKDFGUARD_ERR_* code -
- * including HKDFGUARD_ERR_ACCESS_DENIED if a KEK is present but the
+ * including HKDFGUARD_ERR_KEK_ACCESS_DENIED if a KEK is present but the
  * calling account cannot even open it to confirm that (existence could not
  * be determined, as opposed to *out_exists being a reliable 0).
  * *out_exists is left untouched on failure.
@@ -151,7 +199,7 @@ HKDFGUARD_API int32_t hkdfguard_kek_exists(
  * BUILTIN, NT AUTHORITY or NT SERVICE principal. This protection is host-specific, so domain
  * groups are rejected even on a domain-joined machine, whether written
  * domain-qualified or not. Any entry failing these checks fails the whole
- * call with HKDFGUARD_ERR_GROUP_INVALID before any key is created. A
+ * call with HKDFGUARD_ERR_WIN_GROUP_INVALID before any key is created. A
  * missing or empty value grants no additional principals.
  *
  * The ACL is applied only when the KEK is first created. Changing the
@@ -164,13 +212,13 @@ HKDFGUARD_API int32_t hkdfguard_kek_exists(
  * over-broad principal (the same list rejected above). A key failing any of
  * these - most plausibly one pre-planted under this service's name, or one
  * whose ACL was later widened - fails the call with
- * HKDFGUARD_ERR_KEK_ACL_INVALID and is left exactly as found; it is never
+ * HKDFGUARD_ERR_KEK_INVALID and is left exactly as found; it is never
  * modified, replaced or deleted.
  *
  * service - see hkdfguard_wrap_dek.
  *
  * Returns HKDFGUARD_OK on success, or a negative HKDFGUARD_ERR_* code -
- * notably HKDFGUARD_ERR_ACCESS_DENIED, which covers two distinct cases: the
+ * notably HKDFGUARD_ERR_KEK_ACCESS_DENIED, which covers two distinct cases: the
  * service's KEK already exists but the calling account cannot even open it
  * to verify it, or the KEK does not exist yet and this process is not
  * elevated (creating a *new* machine-scoped KEK requires an elevated
@@ -190,10 +238,13 @@ HKDFGUARD_API int32_t hkdfguard_create_kek(
  *             a payload produced with it; the service name itself is not
  *             recorded in the wrapped payload. Must be non-null, non-empty,
  *             and at most 128 bytes (excluding the null terminator), and may
- *             only contain ASCII letters, digits, and '.'. Case-insensitive:
- *             normalized to lowercase internally, so "MyApp" and "myapp"
- *             identify the same KEK and may be used interchangeably across
- *             hkdfguard_create_kek/hkdfguard_kek_exists/hkdfguard_wrap_dek/
+ *             only contain ASCII letters, digits, and '.'; anything else
+ *             (including NULL) fails with HKDFGUARD_ERR_INVALID_SERVICE_NAME,
+ *             on this and every other function taking `service`.
+ *             Case-insensitive: normalized to lowercase internally, so
+ *             "MyApp" and "myapp" identify the same KEK and may
+ *             be used interchangeably across hkdfguard_create_kek/
+ *             hkdfguard_kek_exists/hkdfguard_wrap_dek/
  *             hkdfguard_unwrap_dek calls for the same logical service.
  *             hkdfguard_create_kek must have already provisioned this
  *             service's KEK; this function never creates one.
@@ -208,7 +259,7 @@ HKDFGUARD_API int32_t hkdfguard_create_kek(
  *
  * Returns HKDFGUARD_OK on success, or a negative HKDFGUARD_ERR_* code -
  * notably HKDFGUARD_ERR_KEK_NOT_FOUND if hkdfguard_create_kek has not yet
- * provisioned this service's KEK, or HKDFGUARD_ERR_ACCESS_DENIED if it has
+ * provisioned this service's KEK, or HKDFGUARD_ERR_KEK_ACCESS_DENIED if it has
  * but the calling account is not authorized to use it (see
  * hkdfguard_create_kek's KeyUseGroups policy). On failure, no partial
  * output is left in the caller's buffer.
@@ -234,15 +285,18 @@ HKDFGUARD_API int32_t hkdfguard_wrap_dek(
  *               (HKDFGUARD_DEK_LEN). Left unchanged on every other failure.
  *
  * Returns HKDFGUARD_OK on success, or a negative HKDFGUARD_ERR_* code.
- * HKDFGUARD_ERR_MALFORMED covers both a structurally invalid payload and a
- * payload whose embedded ephemeral public key is not a valid P-256 point
- * (rejected before it ever reaches the KEK). HKDFGUARD_ERR_KEK_MISMATCH
+ * HKDFGUARD_ERR_PAYLOAD_MALFORMED covers both a structurally invalid
+ * payload (wrong length, nonzero reserved bytes, unknown provider type or
+ * KeyId) and a payload whose embedded ephemeral public key is not a valid
+ * P-256 point (rejected before it ever reaches the KEK).
+ * HKDFGUARD_ERR_PAYLOAD_UNSUPPORTED means the payload's version byte is not
+ * one this build understands. HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH
  * means the payload is well-formed but was wrapped under a different KEK
  * than the one this service currently routes to (its embedded KEK
  * fingerprint doesn't match) - detected before any ECDH or decryption is
- * attempted, and distinct from HKDFGUARD_ERR_AUTH_FAILED, which now
+ * attempted, and distinct from HKDFGUARD_ERR_PAYLOAD_AUTH_FAILED, which now
  * indicates tampering with a payload that *does* belong to this KEK.
- * HKDFGUARD_ERR_KEK_NOT_FOUND and HKDFGUARD_ERR_ACCESS_DENIED are as
+ * HKDFGUARD_ERR_KEK_NOT_FOUND and HKDFGUARD_ERR_KEK_ACCESS_DENIED are as
  * described on hkdfguard_wrap_dek.
  * On any failure (including authentication failure), the output buffer is
  * zeroed before returning; no plaintext is left behind.
@@ -275,7 +329,7 @@ HKDFGUARD_API int32_t hkdfguard_generate_and_wrap_dek(
  * path    - null-terminated UTF-8 path to the file: absolute, or relative to
  *           the process's current directory. The same rules as the CLI's
  *           --key-file-path apply, and fail with
- *           HKDFGUARD_ERR_FILE_PATH_REJECTED: it must be a real file on a
+ *           HKDFGUARD_ERR_FILE_UNTRUSTED: it must be a real file on a
  *           local drive ("C:\..."), reached through real directories. A
  *           symbolic link, junction, volume mount point or other reparse
  *           point at the path or anywhere above it is refused, never
@@ -313,14 +367,18 @@ HKDFGUARD_API int32_t hkdfguard_generate_and_wrap_dek(
  * A file of exactly HKDFGUARD_WRAPPED_LEN bytes is then read and validated
  * as hkdfguard_unwrap_dek would before touching a KEK - version, provider
  * type, reserved bytes, KeyId, and that the ephemeral public key is a valid
- * P-256 point - failing with HKDFGUARD_ERR_MALFORMED otherwise (or
- * HKDFGUARD_ERR_CRYPTO if the software ECDH provider needed for the point
- * check cannot be opened at all - an infrastructure failure, not a verdict
- * on the file). HKDFGUARD_ERR_FILE_NOT_FOUND, HKDFGUARD_ERR_FILE_ACCESS_DENIED
+ * P-256 point - failing with HKDFGUARD_ERR_FILE_MALFORMED otherwise. That
+ * includes an unrecognized version: this call reports the *file* as
+ * malformed rather than returning the payload codes
+ * (HKDFGUARD_ERR_PAYLOAD_MALFORMED / _UNSUPPORTED) hkdfguard_unwrap_dek
+ * would, matching the Linux and macOS builds. The one exception is
+ * HKDFGUARD_ERR_CRYPTO_ERROR, if the software ECDH provider needed for the
+ * point check cannot be opened at all - an infrastructure failure, not a
+ * verdict on the file. HKDFGUARD_ERR_FILE_NOT_FOUND, HKDFGUARD_ERR_FILE_ACCESS_DENIED
  * and HKDFGUARD_ERR_FILE_IO report why the file couldn't be opened or read.
  *
  * Returns HKDFGUARD_OK on success, or a negative HKDFGUARD_ERR_* code -
- * HKDFGUARD_ERR_INVALID_ARG for a null argument, or a path that is empty,
+ * HKDFGUARD_ERR_INVALID_ARGUMENT for a null argument, or a path that is empty,
  * not valid UTF-8, or longer than Windows allows (32,767 characters). On
  * any failure, the output buffer is zeroed before returning.
  */

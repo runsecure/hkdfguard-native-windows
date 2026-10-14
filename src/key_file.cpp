@@ -55,12 +55,12 @@ namespace hkdfguard {
         std::wstring PathToWide(const char *path) {
             size_t len = strnlen(path, kMaxPathBytes + 1);
             if (len == 0 || len > kMaxPathBytes) {
-                throw HkdfGuardError(HKDFGUARD_ERR_INVALID_ARG, "path is empty or too long");
+                throw HkdfGuardError(HKDFGUARD_ERR_INVALID_ARGUMENT, "path is empty or too long");
             }
             int wide_len = MultiByteToWideChar(
                 CP_UTF8, MB_ERR_INVALID_CHARS, path, static_cast<int>(len), nullptr, 0);
             if (wide_len <= 0) {
-                throw HkdfGuardError(HKDFGUARD_ERR_INVALID_ARG, "path is not valid UTF-8");
+                throw HkdfGuardError(HKDFGUARD_ERR_INVALID_ARGUMENT, "path is not valid UTF-8");
             }
             std::wstring wide(static_cast<size_t>(wide_len), L'\0');
             MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, static_cast<int>(len), wide.data(), wide_len);
@@ -147,7 +147,7 @@ namespace hkdfguard {
             if (CompareStringOrdinal(
                     StripExtendedPrefix(long_form).c_str(), -1, StripExtendedPrefix(checked).c_str(), -1, TRUE) !=
                 CSTR_EQUAL) {
-                throw HkdfGuardError(HKDFGUARD_ERR_FILE_PATH_REJECTED, "path uses an 8.3 short name");
+                throw HkdfGuardError(HKDFGUARD_ERR_FILE_UNTRUSTED, "path uses an 8.3 short name");
             }
         }
 
@@ -160,12 +160,12 @@ namespace hkdfguard {
         std::wstring ExpectedFullPath(const std::wstring &path) {
             DWORD needed = GetFullPathNameW(path.c_str(), 0, nullptr, nullptr);
             if (needed == 0) {
-                throw HkdfGuardError(HKDFGUARD_ERR_INVALID_ARG, "GetFullPathName failed");
+                throw HkdfGuardError(HKDFGUARD_ERR_INVALID_ARGUMENT, "GetFullPathName failed");
             }
             std::wstring full(needed, L'\0');
             DWORD written = GetFullPathNameW(path.c_str(), needed, full.data(), nullptr);
             if (written == 0 || written >= needed) {
-                throw HkdfGuardError(HKDFGUARD_ERR_INVALID_ARG, "GetFullPathName failed");
+                throw HkdfGuardError(HKDFGUARD_ERR_INVALID_ARGUMENT, "GetFullPathName failed");
             }
             full.resize(written);
             return full;
@@ -185,10 +185,10 @@ namespace hkdfguard {
                     ((full[0] >= L'A' && full[0] <= L'Z') || (full[0] >= L'a' && full[0] <= L'z')) &&
                     full[1] == L':' && full[2] == L'\\';
             if (!drive_path) {
-                throw HkdfGuardError(HKDFGUARD_ERR_FILE_PATH_REJECTED, "path is not a local drive path");
+                throw HkdfGuardError(HKDFGUARD_ERR_FILE_UNTRUSTED, "path is not a local drive path");
             }
             if (GetDriveTypeW(full.substr(0, 3).c_str()) == DRIVE_REMOTE) {
-                throw HkdfGuardError(HKDFGUARD_ERR_FILE_PATH_REJECTED, "path is on a network drive");
+                throw HkdfGuardError(HKDFGUARD_ERR_FILE_UNTRUSTED, "path is on a network drive");
             }
         }
 
@@ -205,7 +205,7 @@ namespace hkdfguard {
                     // ERROR_PATH_NOT_FOUND here means the file's volume has no
                     // drive letter - reachable only through a volume mount point.
                     throw HkdfGuardError(
-                        GetLastError() == ERROR_PATH_NOT_FOUND ? HKDFGUARD_ERR_FILE_PATH_REJECTED : HKDFGUARD_ERR_FILE_IO,
+                        GetLastError() == ERROR_PATH_NOT_FOUND ? HKDFGUARD_ERR_FILE_UNTRUSTED : HKDFGUARD_ERR_FILE_IO,
                         "GetFinalPathNameByHandle failed");
                 }
                 if (written < final.size()) {
@@ -274,7 +274,7 @@ namespace hkdfguard {
         // reparse point - dedup'd and cloud placeholder files included, since
         // their real contents aren't what this handle would read).
         if (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
-            throw HkdfGuardError(HKDFGUARD_ERR_FILE_PATH_REJECTED, "path is a symbolic link or other reparse point");
+            throw HkdfGuardError(HKDFGUARD_ERR_FILE_UNTRUSTED, "path is a symbolic link or other reparse point");
         }
         if (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
             throw HkdfGuardError(HKDFGUARD_ERR_FILE_IO, "path is a directory");
@@ -288,7 +288,7 @@ namespace hkdfguard {
         // Case-insensitive, like the file system.
         std::wstring actual = FinalPathOfHandle(file.get());
         if (CompareStringOrdinal(actual.c_str(), -1, expected.c_str(), -1, TRUE) != CSTR_EQUAL) {
-            throw HkdfGuardError(HKDFGUARD_ERR_FILE_PATH_REJECTED, "path resolves through a link, junction or SUBST drive");
+            throw HkdfGuardError(HKDFGUARD_ERR_FILE_UNTRUSTED, "path resolves through a link, junction or SUBST drive");
         }
 
         // Decided on the size alone, before reading a byte. In particular a
@@ -336,12 +336,26 @@ namespace hkdfguard {
 
         // The checks hkdfguard_unwrap_dek makes before it touches a KEK: the
         // payload's structure, then its ephemeral public key is a real P-256
-        // point. Both throw HKDFGUARD_ERR_MALFORMED - except that the point
-        // check throws HKDFGUARD_ERR_CRYPTO if the software ECDH provider it
-        // validates with can't be opened at all, which says nothing about
-        // the file.
-        ParsedWrappedDek parsed = ParseWrappedDek(out, static_cast<int32_t>(kTotalLen));
-        ValidateEphemeralPublicKey(parsed.ephemeral_pub);
+        // point. Called directly, those throw the payload codes
+        // (HKDFGUARD_ERR_PAYLOAD_UNSUPPORTED for an unknown version,
+        // HKDFGUARD_ERR_PAYLOAD_MALFORMED for everything else). Here they
+        // are re-thrown as HKDFGUARD_ERR_FILE_MALFORMED: what this call
+        // reports is a verdict on the *file* - it is the right size but
+        // doesn't hold a valid wrapped key - which is also how the Linux and
+        // macOS builds of this ABI report a malformed key file, unknown
+        // version included. The one exception passes through untouched: the
+        // point check throws HKDFGUARD_ERR_CRYPTO_ERROR if the software ECDH
+        // provider it validates with can't be opened at all, which says
+        // nothing about the file.
+        try {
+            ParsedWrappedDek parsed = ParseWrappedDek(out, static_cast<int32_t>(kTotalLen));
+            ValidateEphemeralPublicKey(parsed.ephemeral_pub);
+        } catch (const HkdfGuardError &e) {
+            if (e.code() == HKDFGUARD_ERR_PAYLOAD_MALFORMED || e.code() == HKDFGUARD_ERR_PAYLOAD_UNSUPPORTED) {
+                throw HkdfGuardError(HKDFGUARD_ERR_FILE_MALFORMED, e.what());
+            }
+            throw;
+        }
     }
 
 } // namespace hkdfguard

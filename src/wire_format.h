@@ -23,7 +23,7 @@ namespace hkdfguard {
     // service name - and (b) checked explicitly on unwrap, before any ECDH
     // or decryption: the KEK selected by (service, ProviderType, KeyId) is
     // opened, its public key fingerprinted the same way, and a mismatch is
-    // rejected as HKDFGUARD_ERR_KEK_MISMATCH. That turns "wrong key" into a
+    // rejected as HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH. That turns "wrong key" into a
     // precise, cheap failure (no TPM operation spent on it) instead of an
     // authentication failure indistinguishable from tampering. It is a
     // check, never a lookup: key selection is always by the routing fields,
@@ -141,8 +141,9 @@ namespace hkdfguard {
         uint8_t out[kTotalLen]);
 
     // Validates and parses a wrapped payload. Throws HkdfGuardError with
-    // HKDFGUARD_ERR_MALFORMED if wrapped_len != kTotalLen, the version is not
-    // recognized, the reserved bytes are not zero, the provider type is not
+    // HKDFGUARD_ERR_PAYLOAD_UNSUPPORTED if the version is not recognized,
+    // and with HKDFGUARD_ERR_PAYLOAD_MALFORMED if wrapped_len != kTotalLen,
+    // the reserved bytes are not zero, the provider type is not
     // recognized, or KeyId is not kCurrentKeyId - see that constant's
     // comment for why a payload naming any other KeyId is rejected outright
     // rather than passed through to look up a key that, by design, could

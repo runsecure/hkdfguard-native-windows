@@ -503,7 +503,7 @@ try {
         Check ($denied.Count -ge 1) "the refused provision is recorded in the Application event log (event 2000)"
         if ($denied.Count -ge 1) {
             $evt = $denied[0]
-            Check ([string]$evt.Properties[0].Value -match "HKDFGUARD_ERR_ACCESS_DENIED") "the event names the error code"
+            Check ([string]$evt.Properties[0].Value -match "HKDFGUARD_ERR_KEK_ACCESS_DENIED") "the event names the error code"
             Check ($evt.UserId -and $evt.UserId.Value -eq $identity.User.Value) "the event records the calling user"
             Check ($evt.LevelDisplayName -eq "Warning" -or $evt.Level -eq 3) "the event is logged as a warning"
         }

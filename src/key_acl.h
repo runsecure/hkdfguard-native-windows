@@ -36,7 +36,7 @@ namespace hkdfguard {
     // logon-type groups INTERACTIVE/NETWORK/BATCH/SERVICE/REMOTE INTERACTIVE
     // LOGON), and must be host-local (see IsHostLocalAccountDomain): this protection is host-specific, so domain
     // groups are refused even on a domain-joined machine, however the entry
-    // was spelled. Throws HkdfGuardError(HKDFGUARD_ERR_GROUP_INVALID) on the
+    // was spelled. Throws HkdfGuardError(HKDFGUARD_ERR_WIN_GROUP_INVALID) on the
     // first entry that fails. CreateKek calls this before it opens the key
     // store at all, so a bad policy never results in a half-created key.
     void ValidateKeyUseGroups(
@@ -71,8 +71,8 @@ namespace hkdfguard {
     // hkdfguard_create_kek in hkdfguard.h). This catches a pre-planted or
     // later-widened key, not policy drift.
     //
-    // Throws HkdfGuardError(HKDFGUARD_ERR_KEK_ACL_INVALID) on a violation, or
-    // HKDFGUARD_ERR_ACCESS_DENIED if the caller can't read the ACL at all.
+    // Throws HkdfGuardError(HKDFGUARD_ERR_KEK_INVALID) on a violation, or
+    // HKDFGUARD_ERR_KEK_ACCESS_DENIED if the caller can't read the ACL at all.
     void VerifyExistingKeyAcl(
         NCRYPT_KEY_HANDLE key);
 

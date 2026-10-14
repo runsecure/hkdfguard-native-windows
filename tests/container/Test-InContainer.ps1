@@ -199,7 +199,7 @@ Result ($rc -eq 0 -and [Convert]::ToBase64String($plain) -eq $dekBase64) "a sepa
 [Array]::Clear($plain, 0, $plain.Length)
 
 $opened = Open-WrappedFile $PlainFile
-Result ($opened.Rc -eq -20 -and $opened.Len -eq 164) "hkdfguard_open_file reports a 32-byte file as HKDFGUARD_ERR_FILE_PLAINTEXT_KEY (rc $($opened.Rc)), out_len unchanged"
+Result ($opened.Rc -eq -37 -and $opened.Len -eq 164) "hkdfguard_open_file reports a 32-byte file as HKDFGUARD_ERR_FILE_PLAINTEXT_KEY (rc $($opened.Rc)), out_len unchanged"
 '@
 # Continue, not Stop, around the child: under Windows PowerShell 5.1, 2>&1
 # on a native process turns each stderr line into an error, which Stop would

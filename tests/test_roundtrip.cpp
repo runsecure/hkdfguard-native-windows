@@ -765,16 +765,16 @@ int main() {
 
     // ---- 0c. kek_exists / create_kek argument validation. ----
     rc = hkdfguard_kek_exists(nullptr, &lifecycle_exists);
-    Check(rc == HKDFGUARD_ERR_INVALID_ARG, "kek_exists rejects null service");
+    Check(rc == HKDFGUARD_ERR_INVALID_SERVICE_NAME, "kek_exists rejects null service");
 
     rc = hkdfguard_kek_exists(kServiceLifecycle, nullptr);
-    Check(rc == HKDFGUARD_ERR_INVALID_ARG, "kek_exists rejects null out_exists");
+    Check(rc == HKDFGUARD_ERR_INVALID_ARGUMENT, "kek_exists rejects null out_exists");
 
     rc = hkdfguard_kek_exists("", &lifecycle_exists);
-    Check(rc == HKDFGUARD_ERR_SERVICE_NAME_INVALID, "kek_exists rejects empty service");
+    Check(rc == HKDFGUARD_ERR_INVALID_SERVICE_NAME, "kek_exists rejects empty service");
 
     rc = hkdfguard_create_kek(nullptr);
-    Check(rc == HKDFGUARD_ERR_INVALID_ARG, "create_kek rejects null service");
+    Check(rc == HKDFGUARD_ERR_INVALID_SERVICE_NAME, "create_kek rejects null service");
 
     // ---- 0d. Key-use group policy (HKLM\Software\Policies\HkdfGuard\ ----
     //          KeyUseGroups). Which principals may unwrap is machine policy,
@@ -785,24 +785,24 @@ int main() {
     //          without elevation.
     hkdfguard::SetTestKeyUseGroupsOverride(std::vector<std::wstring>{L"Everyone"});
     Check(
-        InternalCreateKekResult(kServiceUseGroupsWide) == HKDFGUARD_ERR_GROUP_INVALID,
+        InternalCreateKekResult(kServiceUseGroupsWide) == HKDFGUARD_ERR_WIN_GROUP_INVALID,
         "create_kek rejects Everyone as a key-use group");
 
     // The same principal given as a SID string must be caught the same way -
     // the over-broad check is by SID, not by spelling.
     hkdfguard::SetTestKeyUseGroupsOverride(std::vector<std::wstring>{L"S-1-1-0"});
     Check(
-        InternalCreateKekResult(kServiceUseGroupsWide) == HKDFGUARD_ERR_GROUP_INVALID,
+        InternalCreateKekResult(kServiceUseGroupsWide) == HKDFGUARD_ERR_WIN_GROUP_INVALID,
         "create_kek rejects Everyone given as a SID string");
 
     hkdfguard::SetTestKeyUseGroupsOverride(std::vector<std::wstring>{L"Authenticated Users"});
     Check(
-        InternalCreateKekResult(kServiceUseGroupsWide) == HKDFGUARD_ERR_GROUP_INVALID,
+        InternalCreateKekResult(kServiceUseGroupsWide) == HKDFGUARD_ERR_WIN_GROUP_INVALID,
         "create_kek rejects Authenticated Users as a key-use group");
 
     hkdfguard::SetTestKeyUseGroupsOverride(std::vector<std::wstring>{L"Users"});
     Check(
-        InternalCreateKekResult(kServiceUseGroupsWide) == HKDFGUARD_ERR_GROUP_INVALID,
+        InternalCreateKekResult(kServiceUseGroupsWide) == HKDFGUARD_ERR_WIN_GROUP_INVALID,
         "create_kek rejects BUILTIN\\Users as a key-use group");
 
     // Broad well-known groups that are reported as SidTypeWellKnownGroup in
@@ -824,19 +824,19 @@ int main() {
         };
         for (const BroadPrincipal &p: broad) {
             hkdfguard::SetTestKeyUseGroupsOverride(std::vector<std::wstring>{p.sid});
-            Check(InternalCreateKekResult(kServiceUseGroupsWide) == HKDFGUARD_ERR_GROUP_INVALID, p.label);
+            Check(InternalCreateKekResult(kServiceUseGroupsWide) == HKDFGUARD_ERR_WIN_GROUP_INVALID, p.label);
         }
     }
 
     // And by name, for the two most likely to be typed into a policy.
     hkdfguard::SetTestKeyUseGroupsOverride(std::vector<std::wstring>{L"NT AUTHORITY\\Local account"});
     Check(
-        InternalCreateKekResult(kServiceUseGroupsWide) == HKDFGUARD_ERR_GROUP_INVALID,
+        InternalCreateKekResult(kServiceUseGroupsWide) == HKDFGUARD_ERR_WIN_GROUP_INVALID,
         "create_kek rejects NT AUTHORITY\\Local account given by name");
 
     hkdfguard::SetTestKeyUseGroupsOverride(std::vector<std::wstring>{L"NT SERVICE\\ALL SERVICES"});
     Check(
-        InternalCreateKekResult(kServiceUseGroupsWide) == HKDFGUARD_ERR_GROUP_INVALID,
+        InternalCreateKekResult(kServiceUseGroupsWide) == HKDFGUARD_ERR_WIN_GROUP_INVALID,
         "create_kek rejects NT SERVICE\\ALL SERVICES given by name");
 
     // A user account - even a perfectly real one - is not a group.
@@ -845,13 +845,13 @@ int main() {
     if (GetUserNameW(current_user, &current_user_len)) {
         hkdfguard::SetTestKeyUseGroupsOverride(std::vector<std::wstring>{current_user});
         Check(
-            InternalCreateKekResult(kServiceUseGroupsWide) == HKDFGUARD_ERR_GROUP_INVALID,
+            InternalCreateKekResult(kServiceUseGroupsWide) == HKDFGUARD_ERR_WIN_GROUP_INVALID,
             "create_kek rejects a user account as a key-use group");
     }
 
     hkdfguard::SetTestKeyUseGroupsOverride(std::vector<std::wstring>{L"hkdfguard.no.such.group.x"});
     Check(
-        InternalCreateKekResult(kServiceUseGroupsWide) == HKDFGUARD_ERR_GROUP_INVALID,
+        InternalCreateKekResult(kServiceUseGroupsWide) == HKDFGUARD_ERR_WIN_GROUP_INVALID,
         "create_kek rejects an unresolvable key-use group");
 
     // One bad entry anywhere in the list fails the whole call, even when
@@ -861,7 +861,7 @@ int main() {
     hkdfguard::SetTestKeyUseGroupsOverride(
         std::vector<std::wstring>{narrow_group, L"Everyone"});
     Check(
-        InternalCreateKekResult(kServiceUseGroupsWide) == HKDFGUARD_ERR_GROUP_INVALID,
+        InternalCreateKekResult(kServiceUseGroupsWide) == HKDFGUARD_ERR_WIN_GROUP_INVALID,
         "create_kek rejects a list containing one over-broad entry among valid ones");
 
     // None of the rejected attempts may have left a key behind.
@@ -909,7 +909,7 @@ int main() {
     // IsHostLocalAccountDomain checks above cover that branch directly.)
     hkdfguard::SetTestKeyUseGroupsOverride(std::vector<std::wstring>{L"NOSUCHDOMAIN\\Users"});
     Check(
-        InternalCreateKekResult(kServiceUseGroupsWide) == HKDFGUARD_ERR_GROUP_INVALID,
+        InternalCreateKekResult(kServiceUseGroupsWide) == HKDFGUARD_ERR_WIN_GROUP_INVALID,
         "create_kek rejects a group qualified with a foreign domain");
 
     hkdfguard::SetTestKeyUseGroupsOverride(std::vector<std::wstring>{L"  " + narrow_group + L"  "});
@@ -929,11 +929,11 @@ int main() {
     rc = InternalCreateKekResult(kServiceUseGroupsWide);
     Check(rc == HKDFGUARD_OK, "create_kek accepts a real group from the key-use policy (whitespace trimmed)");
     if (rc != HKDFGUARD_OK) {
-        // HKDFGUARD_ERR_ACCESS_DENIED (-13) here with the validation check
+        // HKDFGUARD_ERR_KEK_ACCESS_DENIED (-13) here with the validation check
         // above passing means the environment couldn't provision (this
         // process isn't elevated - NCryptFinalizeKey is the call that
         // actually enforces that for a new machine-scoped key, see
-        // kek_store.cpp's ThrowForNCryptFailure); HKDFGUARD_ERR_GROUP_INVALID
+        // kek_store.cpp's ThrowForNCryptFailure); HKDFGUARD_ERR_WIN_GROUP_INVALID
         // (-10) would mean the vetting inside ApplyKeyAcl disagreed with
         // ValidateKeyUseGroups - a real bug.
         std::printf("    (create_kek returned %d)\n", rc);
@@ -1105,7 +1105,7 @@ int main() {
     std::vector<uint8_t> gen_scratch(HKDFGUARD_WRAPPED_LEN);
     int32_t gen_scratch_len = static_cast<int32_t>(gen_scratch.size());
     rc = hkdfguard_generate_and_wrap_dek(nullptr, gen_scratch.data(), &gen_scratch_len);
-    Check(rc == HKDFGUARD_ERR_INVALID_ARG, "generate_and_wrap rejects null service");
+    Check(rc == HKDFGUARD_ERR_INVALID_SERVICE_NAME, "generate_and_wrap rejects null service");
 
     std::vector<uint8_t> gen_tiny_buf(HKDFGUARD_WRAPPED_LEN - 1);
     int32_t gen_tiny_buf_len = static_cast<int32_t>(gen_tiny_buf.size());
@@ -1117,7 +1117,7 @@ int main() {
     std::vector<uint8_t> scratch(HKDFGUARD_WRAPPED_LEN);
     int32_t scratch_len = static_cast<int32_t>(scratch.size());
     rc = hkdfguard_wrap_dek(kService, dek.data(), bad_len, scratch.data(), &scratch_len);
-    Check(rc == HKDFGUARD_ERR_INVALID_ARG, "wrap rejects wrong dek_len");
+    Check(rc == HKDFGUARD_ERR_INVALID_ARGUMENT, "wrap rejects wrong dek_len");
 
     // ---- 7. Buffer too small on wrap. ----
     // (Named `tiny_buf`/`tiny_out`, not `small`/`small_out`, because
@@ -1153,7 +1153,7 @@ int main() {
     int32_t malformed_out_len = static_cast<int32_t>(out_for_malformed.size());
     rc = hkdfguard_unwrap_dek(kService, truncated.data(), static_cast<int32_t>(truncated.size()),
                               out_for_malformed.data(), &malformed_out_len);
-    Check(rc == HKDFGUARD_ERR_MALFORMED, "unwrap rejects truncated payload");
+    Check(rc == HKDFGUARD_ERR_PAYLOAD_MALFORMED, "unwrap rejects truncated payload");
     Check(AllZero(out_for_malformed.data(), out_for_malformed.size()), "output buffer zeroed after malformed payload");
 
     // ---- 10. Corrupted ciphertext -> authentication failure, output zeroed. ----
@@ -1171,7 +1171,7 @@ int main() {
     int32_t auth_out_len = static_cast<int32_t>(out_for_auth.size());
     rc = hkdfguard_unwrap_dek(kService, corrupted.data(), static_cast<int32_t>(corrupted.size()),
                               out_for_auth.data(), &auth_out_len);
-    Check(rc == HKDFGUARD_ERR_AUTH_FAILED, "unwrap rejects corrupted ciphertext");
+    Check(rc == HKDFGUARD_ERR_PAYLOAD_AUTH_FAILED, "unwrap rejects corrupted ciphertext");
     Check(AllZero(out_for_auth.data(), out_for_auth.size()), "output buffer zeroed after auth failure");
 
     // ---- 11. Corrupted tag -> authentication failure, output zeroed. ----
@@ -1181,10 +1181,10 @@ int main() {
     int32_t tag_out_len = static_cast<int32_t>(out_for_tag.size());
     rc = hkdfguard_unwrap_dek(kService, corrupted_tag.data(), static_cast<int32_t>(corrupted_tag.size()),
                               out_for_tag.data(), &tag_out_len);
-    Check(rc == HKDFGUARD_ERR_AUTH_FAILED, "unwrap rejects corrupted tag");
+    Check(rc == HKDFGUARD_ERR_PAYLOAD_AUTH_FAILED, "unwrap rejects corrupted tag");
     Check(AllZero(out_for_tag.data(), out_for_tag.size()), "output buffer zeroed after tag failure");
 
-    // ---- 11b. Corrupted KEK fingerprint -> KEK_MISMATCH (not AUTH_FAILED), ----
+    // ---- 11b. Corrupted KEK fingerprint -> KEK_FINGERPRINT_MISMATCH (not PAYLOAD_AUTH_FAILED), ----
     //           output zeroed. The fingerprint is checked against the opened
     //           KEK before any ECDH/decryption, so a payload that doesn't
     //           belong to this KEK is distinguishable from a tampered one.
@@ -1195,7 +1195,7 @@ int main() {
     rc = hkdfguard_unwrap_dek(
         kService, corrupted_fingerprint.data(), static_cast<int32_t>(corrupted_fingerprint.size()),
         out_for_fingerprint.data(), &fingerprint_out_len);
-    Check(rc == HKDFGUARD_ERR_KEK_MISMATCH, "unwrap rejects a payload whose KEK fingerprint doesn't match as KEK_MISMATCH");
+    Check(rc == HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH, "unwrap rejects a payload whose KEK fingerprint doesn't match as KEK_FINGERPRINT_MISMATCH");
     Check(AllZero(out_for_fingerprint.data(), out_for_fingerprint.size()), "output buffer zeroed after fingerprint mismatch");
 
     // ---- 11c. Non-zero reserved bytes -> malformed, output zeroed. ----
@@ -1206,25 +1206,26 @@ int main() {
     rc = hkdfguard_unwrap_dek(
         kService, nonzero_reserved.data(), static_cast<int32_t>(nonzero_reserved.size()),
         out_for_reserved.data(), &reserved_out_len);
-    Check(rc == HKDFGUARD_ERR_MALFORMED, "unwrap rejects non-zero reserved bytes");
+    Check(rc == HKDFGUARD_ERR_PAYLOAD_MALFORMED, "unwrap rejects non-zero reserved bytes");
     Check(AllZero(out_for_reserved.data(), out_for_reserved.size()), "output buffer zeroed after reserved-bytes failure");
 
     // ---- 12. Invalid service (null / empty) is rejected on wrap. ----
-    // Null service fails the null-pointer check (HKDFGUARD_ERR_INVALID_ARG);
-    // an empty (but non-null) service fails the length check instead, which
-    // hkdfguard.cpp's ValidateAndConvertService reports as the more specific
-    // HKDFGUARD_ERR_SERVICE_NAME_INVALID - see check 17 below for the
-    // charset check that same function applies.
+    // Both a null service (the null-pointer check) and an empty (but
+    // non-null) one (the length check) are reported by hkdfguard.cpp's
+    // ValidateAndConvertService as HKDFGUARD_ERR_INVALID_SERVICE_NAME, not
+    // the generic HKDFGUARD_ERR_INVALID_ARGUMENT - matching the Linux and
+    // macOS builds of this ABI. See check 17 below for the charset check
+    // that same function applies.
     int32_t null_service_out_len = static_cast<int32_t>(scratch.size());
     rc = hkdfguard_wrap_dek(nullptr, dek.data(), static_cast<int32_t>(dek.size()), scratch.data(), &null_service_out_len);
-    Check(rc == HKDFGUARD_ERR_INVALID_ARG, "wrap rejects null service");
+    Check(rc == HKDFGUARD_ERR_INVALID_SERVICE_NAME, "wrap rejects null service");
 
     int32_t empty_service_out_len = static_cast<int32_t>(scratch.size());
     // `""` is a valid, non-null pointer to a single '\0' byte - a distinct
     // case from `nullptr` above, and this checks the length-based rejection
     // rather than the null-pointer rejection.
     rc = hkdfguard_wrap_dek("", dek.data(), static_cast<int32_t>(dek.size()), scratch.data(), &empty_service_out_len);
-    Check(rc == HKDFGUARD_ERR_SERVICE_NAME_INVALID, "wrap rejects empty service");
+    Check(rc == HKDFGUARD_ERR_INVALID_SERVICE_NAME, "wrap rejects empty service");
 
     // ---- 13. A different service gets its own independent KEK, and a ----
     //          payload wrapped under one service cannot be unwrapped under
@@ -1244,11 +1245,11 @@ int main() {
     rc = hkdfguard_unwrap_dek(kServiceOther, wrapped.data(), wrapped_len, out_wrong_service.data(), &out_wrong_service_len);
     // kServiceOther's own KEK now exists (created just above), so this
     // legitimately opens *that* KEK - whose fingerprint doesn't match the
-    // payload's - and is rejected as KEK_MISMATCH before any ECDH, rather
+    // payload's - and is rejected as KEK_FINGERPRINT_MISMATCH before any ECDH, rather
     // than failing to find a key at all (KEK_NOT_FOUND, the only other
     // correct outcome, if kServiceOther's KEK couldn't be created - e.g.
     // this process isn't elevated).
-    Check(rc == HKDFGUARD_ERR_KEK_MISMATCH || rc == HKDFGUARD_ERR_KEK_NOT_FOUND, "unwrap with the wrong service fails with KEK_MISMATCH");
+    Check(rc == HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH || rc == HKDFGUARD_ERR_KEK_NOT_FOUND, "unwrap with the wrong service fails with KEK_FINGERPRINT_MISMATCH");
     Check(AllZero(out_wrong_service.data(), out_wrong_service.size()), "output buffer zeroed after wrong-service failure");
 
     // ---- 14. Null-pointer argument validation, wrap side. ----
@@ -1257,14 +1258,14 @@ int main() {
     // pointers can't hide behind another argument also being invalid.
     int32_t null_arg_out_len = static_cast<int32_t>(scratch.size());
     rc = hkdfguard_wrap_dek(kService, nullptr, HKDFGUARD_DEK_LEN, scratch.data(), &null_arg_out_len);
-    Check(rc == HKDFGUARD_ERR_INVALID_ARG, "wrap rejects null dek");
+    Check(rc == HKDFGUARD_ERR_INVALID_ARGUMENT, "wrap rejects null dek");
 
     null_arg_out_len = static_cast<int32_t>(scratch.size());
     rc = hkdfguard_wrap_dek(kService, dek.data(), static_cast<int32_t>(dek.size()), nullptr, &null_arg_out_len);
-    Check(rc == HKDFGUARD_ERR_INVALID_ARG, "wrap rejects null out");
+    Check(rc == HKDFGUARD_ERR_INVALID_ARGUMENT, "wrap rejects null out");
 
     rc = hkdfguard_wrap_dek(kService, dek.data(), static_cast<int32_t>(dek.size()), scratch.data(), nullptr);
-    Check(rc == HKDFGUARD_ERR_INVALID_ARG, "wrap rejects null out_len");
+    Check(rc == HKDFGUARD_ERR_INVALID_ARGUMENT, "wrap rejects null out_len");
 
     // ---- 15. Negative dek_len is rejected the same way as any other wrong ----
     //          length (not just a too-small positive one) - a signed/unsigned
@@ -1272,7 +1273,7 @@ int main() {
     //          the `!= HKDFGUARD_DEK_LEN` check.
     int32_t neg_len_out_len = static_cast<int32_t>(scratch.size());
     rc = hkdfguard_wrap_dek(kService, dek.data(), -1, scratch.data(), &neg_len_out_len);
-    Check(rc == HKDFGUARD_ERR_INVALID_ARG, "wrap rejects negative dek_len");
+    Check(rc == HKDFGUARD_ERR_INVALID_ARGUMENT, "wrap rejects negative dek_len");
 
     // ---- 16. Service name length boundary: exactly 128 bytes (the documented ----
     //          maximum) succeeds; 129 bytes fails. Uses its own dedicated
@@ -1298,7 +1299,7 @@ int main() {
     int32_t service129_out_len = static_cast<int32_t>(scratch.size());
     rc = hkdfguard_wrap_dek(
         service129.c_str(), dek.data(), static_cast<int32_t>(dek.size()), scratch.data(), &service129_out_len);
-    Check(rc == HKDFGUARD_ERR_SERVICE_NAME_INVALID, "wrap rejects a service name one byte over the 128-byte maximum");
+    Check(rc == HKDFGUARD_ERR_INVALID_SERVICE_NAME, "wrap rejects a service name one byte over the 128-byte maximum");
 
     // ---- 17. A service name outside the alphanumeric-or-'.' allowlist is ----
     //          rejected - including one that's otherwise perfectly valid
@@ -1314,7 +1315,7 @@ int main() {
     int32_t invalid_utf8_out_len = static_cast<int32_t>(scratch.size());
     rc = hkdfguard_wrap_dek(
         kInvalidUtf8Service, dek.data(), static_cast<int32_t>(dek.size()), scratch.data(), &invalid_utf8_out_len);
-    Check(rc == HKDFGUARD_ERR_SERVICE_NAME_INVALID, "wrap rejects a service name that is not valid UTF-8");
+    Check(rc == HKDFGUARD_ERR_INVALID_SERVICE_NAME, "wrap rejects a service name that is not valid UTF-8");
 
     // ---- 18. A well-formed but non-ASCII UTF-8 service name is rejected. ----
     // UTF-8 bytes for U+00E9 (e-acute), U+65E5 (a CJK character), and
@@ -1328,19 +1329,19 @@ int main() {
     int32_t non_ascii_out_len = static_cast<int32_t>(scratch.size());
     rc = hkdfguard_wrap_dek(
         kNonAsciiService, dek.data(), static_cast<int32_t>(dek.size()), scratch.data(), &non_ascii_out_len);
-    Check(rc == HKDFGUARD_ERR_SERVICE_NAME_INVALID, "wrap rejects a well-formed but non-ASCII UTF-8 service name");
+    Check(rc == HKDFGUARD_ERR_INVALID_SERVICE_NAME, "wrap rejects a well-formed but non-ASCII UTF-8 service name");
 
     // ---- 19. Null-pointer argument validation, unwrap side. ----
     int32_t null_unwrap_out_len = static_cast<int32_t>(unwrapped.size());
     rc = hkdfguard_unwrap_dek(kService, wrapped.data(), wrapped_len, unwrapped.data(), nullptr);
-    Check(rc == HKDFGUARD_ERR_INVALID_ARG, "unwrap rejects null out_len");
+    Check(rc == HKDFGUARD_ERR_INVALID_ARGUMENT, "unwrap rejects null out_len");
 
     rc = hkdfguard_unwrap_dek(kService, wrapped.data(), wrapped_len, nullptr, &null_unwrap_out_len);
-    Check(rc == HKDFGUARD_ERR_INVALID_ARG, "unwrap rejects null out");
+    Check(rc == HKDFGUARD_ERR_INVALID_ARGUMENT, "unwrap rejects null out");
 
     null_unwrap_out_len = static_cast<int32_t>(unwrapped.size());
     rc = hkdfguard_unwrap_dek(kService, nullptr, wrapped_len, unwrapped.data(), &null_unwrap_out_len);
-    Check(rc == HKDFGUARD_ERR_INVALID_ARG, "unwrap rejects null wrapped");
+    Check(rc == HKDFGUARD_ERR_INVALID_ARGUMENT, "unwrap rejects null wrapped");
 
     // ---- 20. Invalid service (null / empty) is rejected on the unwrap side too. ----
     // Check 12 above only checked this for wrap; unwrap validates `service`
@@ -1349,11 +1350,11 @@ int main() {
     // point gets its own check.
     null_unwrap_out_len = static_cast<int32_t>(unwrapped.size());
     rc = hkdfguard_unwrap_dek(nullptr, wrapped.data(), wrapped_len, unwrapped.data(), &null_unwrap_out_len);
-    Check(rc == HKDFGUARD_ERR_INVALID_ARG, "unwrap rejects null service");
+    Check(rc == HKDFGUARD_ERR_INVALID_SERVICE_NAME, "unwrap rejects null service");
 
     null_unwrap_out_len = static_cast<int32_t>(unwrapped.size());
     rc = hkdfguard_unwrap_dek("", wrapped.data(), wrapped_len, unwrapped.data(), &null_unwrap_out_len);
-    Check(rc == HKDFGUARD_ERR_SERVICE_NAME_INVALID, "unwrap rejects empty service");
+    Check(rc == HKDFGUARD_ERR_INVALID_SERVICE_NAME, "unwrap rejects empty service");
 
     // ---- 21. Negative wrapped_len is rejected as malformed, not treated as ----
     //          an enormous unsigned length - ParseWrappedDek checks the sign
@@ -1361,9 +1362,9 @@ int main() {
     //          wire_format.cpp), and this is what proves that check is live.
     null_unwrap_out_len = static_cast<int32_t>(unwrapped.size());
     rc = hkdfguard_unwrap_dek(kService, wrapped.data(), -1, unwrapped.data(), &null_unwrap_out_len);
-    Check(rc == HKDFGUARD_ERR_MALFORMED, "unwrap rejects negative wrapped_len");
+    Check(rc == HKDFGUARD_ERR_PAYLOAD_MALFORMED, "unwrap rejects negative wrapped_len");
 
-    // ---- 22. Corrupted Version byte is rejected as malformed. ----
+    // ---- 22. Corrupted Version byte is rejected as unsupported. ----
     std::vector<uint8_t> corrupted_version = wrapped;
     corrupted_version[0] ^= 0xFF; // Version is byte offset 0 (see wire_format.h)
     std::vector<uint8_t> out_for_version(HKDFGUARD_DEK_LEN, 0xAA);
@@ -1371,7 +1372,7 @@ int main() {
     rc = hkdfguard_unwrap_dek(
         kService, corrupted_version.data(), static_cast<int32_t>(corrupted_version.size()),
         out_for_version.data(), &version_out_len);
-    Check(rc == HKDFGUARD_ERR_MALFORMED, "unwrap rejects a corrupted version byte");
+    Check(rc == HKDFGUARD_ERR_PAYLOAD_UNSUPPORTED, "unwrap rejects a corrupted version byte as unsupported");
     Check(AllZero(out_for_version.data(), out_for_version.size()), "output buffer zeroed after corrupted-version failure");
 
     // ---- 23. Corrupted ProviderType byte is rejected as malformed. ----
@@ -1384,7 +1385,7 @@ int main() {
     rc = hkdfguard_unwrap_dek(
         kService, corrupted_provider.data(), static_cast<int32_t>(corrupted_provider.size()),
         out_for_provider.data(), &provider_out_len);
-    Check(rc == HKDFGUARD_ERR_MALFORMED, "unwrap rejects an unrecognized provider type byte");
+    Check(rc == HKDFGUARD_ERR_PAYLOAD_MALFORMED, "unwrap rejects an unrecognized provider type byte");
     Check(AllZero(out_for_provider.data(), out_for_provider.size()), "output buffer zeroed after unrecognized-provider-type failure");
 
     // ---- 23b. A KeyId other than kCurrentKeyId is rejected as malformed. ----
@@ -1400,16 +1401,16 @@ int main() {
     rc = hkdfguard_unwrap_dek(
         kService, corrupted_key_id.data(), static_cast<int32_t>(corrupted_key_id.size()),
         out_for_key_id.data(), &key_id_out_len);
-    Check(rc == HKDFGUARD_ERR_MALFORMED, "unwrap rejects a KeyId other than kCurrentKeyId");
+    Check(rc == HKDFGUARD_ERR_PAYLOAD_MALFORMED, "unwrap rejects a KeyId other than kCurrentKeyId");
     Check(AllZero(out_for_key_id.data(), out_for_key_id.size()), "output buffer zeroed after unrecognized-KeyId failure");
 
     // ---- 24. Null-pointer argument validation, generate_and_wrap_dek. ----
     int32_t gen_null_out_len = static_cast<int32_t>(gen_scratch.size());
     rc = hkdfguard_generate_and_wrap_dek(kService, nullptr, &gen_null_out_len);
-    Check(rc == HKDFGUARD_ERR_INVALID_ARG, "generate_and_wrap rejects null out");
+    Check(rc == HKDFGUARD_ERR_INVALID_ARGUMENT, "generate_and_wrap rejects null out");
 
     rc = hkdfguard_generate_and_wrap_dek(kService, gen_scratch.data(), nullptr);
-    Check(rc == HKDFGUARD_ERR_INVALID_ARG, "generate_and_wrap rejects null out_len");
+    Check(rc == HKDFGUARD_ERR_INVALID_ARGUMENT, "generate_and_wrap rejects null out_len");
 
     // ---- 24b. Unwrap-side ephemeral public key validation gate. ----
     //          The ephemeral point in a payload is attacker-controlled and
@@ -1424,25 +1425,25 @@ int main() {
         Check(EphemeralGateResult(valid_point) == HKDFGUARD_OK, "ephemeral gate accepts a genuine P-256 point");
 
         std::vector<uint8_t> all_ff(hkdfguard::kEphemeralPubLen, 0xFF);
-        Check(EphemeralGateResult(all_ff) == HKDFGUARD_ERR_MALFORMED, "ephemeral gate rejects all-0xFF coordinates");
+        Check(EphemeralGateResult(all_ff) == HKDFGUARD_ERR_PAYLOAD_MALFORMED, "ephemeral gate rejects all-0xFF coordinates");
 
         std::vector<uint8_t> all_zero(hkdfguard::kEphemeralPubLen, 0x00);
-        Check(EphemeralGateResult(all_zero) == HKDFGUARD_ERR_MALFORMED, "ephemeral gate rejects all-zero coordinates");
+        Check(EphemeralGateResult(all_zero) == HKDFGUARD_ERR_PAYLOAD_MALFORMED, "ephemeral gate rejects all-zero coordinates");
 
         // A single flipped bit in X, and separately in Y, leaves a point
         // that is off the curve with overwhelming probability (~1 - 2^-256).
         std::vector<uint8_t> flipped_x = valid_point;
         flipped_x[0] ^= 0x01;
-        Check(EphemeralGateResult(flipped_x) == HKDFGUARD_ERR_MALFORMED, "ephemeral gate rejects a single-bit mutation in X");
+        Check(EphemeralGateResult(flipped_x) == HKDFGUARD_ERR_PAYLOAD_MALFORMED, "ephemeral gate rejects a single-bit mutation in X");
 
         std::vector<uint8_t> flipped_y = valid_point;
         flipped_y[hkdfguard::kEphemeralPubLen - 1] ^= 0x01;
-        Check(EphemeralGateResult(flipped_y) == HKDFGUARD_ERR_MALFORMED, "ephemeral gate rejects a single-bit mutation in Y");
+        Check(EphemeralGateResult(flipped_y) == HKDFGUARD_ERR_PAYLOAD_MALFORMED, "ephemeral gate rejects a single-bit mutation in Y");
     }
 
     // Through the public ABI: a payload whose EphemeralPublicKey field (bytes
     // 8..71, see wire_format.h) is overwritten with 0xFF must come back as
-    // HKDFGUARD_ERR_MALFORMED - not AUTH_FAILED or CRYPTO - with the output
+    // HKDFGUARD_ERR_PAYLOAD_MALFORMED - not PAYLOAD_AUTH_FAILED or CRYPTO_ERROR - with the output
     // zeroed, proving the gate runs before any ECDH is attempted.
     std::vector<uint8_t> bad_point_payload = wrapped;
     for (size_t i = hkdfguard::kEphemeralPubOffset; i < hkdfguard::kEphemeralPubOffset + hkdfguard::kEphemeralPubLen; ++i) {
@@ -1453,7 +1454,7 @@ int main() {
     rc = hkdfguard_unwrap_dek(
         kService, bad_point_payload.data(), static_cast<int32_t>(bad_point_payload.size()),
         out_for_bad_point.data(), &bad_point_out_len);
-    Check(rc == HKDFGUARD_ERR_MALFORMED, "unwrap rejects a payload whose ephemeral public key is not on P-256");
+    Check(rc == HKDFGUARD_ERR_PAYLOAD_MALFORMED, "unwrap rejects a payload whose ephemeral public key is not on P-256");
     Check(AllZero(out_for_bad_point.data(), out_for_bad_point.size()), "output buffer zeroed after invalid-ephemeral-point failure");
 
     // ---- 24c. hkdfguard_open_file: reads a wrapped-key file's bytes - ----
@@ -1532,12 +1533,12 @@ int main() {
         // Right size, wrong contents.
         std::vector<uint8_t> bad_version = wrapped;
         bad_version[hkdfguard::kVersionOffset] ^= 0xFF;
-        expectFailure(fileFor(L"badversion.key", bad_version), HKDFGUARD_ERR_MALFORMED,
+        expectFailure(fileFor(L"badversion.key", bad_version), HKDFGUARD_ERR_FILE_MALFORMED,
                       "a payload-sized file with a corrupted version byte is malformed");
-        expectFailure(fileFor(L"badpoint.key", bad_point_payload), HKDFGUARD_ERR_MALFORMED,
+        expectFailure(fileFor(L"badpoint.key", bad_point_payload), HKDFGUARD_ERR_FILE_MALFORMED,
                       "a payload-sized file whose ephemeral key is not on P-256 is malformed");
         expectFailure(fileFor(L"zeros.key", std::vector<uint8_t>(HKDFGUARD_WRAPPED_LEN, 0x00)),
-                      HKDFGUARD_ERR_MALFORMED, "164 zero bytes are malformed");
+                      HKDFGUARD_ERR_FILE_MALFORMED, "164 zero bytes are malformed");
 
         // Opening problems.
         expectFailure(ToUtf8(dir + L"\\missing.key"), HKDFGUARD_ERR_FILE_NOT_FOUND, "a missing file is not found");
@@ -1546,11 +1547,11 @@ int main() {
         expectFailure(ToUtf8(dir), HKDFGUARD_ERR_FILE_IO, "a directory is refused");
         // Device and network paths are refused before anything is opened -
         // so these are deterministic with no pipe server and no network.
-        expectFailure("NUL", HKDFGUARD_ERR_FILE_PATH_REJECTED, "a DOS device name (NUL) is refused");
-        expectFailure("\\\\.\\pipe\\hkdfguard-no-such-pipe", HKDFGUARD_ERR_FILE_PATH_REJECTED, "a named-pipe path is refused");
-        expectFailure("\\\\?\\GLOBALROOT\\Device\\Null", HKDFGUARD_ERR_FILE_PATH_REJECTED, "a device-namespace path is refused");
-        expectFailure("\\\\localhost\\C$\\Windows\\hkdfguard.key", HKDFGUARD_ERR_FILE_PATH_REJECTED, "a UNC path is refused");
-        expectFailure("\\\\?\\UNC\\localhost\\C$\\Windows\\hkdfguard.key", HKDFGUARD_ERR_FILE_PATH_REJECTED,
+        expectFailure("NUL", HKDFGUARD_ERR_FILE_UNTRUSTED, "a DOS device name (NUL) is refused");
+        expectFailure("\\\\.\\pipe\\hkdfguard-no-such-pipe", HKDFGUARD_ERR_FILE_UNTRUSTED, "a named-pipe path is refused");
+        expectFailure("\\\\?\\GLOBALROOT\\Device\\Null", HKDFGUARD_ERR_FILE_UNTRUSTED, "a device-namespace path is refused");
+        expectFailure("\\\\localhost\\C$\\Windows\\hkdfguard.key", HKDFGUARD_ERR_FILE_UNTRUSTED, "a UNC path is refused");
+        expectFailure("\\\\?\\UNC\\localhost\\C$\\Windows\\hkdfguard.key", HKDFGUARD_ERR_FILE_UNTRUSTED,
                       "an extended-prefix UNC path is refused");
 
         {
@@ -1584,12 +1585,12 @@ int main() {
         // Argument checks.
         int32_t len = HKDFGUARD_WRAPPED_LEN;
         std::vector<uint8_t> buf(HKDFGUARD_WRAPPED_LEN);
-        Check(hkdfguard_open_file(nullptr, buf.data(), &len) == HKDFGUARD_ERR_INVALID_ARG, "open_file rejects a null path");
+        Check(hkdfguard_open_file(nullptr, buf.data(), &len) == HKDFGUARD_ERR_INVALID_ARGUMENT, "open_file rejects a null path");
         len = HKDFGUARD_WRAPPED_LEN;
-        Check(hkdfguard_open_file(good.c_str(), nullptr, &len) == HKDFGUARD_ERR_INVALID_ARG, "open_file rejects a null out");
-        Check(hkdfguard_open_file(good.c_str(), buf.data(), nullptr) == HKDFGUARD_ERR_INVALID_ARG, "open_file rejects a null out_len");
-        expectFailure("", HKDFGUARD_ERR_INVALID_ARG, "an empty path is rejected");
-        expectFailure("bad\xC3\x28.key", HKDFGUARD_ERR_INVALID_ARG, "a path that is not valid UTF-8 is rejected");
+        Check(hkdfguard_open_file(good.c_str(), nullptr, &len) == HKDFGUARD_ERR_INVALID_ARGUMENT, "open_file rejects a null out");
+        Check(hkdfguard_open_file(good.c_str(), buf.data(), nullptr) == HKDFGUARD_ERR_INVALID_ARGUMENT, "open_file rejects a null out_len");
+        expectFailure("", HKDFGUARD_ERR_INVALID_ARGUMENT, "an empty path is rejected");
+        expectFailure("bad\xC3\x28.key", HKDFGUARD_ERR_INVALID_ARGUMENT, "a path that is not valid UTF-8 is rejected");
         r = open(good, HKDFGUARD_WRAPPED_LEN - 1);
         Check(r.rc == HKDFGUARD_ERR_BUFFER_TOO_SMALL && r.len == HKDFGUARD_WRAPPED_LEN,
               "open_file reports BUFFER_TOO_SMALL with the required size");
@@ -1626,7 +1627,7 @@ int main() {
             for (const Corruption& c : corruptions) {
                 std::vector<uint8_t> bytes = wrapped;
                 bytes[c.offset] = c.value;
-                expectFailure(fileFor(c.file, bytes), HKDFGUARD_ERR_MALFORMED, c.what);
+                expectFailure(fileFor(c.file, bytes), HKDFGUARD_ERR_FILE_MALFORMED, c.what);
             }
         }
 
@@ -1649,7 +1650,7 @@ int main() {
             std::vector<uint8_t> dek_out(HKDFGUARD_DEK_LEN);
             int32_t dek_out_len = static_cast<int32_t>(dek_out.size());
             rc = hkdfguard_unwrap_dek(kService, o.out.data(), o.len, dek_out.data(), &dek_out_len);
-            Check(rc == HKDFGUARD_ERR_KEK_MISMATCH, "...and the later unwrap is what rejects it (KEK_MISMATCH)");
+            Check(rc == HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH, "...and the later unwrap is what rejects it (KEK_FINGERPRINT_MISMATCH)");
         }
 
         // Sharing: other readers are fine; any writer blocks the read, and
@@ -1700,7 +1701,7 @@ int main() {
                 Check(false, "test setup: change into the scratch folder");
             }
 
-            expectFailure(std::string(32767 * 3 + 1, 'a'), HKDFGUARD_ERR_INVALID_ARG,
+            expectFailure(std::string(32767 * 3 + 1, 'a'), HKDFGUARD_ERR_INVALID_ARGUMENT,
                           "a path longer than the Win32 limit is rejected before any file access");
 
             // 8.3 short names are refused, never expanded. The scratch
@@ -1712,9 +1713,9 @@ int main() {
             const std::string long_file = fileFor(L"long-file-name.wrapped.key", wrapped);
             const std::wstring short_file = ShortNameFor(dir + L"\\long-file-name.wrapped.key", L"LONGFI~1.KEY");
             if (!short_folder.empty()) {
-                expectFailure(ToUtf8(short_folder + L"\\good.key"), HKDFGUARD_ERR_FILE_PATH_REJECTED,
+                expectFailure(ToUtf8(short_folder + L"\\good.key"), HKDFGUARD_ERR_FILE_UNTRUSTED,
                               "a path with an 8.3 short folder name is refused");
-                expectFailure(ToUtf8(short_folder + L"\\missing.key"), HKDFGUARD_ERR_FILE_PATH_REJECTED,
+                expectFailure(ToUtf8(short_folder + L"\\missing.key"), HKDFGUARD_ERR_FILE_UNTRUSTED,
                               "a short folder name is refused even when the file doesn't exist (not just NOT_FOUND)");
             } else {
                 Skip("open_file refuses an 8.3 short folder name (no short names here, and not elevated to assign one)");
@@ -1722,7 +1723,7 @@ int main() {
             size_t leaf_sep = short_file.find_last_of(L'\\');
             if (leaf_sep != std::wstring::npos) {
                 // Long folder, short file name: only the leaf is short.
-                expectFailure(ToUtf8(dir + short_file.substr(leaf_sep)), HKDFGUARD_ERR_FILE_PATH_REJECTED,
+                expectFailure(ToUtf8(dir + short_file.substr(leaf_sep)), HKDFGUARD_ERR_FILE_UNTRUSTED,
                               "a path with an 8.3 short file name is refused");
             } else {
                 Skip("open_file refuses an 8.3 short file name (no short names here, and not elevated to assign one)");
@@ -1744,7 +1745,7 @@ int main() {
         {
             const std::wstring junction = dir + L"\\junction";
             if (CreateJunction(junction, dir)) {
-                expectFailure(ToUtf8(junction + L"\\good.key"), HKDFGUARD_ERR_FILE_PATH_REJECTED,
+                expectFailure(ToUtf8(junction + L"\\good.key"), HKDFGUARD_ERR_FILE_UNTRUSTED,
                               "a file reached through a junction is refused");
                 RemoveDirectoryW(junction.c_str());
             } else {
@@ -1753,7 +1754,7 @@ int main() {
 
             const std::wstring file_link = dir + L"\\link.key";
             if (CreateSymbolicLinkW(file_link.c_str(), (dir + L"\\good.key").c_str(), 0)) {
-                expectFailure(ToUtf8(file_link), HKDFGUARD_ERR_FILE_PATH_REJECTED,
+                expectFailure(ToUtf8(file_link), HKDFGUARD_ERR_FILE_UNTRUSTED,
                               "a file symbolic link is refused, not followed");
                 DeleteFileW(file_link.c_str());
             } else if (GetLastError() == ERROR_PRIVILEGE_NOT_HELD) {
@@ -1764,7 +1765,7 @@ int main() {
 
             const std::wstring dir_link = dir + L"\\dirlink";
             if (CreateSymbolicLinkW(dir_link.c_str(), dir.c_str(), SYMBOLIC_LINK_FLAG_DIRECTORY)) {
-                expectFailure(ToUtf8(dir_link + L"\\good.key"), HKDFGUARD_ERR_FILE_PATH_REJECTED,
+                expectFailure(ToUtf8(dir_link + L"\\good.key"), HKDFGUARD_ERR_FILE_UNTRUSTED,
                               "a file reached through a directory symbolic link is refused");
                 RemoveDirectoryW(dir_link.c_str());
             } else if (GetLastError() == ERROR_PRIVILEGE_NOT_HELD) {
@@ -1785,7 +1786,7 @@ int main() {
             } else {
                 const std::wstring device = std::wstring(1, letter) + L":";
                 if (DefineDosDeviceW(0, device.c_str(), dir.c_str())) {
-                    expectFailure(ToUtf8(device + L"\\good.key"), HKDFGUARD_ERR_FILE_PATH_REJECTED,
+                    expectFailure(ToUtf8(device + L"\\good.key"), HKDFGUARD_ERR_FILE_UNTRUSTED,
                                   "a file reached through a SUBST drive is refused");
                     DefineDosDeviceW(DDD_REMOVE_DEFINITION | DDD_EXACT_MATCH_ON_REMOVE, device.c_str(), dir.c_str());
                 } else {
@@ -1816,7 +1817,7 @@ int main() {
         }
 
         // The ECDH provider the point check uses can't be opened: reported as
-        // CRYPTO (an infrastructure failure), never MALFORMED, which would
+        // CRYPTO_ERROR (an infrastructure failure), never FILE_MALFORMED, which would
         // wrongly blame a perfectly good file. Injected through the
         // test-only SetTestEcdhProviderFault seam, so this calls this test's
         // own compiled copy of ReadWrappedKeyFile, not the DLL - the DLL has
@@ -1828,18 +1829,18 @@ int main() {
 
             hkdfguard::SetTestEcdhProviderFault(true);
             Check(CodeOf([&] { hkdfguard::ValidateEphemeralPublicKey(wrapped.data() + hkdfguard::kEphemeralPubOffset); }) ==
-                      HKDFGUARD_ERR_CRYPTO,
-                  "ECDH provider unavailable: the point check reports CRYPTO, not MALFORMED");
-            Check(CodeOf([&] { hkdfguard::ReadWrappedKeyFile(good.c_str(), direct.data()); }) == HKDFGUARD_ERR_CRYPTO,
-                  "ECDH provider unavailable: reading a valid key file reports CRYPTO, not MALFORMED");
+                      HKDFGUARD_ERR_CRYPTO_ERROR,
+                  "ECDH provider unavailable: the point check reports CRYPTO_ERROR, not PAYLOAD_MALFORMED");
+            Check(CodeOf([&] { hkdfguard::ReadWrappedKeyFile(good.c_str(), direct.data()); }) == HKDFGUARD_ERR_CRYPTO_ERROR,
+                  "ECDH provider unavailable: reading a valid key file reports CRYPTO_ERROR, not FILE_MALFORMED");
             // Every check before the point check still decides first: a bad
-            // size or structure is reported as such, not as CRYPTO.
+            // size or structure is reported as such, not as CRYPTO_ERROR.
             Check(CodeOf([&] { hkdfguard::ReadWrappedKeyFile(ToUtf8(dir + L"\\plain.key").c_str(), direct.data()); }) ==
                       HKDFGUARD_ERR_FILE_PLAINTEXT_KEY,
                   "ECDH provider unavailable: a 32-byte file is still reported as a plaintext key");
             Check(CodeOf([&] { hkdfguard::ReadWrappedKeyFile(ToUtf8(dir + L"\\badversion.key").c_str(), direct.data()); }) ==
-                      HKDFGUARD_ERR_MALFORMED,
-                  "ECDH provider unavailable: a structurally bad file is still reported as MALFORMED");
+                      HKDFGUARD_ERR_FILE_MALFORMED,
+                  "ECDH provider unavailable: a structurally bad file is still reported as FILE_MALFORMED");
             // The shipped DLL has no seam: its own open_file is unaffected.
             r = open(good);
             Check(r.rc == HKDFGUARD_OK && r.out == wrapped,
@@ -1889,7 +1890,7 @@ int main() {
         /*tpmMayBeUnavailable=*/true); // no fallback - may legitimately fail without real TPM hardware
 
     // ---- 25b. An invalid KeyStoragePolicy value fails closed with ----
-    //           HKDFGUARD_ERR_INVALID_POLICY, rather than being silently
+    //           HKDFGUARD_ERR_POLICY_INVALID, rather than being silently
     //           treated as PreferTpm. KeyStoragePolicy::Invalid is exactly
     //           what policy.cpp's ParsePolicyValue returns for a REG_DWORD
     //           value that isn't 0/1/2, or what LoadEffectivePolicy returns
@@ -1911,23 +1912,23 @@ int main() {
     try {
         hkdfguard::KekExists(kServiceLifecycleWide);
     } catch (const hkdfguard::HkdfGuardError &e) {
-        kek_exists_rejects_invalid_policy = (e.code() == HKDFGUARD_ERR_INVALID_POLICY);
+        kek_exists_rejects_invalid_policy = (e.code() == HKDFGUARD_ERR_POLICY_INVALID);
     } catch (...) {
     }
-    Check(kek_exists_rejects_invalid_policy, "KekExists fails closed with INVALID_POLICY for an unrecognized policy value");
+    Check(kek_exists_rejects_invalid_policy, "KekExists fails closed with POLICY_INVALID for an unrecognized policy value");
 
     Check(
-        InternalCreateKekResult(kServiceLifecycleWide) == HKDFGUARD_ERR_INVALID_POLICY,
-        "create_kek fails closed with INVALID_POLICY for an unrecognized policy value");
+        InternalCreateKekResult(kServiceLifecycleWide) == HKDFGUARD_ERR_POLICY_INVALID,
+        "create_kek fails closed with POLICY_INVALID for an unrecognized policy value");
 
     bool wrap_rejects_invalid_policy = false;
     try {
         hkdfguard::OpenKekForWrap(kServiceLifecycleWide);
     } catch (const hkdfguard::HkdfGuardError &e) {
-        wrap_rejects_invalid_policy = (e.code() == HKDFGUARD_ERR_INVALID_POLICY);
+        wrap_rejects_invalid_policy = (e.code() == HKDFGUARD_ERR_POLICY_INVALID);
     } catch (...) {
     }
-    Check(wrap_rejects_invalid_policy, "wrap fails closed with INVALID_POLICY for an unrecognized policy value");
+    Check(wrap_rejects_invalid_policy, "wrap fails closed with POLICY_INVALID for an unrecognized policy value");
 
     hkdfguard::SetTestPolicyOverride(std::nullopt);
 
@@ -1939,12 +1940,12 @@ int main() {
     //           SetTestTpmProviderNameOverride - a test-only seam, absent
     //           from HkdfGuardV1.dll), so this is deterministic on hardware
     //           that does have a TPM. Guards against the regression where
-    //           KekExists threw HKDFGUARD_ERR_PROVIDER here while CreateKek
+    //           KekExists threw HKDFGUARD_ERR_PROVIDER_ERROR here while CreateKek
     //           and OpenKekForWrap on the same host happily fell back -
     //           which made hkdfguard_kek_exists, and so the CLI's
     //           `provision`, fail on exactly the hosts the fallback is for.
     //           The RequireTpm half checks the opposite contract: with no
-    //           TPM, "exists?" must fail closed with PROVIDER rather than
+    //           TPM, "exists?" must fail closed with PROVIDER_ERROR rather than
     //           answer from the software provider.
     constexpr const wchar_t* kServiceNoTpmWide = L"hkdfguardwin.test.policy.notpm";
     hkdfguard::SetTestTpmProviderNameOverride(L"hkdfguard-native-windows test: no such provider");
@@ -1957,7 +1958,7 @@ int main() {
         std::printf("    (KekExists threw code %d: %s)\n", e.code(), e.what());
     } catch (...) {
     }
-    Check(no_tpm_exists_is_false, "PreferTpm with no TPM: KekExists falls through to software and reports false (not PROVIDER)");
+    Check(no_tpm_exists_is_false, "PreferTpm with no TPM: KekExists falls through to software and reports false (not PROVIDER_ERROR)");
 
     // The create/exists/open/delete sequence needs elevation like every other
     // KEK creation in this suite; without it, this reports a failure that is
@@ -1979,17 +1980,17 @@ int main() {
     try {
         hkdfguard::KekExists(kServiceNoTpmWide);
     } catch (const hkdfguard::HkdfGuardError &e) {
-        require_tpm_no_tpm_fails_closed = (e.code() == HKDFGUARD_ERR_PROVIDER);
+        require_tpm_no_tpm_fails_closed = (e.code() == HKDFGUARD_ERR_PROVIDER_ERROR);
     } catch (...) {
     }
-    Check(require_tpm_no_tpm_fails_closed, "RequireTpm with no TPM: KekExists fails closed with PROVIDER, never answers from software");
+    Check(require_tpm_no_tpm_fails_closed, "RequireTpm with no TPM: KekExists fails closed with PROVIDER_ERROR, never answers from software");
 
     hkdfguard::SetTestPolicyOverride(std::nullopt);
     hkdfguard::SetTestTpmProviderNameOverride(std::nullopt);
 
     // ---- 25d. Re-provisioning a KEK whose ACL has been widened since ----
     //           creation (or that was pre-planted with a wide ACL) fails
-    //           with HKDFGUARD_ERR_KEK_ACL_INVALID, and the key is left
+    //           with HKDFGUARD_ERR_KEK_INVALID, and the key is left
     //           exactly where it was - never deleted or replaced. Before
     //           this check, create_kek accepted any existing key under the
     //           service's name as "already provisioned" without looking at
@@ -2058,8 +2059,8 @@ int main() {
 
         if (widened) {
             Check(
-                InternalCreateKekResult(kServiceAclWidenedWide) == HKDFGUARD_ERR_KEK_ACL_INVALID,
-                "create_kek rejects an existing KEK whose ACL grants an over-broad principal (KEK_ACL_INVALID)");
+                InternalCreateKekResult(kServiceAclWidenedWide) == HKDFGUARD_ERR_KEK_INVALID,
+                "create_kek rejects an existing KEK whose ACL grants an over-broad principal (KEK_INVALID)");
             Check(
                 hkdfguard::KekExists(kServiceAclWidenedWide),
                 "a KEK rejected for its ACL is left in place, not deleted");
@@ -2100,12 +2101,12 @@ int main() {
             hkdfguard::TestTpmFaults notReady;
             notReady.openKeyStatus = NTE_DEVICE_NOT_READY;
             hkdfguard::SetTestTpmFaults(notReady);
-            Check(CodeOf([&] { hkdfguard::KekExists(kServiceProbeFault); }) == HKDFGUARD_ERR_PROVIDER,
-                  "PreferTpm, TPM probe error: KekExists fails with PROVIDER instead of answering from software");
-            Check(CodeOf([&] { hkdfguard::OpenKekForWrap(kServiceProbeFault); }) == HKDFGUARD_ERR_PROVIDER,
-                  "PreferTpm, TPM probe error: wrap fails with PROVIDER instead of falling back");
-            Check(CodeOf([&] { hkdfguard::CreateKek(kServiceProbeFault); }) == HKDFGUARD_ERR_PROVIDER,
-                  "PreferTpm, TPM probe error: create_kek fails with PROVIDER instead of falling back");
+            Check(CodeOf([&] { hkdfguard::KekExists(kServiceProbeFault); }) == HKDFGUARD_ERR_PROVIDER_ERROR,
+                  "PreferTpm, TPM probe error: KekExists fails with PROVIDER_ERROR instead of answering from software");
+            Check(CodeOf([&] { hkdfguard::OpenKekForWrap(kServiceProbeFault); }) == HKDFGUARD_ERR_PROVIDER_ERROR,
+                  "PreferTpm, TPM probe error: wrap fails with PROVIDER_ERROR instead of falling back");
+            Check(CodeOf([&] { hkdfguard::CreateKek(kServiceProbeFault); }) == HKDFGUARD_ERR_PROVIDER_ERROR,
+                  "PreferTpm, TPM probe error: create_kek fails with PROVIDER_ERROR instead of falling back");
             Check(!MachineKeyExists(MS_KEY_STORAGE_PROVIDER, KekNameFor(kServiceProbeFault)),
                   "PreferTpm, TPM probe error: no software KEK is created");
         } else {
@@ -2147,11 +2148,11 @@ int main() {
                 hkdfguard::TestTpmFaults verifyFails;
                 verifyFails.failVerification = true;
                 hkdfguard::SetTestTpmFaults(verifyFails);
-                Check(CodeOf([&] { hkdfguard::CreateKek(kServiceVerifyFault); }) == HKDFGUARD_ERR_PROVIDER,
+                Check(CodeOf([&] { hkdfguard::CreateKek(kServiceVerifyFault); }) == HKDFGUARD_ERR_PROVIDER_ERROR,
                       "PreferTpm, existing TPM KEK fails verification: create_kek fails instead of falling back");
                 Check(!MachineKeyExists(MS_KEY_STORAGE_PROVIDER, KekNameFor(kServiceVerifyFault)),
                       "PreferTpm, existing TPM KEK fails verification: no software KEK is created beside it");
-                Check(CodeOf([&] { hkdfguard::OpenKekForWrap(kServiceVerifyFault); }) == HKDFGUARD_ERR_PROVIDER,
+                Check(CodeOf([&] { hkdfguard::OpenKekForWrap(kServiceVerifyFault); }) == HKDFGUARD_ERR_PROVIDER_ERROR,
                       "PreferTpm, existing TPM KEK fails verification: wrap fails instead of falling back");
                 Check(MachineKeyExists(MS_PLATFORM_CRYPTO_PROVIDER, KekNameFor(kServiceVerifyFault)),
                       "PreferTpm, existing TPM KEK fails verification: the TPM KEK is left in place");
@@ -2198,9 +2199,9 @@ int main() {
             bool plantedOk = PlantSoftwareKey(name, p.algorithm, p.curve, p.exportable);
             Check(plantedOk, ("test setup: plant " + label).c_str());
             if (plantedOk) {
-                Check(CodeOf([&] { hkdfguard::CreateKek(p.service); }) == HKDFGUARD_ERR_PROVIDER,
+                Check(CodeOf([&] { hkdfguard::CreateKek(p.service); }) == HKDFGUARD_ERR_PROVIDER_ERROR,
                       ("create_kek refuses a pre-planted " + label).c_str());
-                Check(CodeOf([&] { hkdfguard::OpenKekForWrap(p.service); }) == HKDFGUARD_ERR_PROVIDER,
+                Check(CodeOf([&] { hkdfguard::OpenKekForWrap(p.service); }) == HKDFGUARD_ERR_PROVIDER_ERROR,
                       ("wrap refuses a pre-planted " + label).c_str());
                 Check(MachineKeyExists(MS_KEY_STORAGE_PROVIDER, name),
                       ("a refused pre-planted " + label + " is left in place").c_str());
@@ -2246,7 +2247,7 @@ int main() {
                     Check(set, ("test setup: set an ACL with " + label).c_str());
                     if (set) {
                         Check(CodeOf([&] { hkdfguard::CreateKek(kServiceAclEntries); }) ==
-                                  HKDFGUARD_ERR_KEK_ACL_INVALID,
+                                  HKDFGUARD_ERR_KEK_INVALID,
                               ("create_kek rejects an existing KEK whose ACL has " + label).c_str());
                         Check(MachineKeyExists(MS_KEY_STORAGE_PROVIDER, name),
                               ("a KEK rejected for " + label + " is left in place").c_str());

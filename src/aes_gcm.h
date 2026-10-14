@@ -38,8 +38,8 @@ namespace hkdfguard {
     // bytes), authenticating `aad_len` bytes of `aad` alongside it (`aad` may
     // be null iff `aad_len` is 0, and must match what was passed to
     // AesGcmEncrypt or authentication fails). Writes the plaintext directly
-    // into `plaintext_out`. Throws HkdfGuardError(HKDFGUARD_ERR_AUTH_FAILED) if
-    // the tag does not verify, or HkdfGuardError(HKDFGUARD_ERR_CRYPTO) on any
+    // into `plaintext_out`. Throws HkdfGuardError(HKDFGUARD_ERR_PAYLOAD_AUTH_FAILED) if
+    // the tag does not verify, or HkdfGuardError(HKDFGUARD_ERR_CRYPTO_ERROR) on any
     // other failure. Callers must not trust the contents of `plaintext_out`
     // unless this function returns normally.
     void AesGcmDecrypt(

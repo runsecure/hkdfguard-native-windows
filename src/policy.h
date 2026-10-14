@@ -20,7 +20,7 @@ namespace hkdfguard {
         // trailing "invalid policy" throw after the switch (KekExists,
         // CreateKek, OpenKekForWrap), or checks for this sentinel directly
         // (OpenKekForUnwrap) - both fail closed with
-        // HKDFGUARD_ERR_INVALID_POLICY the moment this value appears.
+        // HKDFGUARD_ERR_POLICY_INVALID the moment this value appears.
         Invalid = 0xFFFFFFFFu,
     };
 
@@ -41,7 +41,7 @@ namespace hkdfguard {
     // - and silently substituting PreferTpm would mean a typo can quietly
     // weaken protection instead of being surfaced as the configuration
     // error it is. Every caller of this function turns
-    // KeyStoragePolicy::Invalid into HKDFGUARD_ERR_INVALID_POLICY.
+    // KeyStoragePolicy::Invalid into HKDFGUARD_ERR_POLICY_INVALID.
     //
     // Reads the real registry value (see policy.cpp). When this translation
     // unit is built with HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE defined, a

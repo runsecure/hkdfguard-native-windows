@@ -25,22 +25,24 @@
 //                     wrap that produced it - which also makes a substituted
 //                     older payload visible, since deployment rollback is
 //                     deliberately allowed by the format itself.
-//   2000 Warning      ACCESS_DENIED on any call: someone tried to use (or
+//   2000 Warning      KEK_ACCESS_DENIED on any call: someone tried to use (or
 //                     create) a KEK they aren't authorized for, or tried
 //                     to provision without elevation.
-//   2002 Error        KEK_ACL_INVALID: an existing KEK under a service's
+//   2002 Error        KEK_INVALID: an existing KEK under a service's
 //                     name has an ACL this library would never create -
 //                     possibly pre-planted or widened. Worth investigating.
-//   2003 Warning      AUTH_FAILED / KEK_MISMATCH / MALFORMED on unwrap: the
-//                     payload was tampered with, truncated, wrapped for a
-//                     different service, or under a different KEK.
-//   2004 Error        INVALID_POLICY / GROUP_INVALID: the machine policy in
+//   2003 Warning      PAYLOAD_AUTH_FAILED / KEK_FINGERPRINT_MISMATCH /
+//                     PAYLOAD_MALFORMED / PAYLOAD_UNSUPPORTED on unwrap:
+//                     the payload was tampered with, truncated, wrapped
+//                     for a different service, under a different KEK, or
+//                     in a format version this build does not know.
+//   2004 Error        POLICY_INVALID / WIN_GROUP_INVALID: the machine policy in
 //                     the registry is misconfigured, so calls fail closed.
-//   2005 Error        PROVIDER / CRYPTO / INTERNAL: the key storage
-//                     provider or crypto layer itself failed.
+//   2005 Error        PROVIDER_ERROR / CRYPTO_ERROR / INTERNAL_ERROR: the
+//                     key storage provider or crypto layer itself failed.
 //
-// Not logged: INVALID_ARG / BUFFER_TOO_SMALL /
-// SERVICE_NAME_INVALID (caller programming errors), and KEK_NOT_FOUND
+// Not logged: INVALID_ARGUMENT / BUFFER_TOO_SMALL /
+// INVALID_SERVICE_NAME (caller programming errors), and KEK_NOT_FOUND
 // (the normal "provision first" state). Nothing secret is ever logged -
 // only the service name, provider, operation, error code, calling user
 // and calling process.
@@ -72,27 +74,31 @@ namespace hkdfguard {
         const wchar_t *CodeName(int32_t code) noexcept {
             switch (code) {
                 case HKDFGUARD_OK: return L"HKDFGUARD_OK";
-                case HKDFGUARD_ERR_INVALID_ARG: return L"HKDFGUARD_ERR_INVALID_ARG";
+                case HKDFGUARD_ERR_INVALID_ARGUMENT: return L"HKDFGUARD_ERR_INVALID_ARGUMENT";
                 case HKDFGUARD_ERR_BUFFER_TOO_SMALL: return L"HKDFGUARD_ERR_BUFFER_TOO_SMALL";
-                case HKDFGUARD_ERR_PROVIDER: return L"HKDFGUARD_ERR_PROVIDER";
-                case HKDFGUARD_ERR_CRYPTO: return L"HKDFGUARD_ERR_CRYPTO";
-                case HKDFGUARD_ERR_AUTH_FAILED: return L"HKDFGUARD_ERR_AUTH_FAILED";
-                case HKDFGUARD_ERR_MALFORMED: return L"HKDFGUARD_ERR_MALFORMED";
-                case HKDFGUARD_ERR_INTERNAL: return L"HKDFGUARD_ERR_INTERNAL";
-                case HKDFGUARD_ERR_SERVICE_NAME_INVALID: return L"HKDFGUARD_ERR_SERVICE_NAME_INVALID";
-                case HKDFGUARD_ERR_INVALID_POLICY: return L"HKDFGUARD_ERR_INVALID_POLICY";
-                case HKDFGUARD_ERR_GROUP_INVALID: return L"HKDFGUARD_ERR_GROUP_INVALID";
-                case HKDFGUARD_ERR_KEK_MISMATCH: return L"HKDFGUARD_ERR_KEK_MISMATCH";
+                case HKDFGUARD_ERR_PROVIDER_UNAVAILABLE: return L"HKDFGUARD_ERR_PROVIDER_UNAVAILABLE";
+                case HKDFGUARD_ERR_PROVIDER_ERROR: return L"HKDFGUARD_ERR_PROVIDER_ERROR";
+                case HKDFGUARD_ERR_CRYPTO_ERROR: return L"HKDFGUARD_ERR_CRYPTO_ERROR";
+                case HKDFGUARD_ERR_INTERNAL_ERROR: return L"HKDFGUARD_ERR_INTERNAL_ERROR";
+                case HKDFGUARD_ERR_INVALID_SERVICE_NAME: return L"HKDFGUARD_ERR_INVALID_SERVICE_NAME";
+                case HKDFGUARD_ERR_POLICY_INVALID: return L"HKDFGUARD_ERR_POLICY_INVALID";
+                case HKDFGUARD_ERR_PAYLOAD_MALFORMED: return L"HKDFGUARD_ERR_PAYLOAD_MALFORMED";
+                case HKDFGUARD_ERR_PAYLOAD_AUTH_FAILED: return L"HKDFGUARD_ERR_PAYLOAD_AUTH_FAILED";
+                case HKDFGUARD_ERR_PAYLOAD_UNSUPPORTED: return L"HKDFGUARD_ERR_PAYLOAD_UNSUPPORTED";
+                case HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH: return L"HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH";
                 case HKDFGUARD_ERR_KEK_NOT_FOUND: return L"HKDFGUARD_ERR_KEK_NOT_FOUND";
-                case HKDFGUARD_ERR_ACCESS_DENIED: return L"HKDFGUARD_ERR_ACCESS_DENIED";
-                case HKDFGUARD_ERR_KEK_ACL_INVALID: return L"HKDFGUARD_ERR_KEK_ACL_INVALID";
+                case HKDFGUARD_ERR_KEK_ACCESS_DENIED: return L"HKDFGUARD_ERR_KEK_ACCESS_DENIED";
+                case HKDFGUARD_ERR_KEK_INVALID: return L"HKDFGUARD_ERR_KEK_INVALID";
+                case HKDFGUARD_ERR_PROCESS_HARDENING_FAILED: return L"HKDFGUARD_ERR_PROCESS_HARDENING_FAILED";
                 case HKDFGUARD_ERR_FILE_NOT_FOUND: return L"HKDFGUARD_ERR_FILE_NOT_FOUND";
                 case HKDFGUARD_ERR_FILE_ACCESS_DENIED: return L"HKDFGUARD_ERR_FILE_ACCESS_DENIED";
                 case HKDFGUARD_ERR_FILE_IO: return L"HKDFGUARD_ERR_FILE_IO";
                 case HKDFGUARD_ERR_FILE_TOO_SHORT: return L"HKDFGUARD_ERR_FILE_TOO_SHORT";
                 case HKDFGUARD_ERR_FILE_TOO_LONG: return L"HKDFGUARD_ERR_FILE_TOO_LONG";
                 case HKDFGUARD_ERR_FILE_PLAINTEXT_KEY: return L"HKDFGUARD_ERR_FILE_PLAINTEXT_KEY";
-                case HKDFGUARD_ERR_FILE_PATH_REJECTED: return L"HKDFGUARD_ERR_FILE_PATH_REJECTED";
+                case HKDFGUARD_ERR_FILE_MALFORMED: return L"HKDFGUARD_ERR_FILE_MALFORMED";
+                case HKDFGUARD_ERR_FILE_UNTRUSTED: return L"HKDFGUARD_ERR_FILE_UNTRUSTED";
+                case HKDFGUARD_ERR_WIN_GROUP_INVALID: return L"HKDFGUARD_ERR_WIN_GROUP_INVALID";
                 default: return L"(unknown code)";
             }
         }
@@ -250,7 +256,7 @@ namespace hkdfguard {
             const wchar_t *meaning = L"";
 
             switch (code) {
-                case HKDFGUARD_ERR_ACCESS_DENIED:
+                case HKDFGUARD_ERR_KEK_ACCESS_DENIED:
                     eventId = kEvtAccessDenied;
                     type = EVENTLOG_WARNING_TYPE;
                     meaning = op == AuditOp::CreateKek
@@ -258,40 +264,44 @@ namespace hkdfguard {
                                     L"without an elevated process"
                                   : L"the caller is not authorized to use this KEK";
                     break;
-                case HKDFGUARD_ERR_KEK_ACL_INVALID:
+                case HKDFGUARD_ERR_KEK_INVALID:
                     eventId = kEvtKekAclInvalid;
                     meaning = L"a KEK already exists under this service name, but its ACL is missing, lacks "
                               L"SYSTEM/Administrators, or grants an over-broad principal - it may have been "
                               L"pre-planted or widened; it was left untouched";
                     break;
-                case HKDFGUARD_ERR_AUTH_FAILED:
-                case HKDFGUARD_ERR_KEK_MISMATCH:
-                case HKDFGUARD_ERR_MALFORMED:
+                case HKDFGUARD_ERR_PAYLOAD_AUTH_FAILED:
+                case HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH:
+                case HKDFGUARD_ERR_PAYLOAD_MALFORMED:
+                case HKDFGUARD_ERR_PAYLOAD_UNSUPPORTED:
                     if (op != AuditOp::Unwrap) {
                         return;
                     }
                     eventId = kEvtIntegrityFailure;
                     type = EVENTLOG_WARNING_TYPE;
-                    meaning = code == HKDFGUARD_ERR_AUTH_FAILED
+                    meaning = code == HKDFGUARD_ERR_PAYLOAD_AUTH_FAILED
                                   ? L"the payload failed authentication: tampered with, or presented for the "
                                     L"wrong service"
-                                  : code == HKDFGUARD_ERR_KEK_MISMATCH
+                                  : code == HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH
                                         ? L"the payload was not wrapped under this service's current KEK"
-                                        : L"the payload is not a valid wrapped DEK (truncated, corrupted, or "
-                                          L"tampered with)";
+                                        : code == HKDFGUARD_ERR_PAYLOAD_UNSUPPORTED
+                                              ? L"the payload's format version is not one this build "
+                                                L"understands (corrupted, tampered with, or from a newer version)"
+                                              : L"the payload is not a valid wrapped DEK (truncated, corrupted, "
+                                                L"or tampered with)";
                     break;
-                case HKDFGUARD_ERR_INVALID_POLICY:
-                case HKDFGUARD_ERR_GROUP_INVALID:
+                case HKDFGUARD_ERR_POLICY_INVALID:
+                case HKDFGUARD_ERR_WIN_GROUP_INVALID:
                     eventId = kEvtPolicyInvalid;
-                    meaning = code == HKDFGUARD_ERR_INVALID_POLICY
+                    meaning = code == HKDFGUARD_ERR_POLICY_INVALID
                                   ? L"HKLM\\Software\\Policies\\HkdfGuard\\KeyStoragePolicy is present but not a "
                                     L"valid REG_DWORD 0, 1 or 2; every call fails closed until it is fixed"
                                   : L"an entry in HKLM\\Software\\Policies\\HkdfGuard\\KeyUseGroups is "
                                     L"unresolvable, not a group, over-broad, or not host-local";
                     break;
-                case HKDFGUARD_ERR_PROVIDER:
-                case HKDFGUARD_ERR_CRYPTO:
-                case HKDFGUARD_ERR_INTERNAL:
+                case HKDFGUARD_ERR_PROVIDER_ERROR:
+                case HKDFGUARD_ERR_CRYPTO_ERROR:
+                case HKDFGUARD_ERR_INTERNAL_ERROR:
                     eventId = kEvtOperationFailed;
                     meaning = L"the key storage provider or a cryptographic operation failed";
                     break;

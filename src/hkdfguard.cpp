@@ -71,11 +71,11 @@ namespace {
     // which would make wrap/unwrap fail whenever the two calls' casing
     // didn't match exactly.
     //
-    // Throws HkdfGuardError if `service` is null, empty, too long, or
-    // contains a character outside the allowed charset.
+    // Throws HkdfGuardError(HKDFGUARD_ERR_INVALID_SERVICE_NAME) if `service` is null,
+    // empty, too long, or contains a character outside the allowed charset.
     std::string NormalizeService(const char *service) {
         if (service == nullptr) {
-            throw HkdfGuardError(HKDFGUARD_ERR_INVALID_ARG, "service is null");
+            throw HkdfGuardError(HKDFGUARD_ERR_INVALID_SERVICE_NAME, "service is null");
         }
         // strnlen behaves like the familiar strlen (walk forward until a '\0'
         // byte, return how many bytes were seen) but stops early and returns
@@ -89,14 +89,14 @@ namespace {
         // C string).
         size_t len = strnlen(service, kMaxServiceLen + 1);
         if (len == 0 || len > kMaxServiceLen) {
-            throw HkdfGuardError(HKDFGUARD_ERR_SERVICE_NAME_INVALID, "service is empty or too long");
+            throw HkdfGuardError(HKDFGUARD_ERR_INVALID_SERVICE_NAME, "service is empty or too long");
         }
 
         std::string normalized(service, len);
         for (char &c : normalized) {
             if (!IsValidServiceChar(c)) {
                 throw HkdfGuardError(
-                    HKDFGUARD_ERR_SERVICE_NAME_INVALID,
+                    HKDFGUARD_ERR_INVALID_SERVICE_NAME,
                     "service contains invalid characters");
             }
             c = ToLowerServiceChar(c);
@@ -108,7 +108,7 @@ namespace {
     // wide string used as part of the persisted KEK's name. Every byte in
     // `normalized` is, by construction, ASCII alphanumeric or '.', so this
     // conversion cannot actually fail today - MB_ERR_INVALID_CHARS and the
-    // resulting HKDFGUARD_ERR_INVALID_ARG are kept anyway as defense in
+    // resulting HKDFGUARD_ERR_INVALID_SERVICE_NAME are kept anyway as defense in
     // depth, in case NormalizeService's contract ever changes without this
     // call site being updated to match.
     std::wstring ServiceToWide(const std::string &normalized) {
@@ -119,7 +119,7 @@ namespace {
         int wide_len = MultiByteToWideChar(
             CP_UTF8, MB_ERR_INVALID_CHARS, normalized.c_str(), static_cast<int>(normalized.size()), nullptr, 0);
         if (wide_len <= 0) {
-            throw HkdfGuardError(HKDFGUARD_ERR_INVALID_ARG, "service is not valid UTF-8");
+            throw HkdfGuardError(HKDFGUARD_ERR_INVALID_SERVICE_NAME, "service is not valid UTF-8");
         }
         // `std::wstring wide(static_cast<size_t>(wide_len), L'\0')`
         // constructs a wide string of exactly `wide_len` characters, every
@@ -170,10 +170,10 @@ namespace {
         // Basic null-pointer validation before touching any of the pointers.
         // `dek_len`/`out_len` themselves are validated next.
         if (dek == nullptr || out == nullptr || out_len == nullptr) {
-            return HKDFGUARD_ERR_INVALID_ARG;
+            return HKDFGUARD_ERR_INVALID_ARGUMENT;
         }
         if (dek_len != HKDFGUARD_DEK_LEN) {
-            return HKDFGUARD_ERR_INVALID_ARG;
+            return HKDFGUARD_ERR_INVALID_ARGUMENT;
         }
         // `*out_len` dereferences the pointer to read the caller-supplied
         // buffer capacity (the "in" half of this in/out parameter - see
@@ -193,7 +193,7 @@ namespace {
         // TPM/vTPM-backed Platform Crypto Provider and falling back to the
         // Software Key Storage Provider automatically. Never creates one -
         // hkdfguard_create_kek must have already provisioned it (see
-        // kek_store.h/.cpp) - so this fails with HKDFGUARD_ERR_PROVIDER if
+        // kek_store.h/.cpp) - so this fails with HKDFGUARD_ERR_PROVIDER_ERROR if
         // the service has no KEK yet.
         ResolvedKek kek = OpenKekForWrap(service_name);
 
@@ -309,7 +309,7 @@ extern "C" HKDFGUARD_API int32_t hkdfguard_wrap_dek(
         // makes the ABI's "no exception ever crosses this boundary"
         // guarantee unconditionally true, not just true for the specific
         // exception type this project happens to throw itself.
-        return Audit(AuditOp::Wrap, service, HKDFGUARD_ERR_INTERNAL);
+        return Audit(AuditOp::Wrap, service, HKDFGUARD_ERR_INTERNAL_ERROR);
     }
 }
 
@@ -317,7 +317,7 @@ extern "C" HKDFGUARD_API int32_t hkdfguard_kek_exists(
     const char *service,
     int32_t *out_exists) {
     if (out_exists == nullptr) {
-        return HKDFGUARD_ERR_INVALID_ARG;
+        return HKDFGUARD_ERR_INVALID_ARGUMENT;
     }
 
     try {
@@ -330,7 +330,7 @@ extern "C" HKDFGUARD_API int32_t hkdfguard_kek_exists(
     } catch (const HkdfGuardError &e) {
         return Audit(AuditOp::KekExists, service, e.code());
     } catch (...) {
-        return Audit(AuditOp::KekExists, service, HKDFGUARD_ERR_INTERNAL);
+        return Audit(AuditOp::KekExists, service, HKDFGUARD_ERR_INTERNAL_ERROR);
     }
 }
 
@@ -349,7 +349,7 @@ extern "C" HKDFGUARD_API int32_t hkdfguard_create_kek(
     } catch (const HkdfGuardError &e) {
         return Audit(AuditOp::CreateKek, service, e.code());
     } catch (...) {
-        return Audit(AuditOp::CreateKek, service, HKDFGUARD_ERR_INTERNAL);
+        return Audit(AuditOp::CreateKek, service, HKDFGUARD_ERR_INTERNAL_ERROR);
     }
 }
 
@@ -373,14 +373,14 @@ extern "C" HKDFGUARD_API int32_t hkdfguard_generate_and_wrap_dek(
         NTSTATUS status = BCryptGenRandom(
             nullptr, dek.data(), static_cast<ULONG>(HKDFGUARD_DEK_LEN), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
         if (!BCRYPT_SUCCESS(status)) {
-            return Audit(AuditOp::GenerateAndWrap, service, HKDFGUARD_ERR_CRYPTO);
+            return Audit(AuditOp::GenerateAndWrap, service, HKDFGUARD_ERR_CRYPTO_ERROR);
         }
 
         return WrapDekCore(AuditOp::GenerateAndWrap, service, dek.data(), HKDFGUARD_DEK_LEN, out, out_len);
     } catch (const HkdfGuardError &e) {
         return Audit(AuditOp::GenerateAndWrap, service, e.code());
     } catch (...) {
-        return Audit(AuditOp::GenerateAndWrap, service, HKDFGUARD_ERR_INTERNAL);
+        return Audit(AuditOp::GenerateAndWrap, service, HKDFGUARD_ERR_INTERNAL_ERROR);
     }
 }
 
@@ -392,7 +392,7 @@ extern "C" HKDFGUARD_API int32_t hkdfguard_unwrap_dek(
     // this function (including the `fail` helper defined just below) needs
     // to be able to dereference it safely.
     if (out_len == nullptr) {
-        return HKDFGUARD_ERR_INVALID_ARG;
+        return HKDFGUARD_ERR_INVALID_ARGUMENT;
     }
 
     // Captured once, up front, before any chance of `*out_len` being
@@ -423,7 +423,7 @@ extern "C" HKDFGUARD_API int32_t hkdfguard_unwrap_dek(
 
     try {
         if (out == nullptr || wrapped == nullptr) {
-            return fail(HKDFGUARD_ERR_INVALID_ARG);
+            return fail(HKDFGUARD_ERR_INVALID_ARGUMENT);
         }
         if (capacity < HKDFGUARD_DEK_LEN) {
             // Same contract as the wrap side: report the required size.
@@ -436,7 +436,7 @@ extern "C" HKDFGUARD_API int32_t hkdfguard_unwrap_dek(
 
         // Validates the payload's shape/version and hands back pointers
         // into `wrapped` for each field (see wire_format.h/.cpp) - throws
-        // HKDFGUARD_ERR_MALFORMED on anything that doesn't look like a
+        // HKDFGUARD_ERR_PAYLOAD_MALFORMED on anything that doesn't look like a
         // genuine WrappedDekV1 payload.
         ParsedWrappedDek parsed = ParseWrappedDek(wrapped, wrapped_len);
 
@@ -445,7 +445,7 @@ extern "C" HKDFGUARD_API int32_t hkdfguard_unwrap_dek(
 
         // Is that actually the KEK this payload was wrapped under? Compared
         // before any ECDH so a payload for a different/rotated KEK fails
-        // fast and precisely (HKDFGUARD_ERR_KEK_MISMATCH), costing no TPM
+        // fast and precisely (HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH), costing no TPM
         // operation, rather than surfacing later as an authentication
         // failure that looks identical to tampering. Not constant-time, and
         // needn't be: both sides of the comparison are hashes of public
@@ -454,7 +454,7 @@ extern "C" HKDFGUARD_API int32_t hkdfguard_unwrap_dek(
         uint8_t expected_fingerprint[kFingerprintLen];
         ComputeKekFingerprint(kek.key.get(), expected_fingerprint);
         if (std::memcmp(expected_fingerprint, parsed.fingerprint, kFingerprintLen) != 0) {
-            throw HkdfGuardError(HKDFGUARD_ERR_KEK_MISMATCH, "payload was not wrapped under this KEK");
+            throw HkdfGuardError(HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH, "payload was not wrapped under this KEK");
         }
 
         // Same AAD construction as WrapDekCore: normalized service name ||
@@ -506,7 +506,7 @@ extern "C" HKDFGUARD_API int32_t hkdfguard_unwrap_dek(
         return HKDFGUARD_OK;
     } catch (const HkdfGuardError &e) {
         // Note this correctly covers the auth-failure case too:
-        // AesGcmDecrypt throws HkdfGuardError(HKDFGUARD_ERR_AUTH_FAILED) on
+        // AesGcmDecrypt throws HkdfGuardError(HKDFGUARD_ERR_PAYLOAD_AUTH_FAILED) on
         // a tag mismatch, which unwinds out through the nested block above
         // (wiping wrapping_key via its destructor along the way, same as
         // any other exit) and is caught right here, where `fail(e.code())`
@@ -518,7 +518,7 @@ extern "C" HKDFGUARD_API int32_t hkdfguard_unwrap_dek(
         // left holding unauthenticated bytes while the event is written.
         return Audit(AuditOp::Unwrap, service, fail(e.code()));
     } catch (...) {
-        return Audit(AuditOp::Unwrap, service, fail(HKDFGUARD_ERR_INTERNAL));
+        return Audit(AuditOp::Unwrap, service, fail(HKDFGUARD_ERR_INTERNAL_ERROR));
     }
 }
 
@@ -526,7 +526,7 @@ extern "C" HKDFGUARD_API int32_t hkdfguard_open_file(
     const char *path,
     uint8_t *out, int32_t *out_len) {
     if (out_len == nullptr) {
-        return HKDFGUARD_ERR_INVALID_ARG;
+        return HKDFGUARD_ERR_INVALID_ARGUMENT;
     }
 
     // Same shape as hkdfguard_unwrap_dek: remember the caller's capacity,
@@ -548,7 +548,7 @@ extern "C" HKDFGUARD_API int32_t hkdfguard_open_file(
     // exposure an administrator needs to hear about, logged below.
     try {
         if (path == nullptr || out == nullptr) {
-            return fail(HKDFGUARD_ERR_INVALID_ARG);
+            return fail(HKDFGUARD_ERR_INVALID_ARGUMENT);
         }
         if (capacity < HKDFGUARD_WRAPPED_LEN) {
             *out_len = HKDFGUARD_WRAPPED_LEN;
@@ -572,6 +572,6 @@ extern "C" HKDFGUARD_API int32_t hkdfguard_open_file(
         }
         return code;
     } catch (...) {
-        return fail(HKDFGUARD_ERR_INTERNAL);
+        return fail(HKDFGUARD_ERR_INTERNAL_ERROR);
     }
 }

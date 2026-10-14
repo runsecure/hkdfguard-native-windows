@@ -36,7 +36,7 @@ namespace hkdfguard {
         std::optional<SECURITY_STATUS> openKeyStatus;
 
         // When true, property verification of any TPM key (provider_type 1)
-        // fails with HKDFGUARD_ERR_PROVIDER - simulating an existing TPM KEK
+        // fails with HKDFGUARD_ERR_PROVIDER_ERROR - simulating an existing TPM KEK
         // that a firmware quirk or fault makes fail verification.
         bool failVerification = false;
     };
@@ -84,7 +84,7 @@ namespace hkdfguard {
     //   - Read and validate the machine key-use group policy
     //     (policy.h's LoadKeyUseGroupsPolicy + key_acl.h's
     //     ValidateKeyUseGroups) - before touching the key store, so a bad
-    //     policy fails cleanly with HKDFGUARD_ERR_GROUP_INVALID and no key
+    //     policy fails cleanly with HKDFGUARD_ERR_WIN_GROUP_INVALID and no key
     //   - Resolve effective TPM/software policy
     //   - Create KEK if missing
     //   - Apply ACLs (creation only - see hkdfguard.h)

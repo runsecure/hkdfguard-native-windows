@@ -73,12 +73,16 @@ namespace hkdfguard {
             // catches it - here, that's the `try`/`catch` in hkdfguard.cpp's
             // hkdfguard_unwrap_dek. See errors.h for the full explanation of
             // why this codebase uses exceptions internally.
-            throw HkdfGuardError(HKDFGUARD_ERR_MALFORMED, "wrapped payload has wrong length");
+            throw HkdfGuardError(HKDFGUARD_ERR_PAYLOAD_MALFORMED, "wrapped payload has wrong length");
         }
 
         // Reject anything other than the one version this build understands.
+        // A different version byte is not necessarily *broken* - it may be a
+        // newer format this build simply predates - so it gets its own code,
+        // HKDFGUARD_ERR_PAYLOAD_UNSUPPORTED, distinct from the structural
+        // HKDFGUARD_ERR_PAYLOAD_MALFORMED failures around it.
         if (wrapped[kVersionOffset] != kFormatVersion1) {
-            throw HkdfGuardError(HKDFGUARD_ERR_MALFORMED, "unrecognized wrapped payload version");
+            throw HkdfGuardError(HKDFGUARD_ERR_PAYLOAD_UNSUPPORTED, "unrecognized wrapped payload version");
         }
 
         // The reserved bytes must be exactly what SerializeWrappedDek wrote.
@@ -87,12 +91,12 @@ namespace hkdfguard {
         // an existing payload - so they're pinned to zero now, while nothing
         // depends on them.
         if (wrapped[kReservedOffset] != 0 || wrapped[kReservedOffset + 1] != 0) {
-            throw HkdfGuardError(HKDFGUARD_ERR_MALFORMED, "reserved bytes must be zero");
+            throw HkdfGuardError(HKDFGUARD_ERR_PAYLOAD_MALFORMED, "reserved bytes must be zero");
         }
 
         uint8_t provider_type = wrapped[kProviderTypeOffset];
         if (provider_type != kProviderTypeTpm && provider_type != kProviderTypeSoftware) {
-            throw HkdfGuardError(HKDFGUARD_ERR_MALFORMED, "unrecognized provider type");
+            throw HkdfGuardError(HKDFGUARD_ERR_PAYLOAD_MALFORMED, "unrecognized provider type");
         }
 
         // Reassemble the little-endian KeyId bytes back into a uint32_t - the
@@ -115,10 +119,10 @@ namespace hkdfguard {
         // kek_store.cpp's KeyName, which would just build a persisted-key
         // name for a key that, by design, was never created - turns a
         // payload with a tampered or simply wrong KeyId into an immediate,
-        // precise HKDFGUARD_ERR_MALFORMED instead of a less specific
+        // precise HKDFGUARD_ERR_PAYLOAD_MALFORMED instead of a less specific
         // "provider/key open failed" further down the call chain.
         if (key_id != kCurrentKeyId) {
-            throw HkdfGuardError(HKDFGUARD_ERR_MALFORMED, "unrecognized key id");
+            throw HkdfGuardError(HKDFGUARD_ERR_PAYLOAD_MALFORMED, "unrecognized key id");
         }
 
         // `ParsedWrappedDek parsed{};` default-constructs the struct with every

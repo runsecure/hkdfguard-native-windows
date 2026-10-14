@@ -31,8 +31,8 @@ namespace hkdfguard {
     // by importing it through the Microsoft software provider
     // (BCryptImportKeyPair) - the point-validation path this project has
     // fuzzed, see SecurityAssumptions.md. Throws
-    // HkdfGuardError(HKDFGUARD_ERR_MALFORMED) if it is not; throws
-    // HkdfGuardError(HKDFGUARD_ERR_CRYPTO) only if the provider itself can't
+    // HkdfGuardError(HKDFGUARD_ERR_PAYLOAD_MALFORMED) if it is not; throws
+    // HkdfGuardError(HKDFGUARD_ERR_CRYPTO_ERROR) only if the provider itself can't
     // be opened. DeriveWrappingKeyForUnwrap calls this unconditionally on the
     // payload's ephemeral key before any KSP ever sees it; it's exposed here
     // so tests can exercise the gate directly, without needing a KEK.
@@ -41,9 +41,9 @@ namespace hkdfguard {
 #if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
     // Test-only fault injection: while set, ValidateEphemeralPublicKey acts
     // as if the software ECDH provider could not be opened
-    // (BCryptOpenAlgorithmProvider failing), so the HKDFGUARD_ERR_CRYPTO
+    // (BCryptOpenAlgorithmProvider failing), so the HKDFGUARD_ERR_CRYPTO_ERROR
     // path - an infrastructure failure, deliberately distinct from
-    // MALFORMED - can be tested. Same compile-time scope and caveats as
+    // PAYLOAD_MALFORMED - can be tested. Same compile-time scope and caveats as
     // kek_store.h's SetTestTpmFaults: compiled in only when
     // HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE is defined (tests/CMakeLists.txt,
     // for test_roundtrip's own copy of this file), never in
@@ -57,7 +57,7 @@ namespace hkdfguard {
     // independent of export policy). Writes kFingerprintLen bytes to `out`.
     // Used identically on wrap (to stamp the payload and bind it into the
     // AAD) and on unwrap (to check the payload against the KEK actually
-    // opened, before any ECDH). Throws HkdfGuardError(HKDFGUARD_ERR_CRYPTO)
+    // opened, before any ECDH). Throws HkdfGuardError(HKDFGUARD_ERR_CRYPTO_ERROR)
     // if the export or the hash fails.
     void ComputeKekFingerprint(NCRYPT_KEY_HANDLE kek_key, uint8_t out[kFingerprintLen]);
 

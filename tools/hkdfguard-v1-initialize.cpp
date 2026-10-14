@@ -450,27 +450,29 @@ namespace {
     std::string DescribeStatus(int32_t code) {
         switch (code) {
             case HKDFGUARD_OK: return "success";
-            case HKDFGUARD_ERR_INVALID_ARG: return "invalid argument (bad service name or DEK length)";
+            case HKDFGUARD_ERR_INVALID_ARGUMENT: return "invalid argument (null pointer or wrong DEK length)";
             case HKDFGUARD_ERR_BUFFER_TOO_SMALL: return "output buffer too small";
-            case HKDFGUARD_ERR_PROVIDER: return "KEK provider/key open or create failed";
-            case HKDFGUARD_ERR_CRYPTO: return "a cryptographic operation failed";
-            case HKDFGUARD_ERR_AUTH_FAILED: return "AES-GCM authentication failed";
-            case HKDFGUARD_ERR_MALFORMED: return "wrapped payload is not valid";
-            case HKDFGUARD_ERR_INTERNAL: return "an internal error occurred in HkdfGuardV1.dll";
-            case HKDFGUARD_ERR_SERVICE_NAME_INVALID: return "service name is malformed (ASCII letters, digits and '.' only, 1-128 bytes)";
-            case HKDFGUARD_ERR_INVALID_POLICY: return "invalid key storage policy";
-            case HKDFGUARD_ERR_GROUP_INVALID: return "a KeyUseGroups policy entry is unresolvable, not a group, over-broad, or not host-local";
-            case HKDFGUARD_ERR_KEK_MISMATCH: return "wrapped payload was not produced under this service's current KEK";
+            case HKDFGUARD_ERR_PROVIDER_ERROR: return "KEK provider/key open or create failed";
+            case HKDFGUARD_ERR_CRYPTO_ERROR: return "a cryptographic operation failed";
+            case HKDFGUARD_ERR_PAYLOAD_AUTH_FAILED: return "AES-GCM authentication failed";
+            case HKDFGUARD_ERR_PAYLOAD_MALFORMED: return "wrapped payload is not valid";
+            case HKDFGUARD_ERR_PAYLOAD_UNSUPPORTED: return "wrapped payload uses a format version this build does not understand";
+            case HKDFGUARD_ERR_INTERNAL_ERROR: return "an internal error occurred in HkdfGuardV1.dll";
+            case HKDFGUARD_ERR_INVALID_SERVICE_NAME: return "service name is missing or malformed (ASCII letters, digits and '.' only, 1-128 bytes)";
+            case HKDFGUARD_ERR_POLICY_INVALID: return "invalid key storage policy";
+            case HKDFGUARD_ERR_WIN_GROUP_INVALID: return "a KeyUseGroups policy entry is unresolvable, not a group, over-broad, or not host-local";
+            case HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH: return "wrapped payload was not produced under this service's current KEK";
             case HKDFGUARD_ERR_KEK_NOT_FOUND: return "no KEK is provisioned for this service";
-            case HKDFGUARD_ERR_ACCESS_DENIED: return "this KEK exists, but this account is not authorized to use it";
-            case HKDFGUARD_ERR_KEK_ACL_INVALID: return "a KEK already exists under this service name, but its ACL is missing, lacks SYSTEM/Administrators, or grants an over-broad principal - it was left untouched; investigate it, or provision under a new (versioned) service name";
+            case HKDFGUARD_ERR_KEK_ACCESS_DENIED: return "this KEK exists, but this account is not authorized to use it";
+            case HKDFGUARD_ERR_KEK_INVALID: return "a KEK already exists under this service name, but its ACL is missing, lacks SYSTEM/Administrators, or grants an over-broad principal - it was left untouched; investigate it, or provision under a new (versioned) service name";
             case HKDFGUARD_ERR_FILE_NOT_FOUND: return "the wrapped-key file does not exist";
             case HKDFGUARD_ERR_FILE_ACCESS_DENIED: return "this account may not read the wrapped-key file";
             case HKDFGUARD_ERR_FILE_IO: return "the wrapped-key file is not a regular file, is open for writing, or could not be read";
             case HKDFGUARD_ERR_FILE_TOO_SHORT: return "the wrapped-key file is shorter than a wrapped key";
             case HKDFGUARD_ERR_FILE_TOO_LONG: return "the wrapped-key file is longer than a wrapped key";
             case HKDFGUARD_ERR_FILE_PLAINTEXT_KEY: return "the file is exactly the size of an unwrapped 32-byte key - it may hold a plaintext key; treat it as exposed";
-            case HKDFGUARD_ERR_FILE_PATH_REJECTED: return "the wrapped-key path is, or passes through, a symbolic link, junction or other reparse point, uses an 8.3 short name, or is not on a local drive (UNC, mapped or SUBST drive, device)";
+            case HKDFGUARD_ERR_FILE_MALFORMED: return "the wrapped-key file is the right size but does not hold a valid wrapped key";
+            case HKDFGUARD_ERR_FILE_UNTRUSTED: return "the wrapped-key path is, or passes through, a symbolic link, junction or other reparse point, uses an 8.3 short name, or is not on a local drive (UNC, mapped or SUBST drive, device)";
             default: return "unknown status code " + std::to_string(code);
         }
     }
@@ -531,7 +533,7 @@ namespace {
         rc = hkdfguard_create_kek(service.c_str());
         if (rc != HKDFGUARD_OK) {
             std::string message = "hkdfguard_create_kek failed: " + DescribeStatus(rc);
-            if (rc == HKDFGUARD_ERR_ACCESS_DENIED) {
+            if (rc == HKDFGUARD_ERR_KEK_ACCESS_DENIED) {
                 // For a new KEK, NCryptFinalizeKey rejects a non-elevated
                 // process with NTE_PERM (see kek_store.cpp's
                 // ThrowForNCryptFailure). For an existing KEK, verification

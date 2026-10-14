@@ -16,7 +16,7 @@ namespace hkdfguard {
 
     // `path` (null-terminated UTF-8) converted to UTF-16, exactly as
     // ReadWrappedKeyFile converts it. Throws HkdfGuardError
-    // (HKDFGUARD_ERR_INVALID_ARG) if it is empty, too long or not valid
+    // (HKDFGUARD_ERR_INVALID_ARGUMENT) if it is empty, too long or not valid
     // UTF-8. Used to name the file in the plaintext-key audit event.
     std::wstring KeyFilePathToWide(const char *path);
 } // namespace hkdfguard
