@@ -40,10 +40,37 @@ param(
 $ErrorActionPreference = "Stop"
 $failures = 0
 function Write-Section($title) { Write-Host ""; Write-Host "==== $title ====" -ForegroundColor Cyan }
+$failedChecks = New-Object System.Collections.Generic.List[string]
+# Under GitHub Actions each failed check also becomes an annotation on the
+# run's summary page - the suites' own [FAIL] lines are annotated by
+# ci.yml, but this script's checks (install, chain, events, uninstall) would
+# otherwise only be visible by reading the raw step log.
 function Check($condition, $what) {
     if ($condition) { Write-Host "[PASS] $what" -ForegroundColor Green }
-    else { Write-Host "[FAIL] $what" -ForegroundColor Red; $script:failures++ }
+    else {
+        Write-Host "[FAIL] $what" -ForegroundColor Red
+        $script:failures++
+        $script:failedChecks.Add($what)
+        if ($env:GITHUB_ACTIONS -eq "true") { Write-Host "::error title=Test-InContainer::$what" }
+    }
 }
+
+# Anything that aborts the script (an exception, or under Windows
+# PowerShell 5.1 a native tool writing to stderr while
+# $ErrorActionPreference is Stop) is reported as what it is - with the line
+# that failed - instead of ending the run with a bare exit code 1 and no
+# summary.
+trap {
+    $where = "$($_.InvocationInfo.ScriptName):$($_.InvocationInfo.ScriptLineNumber)"
+    Write-Host "[ABORT] $($_.Exception.Message) (at $where)" -ForegroundColor Red
+    if ($env:GITHUB_ACTIONS -eq "true") { Write-Host "::error title=Test-InContainer aborted::$($_.Exception.Message) (at $where)" }
+    if ($script:failedChecks.Count -gt 0) { Write-Host "Checks failed before the abort: $($script:failedChecks -join '; ')" }
+    exit 2
+}
+
+# msiexec: 0 is success, 3010 is success with a restart required (e.g. a
+# file was in use) - both are installs or removals that took effect.
+function Test-MsiSuccess([int]$code) { return $code -eq 0 -or $code -eq 3010 }
 
 $InstallDir = Join-Path $env:ProgramFiles "HkdfGuard\v1"
 $InstallKey = "HKLM:\Software\hkdfguard-native-windows"
@@ -66,7 +93,7 @@ $msi = $msi[0].FullName
 # ---- 1. Install --------------------------------------------------------------
 Write-Section "Installing $(Split-Path -Leaf $msi)"
 $proc = Start-Process msiexec.exe -ArgumentList @("/i", "`"$msi`"", "/qn", "/norestart", "/l*v", "`"$Out\install.log`"") -Wait -PassThru
-Check ($proc.ExitCode -eq 0) "msiexec /i exits 0 (got $($proc.ExitCode))"
+Check (Test-MsiSuccess $proc.ExitCode) "msiexec /i succeeds (exit $($proc.ExitCode); 0 or 3010)"
 
 foreach ($f in "HkdfGuardV1.dll", "hkdfguard-v1-initialize.exe") {
     Check (Test-Path (Join-Path $InstallDir $f)) "installed $InstallDir\$f"
@@ -175,7 +202,7 @@ Check ($events.Count -gt 0 -and $unrendered.Count -eq 0) "every event's message 
 # ---- 5. Uninstall ----------------------------------------------------------------
 Write-Section "Uninstalling"
 $proc = Start-Process msiexec.exe -ArgumentList @("/x", "`"$msi`"", "/qn", "/norestart", "/l*v", "`"$Out\uninstall.log`"") -Wait -PassThru
-Check ($proc.ExitCode -eq 0) "msiexec /x exits 0 (got $($proc.ExitCode))"
+Check (Test-MsiSuccess $proc.ExitCode) "msiexec /x succeeds (exit $($proc.ExitCode); 0 or 3010)"
 Check (-not (Test-Path (Join-Path $InstallDir "HkdfGuardV1.dll"))) "installed DLL removed"
 Check (-not (Test-Path (Join-Path $InstallDir "hkdfguard-v1-initialize.exe"))) "installed CLI removed"
 $afterInstallPath = (Get-ItemProperty -Path $InstallKey -Name InstallPath -ErrorAction SilentlyContinue).InstallPath
@@ -186,7 +213,8 @@ Check ($LASTEXITCODE -eq 0) "HkdfGuardUsers group kept after uninstall (by desig
 
 Write-Section "Summary"
 if ($failures -gt 0) {
-    Write-Host "$failures check(s) failed on $($os.Caption) (build $($os.BuildNumber))." -ForegroundColor Red
+    Write-Host "$failures check(s) failed on $($os.Caption) (build $($os.BuildNumber)):" -ForegroundColor Red
+    foreach ($f in $failedChecks) { Write-Host "  [FAIL] $f" -ForegroundColor Red }
     exit 1
 }
 Write-Host "All checks passed on $($os.Caption) (build $($os.BuildNumber))." -ForegroundColor Green
