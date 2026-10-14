@@ -21,6 +21,10 @@ add_executable(test_roundtrip
     # event_log.cpp: kek_store.cpp's CreateKek logs KEK creation, so this
     # test's own compiled copy of kek_store.cpp needs it too.
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/event_log.cpp
+    # key_file.cpp: so the test can call ReadWrappedKeyFile (hkdfguard_open_file's
+    # implementation) directly with ecdh_hkdf.cpp's test-only provider fault
+    # enabled - a failure the shipped DLL can't be made to produce on cue.
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/key_file.cpp
 )
 # Links against hkdfguard (the DLL's import library, for the public ABI
 # calls) plus the two raw Windows crypto libraries directly (needed because

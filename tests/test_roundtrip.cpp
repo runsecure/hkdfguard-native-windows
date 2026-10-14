@@ -9,6 +9,7 @@
 #include "kek_store.h"  // CreateKek/KekExists/OpenKekForWrap/DeleteKek - internal helpers, used directly below
 #include "policy.h"     // SetTestPolicyOverride - internal test-only seam, used directly below
 #include "ecdh_hkdf.h"  // ValidateEphemeralPublicKey - the unwrap-side point-validation gate, tested directly below
+#include "key_file.h"   // ReadWrappedKeyFile - hkdfguard_open_file's implementation, for section 24c's provider-fault check
 #include "errors.h"     // HkdfGuardError - caught by EphemeralGateResult below to read the gate's error code
 #include "key_acl.h"    // ValidateKeyUseGroups - vets the key-use policy list without touching any key
 
@@ -1806,6 +1807,41 @@ int main() {
             Check(CompareFileTime(&before.ftLastWriteTime, &after.ftLastWriteTime) == 0 &&
                       before.nFileSizeLow == after.nFileSizeLow,
                   "open_file does not modify the file");
+        }
+
+        // The ECDH provider the point check uses can't be opened: reported as
+        // CRYPTO (an infrastructure failure), never MALFORMED, which would
+        // wrongly blame a perfectly good file. Injected through the
+        // test-only SetTestEcdhProviderFault seam, so this calls this test's
+        // own compiled copy of ReadWrappedKeyFile, not the DLL - the DLL has
+        // no such seam, which the last check below confirms.
+        {
+            std::vector<uint8_t> direct(HKDFGUARD_WRAPPED_LEN, 0xAA);
+            Check(CodeOf([&] { hkdfguard::ReadWrappedKeyFile(good.c_str(), direct.data()); }) == HKDFGUARD_OK,
+                  "ReadWrappedKeyFile (test copy) reads the good file with no fault injected");
+
+            hkdfguard::SetTestEcdhProviderFault(true);
+            Check(CodeOf([&] { hkdfguard::ValidateEphemeralPublicKey(wrapped.data() + hkdfguard::kEphemeralPubOffset); }) ==
+                      HKDFGUARD_ERR_CRYPTO,
+                  "ECDH provider unavailable: the point check reports CRYPTO, not MALFORMED");
+            Check(CodeOf([&] { hkdfguard::ReadWrappedKeyFile(good.c_str(), direct.data()); }) == HKDFGUARD_ERR_CRYPTO,
+                  "ECDH provider unavailable: reading a valid key file reports CRYPTO, not MALFORMED");
+            // Every check before the point check still decides first: a bad
+            // size or structure is reported as such, not as CRYPTO.
+            Check(CodeOf([&] { hkdfguard::ReadWrappedKeyFile(ToUtf8(dir + L"\\plain.key").c_str(), direct.data()); }) ==
+                      HKDFGUARD_ERR_FILE_PLAINTEXT_KEY,
+                  "ECDH provider unavailable: a 32-byte file is still reported as a plaintext key");
+            Check(CodeOf([&] { hkdfguard::ReadWrappedKeyFile(ToUtf8(dir + L"\\badversion.key").c_str(), direct.data()); }) ==
+                      HKDFGUARD_ERR_MALFORMED,
+                  "ECDH provider unavailable: a structurally bad file is still reported as MALFORMED");
+            // The shipped DLL has no seam: its own open_file is unaffected.
+            r = open(good);
+            Check(r.rc == HKDFGUARD_OK && r.out == wrapped,
+                  "the fault is test-only: the DLL's hkdfguard_open_file still reads the file");
+            hkdfguard::SetTestEcdhProviderFault(false);
+
+            Check(CodeOf([&] { hkdfguard::ReadWrappedKeyFile(good.c_str(), direct.data()); }) == HKDFGUARD_OK,
+                  "ReadWrappedKeyFile (test copy) reads the good file again once the fault is cleared");
         }
 
         for (const std::wstring& path : created) {

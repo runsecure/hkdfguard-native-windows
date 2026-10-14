@@ -311,6 +311,14 @@ software fallback. The Software Key Storage Provider path (`provider_type` 2) sh
 same code apart from which NCrypt provider name is opened, and is exercised by the same
 suite's `SoftwareOnly` policy check regardless of whether a TPM is present.
 
+**TPM tests are the developer's and maintainer's responsibility.** CI runners and the
+container tests have no TPM, so the TPM-only checks there print `[SKIP]` - a CI pass
+does not cover them. Developers changing key storage code, and the maintainer before
+tagging every release, must run `scripts\run-build-test-verify.bat -Configuration Release`
+on a machine with an active TPM and confirm `TPM provider available: yes` and no
+`[SKIP]` lines for the TPM sections (`PreferTpm, TPM probe error` and
+`PreferTpm, existing TPM KEK fails verification`) in the roundtrip output.
+
 ## Testing and compatibility
 
 This library has been exercised end to end - KEK creation, wrap, unwrap, and

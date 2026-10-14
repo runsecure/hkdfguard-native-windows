@@ -1,9 +1,11 @@
 <#
 .SYNOPSIS
-    Runs inside a clean Windows Server container: installs the MSI, runs the
-    test suites against the INSTALLED binaries, then uninstalls. Started by
-    scripts\Test-Containers.ps1 - not meant to be run on a developer machine
-    (it installs and uninstalls the product machine-wide).
+    Runs on a clean, disposable Windows Server machine: installs the MSI,
+    runs the test suites against the INSTALLED binaries, then uninstalls.
+    Started by scripts\Test-Containers.ps1 (Server Core containers) and by
+    .github\workflows\ci.yml's install-test job (hosted windows-2022 and
+    windows-2025 runners) - not meant to be run on a developer machine (it
+    installs and uninstalls the product machine-wide).
 
 .DESCRIPTION
     What a fresh server deployment would actually go through:
@@ -24,10 +26,15 @@
 
 .PARAMETER Out
     Writable folder for logs (install/uninstall logs, test output).
+
+.PARAMETER Work
+    Writable scratch folder for the test executable's copy and the files the
+    tests create.
 #>
 param(
     [string]$Payload = "C:\payload",
-    [string]$Out = "C:\out"
+    [string]$Out = "C:\out",
+    [string]$Work = "C:\work"
 )
 
 $ErrorActionPreference = "Stop"
@@ -77,7 +84,7 @@ $testStart = Get-Date
 # Copied to its own folder with no DLL beside it, and only the install folder
 # added to PATH, so the loader can only find the installed HkdfGuardV1.dll.
 Write-Section "test_roundtrip.exe (installed DLL)"
-$work = "C:\work"
+$work = $Work
 New-Item -ItemType Directory -Force -Path $work | Out-Null
 Copy-Item (Join-Path $Payload "test_roundtrip.exe") $work -Force
 $savedPath = $env:PATH

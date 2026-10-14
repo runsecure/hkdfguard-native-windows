@@ -38,6 +38,19 @@ namespace hkdfguard {
     // so tests can exercise the gate directly, without needing a KEK.
     void ValidateEphemeralPublicKey(const uint8_t pub[kEphemeralPubLen]);
 
+#if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
+    // Test-only fault injection: while set, ValidateEphemeralPublicKey acts
+    // as if the software ECDH provider could not be opened
+    // (BCryptOpenAlgorithmProvider failing), so the HKDFGUARD_ERR_CRYPTO
+    // path - an infrastructure failure, deliberately distinct from
+    // MALFORMED - can be tested. Same compile-time scope and caveats as
+    // kek_store.h's SetTestTpmFaults: compiled in only when
+    // HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE is defined (tests/CMakeLists.txt,
+    // for test_roundtrip's own copy of this file), never in
+    // HkdfGuardV1.dll; not thread-safe, by design.
+    void SetTestEcdhProviderFault(bool failOpen);
+#endif
+
     // Computes the KEK fingerprint carried in every wrapped payload (see
     // wire_format.h's layout comment): SHA-256 over the KEK's public key as
     // raw X || Y (64 bytes - exporting the public part is always permitted,
