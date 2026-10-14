@@ -1460,9 +1460,15 @@ int main() {
     //          still wrapped - checking size and structure, never
     //          unwrapping. Files are written to a scratch folder under %TEMP%.
     {
+        // %TEMP% itself may be spelled with an 8.3 short name - on GitHub's
+        // hosted runners it is C:\Users\RUNNER~1\... - and open_file refuses
+        // short names, so it's expanded to its long form first.
         wchar_t temp[MAX_PATH + 1] = {};
         GetTempPathW(MAX_PATH + 1, temp);
-        const std::wstring dir = std::wstring(temp) + L"hkdfguard-openfile-" + std::to_wstring(GetCurrentProcessId());
+        wchar_t temp_long[MAX_PATH + 1] = {};
+        DWORD temp_long_len = GetLongPathNameW(temp, temp_long, MAX_PATH + 1);
+        const std::wstring temp_dir = (temp_long_len > 0 && temp_long_len <= MAX_PATH) ? temp_long : temp;
+        const std::wstring dir = temp_dir + L"hkdfguard-openfile-" + std::to_wstring(GetCurrentProcessId());
         CreateDirectoryW(dir.c_str(), nullptr);
         std::vector<std::wstring> created;
         auto fileFor = [&](const wchar_t* name, const std::vector<uint8_t>& bytes) {

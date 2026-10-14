@@ -121,7 +121,18 @@ function Invoke-Cli {
     return [PSCustomObject]@{ ExitCode = $proc.ExitCode; StdOut = $stdout; StdErr = $stderr }
 }
 
-$workDir = Join-Path $env:TEMP ("hkdfguard-cli-test-" + [Guid]::NewGuid().ToString("N"))
+# %TEMP% itself may be spelled with an 8.3 short name - on GitHub's hosted
+# runners it is C:\Users\RUNNER~1\... - and the CLI refuses short names, so
+# it's expanded to its long form (GetLongPathName) before any path is built
+# from it.
+Add-Type -Namespace HkdfGuardCliTest -Name Path -MemberDefinition @"
+[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+public static extern uint GetLongPathNameW(string shortPath, System.Text.StringBuilder longPath, uint size);
+"@
+$tempLong = New-Object System.Text.StringBuilder 32768
+$tempLen = [HkdfGuardCliTest.Path]::GetLongPathNameW($env:TEMP, $tempLong, 32768)
+$tempDir = if ($tempLen -gt 0 -and $tempLen -lt 32768) { $tempLong.ToString() } else { $env:TEMP }
+$workDir = Join-Path $tempDir ("hkdfguard-cli-test-" + [Guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Force -Path $workDir | Out-Null
 
 try {
