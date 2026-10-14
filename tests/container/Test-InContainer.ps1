@@ -151,17 +151,36 @@ $dek = New-Object byte[] 32
     --dek-stdin --group Administrators --force *> "$Out\chain-wrap.log"
 Check ($LASTEXITCODE -eq 0) "installed CLI wraps a DEK to a file"
 
+# A 32-byte file - the size of a plaintext DEK - must be flagged, not read.
+$plainFile = Join-Path $work "plain.key"
+[IO.File]::WriteAllBytes($plainFile, (New-Object byte[] 32))
+
+# The P/Invoke calls run in a CHILD PowerShell process, never in this one:
+# a DLL loaded into a process stays loaded until that process exits, so
+# loading the installed HkdfGuardV1.dll here would hold it in use through
+# the uninstall below - and on a machine with an interactive session (the
+# hosted CI runners), Windows Installer's Restart Manager then shuts down
+# the application holding it: this script. The child exits, and unloads
+# the DLL, before the uninstall starts. It prints one "RESULT|1|..." or
+# "RESULT|0|..." line per check, which are recorded here as ordinary checks.
+# The DEK goes to the child on stdin, never on its command line.
+$probe = Join-Path $work "chain-probe.ps1"
+Set-Content -Path $probe -Encoding ascii -Value @'
+param([string]$Dll, [string]$KeyFile, [string]$PlainFile, [string]$Service)
+$ErrorActionPreference = "Stop"
+$dekBase64 = [Console]::In.ReadLine()
 Add-Type -TypeDefinition @"
 using System;
 using System.Runtime.InteropServices;
 public static class InstalledHkdfGuard {
-    [DllImport(@"$dll", CallingConvention = CallingConvention.Cdecl)]
+    [DllImport(@"$Dll", CallingConvention = CallingConvention.Cdecl)]
     public static extern int hkdfguard_open_file(byte[] path, byte[] out_buf, ref int out_len);
-    [DllImport(@"$dll", CallingConvention = CallingConvention.Cdecl)]
+    [DllImport(@"$Dll", CallingConvention = CallingConvention.Cdecl)]
     public static extern int hkdfguard_unwrap_dek(
         [MarshalAs(UnmanagedType.LPStr)] string service, byte[] wrapped, int wrapped_len, byte[] out_buf, ref int out_len);
 }
 "@
+function Result([bool]$ok, [string]$what) { Write-Output ("RESULT|{0}|{1}" -f [int]$ok, $what) }
 function Open-WrappedFile([string]$path) {
     $buf = New-Object byte[] 164
     $len = 164
@@ -169,22 +188,42 @@ function Open-WrappedFile([string]$path) {
     return [PSCustomObject]@{ Rc = $rc; Len = $len; Bytes = $buf }
 }
 
-$opened = Open-WrappedFile $keyFile
-$onDisk = [IO.File]::ReadAllBytes($keyFile)
-Check ($opened.Rc -eq 0 -and $opened.Len -eq 164) "hkdfguard_open_file reads the CLI's file (rc $($opened.Rc), $($opened.Len) bytes)"
-Check ([Convert]::ToBase64String($opened.Bytes) -eq [Convert]::ToBase64String($onDisk)) "hkdfguard_open_file returns the file's wrapped bytes unchanged"
+$opened = Open-WrappedFile $KeyFile
+$onDisk = [IO.File]::ReadAllBytes($KeyFile)
+Result ($opened.Rc -eq 0 -and $opened.Len -eq 164) "hkdfguard_open_file reads the CLI's file (rc $($opened.Rc), $($opened.Len) bytes)"
+Result ([Convert]::ToBase64String($opened.Bytes) -eq [Convert]::ToBase64String($onDisk)) "hkdfguard_open_file returns the file's wrapped bytes unchanged"
 $plain = New-Object byte[] 32
 $plainLen = 32
-$rc = [InstalledHkdfGuard]::hkdfguard_unwrap_dek($chainService, $opened.Bytes, $opened.Len, $plain, [ref]$plainLen)
-Check ($rc -eq 0 -and [Convert]::ToBase64String($plain) -eq [Convert]::ToBase64String($dek)) "a separate hkdfguard_unwrap_dek call recovers the original DEK"
+$rc = [InstalledHkdfGuard]::hkdfguard_unwrap_dek($Service, $opened.Bytes, $opened.Len, $plain, [ref]$plainLen)
+Result ($rc -eq 0 -and [Convert]::ToBase64String($plain) -eq $dekBase64) "a separate hkdfguard_unwrap_dek call recovers the original DEK"
 [Array]::Clear($plain, 0, $plain.Length)
-[Array]::Clear($dek, 0, $dek.Length)
 
-# A 32-byte file - the size of a plaintext DEK - is flagged, not read.
-$plainFile = Join-Path $work "plain.key"
-[IO.File]::WriteAllBytes($plainFile, (New-Object byte[] 32))
-$opened = Open-WrappedFile $plainFile
-Check ($opened.Rc -eq -20 -and $opened.Len -eq 164) "hkdfguard_open_file reports a 32-byte file as HKDFGUARD_ERR_FILE_PLAINTEXT_KEY (rc $($opened.Rc)), out_len unchanged"
+$opened = Open-WrappedFile $PlainFile
+Result ($opened.Rc -eq -20 -and $opened.Len -eq 164) "hkdfguard_open_file reports a 32-byte file as HKDFGUARD_ERR_FILE_PLAINTEXT_KEY (rc $($opened.Rc)), out_len unchanged"
+'@
+# Continue, not Stop, around the child: under Windows PowerShell 5.1, 2>&1
+# on a native process turns each stderr line into an error, which Stop would
+# make terminating - the child's output is what should explain a failure.
+$savedPreference = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+try {
+    $probeOutput = [Convert]::ToBase64String($dek) | & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $probe `
+        -Dll $dll -KeyFile $keyFile -PlainFile $plainFile -Service $chainService 2>&1
+    $probeExit = $LASTEXITCODE
+} finally {
+    $ErrorActionPreference = $savedPreference
+}
+[Array]::Clear($dek, 0, $dek.Length)
+$results = @($probeOutput | ForEach-Object { "$_" } | Where-Object { $_ -like "RESULT|*" })
+foreach ($line in $results) {
+    $parts = $line.Split("|", 3)
+    Check ($parts[1] -eq "1") $parts[2]
+}
+Check ($probeExit -eq 0 -and $results.Count -eq 4) "the installed-DLL probe ran all 4 checks in its own process (exit $probeExit, $($results.Count) results)"
+if ($probeExit -ne 0 -or $results.Count -ne 4) {
+    $probeOutput | ForEach-Object { Write-Host "    probe: $_" }
+}
+Remove-Item -Force $probe -ErrorAction SilentlyContinue
 
 Remove-Item -Force $keyFile, $plainFile -ErrorAction SilentlyContinue
 
@@ -201,7 +240,13 @@ Check ($events.Count -gt 0 -and $unrendered.Count -eq 0) "every event's message 
 
 # ---- 5. Uninstall ----------------------------------------------------------------
 Write-Section "Uninstalling"
-$proc = Start-Process msiexec.exe -ArgumentList @("/x", "`"$msi`"", "/qn", "/norestart", "/l*v", "`"$Out\uninstall.log`"") -Wait -PassThru
+# MSIRESTARTMANAGERCONTROL=Disable: Windows Installer must never close an
+# application to free a file - on a machine with an interactive session it
+# would otherwise shut down whatever holds the DLL, which could be this
+# script. A file still in use is instead replaced at the next restart and
+# reported as 3010; the removal checks below then show it.
+$proc = Start-Process msiexec.exe -ArgumentList @(
+    "/x", "`"$msi`"", "/qn", "/norestart", "MSIRESTARTMANAGERCONTROL=Disable", "/l*v", "`"$Out\uninstall.log`"") -Wait -PassThru
 Check (Test-MsiSuccess $proc.ExitCode) "msiexec /x succeeds (exit $($proc.ExitCode); 0 or 3010)"
 Check (-not (Test-Path (Join-Path $InstallDir "HkdfGuardV1.dll"))) "installed DLL removed"
 Check (-not (Test-Path (Join-Path $InstallDir "hkdfguard-v1-initialize.exe"))) "installed CLI removed"
