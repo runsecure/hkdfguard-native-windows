@@ -16,9 +16,9 @@
 #include "wire_format.h"
 
 // windows.h: MultiByteToWideChar, CP_UTF8, MB_ERR_INVALID_CHARS (used by
-// ServiceToWide below). bcrypt.h: BCryptGenRandom (used by
-// hkdfguard_generate_and_wrap_dek below to source the new DEK's
-// randomness). cstring: strnlen, memcpy. string: std::wstring.
+// ServiceToWide below). bcrypt.h: BCryptGenRandom (used by WrapDekCore for
+// each payload's salt, and by hkdfguard_generate_and_wrap_dek to source the
+// new DEK's randomness). cstring: strnlen, memcpy. string: std::wstring.
 #include <windows.h>
 #include <bcrypt.h>
 #include <cstring>
@@ -26,7 +26,7 @@
 
 // `using namespace hkdfguard;` brings every name declared inside `namespace
 // hkdfguard { ... }` (SecureBuffer, ResolvedKek, HkdfGuardError, the
-// kEphemeralPubLen/kNonceLen/... constants, AesGcmEncrypt, and so on) into
+// kSaltLen/kNonceLen/... constants, AesGcmEncrypt, and so on) into
 // scope here without needing the `hkdfguard::` prefix on each one. This is
 // a deliberate, narrow use of the directive: it's placed in a .cpp file
 // (never in a header, where it would leak into every file that includes
@@ -209,9 +209,14 @@ namespace {
         std::vector<uint8_t> aad(normalized_service.begin(), normalized_service.end());
         aad.insert(aad.end(), fingerprint, fingerprint + kFingerprintLen);
 
-        // Ephemeral ECDH + HKDF-SHA512 -> 32-byte AES wrapping key. Only the
-        // KEK's public key is needed here, so this never touches the TPM.
-        uint8_t ephemeral_pub[kEphemeralPubLen];
+        // A fresh random salt for this payload: it selects the point H(salt)
+        // the KEK's private key is combined with, and is HKDF's salt, so
+        // every payload gets its own Z and its own wrapping key.
+        uint8_t salt[kSaltLen];
+        NTSTATUS salt_status = BCryptGenRandom(nullptr, salt, static_cast<ULONG>(kSaltLen), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+        if (!BCRYPT_SUCCESS(salt_status)) {
+            throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO_ERROR, "BCryptGenRandom(salt) failed");
+        }
         // `nonce`/`ciphertext`/`tag` are declared here, *outside* the nested
         // block below, because they're needed again afterward (by
         // SerializeWrappedDek) - none of the three is secret (they're all meant
@@ -234,7 +239,11 @@ namespace {
             // the lifetime" technique used for `prk` inside ecdh_hkdf.cpp's
             // HkdfSha512.
             SecureBuffer<32> wrapping_key;
-            DeriveWrappingKeyForWrap(kek.key.get(), ephemeral_pub, wrapping_key);
+            // ECDH(KEK private key, H(salt)) + HKDF-SHA512 - the same
+            // derivation unwrap runs. Wrapping uses the KEK's *private* key
+            // (inside the TPM for a TPM-backed KEK), which is what makes a
+            // payload impossible to forge from the public key alone.
+            DeriveWrappingKey(kek.provider.get(), kek.key.get(), salt, wrapping_key);
 
             // AES-256-GCM directly from the caller's dek pointer - no
             // intermediate plaintext staging buffer. The AAD's service
@@ -257,10 +266,10 @@ namespace {
                 nonce, ciphertext, tag);
         } // <- wrapping_key's destructor (zeroing it) runs here, right now.
 
-        // Assemble the final 164-byte payload directly into the caller's
+        // Assemble the final 132-byte payload directly into the caller's
         // buffer, and report how many bytes were written back through the
         // out-parameter.
-        SerializeWrappedDek(kek.provider_type, kek.key_id, ephemeral_pub, nonce, ciphertext, tag, fingerprint, out);
+        SerializeWrappedDek(kek.provider_type, kek.key_id, salt, nonce, ciphertext, tag, fingerprint, out);
         *out_len = static_cast<int32_t>(kTotalLen);
 
         // Audit: who wrapped, for which service, under which KEK, and a hash
@@ -469,10 +478,10 @@ extern "C" HKDFGUARD_API int32_t hkdfguard_unwrap_dek(
             // AesGcmDecrypt is done with it - rather than lingering,
             // unused, until the function returns.
             SecureBuffer<32> wrapping_key;
-            // ECDH against the KEK's private key (may execute inside a
+            // ECDH(KEK private key, H(salt)) (may execute inside a
             // TPM/vTPM) + HKDF-SHA512 -> the same 32-byte wrapping key
-            // derived at wrap time.
-            DeriveWrappingKeyForUnwrap(kek.provider.get(), kek.key.get(), parsed.ephemeral_pub, wrapping_key);
+            // derived at wrap time, from the payload's salt.
+            DeriveWrappingKey(kek.provider.get(), kek.key.get(), parsed.salt, wrapping_key);
 
             // Decrypt directly into the caller's buffer - no intermediate
             // plaintext staging buffer. AAD must match what AesGcmEncrypt

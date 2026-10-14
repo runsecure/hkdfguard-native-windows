@@ -4,7 +4,7 @@
 #include <string>
 
 namespace hkdfguard {
-    // Reads exactly kTotalLen (164) bytes of the wrapped-key file at `path`
+    // Reads exactly kTotalLen (132) bytes of the wrapped-key file at `path`
     // (null-terminated UTF-8) into `out`, after refusing any path that is a
     // link or passes through one, uses an 8.3 short name, or is not on a
     // local drive, and refusing any file whose size isn't exactly a wrapped

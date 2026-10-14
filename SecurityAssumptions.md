@@ -43,24 +43,30 @@ defended against:
   read/write, one group read-only - see the CLI's `--group`), not the
   payload format. An application that needs to refuse old DEKs must check
   that itself, after unwrapping.
-- **Anyone who can unwrap can also forge.** Wrapping needs only the KEK's
-  *public* key, which any key-use principal can export. So every principal
-  granted key use (`KeyUseGroups`, `HkdfGuardUsers`) can mint a brand-new,
-  fully valid payload for the service around a DEK of its own choosing, and
-  unwrap will accept it exactly like a genuine one. The payload is
-  authenticated as "made for this service under this KEK", never as "made
-  by the deployment step". Consequences: a key-use principal that can also
-  write the wrapped-key file can make the service run with a DEK it picked,
-  not just an older genuine one. The audit trail only partly helps: a
-  forger who calls `hkdfguard_wrap_dek` leaves a wrap event (1002) under its
-  own account, but one who builds the payload itself, from the public key,
-  leaves none - and an unwrap event (1003) whose payload SHA-256 matches no
-  wrap event by the deployment account is the sign of that.
-  The defenses are the same as for rollback: keep key-use groups narrow, and
-  keep the wrapped file writable only by the deployment account. An
-  application that must know a DEK came from its own deployment needs a
-  separate signature over the payload, made with a key the service can only
-  verify.
+- **Only the KEK's authorized users can create payloads - and all of them
+  can.** The wrapping key comes from `Z = ECDH(KEK private key, H(salt))`
+  (section 13), so making a payload needs a live use of the KEK's private
+  key, governed by its ACL. Knowing the KEK's *public* key is not enough:
+  a payload built from it is rejected (verified, test section 24b). This
+  replaced, before the first release, an ECIES construction in which the
+  public key alone sufficed - so anyone who had ever obtained it (a former
+  key-use principal, a copy taken off the host) could forge payloads
+  offline, indefinitely, without touching the KEK. Now removing an account
+  from the key-use groups really ends its ability to create payloads.
+  What remains is accepted: every principal currently granted key use
+  (`KeyUseGroups`, `HkdfGuardUsers`) can wrap, and so can mint a valid
+  payload around a DEK of its own choosing. The payload is authenticated as
+  "made for this service by a holder of this KEK", never as "made by the
+  deployment step". A key-use principal that can also write the
+  wrapped-key file can make the service run with a DEK it picked. The audit
+  trail only partly helps: a wrap through `hkdfguard_wrap_dek` leaves an
+  event (1002) under the caller's account, but one that calls
+  `NCryptSecretAgreement` itself leaves none - an unwrap event (1003) whose
+  payload SHA-256 matches no wrap event by the deployment account is the
+  sign of that. The defenses: keep key-use groups narrow, and keep the
+  wrapped file writable only by the deployment account. An application that
+  must know a DEK came from its own deployment needs a separate signature
+  over the payload.
 - **Local Administrators and SYSTEM are fully trusted.** They always hold
   full control of every KEK, can change the registry policy, and can alter a
   key's ACL. Nothing here defends the KEK against a host administrator.
@@ -70,66 +76,64 @@ defended against:
 
 ## 2. Public-key point validation (verified)
 
-**Claim.** An attacker-supplied P-256 point that is not on the curve is
-rejected before it is ever combined with the long-term KEK private key.
+**Claim.** No point that is not on P-256 is ever combined with the KEK's
+private key.
 
-**Why it matters.** The ephemeral public key in a wrapped payload is the one
-input an attacker controls outright, and `NCryptSecretAgreement` combines it
-with the KEK's private key - the classic invalid-curve / small-subgroup
-setup. P-256 has cofactor 1, so an on-curve check is sufficient.
+**Why it matters.** `NCryptSecretAgreement` multiplies the KEK's private key
+by whatever point it is given - the classic invalid-curve / small-subgroup
+setup if that point were off the curve. P-256 has cofactor 1, so an
+on-curve check is sufficient.
+
+**How it holds now.** The point is no longer taken from the payload at all:
+it is `H(salt)`, computed by `src/hash_to_curve.cpp` from the salt, and
+lies on the curve by construction - the payload's only input to it is 32
+bytes of salt, which have no invalid value. As defense in depth, every
+`H(salt)` still goes through `IsValidP256Point` (`src/ecdh_hkdf.cpp`)
+before any KSP sees it, so an arithmetic bug in the hash-to-curve could
+only fail closed (`HKDFGUARD_ERR_CRYPTO_ERROR`). The salt is copied out of
+the caller's buffer exactly once, so the point and HKDF's salt are always
+derived from the same bytes, whatever a hostile thread does to the buffer.
 
 **Verified how.** `BCryptImportKeyPair(BCRYPT_ECCPUBLIC_BLOB)` was fuzzed
 with valid keys, all-zero and all-0xFF coordinates, random coordinates,
 single-bit mutations of valid keys, and 100 fuzzed valid keys: every valid
-point imported, every malformed point was rejected, no mutated point
-imported. `tests/test_roundtrip.cpp` re-checks the gate on every run with
-valid, all-zero, all-0xFF and single-bit-mutated (X and Y) points.
+point imported, every malformed point was rejected. `tests/test_roundtrip.cpp`
+re-checks the gate on every run (valid, all-zero, all-0xFF, single-bit
+mutations of X and Y) and checks 32 random salts all hash to valid,
+distinct points. Underneath, the providers refuse bad points themselves
+(section 13): the Software KSP and the Platform Crypto Provider both reject
+off-curve, (0,0), out-of-range and all-0xFF points at `NCryptImportKey`,
+and the PCP does so in software before the TPM.
 
-**Where it is applied.** `ValidateEphemeralPublicKey` (`src/ecdh_hkdf.cpp`)
-runs on the unwrap path *before* `NCryptImportKey`, for every provider. The
-fuzzing covered only the software provider's import; the Platform Crypto
-Provider's own import validation was never tested and is no longer relied
-upon. The point is copied out of the caller's payload buffer exactly once
-and both the validation and the later import read that copy, so a hostile
-thread in the host process cannot swap the bytes between check and use.
+**Residual risk.** None known.
+## 3. Raw ECDH secret byte order (verified)
 
-**Residual risk.** None known for this input. The wrap side imports the
-KEK's *own* public key (not attacker-controlled) through the same fuzzed
-path.
+**Claim.** The shared secret fed to HKDF is the shared point's X coordinate,
+**big-endian** - the same bytes the Linux implementation (RustCrypto's
+`raw_secret_bytes`) feeds HKDF.
 
-## 3. Raw ECDH secret byte order agrees across providers (verified, pre-fingerprint)
+**Why it matters.** `BCRYPT_KDF_RAW_SECRET` returns the secret
+**little-endian** (byte-reversed X). Feeding it as-is would derive a
+different key from the Linux construction for the same inputs.
 
-**Claim.** `BCryptDeriveKey(BCRYPT_KDF_RAW_SECRET)` on the software
-ephemeral key (wrap side) and `NCryptDeriveKey(BCRYPT_KDF_RAW_SECRET)` on a
-TPM-resident KEK via the Platform Crypto Provider (unwrap side) return the
-shared secret in the same byte order, so both sides feed identical bytes to
-HKDF.
+**Verified how.** The proof of concept behind section 13 compared
+`NCryptDeriveKey(BCRYPT_KDF_RAW_SECRET)` against an independent
+`BigInteger` computation of `d·H(salt)` on the Software KSP, and against
+`x(KEK public)` / `x(2·KEK public)` for the generator and its double on the
+Platform Crypto Provider (AMD fTPM): RAW_SECRET is little-endian on both.
+`DeriveWrappingKey` reverses it. Wrap and unwrap now run the same code on
+the same provider, so the earlier concern - BCrypt on wrap and NCrypt on
+unwrap agreeing on byte order - no longer arises.
 
-**Why it matters.** Microsoft documents `BCRYPT_KDF_RAW_SECRET` as returning
-the secret little-endian for BCrypt, and says nothing about whether every
-KSP's `NCryptDeriveKey` does the same. If they disagreed, every TPM-backed
-unwrap would fail authentication.
+**The construction is pinned.** Section 29 of `tests/test_roundtrip.cpp`
+rebuilds a frozen golden payload from the documented construction,
+independently of `src/` - with `H(salt)` taken from the Linux crate's own
+output, not this project's hash-to-curve - and checks the shipped DLL
+unwraps it to a known DEK. Any change to the hash-to-curve, the IKM byte
+order, the HKDF salt, hash or info string, the AAD, or the wire layout fails
+that test while ordinary round trips still pass.
 
-**Verified how.** A full wrap (BCrypt) / unwrap (NCrypt, provider_type = 1,
-AMD fTPM) round-trip succeeded in the elevated test suite, most recently on
-2026-10-06 after the curve-pinning change to `src/ecdh_hkdf.cpp`. Re-run the
-elevated suite after any change to that file to keep this claim current.
-
-**The byte order itself is pinned.** The library uses the raw secret exactly
-as `BCRYPT_KDF_RAW_SECRET` returns it - little-endian, i.e. the shared
-point's X coordinate byte-reversed - as the HKDF input. Section 29 of
-`tests/test_roundtrip.cpp` rebuilds a frozen golden payload from the
-documented construction, independently of `src/`, and checks the shipped DLL
-unwraps it to a known DEK. Any change to the IKM byte order, the HKDF salt,
-hash or info string, the AAD, or the wire layout fails that test while
-ordinary round trips still pass (verified by deliberately changing the HKDF
-context string). Note for cross-platform work: an implementation that feeds
-HKDF the conventional big-endian X coordinate derives a different key, so
-claims of matching another platform's construction hold only if that
-platform reverses the bytes too.
-
-**Residual risk.** Verified on one TPM vendor/firmware only.
-
+**Residual risk.** The PCP path was verified on one TPM vendor/firmware only.
 ## 4. Platform Crypto Provider quirks on an AMD fTPM (verified)
 
 All observed on `Microsoft Platform Crypto Provider` over an AMD fTPM
@@ -326,8 +330,10 @@ use) are still granted by *name*, now restricted to local groups.
   zero and `Version` to be `1`, so neither can currently be varied at all;
   if a second version is ever introduced, `Version` should be added to the
   AAD at that point.
-- Each wrap uses a fresh ephemeral ECDH key and therefore a fresh AES key,
-  so the random 96-bit nonce can never repeat under a key.
+- Each wrap draws a fresh random 32-byte salt, which yields a fresh `Z` and
+  is HKDF's salt, and therefore a fresh AES key; the random 96-bit nonce
+  would have to repeat under the *same* salt to matter (probability of a
+  salt collision: about 2^-128 per pair of wraps).
 - Concurrent mutation of nonce/ciphertext/tag by a hostile in-process thread
   is not a check-then-use problem: `BCryptDecrypt` reads them in one call
   and GCM authenticates whatever it reads.
@@ -382,3 +388,61 @@ use) are still granted by *name*, now restricted to local groups.
   attestation for the zip, DLL and CLI (`gh attestation verify`), which
   needs a public repository or GitHub Enterprise Cloud. Workflow actions
   are pinned to commit SHAs.
+
+## 13. ECDH with a computed point on the Windows providers (verified)
+
+**Claim.** Both KSPs can compute `Z = ECDH(KEK private key, H(salt))` for a
+point the library constructs, deterministically, with the private key
+staying inside the TPM for a Platform Crypto Provider KEK, and with the
+same authorization as any other use of the KEK.
+
+**Verified how.** A standalone proof of concept (not part of the
+repository), run on 2026-10-14 on the Microsoft Platform Crypto Provider
+over an AMD fTPM (firmware 6.24.0.6) and on the Software KSP, with per-user
+keys and, elevated, machine keys:
+
+- `NCryptImportKey` of a constructed `BCRYPT_ECCPUBLIC_BLOB` and
+  `NCryptSecretAgreement` succeed on both. On the PCP, ECDH with the
+  generator G and with 2G returned exactly `x(KEK public)` and
+  `x(2·KEK public)` - computed from the public key alone - so the TPM
+  performs genuine scalar multiplication on a supplied point. No key flags
+  beyond today's: the PCP refuses `NCRYPT_ALLOW_KEY_AGREEMENT_FLAG` and
+  keeps usage `DECRYPT` (section 4), yet the agreement works.
+- `NCryptDeriveKey` KDFs: `BCRYPT_KDF_RAW_SECRET`, `HASH`, `HMAC` and
+  `SP800_56A_CONCAT` work on both providers; `TLS_PRF` and `HKDF` return
+  `NTE_INVALID_PARAMETER`. Passing `NCRYPT_SILENT_FLAG` to `NCryptDeriveKey`
+  makes every KDF fail with `NTE_INVALID_PARAMETER`; the library passes 0.
+- Deterministic: the same KEK and salt twice give identical output;
+  different salts or different KEKs give different output (all four KDFs,
+  both providers).
+- Independent maths (Software KSP, exportable test key): `d·H(salt)`
+  computed with `System.Numerics.BigInteger` matched the provider for two
+  salts and three KDFs. The hash-to-curve re-implementation matched the
+  Linux implementation's `payload_ecdh_point` on the RustCrypto p256 0.14
+  crate for three salts.
+- The private key stays in the TPM: exporting the PCP key's private blob is
+  refused (`0x8009000A`), as is changing its export policy; the provider
+  reports `NCRYPT_IMPL_HARDWARE_FLAG`; one agreement takes ~8.9 ms on the
+  PCP against ~0.09 ms in software. A `TPM` ETW trace recorded no command
+  events, and Microsoft does not document which TPM command the PCP issues,
+  so `TPM2_ECDH_ZGen` is inferred from this evidence, not observed.
+- Bad points are refused at import: off-curve, (0,0), X = p and all-0xFF
+  points by `BCryptImportKeyPair` (`STATUS_INVALID_PARAMETER`), the Software
+  KSP (`NTE_INVALID_PARAMETER`) and the PCP (`TPM_E_PCP_INTERNAL_ERROR`,
+  `0x80290407`) - the PCP in 0.07 ms, as fast as a successful import, i.e.
+  in software before the TPM.
+- Authorization: with a machine KEK whose DACL admits only SYSTEM and
+  Administrators, a non-elevated account fails at `NCryptOpenKey`
+  (`NTE_PERM` on the PCP, `NTE_BAD_KEYSET` on the Software KSP) and cannot
+  read the key file directly, so it can neither run the agreement nor read
+  the public key; the elevated administrator can do both. 52 denied
+  attempts left the TPM's `LockoutCount` at 0 of 32: the refusal happens at
+  the key's ACL, and these keys have no TPM authorization value to fail.
+- Cost: import + agreement + raw derive averaged 9.8 ms on the PCP
+  (median 9.5, p95 11.0, 100 runs) and 0.17 ms on the Software KSP. Every
+  wrap is now one such operation.
+
+**Residual risk.** One TPM vendor/firmware only; a Hyper-V vTPM was not
+tested (no Windows guest was available). Note for diagnostics: on the
+Software KSP an unauthorized caller gets `NTE_BAD_KEYSET`, the same status
+as a missing key.

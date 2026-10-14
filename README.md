@@ -104,7 +104,7 @@ an older payload for the same service. Protect the file itself, which is what th
 after unwrapping.
 
 `dek_len` must be exactly 32 (`HKDFGUARD_DEK_LEN`). A wrapped payload is always exactly
-164 bytes (`HKDFGUARD_WRAPPED_LEN`) - a fixed size regardless of which KEK provider
+132 bytes (`HKDFGUARD_WRAPPED_LEN`) - a fixed size regardless of which KEK provider
 produced it - so callers can allocate output buffers without a size-query round trip.
 See `include/hkdfguard.h` for the full set of `HKDFGUARD_ERR_*` status codes. The table
 is shared number for number with the Linux and macOS builds of this ABI: general codes
@@ -122,7 +122,7 @@ it's zeroed internally the moment it's wrapped. Recover it later via
 `hkdfguard_unwrap_dek` on the resulting payload, with the same `service`.
 
 `hkdfguard_open_file` reads a wrapped-key file, such as one written by the CLI's `wrap`,
-and returns its 164 bytes **still wrapped**, ready for a later, separate
+and returns its 132 bytes **still wrapped**, ready for a later, separate
 `hkdfguard_unwrap_dek` call. It never unwraps, opens no KEK, and needs only read access to
 the file. `path` is UTF-8, absolute or relative to the current directory, and follows the
 same rules as the CLI's `--key-file-path`: it must be a real file on a local drive, reached
@@ -138,8 +138,8 @@ and a path containing one is refused. It checks the file's size before reading a
 fails
 with `HKDFGUARD_ERR_FILE_PLAINTEXT_KEY` for a file of exactly 32 bytes (the size of an
 *unwrapped* DEK, so probably a plaintext key written to disk - treat it as exposed; its
-contents are never read), `HKDFGUARD_ERR_FILE_TOO_SHORT` for any other size under 164, and
-`HKDFGUARD_ERR_FILE_TOO_LONG` for anything over. A 164-byte file must also pass the same
+contents are never read), `HKDFGUARD_ERR_FILE_TOO_SHORT` for any other size under 132, and
+`HKDFGUARD_ERR_FILE_TOO_LONG` for anything over. A 132-byte file must also pass the same
 structural and P-256 point checks unwrap applies, or it fails with
 `HKDFGUARD_ERR_FILE_MALFORMED` (an unrecognized version included). `HKDFGUARD_ERR_FILE_NOT_FOUND`,
 `HKDFGUARD_ERR_FILE_ACCESS_DENIED` and `HKDFGUARD_ERR_FILE_IO` cover a file that can't be
@@ -419,24 +419,30 @@ Get-WinEvent -LogName Application -FilterXPath "*[System[Provider[@Name='hkdfgua
 
 ## Design
 
-- **Crypto**: ephemeral ECDH (P-256) + HKDF-SHA512 + AES-256-GCM, matching the macOS
-  Secure Enclave implementation's pattern. See `src/ecdh_hkdf.cpp` for the derivation
-  design note - wrap-side and unwrap-side both extract the *raw* ECDH shared secret
-  (`BCRYPT_KDF_RAW_SECRET`, works identically via `BCryptDeriveKey` and
-  `NCryptDeriveKey`) and then run one shared, self-contained HKDF-SHA512
-  implementation, rather than relying on two separately-implemented KDF code paths
-  inside BCrypt and NCrypt. The AES-256-GCM step authenticates the normalized `service`
+- **Crypto**: ECDH (P-256) between the KEK's private key and a point hashed from a
+  random per-payload salt, then HKDF-SHA512 and AES-256-GCM - the construction this
+  project's Linux implementation uses. Each wrap draws a 32-byte salt and hashes it to a
+  P-256 point `H(salt)` (`src/hash_to_curve.cpp`: SHA-256 try-and-increment, identical to
+  the Linux `payload_ecdh_point`, pinned by test vectors from the Linux crate). The shared
+  secret `Z = ECDH(KEK private key, H(salt))` is computed by `NCryptSecretAgreement` on the
+  KEK's own provider - inside the TPM for a Platform Crypto Provider KEK - for wrap and
+  unwrap alike, taken out raw (`BCRYPT_KDF_RAW_SECRET`) and reversed to big-endian, then
+  fed to one self-contained HKDF-SHA512 implementation (salt = the payload salt, info =
+  a fixed context string and the KEK's public key). Nobody knows the discrete log of
+  `H(salt)`, so **only an account authorized to use the KEK can create a payload**:
+  knowing the KEK's public key is not enough to forge one. Every wrap is therefore a use
+  of the KEK's private key - a TPM operation of about 10 ms for a TPM-backed KEK. See
+  `src/ecdh_hkdf.cpp` for the derivation design note. The AES-256-GCM step authenticates the normalized `service`
   name followed by a SHA-256 fingerprint of the KEK's public key as additional
   authenticated data (`src/aes_gcm.cpp`'s `AesGcmEncrypt`/`AesGcmDecrypt`, called from
   `src/hkdfguard.cpp`) - binding a wrapped payload to both the exact service and the
   specific KEK it was wrapped under. The fingerprint also travels in the payload and is
   checked against the opened KEK before any ECDH or decryption, so "wrong KEK"
   (`HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH`) is distinguishable from tampering
-  (`HKDFGUARD_ERR_PAYLOAD_AUTH_FAILED`). Matches the construction this project's macOS and
-  Linux implementations use.
-- **Wire format**: `src/wire_format.h` documents the exact 164-byte `WrappedDekV1`
-  layout (version, provider type, key id, ephemeral public key, AES-GCM nonce/
-  ciphertext/tag, KEK fingerprint), serialized field-by-field rather than via a packed
+  (`HKDFGUARD_ERR_PAYLOAD_AUTH_FAILED`).
+- **Wire format**: `src/wire_format.h` documents the exact 132-byte `WrappedDekV1`
+  layout (version, provider type, key id, salt, AES-GCM nonce/ciphertext/tag, KEK
+  fingerprint), serialized field-by-field rather than via a packed
   C struct so the format has no dependency on compiler struct-packing rules.
 - **KEK lifecycle**: `src/kek_store.cpp` creates the KEK (Platform Crypto Provider first,
   falling back to Software KSP under `PreferTpm`) only via `hkdfguard_create_kek`, which

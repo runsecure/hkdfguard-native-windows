@@ -206,7 +206,7 @@ $dek = New-Object byte[] 32
     --dek-stdin --group App_1234 --force
 ```
 
-`--force` overwrites an existing key file. The wrapped file is always 164 bytes. The key
+`--force` overwrites an existing key file. The wrapped file is always 132 bytes. The key
 file must be on a real local path. Symbolic links, junctions, SUBST drives, mapped network
 drives and hard-linked files are refused, and so are 8.3 short names such as `PROGRA~1`:
 spell every folder with its full name. Don't build the path from `%TEMP%` or another
@@ -375,9 +375,9 @@ command-line tool itself never produces:
 | Code | Meaning | What to do |
 |---|---|---|
 | -39 `FILE_UNTRUSTED` | The key file's path is a link, passes through a junction or SUBST drive, uses an 8.3 short name (`PROGRA~1`), is on a network or deduplicated volume, or is a cloud placeholder. | Configure the application with the full long path (if it comes from `%TEMP%` or another environment variable, expand it first), or move the file to a plain local folder. See [Where to keep the key file](#3-wrap-a-dek-into-a-key-file-every-release). |
-| -38 `FILE_MALFORMED` | The file is 164 bytes but does not hold a valid wrapped key (corrupted, edited, or not a key file at all). | Re-run `wrap` to rewrite the file. |
+| -38 `FILE_MALFORMED` | The file is 132 bytes but does not hold a valid wrapped key (corrupted, edited, or not a key file at all). | Re-run `wrap` to rewrite the file. |
 | -37 `FILE_PLAINTEXT_KEY` | The file is exactly 32 bytes: probably an unwrapped key on disk. Event 2006 names it. | Treat the key as exposed. Find out how the file was written, remove it, and re-mint the DEK. |
-| -35 / -36 `FILE_TOO_SHORT` / `FILE_TOO_LONG` | The file isn't 164 bytes, so it isn't a wrapped key. | Check the application is pointed at the right file; re-run `wrap`. |
+| -35 / -36 `FILE_TOO_SHORT` / `FILE_TOO_LONG` | The file isn't 132 bytes, so it isn't a wrapped key. | Check the application is pointed at the right file; re-run `wrap`. |
 | -32 / -33 / -34 `FILE_NOT_FOUND` / `FILE_ACCESS_DENIED` / `FILE_IO` | The file is missing, the service account can't read it, or another process has it open for writing. | Check the path and the file's `--group` ACL, and that nothing is rewriting the file while the service starts. |
 
 For security assumptions and known TPM vendor behavior, see

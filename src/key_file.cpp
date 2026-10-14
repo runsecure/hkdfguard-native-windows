@@ -1,13 +1,10 @@
 // Reading a wrapped-key file for hkdfguard_open_file (see hkdfguard.h for the
 // contract). Its own file, rather than part of hkdfguard.cpp, so the test
-// executable can compile and call ReadWrappedKeyFile directly - with the
-// test-only seams (e.g. ecdh_hkdf.h's SetTestEcdhProviderFault) that are
-// compiled into the test's copies of these sources but never into
-// HkdfGuardV1.dll - the same way kek_store.cpp is shared.
+// executable can compile and call ReadWrappedKeyFile directly, the same way
+// kek_store.cpp is shared.
 #include "key_file.h"
 
 #include "../include/hkdfguard.h"
-#include "ecdh_hkdf.h"   // ValidateEphemeralPublicKey
 #include "errors.h"
 #include "wire_format.h" // ParseWrappedDek, kTotalLen
 
@@ -334,22 +331,19 @@ namespace hkdfguard {
             throw HkdfGuardError(HKDFGUARD_ERR_FILE_TOO_LONG, "file is longer than a wrapped payload");
         }
 
-        // The checks hkdfguard_unwrap_dek makes before it touches a KEK: the
-        // payload's structure, then its ephemeral public key is a real P-256
-        // point. Called directly, those throw the payload codes
-        // (HKDFGUARD_ERR_PAYLOAD_UNSUPPORTED for an unknown version,
-        // HKDFGUARD_ERR_PAYLOAD_MALFORMED for everything else). Here they
-        // are re-thrown as HKDFGUARD_ERR_FILE_MALFORMED: what this call
-        // reports is a verdict on the *file* - it is the right size but
-        // doesn't hold a valid wrapped key - which is also how the Linux and
-        // macOS builds of this ABI report a malformed key file, unknown
-        // version included. The one exception passes through untouched: the
-        // point check throws HKDFGUARD_ERR_CRYPTO_ERROR if the software ECDH
-        // provider it validates with can't be opened at all, which says
-        // nothing about the file.
+        // The structural checks hkdfguard_unwrap_dek makes before it touches
+        // a KEK: version, provider type, reserved bytes, KeyId. (The salt
+        // has no structure - any 32 bytes are a valid salt - so there is
+        // nothing more to check without the KEK.) Called directly, those
+        // throw the payload codes (HKDFGUARD_ERR_PAYLOAD_UNSUPPORTED for an
+        // unknown version, HKDFGUARD_ERR_PAYLOAD_MALFORMED for everything
+        // else). Here they are re-thrown as HKDFGUARD_ERR_FILE_MALFORMED:
+        // what this call reports is a verdict on the *file* - it is the
+        // right size but doesn't hold a valid wrapped key - which is also how
+        // the Linux and macOS builds of this ABI report a malformed key file,
+        // unknown version included.
         try {
-            ParsedWrappedDek parsed = ParseWrappedDek(out, static_cast<int32_t>(kTotalLen));
-            ValidateEphemeralPublicKey(parsed.ephemeral_pub);
+            ParseWrappedDek(out, static_cast<int32_t>(kTotalLen));
         } catch (const HkdfGuardError &e) {
             if (e.code() == HKDFGUARD_ERR_PAYLOAD_MALFORMED || e.code() == HKDFGUARD_ERR_PAYLOAD_UNSUPPORTED) {
                 throw HkdfGuardError(HKDFGUARD_ERR_FILE_MALFORMED, e.what());

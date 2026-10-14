@@ -4,7 +4,7 @@
 #include <cstdint> // uint8_t, uint32_t
 
 namespace hkdfguard {
-    // WrappedDekV1 layout (all integers little-endian; total 164 bytes,
+    // WrappedDekV1 layout (all integers little-endian; total 132 bytes,
     // identical regardless of which KEK provider produced it):
     //
     //   offset  size  field
@@ -12,11 +12,22 @@ namespace hkdfguard {
     //   1       1     ProviderType       (1 = Platform Crypto Provider, 2 = Software KSP)
     //   2       2     Reserved           (must be 0; rejected otherwise)
     //   4       4     KeyId              (little-endian; = 1 for this format version)
-    //   8       64    EphemeralPublicKey (raw P-256 point, X || Y)
-    //   72      12    Nonce              (AES-GCM IV)
-    //   84      32    Ciphertext         (AES-256-GCM ciphertext of the 32-byte DEK)
-    //   116     16    Tag                (AES-GCM authentication tag)
-    //   132     32    KekFingerprint     (SHA-256 of the KEK's public key, raw X || Y)
+    //   8       32    Salt               (random per payload; see below)
+    //   40      12    Nonce              (AES-GCM IV)
+    //   52      32    Ciphertext         (AES-256-GCM ciphertext of the 32-byte DEK)
+    //   84      16    Tag                (AES-GCM authentication tag)
+    //   100     32    KekFingerprint     (SHA-256 of the KEK's public key, raw X || Y)
+    //
+    // The wrapping key is Z = ECDH(KEK private key, H(Salt)), where H hashes
+    // the salt to a P-256 point (hash_to_curve.h) - the same construction as
+    // this project's Linux implementation. Nobody knows the discrete log of
+    // H(Salt), so computing Z needs the KEK's *private* key: only an account
+    // authorized to use the KEK can create a payload, and knowing the KEK's
+    // public key is not enough to forge one. (The format carried an
+    // ephemeral public key here before the library's first release; that
+    // ECIES construction let anyone holding the public key forge payloads.)
+    // The salt is also HKDF's salt, and is otherwise unstructured - any 32
+    // bytes are a well-formed salt.
     //
     // KekFingerprint identifies which KEK produced the payload. It is both
     // (a) authenticated - it is part of the AES-GCM AAD, alongside the
@@ -70,7 +81,10 @@ namespace hkdfguard {
     constexpr uint8_t kProviderTypeTpm = 1; // Microsoft Platform Crypto Provider
     constexpr uint8_t kProviderTypeSoftware = 2; // Microsoft Software Key Storage Provider
 
-    constexpr size_t kEphemeralPubLen = 64;
+    constexpr size_t kSaltLen = 32;
+    // A raw P-256 public point, X || Y - the KEK's public key and H(Salt).
+    // Not part of the payload.
+    constexpr size_t kPublicPointLen = 64;
     constexpr size_t kNonceLen = 12;
     constexpr size_t kCiphertextLen = 32; // == HKDFGUARD_DEK_LEN
     constexpr size_t kTagLen = 16;
@@ -84,17 +98,17 @@ namespace hkdfguard {
     constexpr size_t kProviderTypeOffset = 1;
     constexpr size_t kReservedOffset = 2;
     constexpr size_t kKeyIdOffset = 4;
-    constexpr size_t kEphemeralPubOffset = 8;
-    constexpr size_t kNonceOffset = kEphemeralPubOffset + kEphemeralPubLen; // 72
-    constexpr size_t kCiphertextOffset = kNonceOffset + kNonceLen; // 84
-    constexpr size_t kTagOffset = kCiphertextOffset + kCiphertextLen; // 116
-    constexpr size_t kFingerprintOffset = kTagOffset + kTagLen; // 132
-    constexpr size_t kTotalLen = kFingerprintOffset + kFingerprintLen; // 164
+    constexpr size_t kSaltOffset = 8;
+    constexpr size_t kNonceOffset = kSaltOffset + kSaltLen; // 40
+    constexpr size_t kCiphertextOffset = kNonceOffset + kNonceLen; // 52
+    constexpr size_t kTagOffset = kCiphertextOffset + kCiphertextLen; // 84
+    constexpr size_t kFingerprintOffset = kTagOffset + kTagLen; // 100
+    constexpr size_t kTotalLen = kFingerprintOffset + kFingerprintLen; // 132
 
     // A plain C++ `struct` (equivalent to a `class` whose members default to
     // `public`) used purely to bundle the parsed-out pieces of a wrapped
     // payload for easy return from ParseWrappedDek below. None of these fields
-    // are secret (they're either public metadata, a public ephemeral key, or
+    // are secret (they're either public metadata, the public salt, or
     // AES-GCM ciphertext/tag bytes that are meant to be stored/transmitted), so
     // unlike SecureBuffer there's no zero-on-destruction behavior needed here.
     //
@@ -108,7 +122,7 @@ namespace hkdfguard {
     struct ParsedWrappedDek {
         uint8_t provider_type;
         uint32_t key_id;
-        const uint8_t *ephemeral_pub; // kEphemeralPubLen bytes
+        const uint8_t *salt; // kSaltLen bytes
         const uint8_t *nonce; // kNonceLen bytes
         const uint8_t *ciphertext; // kCiphertextLen bytes
         const uint8_t *tag; // kTagLen bytes
@@ -123,17 +137,17 @@ namespace hkdfguard {
     // the two together afterward.
     //
     // Writes a kTotalLen-byte WrappedDekV1 payload into out. The parameter
-    // types like `const uint8_t ephemeral_pub[kEphemeralPubLen]` are a bit of
+    // types like `const uint8_t salt[kSaltLen]` are a bit of
     // C/C++ notation worth knowing: as a *function parameter*, an array type
     // always silently decays to a plain pointer (`const uint8_t*`) - the
-    // `[kEphemeralPubLen]` here is purely documentation for a human reader of
+    // `[kSaltLen]` here is purely documentation for a human reader of
     // exactly how many bytes the function expects to find at that pointer; the
     // compiler does not actually check the caller passed an array of that
     // length.
     void SerializeWrappedDek(
         uint8_t provider_type,
         uint32_t key_id,
-        const uint8_t ephemeral_pub[kEphemeralPubLen],
+        const uint8_t salt[kSaltLen],
         const uint8_t nonce[kNonceLen],
         const uint8_t ciphertext[kCiphertextLen],
         const uint8_t tag[kTagLen],

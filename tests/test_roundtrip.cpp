@@ -8,9 +8,10 @@
 #include "hkdfguard.h"  // the public ABI under test
 #include "kek_store.h"  // CreateKek/KekExists/OpenKekForWrap/DeleteKek - internal helpers, used directly below
 #include "policy.h"     // SetTestPolicyOverride - internal test-only seam, used directly below
-#include "ecdh_hkdf.h"  // ValidateEphemeralPublicKey - the unwrap-side point-validation gate, tested directly below
-#include "key_file.h"   // ReadWrappedKeyFile - hkdfguard_open_file's implementation, for section 24c's provider-fault check
-#include "errors.h"     // HkdfGuardError - caught by EphemeralGateResult below to read the gate's error code
+#include "ecdh_hkdf.h"  // IsValidP256Point, DeriveWrappingKey - the point gate and the derivation, tested directly below
+#include "hash_to_curve.h" // PayloadEcdhPoint - checked against the Linux implementation's vectors below
+#include "key_file.h"   // ReadWrappedKeyFile - hkdfguard_open_file's implementation, called directly in section 24c
+#include "errors.h"     // HkdfGuardError - caught by PointGateResult and CodeOf below to read error codes
 #include "key_acl.h"    // ValidateKeyUseGroups - vets the key-use policy list without touching any key
 
 #include <aclapi.h>  // SetEntriesInAclW - section 25d widens an existing KEK's ACL
@@ -181,9 +182,8 @@ void CheckPolicyCreatesKek(
 }
 
 // Generates a genuine, freshly-random P-256 public point (raw X||Y, 64
-// bytes) via BCrypt - the same way ecdh_hkdf.cpp's wrap side makes its
-// ephemeral key - as known-good input for the ValidateEphemeralPublicKey
-// checks. Returns an empty vector if any BCrypt step fails, which the caller
+// bytes) via BCrypt, as known-good input for the IsValidP256Point checks.
+// Returns an empty vector if any BCrypt step fails, which the caller
 // reports as its own failed check rather than silently skipping the section.
 std::vector<uint8_t> MakeValidP256Point() {
     hkdfguard::ScopedBCryptAlg alg;
@@ -195,19 +195,18 @@ std::vector<uint8_t> MakeValidP256Point() {
     if (!BCRYPT_SUCCESS(BCryptExportKey(key.get(), nullptr, BCRYPT_ECCPUBLIC_BLOB, nullptr, 0, &cb, 0))) return {};
     std::vector<uint8_t> blob(cb);
     if (!BCRYPT_SUCCESS(BCryptExportKey(key.get(), nullptr, BCRYPT_ECCPUBLIC_BLOB, blob.data(), cb, &cb, 0))) return {};
-    if (blob.size() < sizeof(BCRYPT_ECCKEY_BLOB) + hkdfguard::kEphemeralPubLen) return {};
+    if (blob.size() < sizeof(BCRYPT_ECCKEY_BLOB) + hkdfguard::kPublicPointLen) return {};
     return std::vector<uint8_t>(
         blob.begin() + sizeof(BCRYPT_ECCKEY_BLOB),
-        blob.begin() + sizeof(BCRYPT_ECCKEY_BLOB) + hkdfguard::kEphemeralPubLen);
+        blob.begin() + sizeof(BCRYPT_ECCKEY_BLOB) + hkdfguard::kPublicPointLen);
 }
 
-// Runs the gate on `point` and returns the HKDFGUARD_* code it produced:
-// HKDFGUARD_OK if it accepted the point, the thrown error's code if it
-// rejected it, or a sentinel if something other than HkdfGuardError escaped.
-int32_t EphemeralGateResult(const std::vector<uint8_t>& point) {
+// Runs the point gate on `point`: 1 if it accepted the point, 0 if it
+// rejected it, or the thrown HKDFGUARD_* code (negative) if the gate itself
+// failed, or a sentinel if something other than HkdfGuardError escaped.
+int32_t PointGateResult(const std::vector<uint8_t>& point) {
     try {
-        hkdfguard::ValidateEphemeralPublicKey(point.data());
-        return HKDFGUARD_OK;
+        return hkdfguard::IsValidP256Point(point.data()) ? 1 : 0;
     } catch (const hkdfguard::HkdfGuardError& e) {
         return e.code();
     } catch (...) {
@@ -495,28 +494,31 @@ std::string ToHex(const std::vector<uint8_t>& bytes) {
     return out;
 }
 
-// Fixed P-256 key pairs for the golden payload (section 29), generated once
-// with BCrypt and frozen here. Test-only keys: they protect nothing.
+// A fixed P-256 KEK for the golden payload (section 29), generated once with
+// BCrypt and frozen here. Test-only key: it protects nothing.
 constexpr char kGoldenKekX[] = "a55c04e4b2113126f3ea5244034decd0c0c9f55cd25d2e0396a365a7e265082f";
 constexpr char kGoldenKekY[] = "4ab897ae67c14350a0213b0a67d416472aa053a16992018ac4d874dc8529569d";
 constexpr char kGoldenKekD[] = "9639379738995d1017b34a6398b444cf9cd0c82acb0dc0cd5d40c91b513f4e90";
-constexpr char kGoldenEphX[] = "49558684f39417442947acb7dadc2f1fa748707d0fd67c77dac65f9b7bc83524";
-constexpr char kGoldenEphY[] = "7676693e78abc03028a6648960ed359395e403b079b2e8e46456a84ddb76116d";
-constexpr char kGoldenEphD[] = "43d28ac36869f16095e0a4e2a09b7ae147ead807317fa0299828102bd03022d0";
+constexpr char kGoldenSalt[] = "4242424242424242424242424242424242424242424242424242424242424242";
+// H(kGoldenSalt): produced by the Linux implementation's payload_ecdh_point
+// on the RustCrypto p256 0.14 crate - NOT by this project's
+// hash_to_curve.cpp - so the golden payload pins Windows to the Linux
+// hash-to-curve as well as to the rest of the construction.
+constexpr char kGoldenPointX[] = "23705f112056934aef2059c9c3ffa610ccb2f070d266d4ffa06210d37e9a0de5";
+constexpr char kGoldenPointY[] = "df412b76994469fb7c27385e2d8f389f3da716076c79a19bb57249c9755f032a";
 constexpr char kGoldenNonce[] = "977bcd31c21caffe32bc3f6a";
 constexpr char kGoldenService[] = "hkdfguardwin.test.golden";
 constexpr wchar_t kGoldenServiceWide[] = L"hkdfguardwin.test.golden";
 
 // The golden WrappedDekV1 payload: MakeDek() wrapped under the golden KEK
-// for kGoldenService, with the golden ephemeral key and nonce. Frozen. If a
-// code change makes this stop unwrapping, that change breaks every payload
+// for kGoldenService, with the golden salt and nonce. Frozen. If a code
+// change makes this stop unwrapping, that change breaks every payload
 // already deployed - fix the change, never this constant.
 constexpr char kGoldenPayloadHex[] =
-    "010200000100000049558684f39417442947acb7dadc2f1fa748707d0fd67c77dac65f9b"
-    "7bc835247676693e78abc03028a6648960ed359395e403b079b2e8e46456a84ddb76116d"
-    "977bcd31c21caffe32bc3f6a1f076220e98a1e9a444280622f6411869f972b9cbef3c705"
-    "448621c8d6b812acea664278b5976d4a6f46d3d1e59fbad038d1ef5a8d210826eeabdd24"
-    "b8676833717a7ecedb999ae3b9b3012a0d4353c4";
+    "010200000100000042424242424242424242424242424242424242424242424242424242"
+    "42424242977bcd31c21caffe32bc3f6a0e565cb000978ea50f780da588daece0022d5929"
+    "f9404d50f87daf7c78383cd93d1fd63a73571b967fc18ebaf31f8d0938d1ef5a8d210826"
+    "eeabdd24b8676833717a7ecedb999ae3b9b3012a0d4353c4";
 
 // BCRYPT_ECCPRIVATE_BLOB for a P-256 ECDH key from hex X, Y, d.
 std::vector<uint8_t> EccPrivateBlob(const char* x, const char* y, const char* d) {
@@ -538,63 +540,88 @@ bool HmacSha512(const std::vector<uint8_t>& key, const std::vector<uint8_t>& dat
                                      static_cast<ULONG>(data.size()), out.data(), 64));
 }
 
-// Builds the golden payload from the *documented* construction, written
-// independently of src/ (no library function is called): ECDH(ephemeral d,
-// KEK public) -> raw secret -> HKDF-SHA512 (RFC 5869, salt = 64 zero bytes,
-// info = "HkdfGuardWin-DEK-Wrap-v1" || ephemeral X||Y || KEK X||Y) -> first
-// 32 bytes as the AES-256-GCM key; AAD = service || SHA-256(KEK X||Y); then
-// the WrappedDekV1 layout. Agreement with the library's own output (the
-// frozen constant, which the library must unwrap) shows the code still
-// implements this construction.
-//
-// IKM byte order: BCRYPT_KDF_RAW_SECRET returns the shared secret
-// LITTLE-endian (byte-reversed relative to the usual big-endian X
-// coordinate), and the library feeds those bytes to HKDF as they come. This
-// test uses them the same way, which pins that choice: switching to
-// big-endian would break every existing payload.
-bool BuildGoldenPayloadIndependently(std::vector<uint8_t>& payload) {
+// The wrapping key, derived from the *documented* construction written
+// independently of src/ (no library function is called): Z = ECDH(KEK d,
+// point) as big-endian X -> HKDF-SHA512 (RFC 5869, salt = the payload salt,
+// info = "HkdfGuardWin-DEK-Wrap-v1" || KEK X||Y) -> first 32 bytes. Shared by
+// the golden payload and the forgery test (section 24b). `kekPub` is the
+// KEK's public key (X||Y). With `kekD` (the KEK's private scalar) this is
+// the genuine derivation, Z = ECDH(d, point). Without it - `kekD` null - Z
+// is instead ECDH(e, KEK public) for a fresh random e: exactly what someone
+// holding only the KEK's public key can compute, as the earlier ECIES
+// construction allowed.
+bool IndependentWrappingKey(const std::vector<uint8_t>& salt, const std::vector<uint8_t>& point,
+                            const std::vector<uint8_t>& kekPub, const std::vector<uint8_t>* kekD,
+                            std::vector<uint8_t>& aesKey) {
     BCRYPT_ALG_HANDLE ecdh = BCRYPT_ECDH_P256_ALG_HANDLE;
-    std::vector<uint8_t> kekBlob = EccPrivateBlob(kGoldenKekX, kGoldenKekY, kGoldenKekD);
-    std::vector<uint8_t> ephBlob = EccPrivateBlob(kGoldenEphX, kGoldenEphY, kGoldenEphD);
-    hkdfguard::ScopedBCryptKey kek, eph;
-    if (!BCRYPT_SUCCESS(BCryptImportKeyPair(ecdh, nullptr, BCRYPT_ECCPRIVATE_BLOB, kek.put(), kekBlob.data(),
-                                            static_cast<ULONG>(kekBlob.size()), 0)) ||
-        !BCRYPT_SUCCESS(BCryptImportKeyPair(ecdh, nullptr, BCRYPT_ECCPRIVATE_BLOB, eph.put(), ephBlob.data(),
-                                            static_cast<ULONG>(ephBlob.size()), 0))) {
+    hkdfguard::ScopedBCryptKey priv, pub;
+    if (kekD != nullptr) {
+        std::vector<uint8_t> kekBlob(sizeof(BCRYPT_ECCKEY_BLOB));
+        auto* privHeader = reinterpret_cast<BCRYPT_ECCKEY_BLOB*>(kekBlob.data());
+        privHeader->dwMagic = BCRYPT_ECDH_PRIVATE_P256_MAGIC;
+        privHeader->cbKey = 32;
+        kekBlob.insert(kekBlob.end(), kekPub.begin(), kekPub.end());
+        kekBlob.insert(kekBlob.end(), kekD->begin(), kekD->end());
+        if (!BCRYPT_SUCCESS(BCryptImportKeyPair(ecdh, nullptr, BCRYPT_ECCPRIVATE_BLOB, priv.put(), kekBlob.data(),
+                                                static_cast<ULONG>(kekBlob.size()), 0))) {
+            return false;
+        }
+    } else if (!BCRYPT_SUCCESS(BCryptGenerateKeyPair(ecdh, priv.put(), 256, 0)) ||
+               !BCRYPT_SUCCESS(BCryptFinalizeKeyPair(priv.get(), 0))) {
+        return false;
+    }
+    std::vector<uint8_t> pubBlob(sizeof(BCRYPT_ECCKEY_BLOB));
+    auto* header = reinterpret_cast<BCRYPT_ECCKEY_BLOB*>(pubBlob.data());
+    header->dwMagic = BCRYPT_ECDH_PUBLIC_P256_MAGIC;
+    header->cbKey = 32;
+    const std::vector<uint8_t>& peer = kekD != nullptr ? point : kekPub;
+    pubBlob.insert(pubBlob.end(), peer.begin(), peer.end());
+    if (!BCRYPT_SUCCESS(BCryptImportKeyPair(ecdh, nullptr, BCRYPT_ECCPUBLIC_BLOB, pub.put(), pubBlob.data(),
+                                            static_cast<ULONG>(pubBlob.size()), 0))) {
         return false;
     }
     hkdfguard::ScopedBCryptSecret secret;
-    if (!BCRYPT_SUCCESS(BCryptSecretAgreement(eph.get(), kek.get(), secret.put(), 0))) return false;
-    std::vector<uint8_t> ikm(32);
+    if (!BCRYPT_SUCCESS(BCryptSecretAgreement(priv.get(), pub.get(), secret.put(), 0))) return false;
+    std::vector<uint8_t> z(32);
     ULONG got = 0;
-    if (!BCRYPT_SUCCESS(BCryptDeriveKey(secret.get(), BCRYPT_KDF_RAW_SECRET, nullptr, ikm.data(), 32, &got, 0)) ||
+    if (!BCRYPT_SUCCESS(BCryptDeriveKey(secret.get(), BCRYPT_KDF_RAW_SECRET, nullptr, z.data(), 32, &got, 0)) ||
         got != 32) {
         return false;
     }
-
-    std::vector<uint8_t> ephPub = FromHex(kGoldenEphX), kekPub = FromHex(kGoldenKekX);
-    std::vector<uint8_t> ephY = FromHex(kGoldenEphY), kekY = FromHex(kGoldenKekY);
-    ephPub.insert(ephPub.end(), ephY.begin(), ephY.end());
-    kekPub.insert(kekPub.end(), kekY.begin(), kekY.end());
+    // BCRYPT_KDF_RAW_SECRET is little-endian; the construction uses the
+    // conventional big-endian X coordinate (as the Linux implementation does).
+    std::reverse(z.begin(), z.end());
 
     const char context[] = "HkdfGuardWin-DEK-Wrap-v1";
     std::vector<uint8_t> info(context, context + sizeof(context) - 1);
-    info.insert(info.end(), ephPub.begin(), ephPub.end());
     info.insert(info.end(), kekPub.begin(), kekPub.end());
 
     std::vector<uint8_t> prk, t1;
-    if (!HmacSha512(std::vector<uint8_t>(64, 0), ikm, prk)) return false;
+    if (!HmacSha512(salt, z, prk)) return false;
     std::vector<uint8_t> t1Input = info;
     t1Input.push_back(0x01);
     if (!HmacSha512(prk, t1Input, t1)) return false;
-    std::vector<uint8_t> aesKey(t1.begin(), t1.begin() + 32);
+    aesKey.assign(t1.begin(), t1.begin() + 32);
+    return true;
+}
 
+// Seals `dek` into a WrappedDekV1 payload with a given wrapping key, salt and
+// nonce, independently of src/: AAD = service || SHA-256(KEK X||Y), then the
+// documented 132-byte layout. `providerType` must name the provider the KEK
+// actually lives on (1 = TPM, 2 = Software KSP): unwrap routes by it, so a
+// wrong value sends unwrap looking for the KEK on the wrong provider.
+bool SealPayloadIndependently(const std::vector<uint8_t>& aesKey, const std::vector<uint8_t>& salt,
+                              const std::vector<uint8_t>& nonceIn, const char* service,
+                              const std::vector<uint8_t>& kekPub, const std::vector<uint8_t>& dek,
+                              uint8_t providerType, std::vector<uint8_t>& payload) {
+    // CNG takes non-const input pointers; work on copies.
+    std::vector<uint8_t> pub = kekPub, key = aesKey;
     std::vector<uint8_t> fingerprint(32);
-    if (!BCRYPT_SUCCESS(BCryptHash(BCRYPT_SHA256_ALG_HANDLE, nullptr, 0, kekPub.data(),
-                                   static_cast<ULONG>(kekPub.size()), fingerprint.data(), 32))) {
+    if (!BCRYPT_SUCCESS(BCryptHash(BCRYPT_SHA256_ALG_HANDLE, nullptr, 0, pub.data(),
+                                   static_cast<ULONG>(pub.size()), fingerprint.data(), 32))) {
         return false;
     }
-    std::vector<uint8_t> aad(kGoldenService, kGoldenService + sizeof(kGoldenService) - 1);
+    std::vector<uint8_t> aad(service, service + std::strlen(service));
     aad.insert(aad.end(), fingerprint.begin(), fingerprint.end());
 
     hkdfguard::ScopedBCryptAlg aes;
@@ -603,11 +630,11 @@ bool BuildGoldenPayloadIndependently(std::vector<uint8_t>& payload) {
         !BCRYPT_SUCCESS(BCryptSetProperty(aes.get(), BCRYPT_CHAINING_MODE,
                                           reinterpret_cast<PUCHAR>(const_cast<wchar_t*>(BCRYPT_CHAIN_MODE_GCM)),
                                           sizeof(BCRYPT_CHAIN_MODE_GCM), 0)) ||
-        !BCRYPT_SUCCESS(BCryptGenerateSymmetricKey(aes.get(), aesHandle.put(), nullptr, 0, aesKey.data(), 32, 0))) {
+        !BCRYPT_SUCCESS(BCryptGenerateSymmetricKey(aes.get(), aesHandle.put(), nullptr, 0, key.data(), 32, 0))) {
         return false;
     }
-    std::vector<uint8_t> nonce = FromHex(kGoldenNonce);
-    std::vector<uint8_t> dek = MakeDek();
+    std::vector<uint8_t> nonce = nonceIn;
+    std::vector<uint8_t> plaintext = dek;
     std::vector<uint8_t> ciphertext(32), tag(16);
     BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO info_gcm;
     BCRYPT_INIT_AUTH_MODE_INFO(info_gcm);
@@ -618,19 +645,33 @@ bool BuildGoldenPayloadIndependently(std::vector<uint8_t>& payload) {
     info_gcm.pbAuthData = aad.data();
     info_gcm.cbAuthData = static_cast<ULONG>(aad.size());
     ULONG written = 0;
-    if (!BCRYPT_SUCCESS(BCryptEncrypt(aesHandle.get(), dek.data(), 32, &info_gcm, nullptr, 0, ciphertext.data(), 32,
+    if (!BCRYPT_SUCCESS(BCryptEncrypt(aesHandle.get(), plaintext.data(), 32, &info_gcm, nullptr, 0, ciphertext.data(), 32,
                                       &written, 0)) ||
         written != 32) {
         return false;
     }
 
-    payload = {0x01, 0x02, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00}; // version, software provider, reserved, KeyId 1 (LE)
-    payload.insert(payload.end(), ephPub.begin(), ephPub.end());
+    payload = {0x01, providerType, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00}; // version, provider, reserved, KeyId 1 (LE)
+    payload.insert(payload.end(), salt.begin(), salt.end());
     payload.insert(payload.end(), nonce.begin(), nonce.end());
     payload.insert(payload.end(), ciphertext.begin(), ciphertext.end());
     payload.insert(payload.end(), tag.begin(), tag.end());
     payload.insert(payload.end(), fingerprint.begin(), fingerprint.end());
     return payload.size() == HKDFGUARD_WRAPPED_LEN;
+}
+
+// The golden payload, built entirely from the constants above.
+bool BuildGoldenPayloadIndependently(std::vector<uint8_t>& payload) {
+    std::vector<uint8_t> salt = FromHex(kGoldenSalt);
+    std::vector<uint8_t> point = FromHex(kGoldenPointX), pointY = FromHex(kGoldenPointY);
+    point.insert(point.end(), pointY.begin(), pointY.end());
+    std::vector<uint8_t> kekPub = FromHex(kGoldenKekX), kekY = FromHex(kGoldenKekY);
+    kekPub.insert(kekPub.end(), kekY.begin(), kekY.end());
+    std::vector<uint8_t> kekD = FromHex(kGoldenKekD);
+    std::vector<uint8_t> aesKey;
+    return IndependentWrappingKey(salt, point, kekPub, &kekD, aesKey) &&
+           SealPayloadIndependently(aesKey, salt, FromHex(kGoldenNonce), kGoldenService, kekPub, MakeDek(),
+                                    hkdfguard::kProviderTypeSoftware, payload); // the golden KEK is imported on the Software KSP
 }
 
 // Persists the golden KEK on the Software KSP as a machine key under the
@@ -1164,9 +1205,10 @@ int main() {
     std::vector<uint8_t> corrupted = wrapped;
     // `^= 0xFF` flips every bit of that one byte (XOR-assignment) -
     // guaranteed to change its value no matter what it was, corrupting one
-    // byte inside the ciphertext region (see wire_format.h's offset table:
-    // byte 100 falls between kCiphertextOffset=84 and kTagOffset=116).
-    corrupted[100] ^= 0xFF; // inside the ciphertext region
+    // byte in the middle of the ciphertext region. Computed from
+    // wire_format.h's offsets, never written as a number, so a layout
+    // change can't silently move it into a different field.
+    corrupted[hkdfguard::kCiphertextOffset + hkdfguard::kCiphertextLen / 2] ^= 0xFF; // inside the ciphertext region
     std::vector<uint8_t> out_for_auth(HKDFGUARD_DEK_LEN, 0xAA);
     int32_t auth_out_len = static_cast<int32_t>(out_for_auth.size());
     rc = hkdfguard_unwrap_dek(kService, corrupted.data(), static_cast<int32_t>(corrupted.size()),
@@ -1412,50 +1454,173 @@ int main() {
     rc = hkdfguard_generate_and_wrap_dek(kService, gen_scratch.data(), nullptr);
     Check(rc == HKDFGUARD_ERR_INVALID_ARGUMENT, "generate_and_wrap rejects null out_len");
 
-    // ---- 24b. Unwrap-side ephemeral public key validation gate. ----
-    //          The ephemeral point in a payload is attacker-controlled and
-    //          is combined with the long-term KEK private key, so it must be
-    //          proven to lie on P-256 before any KSP (especially the TPM's)
-    //          ever sees it. First the gate itself, directly - no KEK or
-    //          elevation needed - then the same thing through the public
-    //          ABI against a real payload.
+    // ---- 24b. The ECDH construction: Z = ECDH(KEK private key, H(salt)). ----
+    //          First the pieces with no KEK - hash-to-curve against the
+    //          Linux implementation, and the point gate - then, against the
+    //          real KEK, that a payload can't be forged from the public key.
+    {
+        // Points produced by the Linux implementation's payload_ecdh_point on
+        // the RustCrypto p256 0.14 crate (hkdfguard-native-linux), for three
+        // fixed salts. Windows must hash every salt to exactly these points.
+        std::vector<uint8_t> sequential(hkdfguard::kSaltLen);
+        for (size_t i = 0; i < sequential.size(); ++i) sequential[i] = static_cast<uint8_t>(i);
+        struct LinuxVector {
+            std::vector<uint8_t> salt;
+            const char* x;
+            const char* y;
+        };
+        const LinuxVector vectors[] = {
+            {std::vector<uint8_t>(hkdfguard::kSaltLen, 0x00),
+             "c68960c82e7e3d5395da61ee0f2024fb5e9ec0e45e2f104e33c65cca87c93620",
+             "ef42f3f44d5c434e04ef8d0ffb90b23b4a7d7517d32f65e0c645c610bb370982"},
+            {std::vector<uint8_t>(hkdfguard::kSaltLen, 0x42),
+             "23705f112056934aef2059c9c3ffa610ccb2f070d266d4ffa06210d37e9a0de5",
+             "df412b76994469fb7c27385e2d8f389f3da716076c79a19bb57249c9755f032a"},
+            {sequential,
+             "074508261589a2c703bcb88966769c27f980a528de99cd3dc92d93d3de8fa2a6",
+             "06260ec7bdd3a303f376430f01bdb5aafba4d1b6688f550077279977b1c9de88"},
+        };
+        for (const LinuxVector& v : vectors) {
+            std::vector<uint8_t> expected = FromHex(v.x), expectedY = FromHex(v.y);
+            expected.insert(expected.end(), expectedY.begin(), expectedY.end());
+            std::vector<uint8_t> point(hkdfguard::kPublicPointLen);
+            int32_t code = CodeOf([&] { hkdfguard::PayloadEcdhPoint(v.salt.data(), point.data()); });
+            Check(code == HKDFGUARD_OK && point == expected,
+                  ("hash-to-curve matches the Linux implementation for salt " + ToHex(v.salt).substr(0, 8) + "...").c_str());
+        }
+
+        // Any salt maps to a valid P-256 point, and different salts to
+        // different points.
+        bool all_valid = true, all_distinct = true;
+        std::vector<std::vector<uint8_t>> seen;
+        for (int i = 0; i < 32; ++i) {
+            std::vector<uint8_t> salt(hkdfguard::kSaltLen);
+            BCryptGenRandom(nullptr, salt.data(), static_cast<ULONG>(salt.size()), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+            std::vector<uint8_t> point(hkdfguard::kPublicPointLen);
+            if (CodeOf([&] { hkdfguard::PayloadEcdhPoint(salt.data(), point.data()); }) != HKDFGUARD_OK ||
+                PointGateResult(point) != 1) {
+                all_valid = false;
+            }
+            for (const auto& other : seen) all_distinct = all_distinct && other != point;
+            seen.push_back(point);
+        }
+        Check(all_valid, "32 random salts all hash to valid P-256 points");
+        Check(all_distinct, "32 random salts hash to 32 different points");
+    }
+
+    // The point gate every H(salt) passes through before any KSP sees it:
+    // a genuine point is accepted, malformed ones are refused.
     std::vector<uint8_t> valid_point = MakeValidP256Point();
-    Check(valid_point.size() == hkdfguard::kEphemeralPubLen, "test harness can generate a valid P-256 point");
-    if (valid_point.size() == hkdfguard::kEphemeralPubLen) {
-        Check(EphemeralGateResult(valid_point) == HKDFGUARD_OK, "ephemeral gate accepts a genuine P-256 point");
+    Check(valid_point.size() == hkdfguard::kPublicPointLen, "test harness can generate a valid P-256 point");
+    if (valid_point.size() == hkdfguard::kPublicPointLen) {
+        Check(PointGateResult(valid_point) == 1, "point gate accepts a genuine P-256 point");
 
-        std::vector<uint8_t> all_ff(hkdfguard::kEphemeralPubLen, 0xFF);
-        Check(EphemeralGateResult(all_ff) == HKDFGUARD_ERR_PAYLOAD_MALFORMED, "ephemeral gate rejects all-0xFF coordinates");
+        std::vector<uint8_t> all_ff(hkdfguard::kPublicPointLen, 0xFF);
+        Check(PointGateResult(all_ff) == 0, "point gate rejects all-0xFF coordinates");
 
-        std::vector<uint8_t> all_zero(hkdfguard::kEphemeralPubLen, 0x00);
-        Check(EphemeralGateResult(all_zero) == HKDFGUARD_ERR_PAYLOAD_MALFORMED, "ephemeral gate rejects all-zero coordinates");
+        std::vector<uint8_t> all_zero(hkdfguard::kPublicPointLen, 0x00);
+        Check(PointGateResult(all_zero) == 0, "point gate rejects all-zero coordinates");
 
         // A single flipped bit in X, and separately in Y, leaves a point
         // that is off the curve with overwhelming probability (~1 - 2^-256).
         std::vector<uint8_t> flipped_x = valid_point;
         flipped_x[0] ^= 0x01;
-        Check(EphemeralGateResult(flipped_x) == HKDFGUARD_ERR_PAYLOAD_MALFORMED, "ephemeral gate rejects a single-bit mutation in X");
+        Check(PointGateResult(flipped_x) == 0, "point gate rejects a single-bit mutation in X");
 
         std::vector<uint8_t> flipped_y = valid_point;
-        flipped_y[hkdfguard::kEphemeralPubLen - 1] ^= 0x01;
-        Check(EphemeralGateResult(flipped_y) == HKDFGUARD_ERR_PAYLOAD_MALFORMED, "ephemeral gate rejects a single-bit mutation in Y");
+        flipped_y[hkdfguard::kPublicPointLen - 1] ^= 0x01;
+        Check(PointGateResult(flipped_y) == 0, "point gate rejects a single-bit mutation in Y");
     }
 
-    // Through the public ABI: a payload whose EphemeralPublicKey field (bytes
-    // 8..71, see wire_format.h) is overwritten with 0xFF must come back as
-    // HKDFGUARD_ERR_PAYLOAD_MALFORMED - not PAYLOAD_AUTH_FAILED or CRYPTO_ERROR - with the output
-    // zeroed, proving the gate runs before any ECDH is attempted.
-    std::vector<uint8_t> bad_point_payload = wrapped;
-    for (size_t i = hkdfguard::kEphemeralPubOffset; i < hkdfguard::kEphemeralPubOffset + hkdfguard::kEphemeralPubLen; ++i) {
-        bad_point_payload[i] = 0xFF;
+    // Forgery. The KEK's public key is readable by any account allowed to
+    // use the KEK. Under the earlier ECIES construction that was enough to
+    // build a payload unwrap accepted; now Z needs the private key. Built
+    // here entirely outside the library: a payload sealed with the right
+    // wrapping key must unwrap (proving the independent sealing is correct),
+    // and one sealed with a key derived from the public key alone must not.
+    {
+        std::vector<uint8_t> kek_pub;
+        std::vector<uint8_t> genuine_key;
+        std::vector<uint8_t> salt(hkdfguard::kSaltLen);
+        BCryptGenRandom(nullptr, salt.data(), static_cast<ULONG>(salt.size()), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+        int32_t setup = CodeOf([&] {
+            hkdfguard::ResolvedKek kek = hkdfguard::OpenKekForWrap(kServiceWide);
+            DWORD cb = 0;
+            std::vector<uint8_t> blob(sizeof(BCRYPT_ECCKEY_BLOB) + hkdfguard::kPublicPointLen);
+            if (NCryptExportKey(kek.key.get(), 0, BCRYPT_ECCPUBLIC_BLOB, nullptr, blob.data(),
+                                static_cast<DWORD>(blob.size()), &cb, 0) != ERROR_SUCCESS) {
+                throw std::runtime_error("export");
+            }
+            kek_pub.assign(blob.begin() + sizeof(BCRYPT_ECCKEY_BLOB), blob.end());
+            // The genuine wrapping key for this salt, from the library's own
+            // derivation on the real KEK (inside the TPM for a TPM KEK).
+            hkdfguard::SecureBuffer<32> key;
+            hkdfguard::DeriveWrappingKey(kek.provider.get(), kek.key.get(), salt.data(), key);
+            genuine_key.assign(key.data(), key.data() + key.size());
+        });
+        Check(setup == HKDFGUARD_OK, "test setup: read the KEK's public key and derive a genuine wrapping key");
+
+        if (setup == HKDFGUARD_OK) {
+            // The provider kService's KEK actually lives on (TPM on a machine
+            // with one, software otherwise), as a genuine payload records it.
+            const uint8_t provider = wrapped[hkdfguard::kProviderTypeOffset];
+            std::vector<uint8_t> nonce(hkdfguard::kNonceLen, 0x5A);
+            std::vector<uint8_t> honest;
+            bool sealed = SealPayloadIndependently(genuine_key, salt, nonce, kService, kek_pub, dek, provider, honest);
+            std::vector<uint8_t> out(HKDFGUARD_DEK_LEN, 0xAA);
+            int32_t out_len = static_cast<int32_t>(out.size());
+            rc = hkdfguard_unwrap_dek(kService, honest.data(), static_cast<int32_t>(honest.size()), out.data(), &out_len);
+            Check(sealed && rc == HKDFGUARD_OK && std::memcmp(out.data(), dek.data(), HKDFGUARD_DEK_LEN) == 0,
+                  "control: a payload sealed outside the library with the genuine wrapping key unwraps");
+            if (rc != HKDFGUARD_OK) std::printf("    (provider type %u, hkdfguard_unwrap_dek returned %d)\n", provider, rc);
+
+            bool all_rejected = true;
+            for (int attempt = 0; attempt < 3; ++attempt) {
+                std::vector<uint8_t> forged_salt(hkdfguard::kSaltLen), forged_key, forged;
+                BCryptGenRandom(nullptr, forged_salt.data(), static_cast<ULONG>(forged_salt.size()),
+                                BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+                // Z from the public key only: ECDH(random e, KEK public).
+                bool built = IndependentWrappingKey(forged_salt, {}, kek_pub, nullptr, forged_key) &&
+                             SealPayloadIndependently(forged_key, forged_salt, nonce, kService, kek_pub,
+                                                      std::vector<uint8_t>(HKDFGUARD_DEK_LEN, 0x66), provider, forged);
+                std::vector<uint8_t> forged_out(HKDFGUARD_DEK_LEN, 0xAA);
+                int32_t forged_out_len = static_cast<int32_t>(forged_out.size());
+                rc = hkdfguard_unwrap_dek(kService, forged.data(), static_cast<int32_t>(forged.size()),
+                                          forged_out.data(), &forged_out_len);
+                if (rc != HKDFGUARD_ERR_PAYLOAD_AUTH_FAILED) {
+                    std::printf("    (forgery %d: hkdfguard_unwrap_dek returned %d)\n", attempt + 1, rc);
+                }
+                all_rejected = all_rejected && built && rc == HKDFGUARD_ERR_PAYLOAD_AUTH_FAILED &&
+                               AllZero(forged_out.data(), forged_out.size());
+            }
+            Check(all_rejected,
+                  "a payload forged from the KEK's public key alone is rejected (PAYLOAD_AUTH_FAILED, output zeroed), 3 of 3");
+        }
     }
-    std::vector<uint8_t> out_for_bad_point(HKDFGUARD_DEK_LEN, 0xAA);
-    int32_t bad_point_out_len = static_cast<int32_t>(out_for_bad_point.size());
+
+    // The salt is authenticated through the key it derives: change one bit
+    // of it and the wrapping key changes, so unwrap fails authentication -
+    // with the output zeroed.
+    std::vector<uint8_t> tampered_salt_payload = wrapped;
+    tampered_salt_payload[hkdfguard::kSaltOffset] ^= 0x01;
+    std::vector<uint8_t> out_for_salt(HKDFGUARD_DEK_LEN, 0xAA);
+    int32_t salt_out_len = static_cast<int32_t>(out_for_salt.size());
     rc = hkdfguard_unwrap_dek(
-        kService, bad_point_payload.data(), static_cast<int32_t>(bad_point_payload.size()),
-        out_for_bad_point.data(), &bad_point_out_len);
-    Check(rc == HKDFGUARD_ERR_PAYLOAD_MALFORMED, "unwrap rejects a payload whose ephemeral public key is not on P-256");
-    Check(AllZero(out_for_bad_point.data(), out_for_bad_point.size()), "output buffer zeroed after invalid-ephemeral-point failure");
+        kService, tampered_salt_payload.data(), static_cast<int32_t>(tampered_salt_payload.size()),
+        out_for_salt.data(), &salt_out_len);
+    Check(rc == HKDFGUARD_ERR_PAYLOAD_AUTH_FAILED, "unwrap rejects a payload whose salt was changed (PAYLOAD_AUTH_FAILED)");
+    Check(AllZero(out_for_salt.data(), out_for_salt.size()), "output buffer zeroed after a changed-salt failure");
+
+    // Every wrap draws a fresh salt.
+    {
+        std::vector<uint8_t> again(HKDFGUARD_WRAPPED_LEN);
+        int32_t again_len = static_cast<int32_t>(again.size());
+        rc = hkdfguard_wrap_dek(kService, dek.data(), static_cast<int32_t>(dek.size()), again.data(), &again_len);
+        Check(rc == HKDFGUARD_OK &&
+                  std::memcmp(again.data() + hkdfguard::kSaltOffset, wrapped.data() + hkdfguard::kSaltOffset,
+                              hkdfguard::kSaltLen) != 0,
+              "two wraps of the same DEK use different salts");
+    }
 
     // ---- 24c. hkdfguard_open_file: reads a wrapped-key file's bytes - ----
     //          still wrapped - checking size and structure, never
@@ -1535,10 +1700,15 @@ int main() {
         bad_version[hkdfguard::kVersionOffset] ^= 0xFF;
         expectFailure(fileFor(L"badversion.key", bad_version), HKDFGUARD_ERR_FILE_MALFORMED,
                       "a payload-sized file with a corrupted version byte is malformed");
-        expectFailure(fileFor(L"badpoint.key", bad_point_payload), HKDFGUARD_ERR_FILE_MALFORMED,
-                      "a payload-sized file whose ephemeral key is not on P-256 is malformed");
         expectFailure(fileFor(L"zeros.key", std::vector<uint8_t>(HKDFGUARD_WRAPPED_LEN, 0x00)),
-                      HKDFGUARD_ERR_FILE_MALFORMED, "164 zero bytes are malformed");
+                      HKDFGUARD_ERR_FILE_MALFORMED, "a payload-sized file of zero bytes is malformed");
+        // The salt has no structure, so a changed salt is still a well-formed
+        // file: open_file returns it, and the later unwrap is what rejects it.
+        {
+            OpenResult o = open(fileFor(L"changedsalt.key", tampered_salt_payload));
+            Check(o.rc == HKDFGUARD_OK && o.out == tampered_salt_payload,
+                  "open_file returns a payload with a changed salt (any 32 bytes are a well-formed salt)");
+        }
 
         // Opening problems.
         expectFailure(ToUtf8(dir + L"\\missing.key"), HKDFGUARD_ERR_FILE_NOT_FOUND, "a missing file is not found");
@@ -1599,10 +1769,10 @@ int main() {
         Check(r.rc == HKDFGUARD_ERR_BUFFER_TOO_SMALL && r.len == HKDFGUARD_WRAPPED_LEN,
               "open_file treats a negative capacity as too small");
 
-        // A larger buffer: exactly 164 bytes are written and reported, and
+        // A larger buffer: exactly HKDFGUARD_WRAPPED_LEN bytes are written and reported, and
         // nothing past them is touched.
         r = open(good, HKDFGUARD_WRAPPED_LEN + 36);
-        Check(r.rc == HKDFGUARD_OK && r.len == HKDFGUARD_WRAPPED_LEN, "open_file into a larger buffer reports 164 bytes");
+        Check(r.rc == HKDFGUARD_OK && r.len == HKDFGUARD_WRAPPED_LEN, "open_file into a larger buffer reports HKDFGUARD_WRAPPED_LEN bytes");
         Check(std::equal(wrapped.begin(), wrapped.end(), r.out.begin()), "open_file into a larger buffer writes the payload at the start");
         bool tail_untouched = true;
         for (size_t i = HKDFGUARD_WRAPPED_LEN; i < r.out.size(); ++i) tail_untouched &= (r.out[i] == 0xAA);
@@ -1816,41 +1986,36 @@ int main() {
                   "open_file does not modify the file");
         }
 
-        // The ECDH provider the point check uses can't be opened: reported as
-        // CRYPTO_ERROR (an infrastructure failure), never FILE_MALFORMED, which would
-        // wrongly blame a perfectly good file. Injected through the
-        // test-only SetTestEcdhProviderFault seam, so this calls this test's
-        // own compiled copy of ReadWrappedKeyFile, not the DLL - the DLL has
-        // no such seam, which the last check below confirms.
+        // The ECDH provider the point gate uses can't be opened: the
+        // derivation reports CRYPTO_ERROR (an infrastructure failure), and
+        // open_file - which checks only structure - is unaffected. Injected
+        // through the test-only SetTestEcdhProviderFault seam, so this calls
+        // this test's own compiled copies of DeriveWrappingKey and
+        // ReadWrappedKeyFile, not the DLL - the DLL has no such seam, which
+        // the unwrap check below confirms.
         {
             std::vector<uint8_t> direct(HKDFGUARD_WRAPPED_LEN, 0xAA);
-            Check(CodeOf([&] { hkdfguard::ReadWrappedKeyFile(good.c_str(), direct.data()); }) == HKDFGUARD_OK,
-                  "ReadWrappedKeyFile (test copy) reads the good file with no fault injected");
-
             hkdfguard::SetTestEcdhProviderFault(true);
-            Check(CodeOf([&] { hkdfguard::ValidateEphemeralPublicKey(wrapped.data() + hkdfguard::kEphemeralPubOffset); }) ==
-                      HKDFGUARD_ERR_CRYPTO_ERROR,
-                  "ECDH provider unavailable: the point check reports CRYPTO_ERROR, not PAYLOAD_MALFORMED");
-            Check(CodeOf([&] { hkdfguard::ReadWrappedKeyFile(good.c_str(), direct.data()); }) == HKDFGUARD_ERR_CRYPTO_ERROR,
-                  "ECDH provider unavailable: reading a valid key file reports CRYPTO_ERROR, not FILE_MALFORMED");
-            // Every check before the point check still decides first: a bad
-            // size or structure is reported as such, not as CRYPTO_ERROR.
-            Check(CodeOf([&] { hkdfguard::ReadWrappedKeyFile(ToUtf8(dir + L"\\plain.key").c_str(), direct.data()); }) ==
-                      HKDFGUARD_ERR_FILE_PLAINTEXT_KEY,
-                  "ECDH provider unavailable: a 32-byte file is still reported as a plaintext key");
-            Check(CodeOf([&] { hkdfguard::ReadWrappedKeyFile(ToUtf8(dir + L"\\badversion.key").c_str(), direct.data()); }) ==
-                      HKDFGUARD_ERR_FILE_MALFORMED,
-                  "ECDH provider unavailable: a structurally bad file is still reported as FILE_MALFORMED");
-            // The shipped DLL has no seam: its own open_file is unaffected.
-            r = open(good);
-            Check(r.rc == HKDFGUARD_OK && r.out == wrapped,
-                  "the fault is test-only: the DLL's hkdfguard_open_file still reads the file");
+            Check(PointGateResult(valid_point) == HKDFGUARD_ERR_CRYPTO_ERROR,
+                  "ECDH provider unavailable: the point gate reports CRYPTO_ERROR rather than a verdict");
+            int32_t derive = CodeOf([&] {
+                hkdfguard::ResolvedKek kek = hkdfguard::OpenKekForWrap(kServiceWide);
+                hkdfguard::SecureBuffer<32> key;
+                hkdfguard::DeriveWrappingKey(kek.provider.get(), kek.key.get(), wrapped.data() + hkdfguard::kSaltOffset, key);
+            });
+            Check(derive == HKDFGUARD_ERR_CRYPTO_ERROR,
+                  "ECDH provider unavailable: the wrapping-key derivation reports CRYPTO_ERROR");
+            Check(CodeOf([&] { hkdfguard::ReadWrappedKeyFile(good.c_str(), direct.data()); }) == HKDFGUARD_OK,
+                  "ECDH provider unavailable: open_file (test copy) still reads a valid file - it checks only structure");
+            // The shipped DLL has no seam: its own unwrap is unaffected.
+            std::vector<uint8_t> dll_out(HKDFGUARD_DEK_LEN);
+            int32_t dll_out_len = static_cast<int32_t>(dll_out.size());
+            rc = hkdfguard_unwrap_dek(kService, wrapped.data(), static_cast<int32_t>(wrapped.size()), dll_out.data(), &dll_out_len);
+            Check(rc == HKDFGUARD_OK, "the fault is test-only: the DLL's hkdfguard_unwrap_dek still unwraps");
             hkdfguard::SetTestEcdhProviderFault(false);
 
-            Check(CodeOf([&] { hkdfguard::ReadWrappedKeyFile(good.c_str(), direct.data()); }) == HKDFGUARD_OK,
-                  "ReadWrappedKeyFile (test copy) reads the good file again once the fault is cleared");
+            Check(PointGateResult(valid_point) == 1, "the point gate works again once the fault is cleared");
         }
-
         for (const std::wstring& path : created) {
             SetFileAttributesW(path.c_str(), FILE_ATTRIBUTE_NORMAL);
             DeleteFileW(path.c_str());

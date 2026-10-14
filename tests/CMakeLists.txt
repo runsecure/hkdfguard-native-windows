@@ -14,16 +14,17 @@ add_executable(test_roundtrip
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/wire_format.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/policy.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/key_acl.cpp
-    # ecdh_hkdf.cpp: so the test can call ValidateEphemeralPublicKey (the
-    # unwrap-side point-validation gate) directly, with hand-built valid and
-    # invalid points, without needing a provisioned KEK or elevation.
+    # ecdh_hkdf.cpp + hash_to_curve.cpp: so the test can call
+    # IsValidP256Point and PayloadEcdhPoint directly (hand-built points, and
+    # the Linux implementation's hash-to-curve vectors) without a KEK, and
+    # DeriveWrappingKey with the test-only provider fault enabled.
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/ecdh_hkdf.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/hash_to_curve.cpp
     # event_log.cpp: kek_store.cpp's CreateKek logs KEK creation, so this
     # test's own compiled copy of kek_store.cpp needs it too.
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/event_log.cpp
     # key_file.cpp: so the test can call ReadWrappedKeyFile (hkdfguard_open_file's
-    # implementation) directly with ecdh_hkdf.cpp's test-only provider fault
-    # enabled - a failure the shipped DLL can't be made to produce on cue.
+    # implementation) directly.
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/key_file.cpp
 )
 # Links against hkdfguard (the DLL's import library, for the public ABI

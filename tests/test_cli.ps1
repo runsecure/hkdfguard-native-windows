@@ -447,7 +447,7 @@ try {
         $providerName = $null
         if ($r.ExitCode -eq 0) {
             $bytes = [System.IO.File]::ReadAllBytes($happyKeyFile)
-            Check ($bytes.Length -eq 164) "CLI-produced wrapped file is 164 bytes"
+            Check ($bytes.Length -eq 132) "CLI-produced wrapped file is 132 bytes"
 
             # The wrap is audited (event 1002) with a SHA-256 of the exact
             # payload written - the value an unwrap event will later repeat.

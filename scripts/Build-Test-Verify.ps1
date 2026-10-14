@@ -218,10 +218,10 @@ if ($provisionExit -eq 0) {
 
 if ($cliExit -eq 0) {
     $wrapped = [System.IO.File]::ReadAllBytes($keyFile)
-    if ($wrapped.Length -ne 164) {
-        Write-Bad "wrapped file is $($wrapped.Length) bytes, expected 164"
+    if ($wrapped.Length -ne 132) {
+        Write-Bad "wrapped file is $($wrapped.Length) bytes, expected 132"
     } else {
-        Write-Ok "wrapped file is the expected 164 bytes"
+        Write-Ok "wrapped file is the expected 132 bytes"
     }
 
     $providerType = $wrapped[1]
@@ -264,17 +264,17 @@ public static class HkdfGuardNative {
     # way a consumer would, and unwrap *those* bytes: CLI wrap -> file ->
     # open_file -> unwrap, end to end.
     $pathBytes = [System.Text.Encoding]::UTF8.GetBytes($keyFile + [char]0)
-    $fromFile = New-Object byte[] 164
-    $fromFileLen = 164
+    $fromFile = New-Object byte[] 132
+    $fromFileLen = 132
     $rc = [HkdfGuardNative]::hkdfguard_open_file($pathBytes, $fromFile, [ref]$fromFileLen)
     if ($rc -ne 0) {
         Write-Bad "hkdfguard_open_file returned status $rc (expected 0/HKDFGUARD_OK)"
-    } elseif ($fromFileLen -ne 164) {
-        Write-Bad "hkdfguard_open_file reported $fromFileLen bytes, expected 164"
+    } elseif ($fromFileLen -ne 132) {
+        Write-Bad "hkdfguard_open_file reported $fromFileLen bytes, expected 132"
     } elseif ([Convert]::ToBase64String($fromFile) -ne [Convert]::ToBase64String($wrapped)) {
         Write-Bad "hkdfguard_open_file returned different bytes than the file holds"
     } else {
-        Write-Ok "hkdfguard_open_file read the CLI's wrapped file: 164 bytes, still wrapped, identical to the file"
+        Write-Ok "hkdfguard_open_file read the CLI's wrapped file: 132 bytes, still wrapped, identical to the file"
     }
 
     $outBuf = New-Object byte[] 32

@@ -6,14 +6,14 @@
 #include <cstring>
 
 namespace hkdfguard {
-    // Builds the 164-byte wire payload by writing each field at its known
-    // offset. Every field here is public information (metadata, a public
-    // ephemeral key, ciphertext, and an auth tag) - nothing in this function
+    // Builds the 132-byte wire payload by writing each field at its known
+    // offset. Every field here is public information (metadata, the
+    // salt, ciphertext, and an auth tag) - nothing in this function
     // handles a secret, so there's no zeroing concern in this file.
     void SerializeWrappedDek(
         uint8_t provider_type,
         uint32_t key_id,
-        const uint8_t ephemeral_pub[kEphemeralPubLen],
+        const uint8_t salt[kSaltLen],
         const uint8_t nonce[kNonceLen],
         const uint8_t ciphertext[kCiphertextLen],
         const uint8_t tag[kTagLen],
@@ -47,7 +47,7 @@ namespace hkdfguard {
         // so they're just block-copied into place: destination pointer
         // (`out + <offset>`, i.e. pointer arithmetic - "the address `offset`
         // bytes past the start of `out`"), source pointer, and byte count.
-        memcpy(out + kEphemeralPubOffset, ephemeral_pub, kEphemeralPubLen);
+        memcpy(out + kSaltOffset, salt, kSaltLen);
         memcpy(out + kNonceOffset, nonce, kNonceLen);
         memcpy(out + kCiphertextOffset, ciphertext, kCiphertextLen);
         memcpy(out + kTagOffset, tag, kTagLen);
@@ -134,7 +134,7 @@ namespace hkdfguard {
         ParsedWrappedDek parsed{};
         parsed.provider_type = provider_type;
         parsed.key_id = key_id;
-        parsed.ephemeral_pub = wrapped + kEphemeralPubOffset;
+        parsed.salt = wrapped + kSaltOffset;
         parsed.nonce = wrapped + kNonceOffset;
         parsed.ciphertext = wrapped + kCiphertextOffset;
         parsed.tag = wrapped + kTagOffset;

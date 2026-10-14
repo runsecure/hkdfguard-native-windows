@@ -182,15 +182,15 @@ public static class InstalledHkdfGuard {
 "@
 function Result([bool]$ok, [string]$what) { Write-Output ("RESULT|{0}|{1}" -f [int]$ok, $what) }
 function Open-WrappedFile([string]$path) {
-    $buf = New-Object byte[] 164
-    $len = 164
+    $buf = New-Object byte[] 132
+    $len = 132
     $rc = [InstalledHkdfGuard]::hkdfguard_open_file([Text.Encoding]::UTF8.GetBytes($path + [char]0), $buf, [ref]$len)
     return [PSCustomObject]@{ Rc = $rc; Len = $len; Bytes = $buf }
 }
 
 $opened = Open-WrappedFile $KeyFile
 $onDisk = [IO.File]::ReadAllBytes($KeyFile)
-Result ($opened.Rc -eq 0 -and $opened.Len -eq 164) "hkdfguard_open_file reads the CLI's file (rc $($opened.Rc), $($opened.Len) bytes)"
+Result ($opened.Rc -eq 0 -and $opened.Len -eq 132) "hkdfguard_open_file reads the CLI's file (rc $($opened.Rc), $($opened.Len) bytes)"
 Result ([Convert]::ToBase64String($opened.Bytes) -eq [Convert]::ToBase64String($onDisk)) "hkdfguard_open_file returns the file's wrapped bytes unchanged"
 $plain = New-Object byte[] 32
 $plainLen = 32
@@ -199,7 +199,7 @@ Result ($rc -eq 0 -and [Convert]::ToBase64String($plain) -eq $dekBase64) "a sepa
 [Array]::Clear($plain, 0, $plain.Length)
 
 $opened = Open-WrappedFile $PlainFile
-Result ($opened.Rc -eq -37 -and $opened.Len -eq 164) "hkdfguard_open_file reports a 32-byte file as HKDFGUARD_ERR_FILE_PLAINTEXT_KEY (rc $($opened.Rc)), out_len unchanged"
+Result ($opened.Rc -eq -37 -and $opened.Len -eq 132) "hkdfguard_open_file reports a 32-byte file as HKDFGUARD_ERR_FILE_PLAINTEXT_KEY (rc $($opened.Rc)), out_len unchanged"
 '@
 # Continue, not Stop, around the child: under Windows PowerShell 5.1, 2>&1
 # on a native process turns each stderr line into an error, which Stop would

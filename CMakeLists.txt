@@ -54,6 +54,7 @@ add_library(hkdfguard SHARED
     src/key_acl.cpp
     src/event_log.cpp
     src/key_file.cpp
+    src/hash_to_curve.cpp
 )
 
 # Event log message table: mc.exe (Windows SDK) compiles

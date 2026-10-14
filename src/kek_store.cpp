@@ -397,9 +397,9 @@ namespace hkdfguard {
         // returns NTE_NOT_SUPPORTED - see CreateKekOnProvider's comment on
         // that same call). Verified empirically that this is a labeling
         // quirk, not an actual capability restriction: a genuine
-        // NCryptSecretAgreement call against such a key, using a real
-        // ephemeral peer public key, succeeds and produces a correct shared
-        // secret. An ECDH key has no meaningful "decrypt" operation of its
+        // NCryptSecretAgreement call against such a key, using a supplied
+        // peer point (as DeriveWrappingKey does with H(salt)), succeeds and
+        // produces a correct shared secret. An ECDH key has no meaningful "decrypt" operation of its
         // own on Windows CNG (NCryptDecrypt is for RSA-family keys) - by the
         // time this function runs, VerifyAlgorithm has already confirmed
         // the key's algorithm group genuinely is ECDH, so accepting the

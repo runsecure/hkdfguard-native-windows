@@ -31,7 +31,7 @@ namespace hkdfguard {
 
     // A wrap (op Wrap or GenerateAndWrap) or unwrap (op Unwrap) succeeded.
     // Records which KEK was used (its public-key fingerprint) and which
-    // payload (SHA-256 of the 164 wrapped bytes) - both public values that
+    // payload (SHA-256 of the 132 wrapped bytes) - both public values that
     // reveal nothing about the DEK - so an unwrap can be matched back to the
     // wrap that produced it, and a substituted older payload is visible.
     // `payload` is the wrapped output (wrap) or input (unwrap); it is only

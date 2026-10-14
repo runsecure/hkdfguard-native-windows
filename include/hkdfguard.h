@@ -71,7 +71,7 @@ extern "C" {
 // ever runs. This is the traditional C way of naming a constant so it can
 // also be used where the language requires a compile-time literal.
 #define HKDFGUARD_DEK_LEN     32
-#define HKDFGUARD_WRAPPED_LEN 164 /* fixed size of a WrappedDekV1 payload (incl. 32-byte KEK fingerprint) */
+#define HKDFGUARD_WRAPPED_LEN 132 /* fixed size of a WrappedDekV1 payload (incl. 32-byte salt and 32-byte KEK fingerprint) */
 
 // Status codes. HKDFGUARD_OK is 0 (following the common C convention that
 // "0 means success"); every failure is a distinct *negative* number, so a
@@ -122,7 +122,7 @@ extern "C" {
 #define HKDFGUARD_ERR_INVALID_SERVICE_NAME       (-8) /* service is null, empty, too long, not valid UTF-8, or contains a disallowed character */
 #define HKDFGUARD_ERR_POLICY_INVALID             (-9) /* a machine policy value (HKLM\Software\Policies\HkdfGuard) is invalid */
 // ---- Wrapped payload (-10..-15) ----
-#define HKDFGUARD_ERR_PAYLOAD_MALFORMED         (-10) /* wrapped payload is not a valid WrappedDekV1: wrong length, nonzero reserved bytes, unknown provider type or key id, or an ephemeral public key that is not a valid P-256 point */
+#define HKDFGUARD_ERR_PAYLOAD_MALFORMED         (-10) /* wrapped payload is not a valid WrappedDekV1: wrong length, nonzero reserved bytes, or unknown provider type or key id */
 #define HKDFGUARD_ERR_PAYLOAD_AUTH_FAILED       (-11) /* AES-GCM authentication tag verification failed */
 #define HKDFGUARD_ERR_PAYLOAD_UNSUPPORTED       (-12) /* wrapped payload's version (or suite) is not one this build understands */
 /* -13..-15 reserved */
@@ -231,6 +231,12 @@ HKDFGUARD_API int32_t hkdfguard_create_kek(
 /*
  * Wraps a 32-byte DEK into a self-contained, versioned payload.
  *
+ * The wrapping key is derived from ECDH between the KEK's *private* key and
+ * a point hashed from a random per-payload salt, so only an account
+ * authorized to use the KEK can create a payload that hkdfguard_unwrap_dek
+ * accepts - knowing the KEK's public key is not enough. For a TPM-backed KEK
+ * that makes every wrap a TPM operation (around 10 ms).
+ *
  * service   - null-terminated UTF-8 string identifying which persistent KEK
  *             to use (e.g. an application or tenant name). Different service
  *             names get independent, non-interoperable KEKs. The same
@@ -285,10 +291,10 @@ HKDFGUARD_API int32_t hkdfguard_wrap_dek(
  *               (HKDFGUARD_DEK_LEN). Left unchanged on every other failure.
  *
  * Returns HKDFGUARD_OK on success, or a negative HKDFGUARD_ERR_* code.
- * HKDFGUARD_ERR_PAYLOAD_MALFORMED covers both a structurally invalid
- * payload (wrong length, nonzero reserved bytes, unknown provider type or
- * KeyId) and a payload whose embedded ephemeral public key is not a valid
- * P-256 point (rejected before it ever reaches the KEK).
+ * HKDFGUARD_ERR_PAYLOAD_MALFORMED means a structurally invalid payload
+ * (wrong length, nonzero reserved bytes, unknown provider type or KeyId).
+ * The salt has no structure: a changed salt yields a different wrapping
+ * key, so it surfaces as HKDFGUARD_ERR_PAYLOAD_AUTH_FAILED.
  * HKDFGUARD_ERR_PAYLOAD_UNSUPPORTED means the payload's version byte is not
  * one this build understands. HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH
  * means the payload is well-formed but was wrapped under a different KEK
@@ -366,15 +372,12 @@ HKDFGUARD_API int32_t hkdfguard_generate_and_wrap_dek(
  *   HKDFGUARD_ERR_FILE_TOO_LONG - more than HKDFGUARD_WRAPPED_LEN bytes.
  * A file of exactly HKDFGUARD_WRAPPED_LEN bytes is then read and validated
  * as hkdfguard_unwrap_dek would before touching a KEK - version, provider
- * type, reserved bytes, KeyId, and that the ephemeral public key is a valid
- * P-256 point - failing with HKDFGUARD_ERR_FILE_MALFORMED otherwise. That
- * includes an unrecognized version: this call reports the *file* as
- * malformed rather than returning the payload codes
- * (HKDFGUARD_ERR_PAYLOAD_MALFORMED / _UNSUPPORTED) hkdfguard_unwrap_dek
- * would, matching the Linux and macOS builds. The one exception is
- * HKDFGUARD_ERR_CRYPTO_ERROR, if the software ECDH provider needed for the
- * point check cannot be opened at all - an infrastructure failure, not a
- * verdict on the file. HKDFGUARD_ERR_FILE_NOT_FOUND, HKDFGUARD_ERR_FILE_ACCESS_DENIED
+ * type, reserved bytes and KeyId (the salt has no structure to check) -
+ * failing with HKDFGUARD_ERR_FILE_MALFORMED otherwise. That includes an
+ * unrecognized version: this call reports the *file* as malformed rather
+ * than returning the payload codes (HKDFGUARD_ERR_PAYLOAD_MALFORMED /
+ * _UNSUPPORTED) hkdfguard_unwrap_dek would, matching the Linux and macOS
+ * builds. HKDFGUARD_ERR_FILE_NOT_FOUND, HKDFGUARD_ERR_FILE_ACCESS_DENIED
  * and HKDFGUARD_ERR_FILE_IO report why the file couldn't be opened or read.
  *
  * Returns HKDFGUARD_OK on success, or a negative HKDFGUARD_ERR_* code -
