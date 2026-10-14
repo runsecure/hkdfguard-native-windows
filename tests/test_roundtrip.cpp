@@ -663,7 +663,7 @@ int main() {
     {
         HMODULE dll = GetModuleHandleW(L"HkdfGuardV1.dll");
         Check(dll != nullptr, "the HkdfGuard DLL is loaded in this test process");
-        const DWORD ids[] = {1000, 1001, 1002, 1003, 2000, 2002, 2003, 2004, 2005};
+        const DWORD ids[] = {1000, 1001, 1002, 1003, 2000, 2002, 2003, 2004, 2005, 2006};
         bool allPresent = dll != nullptr;
         for (DWORD id : ids) {
             if (dll == nullptr) break;

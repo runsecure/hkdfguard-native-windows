@@ -820,9 +820,10 @@ extern "C" HKDFGUARD_API int32_t hkdfguard_open_file(
         return code;
     };
 
-    // Not audited: the event log records failures against a service's KEK,
-    // and a file read involves neither. A caller that finds
-    // HKDFGUARD_ERR_FILE_PLAINTEXT_KEY should raise it in its own logging.
+    // Mostly not audited: the event log records failures against a
+    // service's KEK, and a file read involves neither. The one exception is
+    // a DEK-sized file (HKDFGUARD_ERR_FILE_PLAINTEXT_KEY) - a possible key
+    // exposure an administrator needs to hear about, logged below.
     try {
         if (path == nullptr || out == nullptr) {
             return fail(HKDFGUARD_ERR_INVALID_ARG);
@@ -836,7 +837,18 @@ extern "C" HKDFGUARD_API int32_t hkdfguard_open_file(
         *out_len = HKDFGUARD_WRAPPED_LEN;
         return HKDFGUARD_OK;
     } catch (const HkdfGuardError &e) {
-        return fail(e.code());
+        // Zero first, log second, as hkdfguard_unwrap_dek does.
+        const int32_t code = fail(e.code());
+        if (code == HKDFGUARD_ERR_FILE_PLAINTEXT_KEY) {
+            std::wstring loggable;
+            try {
+                loggable = PathToWide(path); // already succeeded once to get this far
+            } catch (...) {
+                loggable = L"(unprintable path)";
+            }
+            LogPlaintextKeyFile(loggable);
+        }
+        return code;
     } catch (...) {
         return fail(HKDFGUARD_ERR_INTERNAL);
     }

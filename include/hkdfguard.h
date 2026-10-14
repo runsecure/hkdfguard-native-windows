@@ -130,7 +130,12 @@ HKDFGUARD_API int32_t hkdfguard_kek_exists(
  *
  * Which principals may use (unwrap with) the KEK is machine policy, not a
  * caller choice. SYSTEM and BUILTIN\Administrators always receive full
- * control. In addition, every entry of the REG_MULTI_SZ registry value
+ * control. Two optional local groups are honored if they exist - as groups
+ * in this machine's own SAM - at the moment the KEK is created:
+ * HkdfGuardAdmins receives full control and HkdfGuardUsers receives
+ * key-use access. The MSI creates HkdfGuardUsers; HkdfGuardAdmins exists
+ * only if an administrator creates it. In addition, every entry of the
+ * REG_MULTI_SZ registry value
  *
  *     HKLM\Software\Policies\HkdfGuard\KeyUseGroups
  *

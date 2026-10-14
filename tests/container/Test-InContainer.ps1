@@ -160,6 +160,8 @@ $events = @(Get-WinEvent -FilterHashtable @{ LogName = "Application"; ProviderNa
 Write-Host "events written during the tests: $($events.Count)"
 Check (@($events | Where-Object Id -eq 1000).Count -gt 0) "KEK-created events (1000) were logged"
 Check (@($events | Where-Object Id -eq 1002).Count -gt 0) "DEK-wrapped events (1002) were logged"
+$plaintextEvents = @($events | Where-Object Id -eq 2006)
+Check ($plaintextEvents.Count -gt 0 -and $plaintextEvents[0].Message -match 'plain\.key') "hkdfguard_open_file logged the 32-byte file as a plaintext-key finding (2006), naming the file"
 $unrendered = @($events | Where-Object { [string]::IsNullOrEmpty($_.Message) })
 Check ($events.Count -gt 0 -and $unrendered.Count -eq 0) "every event's message renders through the installed message table"
 

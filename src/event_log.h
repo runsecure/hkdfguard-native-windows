@@ -50,4 +50,11 @@ namespace hkdfguard {
     // `service` is the normalized service name, or empty if it was invalid.
     void LogOperationFailure(AuditOp op, const std::string &service, int32_t code) noexcept;
 
+    // hkdfguard_open_file refused `path` because it is exactly DEK-sized
+    // (HKDFGUARD_ERR_FILE_PLAINTEXT_KEY): possibly a plaintext key on disk.
+    // The only event that call writes - its other failures concern no KEK
+    // and are reported to the caller alone. The path is logged so an
+    // administrator can find the file; its contents were never read.
+    void LogPlaintextKeyFile(const std::wstring &path) noexcept;
+
 } // namespace hkdfguard

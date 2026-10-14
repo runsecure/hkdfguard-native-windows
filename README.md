@@ -41,7 +41,9 @@ itself (e.g. `myapp.v2`), not by rotating anything under the existing one.
 Creating a KEK for the first time requires the calling process to be elevated -
 opening/using an already-created one does not. Who else may use it is machine policy,
 not something either the creating tool or a caller chooses: SYSTEM and
-`BUILTIN\Administrators` always get full control, and every entry of the `REG_MULTI_SZ`
+`BUILTIN\Administrators` always get full control; the local groups `HkdfGuardAdmins` (full
+control) and `HkdfGuardUsers` (use access) are granted if they exist when the KEK is created
+(the MSI creates `HkdfGuardUsers`, never `HkdfGuardAdmins`); and every entry of the `REG_MULTI_SZ`
 registry value `HKLM\Software\Policies\HkdfGuard\KeyUseGroups` is granted use (unwrap)
 access when the KEK is created - each entry must resolve to a real, host-local group
 (this machine's own SAM, `BUILTIN`, `NT AUTHORITY`, or `NT SERVICE`; domain groups are
@@ -350,6 +352,7 @@ including the impersonated client when a service acts on someone's behalf.
 | 2003 | Warning | `AUTH_FAILED`, `KEK_MISMATCH` or `MALFORMED` on unwrap: a tampered, corrupted, or misdirected payload. |
 | 2004 | Error | `INVALID_POLICY` or `GROUP_INVALID`: the registry policy is misconfigured, so calls fail closed. |
 | 2005 | Error | `PROVIDER`, `CRYPTO` or `INTERNAL`: the key storage provider or crypto layer failed. |
+| 2006 | Error | `hkdfguard_open_file` refused a file of exactly 32 bytes - the size of an unwrapped DEK, so possibly a plaintext key on disk. Names the file; its contents were not read. Investigate it. |
 
 The wrap and unwrap events also record the KEK's fingerprint and a SHA-256 of the
 wrapped payload. Both are public values that reveal nothing about the DEK. Because the
@@ -360,7 +363,9 @@ older payload visible, which matters because the format deliberately allows roll
 comparison: `(Get-FileHash <file> -Algorithm SHA256).Hash.ToLower()`.
 
 Deliberately not logged: caller mistakes (`INVALID_ARG`, `BUFFER_TOO_SMALL`,
-`SERVICE_NAME_INVALID`) and `KEK_NOT_FOUND`. No key material is ever logged. Every
+`SERVICE_NAME_INVALID`) and `KEK_NOT_FOUND`. `hkdfguard_open_file` writes only event 2006;
+its other failures (a missing, unreadable, wrong-sized or malformed file, or a rejected
+path) involve no KEK and are reported to the caller alone. No key material is ever logged. Every
 successful wrap and unwrap writes one event, which suits deployment-time wrapping and
 unwrap-at-service-start.
 
@@ -511,7 +516,9 @@ The MSI does four things:
 - **Creates the local group `HkdfGuardUsers`** if it doesn't already exist. KEKs created
   while the group exists grant it use access, so add the accounts that need to wrap or
   unwrap to it. The group has to exist before a service's KEK is provisioned to be
-  included, so install the MSI first.
+  included, so install the MSI first. The MSI does not create the optional
+  `HkdfGuardAdmins` group (full control of KEKs created while it exists); create it
+  yourself, before provisioning, only if you want to delegate key administration.
 
 Then, once per service, elevated:
 
