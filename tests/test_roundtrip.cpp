@@ -388,6 +388,46 @@ bool WriteTestFile(const std::wstring& path, const std::vector<uint8_t>& bytes) 
     return ok;
 }
 
+// The 8.3 short name of `path`, or empty if it has none. Where the volume
+// doesn't generate short names (8.3 creation is off by default on
+// container and many server volumes), one is assigned explicitly with
+// SetFileShortNameW, which works regardless of that setting but needs an
+// elevated process (SeRestorePrivilege) - so section 24c's short-name
+// checks run on every elevated run instead of only on some machines.
+std::wstring ShortNameFor(const std::wstring& path, const wchar_t* assign_if_missing) {
+    // Only `path`'s own last component counts: GetShortPathName shortens
+    // every folder above it too, so a short *folder* name alone must not be
+    // mistaken for the item itself having one.
+    auto leaf = [](const std::wstring& p) { return p.substr(p.find_last_of(L'\\') + 1); };
+    auto current = [&]() -> std::wstring {
+        wchar_t buf[MAX_PATH + 1] = {};
+        DWORD len = GetShortPathNameW(path.c_str(), buf, MAX_PATH + 1);
+        if (len == 0 || len > MAX_PATH) return {};
+        std::wstring s(buf, len);
+        return CompareStringOrdinal(leaf(s).c_str(), -1, leaf(path).c_str(), -1, TRUE) == CSTR_EQUAL ? std::wstring() : s;
+    };
+    std::wstring found = current();
+    if (!found.empty()) return found;
+
+    HANDLE token = nullptr;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token)) {
+        TOKEN_PRIVILEGES tp{};
+        tp.PrivilegeCount = 1;
+        tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+        // L"SeRestorePrivilege": SE_RESTORE_NAME is narrow in this non-UNICODE target.
+        if (LookupPrivilegeValueW(nullptr, L"SeRestorePrivilege", &tp.Privileges[0].Luid)) {
+            AdjustTokenPrivileges(token, FALSE, &tp, sizeof(tp), nullptr, nullptr);
+        }
+        CloseHandle(token);
+    }
+    HANDLE handle = CreateFileW(path.c_str(), GENERIC_WRITE | DELETE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) return {};
+    SetFileShortNameW(handle, assign_if_missing);
+    CloseHandle(handle);
+    return current();
+}
+
 // Creates an NTFS junction (mount-point reparse point) at `junction`
 // pointing at the directory `target`, the way `mklink /J` does. Junctions
 // are the link type a non-administrator can create, so section 24c uses one
@@ -1656,18 +1696,38 @@ int main() {
             expectFailure(std::string(32767 * 3 + 1, 'a'), HKDFGUARD_ERR_INVALID_ARG,
                           "a path longer than the Win32 limit is rejected before any file access");
 
-            // 8.3 short names spell the same file, and must be accepted (the
-            // expected path is expanded before it's compared with the
-            // handle's). Skipped on a volume without short names.
-            wchar_t short_buf[MAX_PATH + 1] = {};
-            DWORD short_len = GetShortPathNameW((dir + L"\\good.key").c_str(), short_buf, MAX_PATH + 1);
-            if (short_len > 0 && short_len <= MAX_PATH &&
-                CompareStringOrdinal(short_buf, -1, (dir + L"\\good.key").c_str(), -1, TRUE) != CSTR_EQUAL) {
-                r = open(ToUtf8(short_buf));
-                Check(r.rc == HKDFGUARD_OK && r.out == wrapped, "open_file accepts an 8.3 short-name spelling of the path");
+            // 8.3 short names are refused, never expanded. The scratch
+            // folder ("hkdfguard-openfile-<pid>") and the file below have
+            // long names; ShortNameFor finds or assigns their short names.
+            // Skipped only on a non-elevated run of a volume that doesn't
+            // generate them.
+            const std::wstring short_folder = ShortNameFor(dir, L"HKOPEN~1");
+            const std::string long_file = fileFor(L"long-file-name.wrapped.key", wrapped);
+            const std::wstring short_file = ShortNameFor(dir + L"\\long-file-name.wrapped.key", L"LONGFI~1.KEY");
+            if (!short_folder.empty()) {
+                expectFailure(ToUtf8(short_folder + L"\\good.key"), HKDFGUARD_ERR_FILE_PATH_REJECTED,
+                              "a path with an 8.3 short folder name is refused");
+                expectFailure(ToUtf8(short_folder + L"\\missing.key"), HKDFGUARD_ERR_FILE_PATH_REJECTED,
+                              "a short folder name is refused even when the file doesn't exist (not just NOT_FOUND)");
             } else {
-                Skip("open_file accepts an 8.3 short-name spelling (this volume has no short names)");
+                Skip("open_file refuses an 8.3 short folder name (no short names here, and not elevated to assign one)");
             }
+            size_t leaf_sep = short_file.find_last_of(L'\\');
+            if (leaf_sep != std::wstring::npos) {
+                // Long folder, short file name: only the leaf is short.
+                expectFailure(ToUtf8(dir + short_file.substr(leaf_sep)), HKDFGUARD_ERR_FILE_PATH_REJECTED,
+                              "a path with an 8.3 short file name is refused");
+            } else {
+                Skip("open_file refuses an 8.3 short file name (no short names here, and not elevated to assign one)");
+            }
+            r = open(long_file);
+            Check(r.rc == HKDFGUARD_OK && r.out == wrapped, "the same file opens by its long name");
+
+            // The check is exact, not a "~" heuristic: a real long name that
+            // happens to look like a short one is accepted.
+            const std::string tilde = fileFor(L"report~1.key", wrapped);
+            r = open(tilde);
+            Check(r.rc == HKDFGUARD_OK && r.out == wrapped, "a genuine file name containing \"~1\" is accepted");
         }
 
         // Links are refused, never followed - at the file, and anywhere

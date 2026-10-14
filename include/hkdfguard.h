@@ -103,7 +103,7 @@ extern "C" {
 #define HKDFGUARD_ERR_FILE_TOO_SHORT  (-18) /* hkdfguard_open_file: file is shorter than HKDFGUARD_WRAPPED_LEN */
 #define HKDFGUARD_ERR_FILE_TOO_LONG   (-19) /* hkdfguard_open_file: file is longer than HKDFGUARD_WRAPPED_LEN */
 #define HKDFGUARD_ERR_FILE_PLAINTEXT_KEY (-20) /* hkdfguard_open_file: file is exactly HKDFGUARD_DEK_LEN bytes - likely an unwrapped key */
-#define HKDFGUARD_ERR_FILE_PATH_REJECTED (-21) /* hkdfguard_open_file: path is, or passes through, a symbolic link, junction or other reparse point, or is not on a local drive (UNC, mapped or SUBST drive, device) */
+#define HKDFGUARD_ERR_FILE_PATH_REJECTED (-21) /* hkdfguard_open_file: path is, or passes through, a symbolic link, junction or other reparse point, uses an 8.3 short name, or is not on a local drive (UNC, mapped or SUBST drive, device) */
 
 /*
  * Reports whether a persistent KEK already exists for `service`, without
@@ -280,7 +280,10 @@ HKDFGUARD_API int32_t hkdfguard_generate_and_wrap_dek(
  *           symbolic link, junction, volume mount point or other reparse
  *           point at the path or anywhere above it is refused, never
  *           followed - so a link planted in the key folder cannot redirect
- *           a privileged reader to some other file. (Files on volumes with
+ *           a privileged reader to some other file. A path that spells any
+ *           folder or the file with its 8.3 short name ("PROGRA~1") is
+ *           refused too, rather than expanded; a genuine long name that
+ *           merely contains "~" is fine. (Files on volumes with
  *           Data Deduplication enabled, and cloud placeholder files, are
  *           reparse points too and are refused for the same reason.) UNC
  *           paths, mapped and SUBST drives, and device paths (\\.\pipe\...,

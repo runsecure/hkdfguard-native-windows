@@ -350,12 +350,64 @@ namespace {
         return p;
     }
 
+    // The long-name form of `path` from GetLongPathName, which walks the path
+    // component by component through the directory listing - expanding any
+    // 8.3 short name ("PROGRA~1") to its real name, but reporting a link by
+    // its own name, never its target. Empty if any component doesn't exist.
+    std::wstring TryLongPathName(const std::wstring &path) {
+        DWORD needed = GetLongPathNameW(path.c_str(), nullptr, 0);
+        if (needed == 0) {
+            return {};
+        }
+        std::wstring long_form(needed, L'\0');
+        DWORD written = GetLongPathNameW(path.c_str(), long_form.data(), needed);
+        if (written == 0 || written >= needed) {
+            return {};
+        }
+        long_form.resize(written);
+        return long_form;
+    }
+
+    // 8.3 short names are refused outright rather than expanded. They are a
+    // second, auto-generated name for the same file, and their history -
+    // checks that matched one spelling but not the other, and a name that
+    // isn't chosen by whoever created the file - makes them a liability for
+    // a path that decides which key file a privileged process reads.
+    //
+    // The test is exact, not a guess from "~" characters: a path is refused
+    // only if the file system itself expands one of its components to a
+    // different name, so a genuine long name such as "report~1.key" is
+    // fine. Case differences don't count; the file system ignores case.
+    // If the file doesn't exist, its folder is checked instead, so
+    // "C:\PROGRA~1\missing.key" is refused too rather than reported as
+    // merely not found.
+    void RejectShortNames(const std::wstring &full) {
+        std::wstring checked = full;
+        std::wstring long_form = TryLongPathName(checked);
+        if (long_form.empty()) {
+            size_t sep = full.find_last_of(L'\\');
+            if (sep == std::wstring::npos || sep < 3) {
+                return; // nothing above a drive root to check
+            }
+            checked = full.substr(0, sep);
+            long_form = TryLongPathName(checked);
+            if (long_form.empty()) {
+                return; // the folder doesn't exist either: CreateFileW reports it
+            }
+        }
+        if (CompareStringOrdinal(
+                StripExtendedPrefix(long_form).c_str(), -1, StripExtendedPrefix(checked).c_str(), -1, TRUE) !=
+            CSTR_EQUAL) {
+            throw HkdfGuardError(HKDFGUARD_ERR_FILE_PATH_REJECTED, "path uses an 8.3 short name");
+        }
+    }
+
     // The fully-qualified path the caller actually spelled - relative paths
-    // resolved against the current directory, 8.3 short names expanded where
-    // the file exists - with no link followed. This is what the opened
-    // handle's own path is compared against in ReadWrappedKeyFile: any
-    // difference means the open went somewhere other than where the caller
-    // pointed. The same construction as the CLI's FullLongPath.
+    // resolved against the current directory - with no link followed and
+    // nothing expanded (8.3 short names are refused, see RejectShortNames).
+    // This is what the opened handle's own path is compared against in
+    // ReadWrappedKeyFile: any difference means the open went somewhere other
+    // than where the caller pointed.
     std::wstring ExpectedFullPath(const std::wstring &path) {
         DWORD needed = GetFullPathNameW(path.c_str(), 0, nullptr, nullptr);
         if (needed == 0) {
@@ -367,21 +419,6 @@ namespace {
             throw HkdfGuardError(HKDFGUARD_ERR_INVALID_ARG, "GetFullPathName failed");
         }
         full.resize(written);
-
-        // GetLongPathName walks the path component by component with the
-        // directory listing, so it expands "PROGRA~1" but reports a link by
-        // its own name, never its target. It fails if the file doesn't
-        // exist; CreateFileW reports that case precisely, so the
-        // unexpanded form is used then.
-        needed = GetLongPathNameW(full.c_str(), nullptr, 0);
-        if (needed != 0) {
-            std::wstring long_form(needed, L'\0');
-            written = GetLongPathNameW(full.c_str(), long_form.data(), needed);
-            if (written != 0 && written < needed) {
-                long_form.resize(written);
-                return long_form;
-            }
-        }
         return full;
     }
 
@@ -439,6 +476,9 @@ namespace {
         std::wstring wide_path = PathToWide(path);
         std::wstring expected = StripExtendedPrefix(ExpectedFullPath(wide_path));
         RequireLocalDrivePath(expected);
+        // After the local-drive check: GetLongPathName reads directory
+        // listings, which must never mean contacting a server.
+        RejectShortNames(expected);
 
         // A directory can't be opened without FILE_FLAG_BACKUP_SEMANTICS, so
         // CreateFileW would report one as ERROR_ACCESS_DENIED - checked first

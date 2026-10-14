@@ -120,8 +120,9 @@ and returns its 164 bytes **still wrapped**, ready for a later, separate
 the file. `path` is UTF-8, absolute or relative to the current directory, and follows the
 same rules as the CLI's `--key-file-path`: it must be a real file on a local drive, reached
 through real directories. A symbolic link, junction or other reparse point at the path or
-anywhere above it is refused, never followed, and so are UNC paths, mapped and SUBST
-drives and device paths - all with `HKDFGUARD_ERR_FILE_PATH_REJECTED`, and before anything
+anywhere above it is refused, never followed, and so are 8.3 short names (`PROGRA~1`),
+UNC paths, mapped and SUBST drives and device paths - all with
+`HKDFGUARD_ERR_FILE_PATH_REJECTED`, and the network and device cases before anything
 is opened, so the process never connects to a server named in a path. It checks the file's
 size before reading anything, and fails
 with `HKDFGUARD_ERR_FILE_PLAINTEXT_KEY` for a file of exactly 32 bytes (the size of an
@@ -179,7 +180,8 @@ wrapper around the ABI above with two subcommands:
   is refused, never followed, with or without `--force` - so a link planted in the
   output directory cannot redirect a (possibly elevated) `wrap --force` at some other
   file. Paths through a SUBST or mapped network drive are refused for the same
-  reason; put the file on a real local path. An existing file with more than one
+  reason; put the file on a real local path. So is a path that spells any folder with
+  its 8.3 short name (`PROGRA~1`): use full names. An existing file with more than one
   hard link is refused too, so `--force` cannot overwrite a file at some other path
   that shares its data.
 

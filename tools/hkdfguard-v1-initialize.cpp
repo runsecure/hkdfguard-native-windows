@@ -470,7 +470,7 @@ namespace {
             case HKDFGUARD_ERR_FILE_TOO_SHORT: return "the wrapped-key file is shorter than a wrapped key";
             case HKDFGUARD_ERR_FILE_TOO_LONG: return "the wrapped-key file is longer than a wrapped key";
             case HKDFGUARD_ERR_FILE_PLAINTEXT_KEY: return "the file is exactly the size of an unwrapped 32-byte key - it may hold a plaintext key; treat it as exposed";
-            case HKDFGUARD_ERR_FILE_PATH_REJECTED: return "the wrapped-key path is, or passes through, a symbolic link, junction or other reparse point, or is not on a local drive (UNC, mapped or SUBST drive, device)";
+            case HKDFGUARD_ERR_FILE_PATH_REJECTED: return "the wrapped-key path is, or passes through, a symbolic link, junction or other reparse point, uses an 8.3 short name, or is not on a local drive (UNC, mapped or SUBST drive, device)";
             default: return "unknown status code " + std::to_string(code);
         }
     }
@@ -798,10 +798,11 @@ namespace {
     //      silently followed.
     //   2. It must be a file, not a directory.
     //   3. The kernel's own resolved path for the handle
-    //      (GetFinalPathNameByHandle) must equal the fully-qualified,
-    //      long-name form of what the caller typed - which is what catches a
-    //      junction or symlink in a *parent* component, where flag (1) on the
-    //      leaf can't see it.
+    //      (GetFinalPathNameByHandle) must equal the fully-qualified form of
+    //      what the caller typed - which is what catches a junction or
+    //      symlink in a *parent* component, where flag (1) on the leaf can't
+    //      see it. (A path using 8.3 short names is refused before this, in
+    //      FullLongPath.)
     //   4. The file must have exactly one name (no hard links), since
     //      neither (1) nor (3) can tell that a file is also reachable at
     //      another path, and overwriting it would change that file too.
@@ -826,14 +827,23 @@ namespace {
         return longForm;
     }
 
-    // Fully-qualified, long-name (no 8.3 short names) form of `path`, as the
-    // caller spelled it - *not* resolved through any reparse point. This is
-    // the "expected" side of check (3) above.
+    // Fully-qualified form of `path`, as the caller spelled it - *not*
+    // resolved through any reparse point. This is the "expected" side of
+    // check (3) above.
+    //
+    // 8.3 short names ("PROGRA~1") are refused rather than expanded, here
+    // and in HkdfGuardV1.dll's hkdfguard_open_file alike: they are a second,
+    // auto-generated name for the same file, with a history of checks that
+    // matched one spelling but not the other. The test is exact, not a guess
+    // from "~" characters: GetLongPathName walks the path through the
+    // directory listing, and a path is refused only if that changes one of
+    // its components (ignoring case). A genuine long name such as
+    // "report~1.key" passes.
     //
     // GetLongPathName only works on paths that exist, and the wrapped-key
     // file usually doesn't yet. So if the full path doesn't resolve, the
-    // parent directory (which must exist) is long-named instead and the leaf
-    // name is appended as typed.
+    // parent directory (which must exist) is checked instead; the leaf of a
+    // file that doesn't exist yet has no short name to check.
     std::string FullLongPath(const std::string &path) {
         DWORD needed = GetFullPathNameA(path.c_str(), 0, nullptr, nullptr);
         if (needed == 0) {
@@ -846,9 +856,18 @@ namespace {
         }
         full.resize(written);
 
+        auto refuseShortName = [&path]() {
+            throw CliError(
+                path + " uses an 8.3 short name (such as PROGRA~1); spell every folder and the file "
+                "with its full name");
+        };
+
         std::string longForm = TryLongPathName(full);
         if (!longForm.empty()) {
-            return longForm;
+            if (_stricmp(longForm.c_str(), full.c_str()) != 0) {
+                refuseShortName();
+            }
+            return full;
         }
         DWORD err = GetLastError();
         if (err != ERROR_FILE_NOT_FOUND) {
@@ -866,10 +885,10 @@ namespace {
                 "the directory for " + path + " (" + parent + ") does not exist or cannot be resolved: " +
                 FormatWin32Error(GetLastError()));
         }
-        if (parentLong.back() != '\\') {
-            parentLong.push_back('\\');
+        if (_stricmp(parentLong.c_str(), parent.c_str()) != 0) {
+            refuseShortName();
         }
-        return parentLong + full.substr(sep + 1);
+        return full;
     }
 
     // The kernel's canonical DOS path for an open handle, with the "\\?\"
