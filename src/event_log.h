@@ -50,11 +50,19 @@ namespace hkdfguard {
     // `service` is the normalized service name, or empty if it was invalid.
     void LogOperationFailure(AuditOp op, const std::string &service, int32_t code) noexcept;
 
-    // hkdfguard_open_file refused `path` because it is exactly DEK-sized
+    // hkdfguard_open_file refused `path` because it holds what looks like an
+    // unwrapped DEK - 32 raw bytes, or its hex or base64
     // (HKDFGUARD_ERR_FILE_PLAINTEXT_KEY): possibly a plaintext key on disk.
     // The only event that call writes - its other failures concern no KEK
     // and are reported to the caller alone. The path is logged so an
-    // administrator can find the file; its contents were never read.
+    // administrator can find the file; none of its contents are logged.
     void LogPlaintextKeyFile(const std::wstring &path) noexcept;
+
+    // This process has just made its (`calls` + 1)th setup call
+    // (hkdfguard_create_kek / hkdfguard_kek_exists), each held to at least
+    // `floor_ms`: the signature of a caller looping on them. Logged once
+    // per process, a warning - the counterpart of the Linux build's
+    // log::warn at the same point.
+    void LogSetupCallsExceeded(unsigned long calls, unsigned long floor_ms) noexcept;
 
 } // namespace hkdfguard

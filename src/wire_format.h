@@ -2,6 +2,8 @@
 
 #include <cstddef> // size_t
 #include <cstdint> // uint8_t, uint32_t
+#include <string> // std::string (BuildWrappedDekAad's service parameter)
+#include <vector> // std::vector (BuildWrappedDekAad's result)
 
 namespace hkdfguard {
     // WrappedDekV1 layout (all integers little-endian; total 132 bytes,
@@ -29,9 +31,23 @@ namespace hkdfguard {
     // The salt is also HKDF's salt, and is otherwise unstructured - any 32
     // bytes are a well-formed salt.
     //
+    // The AES-GCM AAD is the header || KekFingerprint || normalized service
+    // name (see BuildWrappedDekAad). The header is bytes 0..39 - Version,
+    // ProviderType, Reserved, KeyId and Salt - so every field a parser reads
+    // or routes on is authenticated: a payload whose version, provider type
+    // or KeyId was rewritten fails the tag even when the rewritten value
+    // would itself parse, which is what keeps a future second format version
+    // from being able to relabel a payload as the first. The Nonce is not in
+    // the AAD: AesGcmEncrypt generates it, so it does not exist yet when the
+    // AAD is fixed, and GCM authenticates it inherently (a different nonce
+    // changes both the keystream and the tag). The Ciphertext and Tag are
+    // what the AAD is authenticated *with*. The service name goes last, after
+    // the fixed-length fields, so the AAD encoding is unambiguous without a
+    // length prefix.
+    //
     // KekFingerprint identifies which KEK produced the payload. It is both
     // (a) authenticated - it is part of the AES-GCM AAD, alongside the
-    // service name - and (b) checked explicitly on unwrap, before any ECDH
+    // header and the service name - and (b) checked explicitly on unwrap, before any ECDH
     // or decryption: the KEK selected by (service, ProviderType, KeyId) is
     // opened, its public key fingerprinted the same way, and a mismatch is
     // rejected as HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH. That turns "wrong key" into a
@@ -90,7 +106,7 @@ namespace hkdfguard {
     constexpr size_t kTagLen = 16;
     constexpr size_t kFingerprintLen = 32; // SHA-256 output
 
-    // Byte offsets of each field within the 164-byte payload. Each one is
+    // Byte offsets of each field within the 132-byte payload. Each one is
     // defined in terms of the previous field's offset and length, so if a field
     // length above ever changed, every later offset would automatically recompute
     // correctly at compile time rather than needing to be hand-edited.
@@ -104,6 +120,12 @@ namespace hkdfguard {
     constexpr size_t kTagOffset = kCiphertextOffset + kCiphertextLen; // 84
     constexpr size_t kFingerprintOffset = kTagOffset + kTagLen; // 100
     constexpr size_t kTotalLen = kFingerprintOffset + kFingerprintLen; // 132
+
+    // The authenticated header: every byte before the Nonce (Version through
+    // Salt). It is a prefix of the payload, so on unwrap the AAD is built
+    // from the received bytes themselves, never from a re-serialization of
+    // what was parsed out of them.
+    constexpr size_t kHeaderLen = kNonceOffset; // 40
 
     // A plain C++ `struct` (equivalent to a `class` whose members default to
     // `public`) used purely to bundle the parsed-out pieces of a wrapped
@@ -122,6 +144,7 @@ namespace hkdfguard {
     struct ParsedWrappedDek {
         uint8_t provider_type;
         uint32_t key_id;
+        const uint8_t *header; // kHeaderLen bytes, as received - the AAD's first part
         const uint8_t *salt; // kSaltLen bytes
         const uint8_t *nonce; // kNonceLen bytes
         const uint8_t *ciphertext; // kCiphertextLen bytes
@@ -153,6 +176,25 @@ namespace hkdfguard {
         const uint8_t tag[kTagLen],
         const uint8_t fingerprint[kFingerprintLen],
         uint8_t out[kTotalLen]);
+
+    // Writes just the kHeaderLen-byte header (Version through Salt) into
+    // out - exactly the first kHeaderLen bytes SerializeWrappedDek writes,
+    // since that function writes its header through this one. Wrap needs the
+    // header before the payload exists, to build the AAD it encrypts under.
+    void SerializeWrappedDekHeader(
+        uint8_t provider_type,
+        uint32_t key_id,
+        const uint8_t salt[kSaltLen],
+        uint8_t out[kHeaderLen]);
+
+    // The AES-GCM AAD: header || fingerprint || normalized_service (see the
+    // layout comment above). Wrap passes the header it is about to
+    // serialize; unwrap passes ParsedWrappedDek::header, the received bytes.
+    // None of it is secret.
+    std::vector<uint8_t> BuildWrappedDekAad(
+        const uint8_t header[kHeaderLen],
+        const uint8_t fingerprint[kFingerprintLen],
+        const std::string &normalized_service);
 
     // Validates and parses a wrapped payload. Throws HkdfGuardError with
     // HKDFGUARD_ERR_PAYLOAD_UNSUPPORTED if the version is not recognized,

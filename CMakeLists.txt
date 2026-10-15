@@ -55,6 +55,7 @@ add_library(hkdfguard SHARED
     src/event_log.cpp
     src/key_file.cpp
     src/hash_to_curve.cpp
+    src/process_hardening.cpp
 )
 
 # Event log message table: mc.exe (Windows SDK) compiles
@@ -113,8 +114,9 @@ target_include_directories(hkdfguard
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 # The two Windows system libraries providing every NCrypt*/BCrypt* function
-# called throughout src/.
-target_link_libraries(hkdfguard PRIVATE ncrypt.lib bcrypt.lib)
+# called throughout src/, plus wer.lib for process_hardening.cpp's
+# WerSetFlags.
+target_link_libraries(hkdfguard PRIVATE ncrypt.lib bcrypt.lib wer.lib)
 
 # MSVC-specific hardening flags, applied only when compiling with MSVC (as
 # opposed to some other compiler CMake might be configured to use). Defined

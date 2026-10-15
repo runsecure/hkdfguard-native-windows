@@ -8,9 +8,13 @@
 #include "errors.h"
 #include "wire_format.h" // ParseWrappedDek, kTotalLen
 
+#include "secure_buffer.h" // SecureBuffer - holds a small file's bytes while they're inspected
+
 #include <windows.h>
+#include <aclapi.h> // GetSecurityInfo
 #include <cstring>
 #include <string>
+#include <vector>
 
 namespace hkdfguard {
     namespace {
@@ -213,7 +217,326 @@ namespace hkdfguard {
             }
             throw HkdfGuardError(HKDFGUARD_ERR_FILE_IO, "GetFinalPathNameByHandle could not size its result");
         }
+
+        // MARK: Who may have written the file
+
+        // Rights on the key file that let a principal change what it holds,
+        // delete or rename it, or take it over. Read access is not here: a
+        // wrapped DEK is ciphertext, so reading it gains nothing. GENERIC_*
+        // appear because an ACE may carry them unmapped.
+        constexpr ACCESS_MASK kFileWriteRights = FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_EA |
+                                                 FILE_WRITE_ATTRIBUTES | DELETE | WRITE_DAC | WRITE_OWNER |
+                                                 GENERIC_WRITE | GENERIC_ALL;
+
+        // Rights on a folder in the key's path that let a principal remove
+        // or rename an entry in it (FILE_DELETE_CHILD), remove or rename the
+        // folder itself (DELETE), or take it over (WRITE_DAC, WRITE_OWNER) -
+        // any of which lets them put a file of their choosing where the key
+        // was. Creating new entries (FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY,
+        // and GENERIC_WRITE, which maps to those) is not here: it can't
+        // displace an existing entry, which is why C:\ProgramData - where
+        // Users may create but not delete others' files - is acceptable.
+        // That is the Windows counterpart of the Linux build allowing a
+        // sticky (/tmp-style) directory.
+        constexpr ACCESS_MASK kFolderReplaceRights = FILE_DELETE_CHILD | DELETE | WRITE_DAC | WRITE_OWNER | GENERIC_ALL;
+
+        // NT SERVICE\TrustedInstaller, which owns C:\ and much of the system
+        // drive: S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464.
+        class TrustedInstallerSid {
+        public:
+            TrustedInstallerSid() {
+                SID_IDENTIFIER_AUTHORITY nt = SECURITY_NT_AUTHORITY;
+                if (!AllocateAndInitializeSid(&nt, 6, SECURITY_SERVICE_ID_BASE_RID, 956008885, 3418522649,
+                                              1831038044, 1853292631, 2271478464, 0, 0, &sid_)) {
+                    throw HkdfGuardError(HKDFGUARD_ERR_INTERNAL_ERROR, "AllocateAndInitializeSid failed");
+                }
+            }
+
+            ~TrustedInstallerSid() { FreeSid(sid_); }
+
+            TrustedInstallerSid(const TrustedInstallerSid &) = delete;
+
+            TrustedInstallerSid &operator=(const TrustedInstallerSid &) = delete;
+
+            PSID get() const { return sid_; }
+
+        private:
+            PSID sid_ = nullptr;
+        };
+
+        // The principals a key file and its folders may be owned by, and
+        // the only ones that may hold the write-type rights above: SYSTEM,
+        // BUILTIN\Administrators, TrustedInstaller, and the account this
+        // process runs as - the counterpart of the Linux build's "root or
+        // this process's user". (Administrators is here because an elevated
+        // administrator's files are owned by the group, not the user;
+        // that's who the CLI's wrap, run elevated, writes them as.)
+        //
+        // OWNER RIGHTS is accepted in an ACE because it means "whoever owns
+        // this", and the owner is checked separately. CREATOR OWNER and
+        // CREATOR GROUP are accepted because outside an inherit-only ACE
+        // they match nobody.
+        class TrustedPrincipals {
+        public:
+            TrustedPrincipals() {
+                DWORD size = 0;
+                GetTokenInformation(GetCurrentProcessToken(), TokenUser, nullptr, 0, &size);
+                if (size == 0) {
+                    throw HkdfGuardError(HKDFGUARD_ERR_INTERNAL_ERROR, "GetTokenInformation(TokenUser) failed");
+                }
+                user_buffer_.resize(size);
+                if (!GetTokenInformation(GetCurrentProcessToken(), TokenUser, user_buffer_.data(), size, &size)) {
+                    throw HkdfGuardError(HKDFGUARD_ERR_INTERNAL_ERROR, "GetTokenInformation(TokenUser) failed");
+                }
+            }
+
+            bool MayOwn(PSID sid) const {
+                return IsWellKnownSid(sid, WinLocalSystemSid) || IsWellKnownSid(sid, WinBuiltinAdministratorsSid) ||
+                       EqualSid(sid, trusted_installer_.get()) || EqualSid(sid, User());
+            }
+
+            bool MayWrite(PSID sid) const {
+                return MayOwn(sid) || IsWellKnownSid(sid, WinCreatorOwnerRightsSid) ||
+                       IsWellKnownSid(sid, WinCreatorOwnerSid) || IsWellKnownSid(sid, WinCreatorGroupSid);
+            }
+
+        private:
+            PSID User() const { return reinterpret_cast<const TOKEN_USER *>(user_buffer_.data())->User.Sid; }
+
+            std::vector<BYTE> user_buffer_;
+            TrustedInstallerSid trusted_installer_;
+        };
+
+        // The owner/DACL test itself, on an already-fetched owner and DACL.
+        // `what` names the object for the error message.
+        void CheckOwnerAndDacl(PSID owner, PACL dacl, bool dacl_present, ACCESS_MASK forbidden,
+                               const TrustedPrincipals &trusted, const char *what) {
+            if (owner == nullptr || !trusted.MayOwn(owner)) {
+                throw HkdfGuardError(
+                    HKDFGUARD_ERR_FILE_UNTRUSTED,
+                    (std::string(what) + " is not owned by SYSTEM, Administrators, TrustedInstaller or this account").c_str());
+            }
+            if (!dacl_present || dacl == nullptr) {
+                throw HkdfGuardError(HKDFGUARD_ERR_FILE_UNTRUSTED,
+                                     (std::string(what) + " has no DACL, so everyone has full access to it").c_str());
+            }
+            for (DWORD i = 0; i < dacl->AceCount; ++i) {
+                void *ace = nullptr;
+                if (!GetAce(dacl, i, &ace)) {
+                    throw HkdfGuardError(HKDFGUARD_ERR_FILE_UNTRUSTED, (std::string(what) + ": GetAce failed").c_str());
+                }
+                const ACE_HEADER *header = static_cast<const ACE_HEADER *>(ace);
+                if (header->AceFlags & INHERIT_ONLY_ACE) {
+                    continue; // applies only to children, which are checked on their own
+                }
+                switch (header->AceType) {
+                    case ACCESS_DENIED_ACE_TYPE:
+                    case ACCESS_DENIED_OBJECT_ACE_TYPE:
+                    case ACCESS_DENIED_CALLBACK_ACE_TYPE:
+                    case ACCESS_DENIED_CALLBACK_OBJECT_ACE_TYPE:
+                        continue; // a deny only ever takes access away
+                    case ACCESS_ALLOWED_ACE_TYPE:
+                    case ACCESS_ALLOWED_CALLBACK_ACE_TYPE: {
+                        // The same layout up to the SID: header, mask, SID.
+                        // A callback (conditional) ACE is judged as if its
+                        // condition held, since it may.
+                        const ACCESS_ALLOWED_ACE *allowed = static_cast<const ACCESS_ALLOWED_ACE *>(ace);
+                        PSID sid = const_cast<DWORD *>(&allowed->SidStart);
+                        if ((allowed->Mask & forbidden) != 0 && !trusted.MayWrite(sid)) {
+                            throw HkdfGuardError(
+                                HKDFGUARD_ERR_FILE_UNTRUSTED,
+                                (std::string(what) + " grants write, delete or ownership rights to an account other "
+                                "than SYSTEM, Administrators, TrustedInstaller or this account").c_str());
+                        }
+                        continue;
+                    }
+                    default:
+                        // Object and compound allow ACEs never belong on a
+                        // file system object; one that can't be read can't
+                        // be vouched for.
+                        throw HkdfGuardError(HKDFGUARD_ERR_FILE_UNTRUSTED,
+                                             (std::string(what) + " has an access-allowed ACE of an unexpected type").c_str());
+                }
+            }
+        }
+
+        // CheckOwnerAndDacl on an open handle's live security descriptor.
+        void CheckHandleSecurity(HANDLE handle, ACCESS_MASK forbidden, const TrustedPrincipals &trusted,
+                                 const char *what) {
+            PSID owner = nullptr;
+            PACL dacl = nullptr;
+            PSECURITY_DESCRIPTOR sd = nullptr;
+            DWORD rc = GetSecurityInfo(handle, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                                       &owner, nullptr, &dacl, nullptr, &sd);
+            if (rc != ERROR_SUCCESS) {
+                throw HkdfGuardError(HKDFGUARD_ERR_FILE_UNTRUSTED, (std::string(what) + ": its security could not be read").c_str());
+            }
+            try {
+                // GetSecurityInfo reports a missing DACL and a NULL DACL
+                // alike, as dacl == nullptr - both mean unrestricted access.
+                CheckOwnerAndDacl(owner, dacl, true, forbidden, trusted, what);
+            } catch (...) {
+                LocalFree(sd);
+                throw;
+            }
+            LocalFree(sd);
+        }
+
+        // Every folder above the key file, from its own folder up to the
+        // drive root, must pass the same owner test and grant nobody else
+        // kFolderReplaceRights - otherwise someone else could rename a file
+        // of their choosing over the key, or the key's folder out of the way
+        // and one of their own into its place. `final_path` is the opened
+        // file's canonical path, already confirmed to contain no link, so
+        // every prefix of it is a real folder. Each is opened without
+        // following a reparse point and checked to still be a plain folder:
+        // replacing one would need exactly the rights being checked for.
+        // Any failure to open or read a folder means it can't be vouched for.
+        void CheckFolderChain(const std::wstring &final_path, const TrustedPrincipals &trusted) {
+            size_t sep = final_path.find_last_of(L'\\');
+            while (sep != std::wstring::npos && sep >= 2) {
+                // "C:\a\b" for every folder but the root, which needs its
+                // trailing backslash ("C:" alone is a drive's current folder).
+                std::wstring folder = final_path.substr(0, sep == 2 ? 3 : sep);
+                ScopedFile handle(CreateFileW(
+                    (L"\\\\?\\" + folder).c_str(), READ_CONTROL | FILE_READ_ATTRIBUTES,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                    FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+                if (!handle.valid()) {
+                    throw HkdfGuardError(HKDFGUARD_ERR_FILE_UNTRUSTED, "a folder in the path could not be opened to check its security");
+                }
+                BY_HANDLE_FILE_INFORMATION info{};
+                if (!GetFileInformationByHandle(handle.get(), &info) ||
+                    !(info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ||
+                    (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
+                    throw HkdfGuardError(HKDFGUARD_ERR_FILE_UNTRUSTED, "a folder in the path changed while it was checked");
+                }
+                CheckHandleSecurity(handle.get(), kFolderReplaceRights, trusted, "a folder in the path");
+                if (sep == 2) {
+                    break; // that was the root
+                }
+                sep = final_path.find_last_of(L'\\', sep - 1);
+            }
+        }
+
+        // MARK: Plaintext keys written as text
+
+        // Longest text form of a DEK recognised, surrounding whitespace
+        // included - the same limit as the Linux build. Every length up to
+        // it is below a payload's, so no payload can be mistaken for one.
+        constexpr size_t kMaxPlaintextTextLen = 96;
+        static_assert(kMaxPlaintextTextLen < kTotalLen && HKDFGUARD_DEK_LEN < kTotalLen,
+                      "plaintext detection must never be able to refuse a real payload");
+
+        // The characters Rust's trim_ascii removes, so both builds trim the
+        // same: space, tab, LF, form feed, CR.
+        bool IsAsciiWhitespace(uint8_t c) {
+            return c == ' ' || c == '\t' || c == '\n' || c == '\f' || c == '\r';
+        }
+
+        // The 6-bit value of a base64 character in the standard (+/) or
+        // URL-safe (-_) alphabet, or -1.
+        int Base64Value(uint8_t c, bool url_safe) {
+            if (c >= 'A' && c <= 'Z') return c - 'A';
+            if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+            if (c >= '0' && c <= '9') return c - '0' + 52;
+            if (c == (url_safe ? '-' : '+')) return 62;
+            if (c == (url_safe ? '_' : '/')) return 63;
+            return -1;
+        }
+
+        // Whether `data` (`len` characters, padding already removed) is
+        // exactly 32 bytes of base64 in one alphabet: 43 characters whose
+        // last carries 2 unused bits, which must be zero - what the Rust
+        // base64 crate's decoders the Linux build uses require. Decides
+        // without decoding, so the possible key is never reassembled.
+        bool IsBase64OfDek(const uint8_t *data, size_t len, bool url_safe) {
+            if (len != 43) {
+                return false;
+            }
+            int last = 0;
+            for (size_t i = 0; i < len; ++i) {
+                last = Base64Value(data[i], url_safe);
+                if (last < 0) {
+                    return false;
+                }
+            }
+            return (last & 0x3) == 0;
+        }
+
+        // 32 raw bytes, or 32 bytes written as text: hex (either case, 64
+        // digits) or base64 (standard or URL-safe, with or without its one
+        // '=' of padding - the CLI's own DEK input is standard, padded),
+        // with any leading or trailing whitespace an editor or `echo` adds.
+        // The same forms the Linux build recognises. Every one of these is
+        // too short to be a payload anyway; recognising them is what turns
+        // "wrong file" into "this key is exposed".
+        bool LooksLikePlaintextDek(const uint8_t *bytes, size_t len) {
+            if (len == HKDFGUARD_DEK_LEN) {
+                return true;
+            }
+            if (len > kMaxPlaintextTextLen) {
+                return false;
+            }
+            const uint8_t *begin = bytes;
+            const uint8_t *end = bytes + len;
+            while (begin < end && IsAsciiWhitespace(*begin)) ++begin;
+            while (end > begin && IsAsciiWhitespace(end[-1])) --end;
+            size_t text_len = static_cast<size_t>(end - begin);
+            if (text_len == 2 * HKDFGUARD_DEK_LEN) {
+                for (const uint8_t *p = begin; p < end; ++p) {
+                    if (!((*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'f') || (*p >= 'A' && *p <= 'F'))) {
+                        return false;
+                    }
+                }
+                return true;
+            }
+            if (text_len == 44 && end[-1] == '=') {
+                --text_len; // its one '=' of padding
+            }
+            return IsBase64OfDek(begin, text_len, false) || IsBase64OfDek(begin, text_len, true);
+        }
+
+        // Reads a file already known to be no longer than
+        // kMaxPlaintextTextLen into a buffer that's wiped afterwards, and
+        // reports whether it holds a DEK as text. Nothing read here is ever
+        // copied to the caller. A read error just means "can't tell", and
+        // the caller reports the file as too short, which it is.
+        bool SmallFileLooksLikePlaintextDek(HANDLE file) {
+            SecureBuffer<kMaxPlaintextTextLen + 1> contents;
+            DWORD total = 0;
+            while (total < contents.size()) {
+                DWORD got = 0;
+                if (!ReadFile(file, contents.data() + total, static_cast<DWORD>(contents.size() - total), &got, nullptr)) {
+                    return false;
+                }
+                if (got == 0) {
+                    break;
+                }
+                total += got;
+            }
+            return LooksLikePlaintextDek(contents.data(), total);
+        }
     } // namespace
+
+    void CheckKeyFileSecurity(PSECURITY_DESCRIPTOR sd, bool is_folder) {
+        PSID owner = nullptr;
+        BOOL owner_defaulted = FALSE;
+        PACL dacl = nullptr;
+        BOOL dacl_present = FALSE;
+        BOOL dacl_defaulted = FALSE;
+        if (!GetSecurityDescriptorOwner(sd, &owner, &owner_defaulted) ||
+            !GetSecurityDescriptorDacl(sd, &dacl_present, &dacl, &dacl_defaulted)) {
+            throw HkdfGuardError(HKDFGUARD_ERR_FILE_UNTRUSTED, "security descriptor could not be read");
+        }
+        TrustedPrincipals trusted;
+        CheckOwnerAndDacl(owner, dacl, dacl_present != FALSE, is_folder ? kFolderReplaceRights : kFileWriteRights,
+                          trusted, is_folder ? "a folder in the path" : "the file");
+    }
+
+    bool LooksLikePlaintextKeyForTest(const uint8_t *bytes, size_t len) {
+        return LooksLikePlaintextDek(bytes, len);
+    }
 
     std::wstring KeyFilePathToWide(const char *path) {
         return PathToWide(path);
@@ -288,9 +611,28 @@ namespace hkdfguard {
             throw HkdfGuardError(HKDFGUARD_ERR_FILE_UNTRUSTED, "path resolves through a link, junction or SUBST drive");
         }
 
-        // Decided on the size alone, before reading a byte. In particular a
-        // DEK-sized file is never read at all: if it really is a plaintext
-        // key, it never enters this process's memory.
+        // Who could have written what is about to be read. A wrapped DEK is
+        // ciphertext, so reading it gains nothing - but *replacing* it does:
+        // anyone who can write the file, or put another one in its place,
+        // and can also wrap under the service's KEK could plant a DEK they
+        // know, and unwrap would accept it as genuine. So the file and every
+        // folder above it must be owned by SYSTEM, Administrators,
+        // TrustedInstaller or this account, and grant nobody else write,
+        // delete or ownership rights (see kFileWriteRights and
+        // kFolderReplaceRights) - the Linux build's owner and mode checks,
+        // in ACL form. Checked on the open handle, after the path checks
+        // above, so it's the file actually read that is judged. (The OS
+        // refusing the open itself was HKDFGUARD_ERR_FILE_ACCESS_DENIED,
+        // above.)
+        TrustedPrincipals trusted;
+        CheckHandleSecurity(file.get(), kFileWriteRights, trusted, "the file");
+        CheckFolderChain(actual, trusted);
+
+        // Decided on the size first. A DEK-sized file is never read at all:
+        // if it really is a plaintext key, it never enters this process's
+        // memory. A file too short to be a payload but short enough to be a
+        // DEK written as text (hex or base64) is read into a wiped buffer to
+        // tell which; its bytes are never copied to the caller.
         LARGE_INTEGER size{};
         if (!GetFileSizeEx(file.get(), &size)) {
             throw HkdfGuardError(HKDFGUARD_ERR_FILE_IO, "GetFileSizeEx failed");
@@ -299,6 +641,10 @@ namespace hkdfguard {
             throw HkdfGuardError(HKDFGUARD_ERR_FILE_PLAINTEXT_KEY, "file is the size of a plaintext DEK");
         }
         if (size.QuadPart < static_cast<LONGLONG>(kTotalLen)) {
+            if (size.QuadPart <= static_cast<LONGLONG>(kMaxPlaintextTextLen) &&
+                SmallFileLooksLikePlaintextDek(file.get())) {
+                throw HkdfGuardError(HKDFGUARD_ERR_FILE_PLAINTEXT_KEY, "file holds a DEK written as hex or base64");
+            }
             throw HkdfGuardError(HKDFGUARD_ERR_FILE_TOO_SHORT, "file is shorter than a wrapped payload");
         }
         if (size.QuadPart > static_cast<LONGLONG>(kTotalLen)) {

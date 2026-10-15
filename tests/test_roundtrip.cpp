@@ -18,6 +18,8 @@
 #include <winioctl.h> // FSCTL_SET_REPARSE_POINT - section 24c plants a junction
 #include <sddl.h>    // ConvertStringSecurityDescriptorToSecurityDescriptorW - section 28
 #include <algorithm> // std::equal - section 24c
+#include <chrono>    // steady_clock - section 0c2 times the setup floor
+#include <thread>    // std::thread - section 0c2 checks setup calls are serialized
 #include <cstdio>
 #include <cstring>
 #include <stdexcept> // std::exception, caught in CleanupKek and CheckPolicyCreatesKek
@@ -388,6 +390,75 @@ bool WriteTestFile(const std::wstring& path, const std::vector<uint8_t>& bytes) 
     return ok;
 }
 
+// Text forms of a DEK, for section 24c's plaintext-key checks - written
+// here independently of src/key_file.cpp's detector.
+std::string HexOf(const std::vector<uint8_t>& bytes, bool upper) {
+    const char* digits = upper ? "0123456789ABCDEF" : "0123456789abcdef";
+    std::string out;
+    for (uint8_t b : bytes) {
+        out += digits[b >> 4];
+        out += digits[b & 0xF];
+    }
+    return out;
+}
+
+std::string Base64Of(const std::vector<uint8_t>& bytes, bool url_safe, bool pad) {
+    const char* alphabet = url_safe ? "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+                                    : "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    size_t i = 0;
+    for (; i + 3 <= bytes.size(); i += 3) {
+        uint32_t v = (bytes[i] << 16) | (bytes[i + 1] << 8) | bytes[i + 2];
+        out += alphabet[(v >> 18) & 63];
+        out += alphabet[(v >> 12) & 63];
+        out += alphabet[(v >> 6) & 63];
+        out += alphabet[v & 63];
+    }
+    size_t rest = bytes.size() - i;
+    if (rest > 0) {
+        uint32_t v = bytes[i] << 16;
+        if (rest == 2) v |= bytes[i + 1] << 8;
+        out += alphabet[(v >> 18) & 63];
+        out += alphabet[(v >> 12) & 63];
+        if (rest == 2) out += alphabet[(v >> 6) & 63];
+        if (pad) out += (rest == 2) ? "=" : "==";
+    }
+    return out;
+}
+
+std::vector<uint8_t> BytesOf(const std::string& s) { return std::vector<uint8_t>(s.begin(), s.end()); }
+
+// This process's user SID as an SDDL string, for section 24d's descriptors.
+std::wstring CurrentUserSidString() {
+    DWORD size = 0;
+    GetTokenInformation(GetCurrentProcessToken(), TokenUser, nullptr, 0, &size);
+    std::vector<BYTE> buffer(size);
+    wchar_t* text = nullptr;
+    if (size == 0 || !GetTokenInformation(GetCurrentProcessToken(), TokenUser, buffer.data(), size, &size) ||
+        !ConvertSidToStringSidW(reinterpret_cast<TOKEN_USER*>(buffer.data())->User.Sid, &text)) {
+        return L"";
+    }
+    std::wstring sid(text);
+    LocalFree(text);
+    return sid;
+}
+
+// Replaces an existing file's or folder's DACL with `sddl`'s, protected
+// from inheritance, so exactly those ACEs apply. (Setting an owner other
+// than oneself needs privileges, so only the DACL is set.)
+bool SetProtectedDacl(const std::wstring& path, const std::wstring& sddl) {
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.c_str(), SDDL_REVISION_1, &sd, nullptr)) return false;
+    PACL dacl = nullptr;
+    BOOL present = FALSE, defaulted = FALSE;
+    bool ok = GetSecurityDescriptorDacl(sd, &present, &dacl, &defaulted) &&
+              SetNamedSecurityInfoW(const_cast<wchar_t*>(path.c_str()), SE_FILE_OBJECT,
+                                    DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION, nullptr,
+                                    nullptr, dacl, nullptr) == ERROR_SUCCESS;
+    LocalFree(sd);
+    return ok;
+}
+
 // The 8.3 short name of `path`, or empty if it has none. Where the volume
 // doesn't generate short names (8.3 creation is off by default on
 // container and many server volumes), one is assigned explicitly with
@@ -517,7 +588,7 @@ constexpr wchar_t kGoldenServiceWide[] = L"hkdfguardwin.test.golden";
 constexpr char kGoldenPayloadHex[] =
     "010200000100000042424242424242424242424242424242424242424242424242424242"
     "42424242977bcd31c21caffe32bc3f6a0e565cb000978ea50f780da588daece0022d5929"
-    "f9404d50f87daf7c78383cd93d1fd63a73571b967fc18ebaf31f8d0938d1ef5a8d210826"
+    "f9404d50f87daf7c78383cd97fcd39e16d6890acb44cf9306b945a0838d1ef5a8d210826"
     "eeabdd24b8676833717a7ecedb999ae3b9b3012a0d4353c4";
 
 // BCRYPT_ECCPRIVATE_BLOB for a P-256 ECDH key from hex X, Y, d.
@@ -606,7 +677,8 @@ bool IndependentWrappingKey(const std::vector<uint8_t>& salt, const std::vector<
 }
 
 // Seals `dek` into a WrappedDekV1 payload with a given wrapping key, salt and
-// nonce, independently of src/: AAD = service || SHA-256(KEK X||Y), then the
+// nonce, independently of src/: AAD = header (bytes 0..39: version,
+// provider, reserved, KeyId, salt) || SHA-256(KEK X||Y) || service, then the
 // documented 132-byte layout. `providerType` must name the provider the KEK
 // actually lives on (1 = TPM, 2 = Software KSP): unwrap routes by it, so a
 // wrong value sends unwrap looking for the KEK on the wrong provider.
@@ -621,8 +693,11 @@ bool SealPayloadIndependently(const std::vector<uint8_t>& aesKey, const std::vec
                                    static_cast<ULONG>(pub.size()), fingerprint.data(), 32))) {
         return false;
     }
-    std::vector<uint8_t> aad(service, service + std::strlen(service));
+    std::vector<uint8_t> header = {0x01, providerType, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00}; // version, provider, reserved, KeyId 1 (LE)
+    header.insert(header.end(), salt.begin(), salt.end());
+    std::vector<uint8_t> aad = header;
     aad.insert(aad.end(), fingerprint.begin(), fingerprint.end());
+    aad.insert(aad.end(), service, service + std::strlen(service));
 
     hkdfguard::ScopedBCryptAlg aes;
     hkdfguard::ScopedBCryptKey aesHandle;
@@ -651,8 +726,7 @@ bool SealPayloadIndependently(const std::vector<uint8_t>& aesKey, const std::vec
         return false;
     }
 
-    payload = {0x01, providerType, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00}; // version, provider, reserved, KeyId 1 (LE)
-    payload.insert(payload.end(), salt.begin(), salt.end());
+    payload = header; // the same header bytes the AAD covers
     payload.insert(payload.end(), nonce.begin(), nonce.end());
     payload.insert(payload.end(), ciphertext.begin(), ciphertext.end());
     payload.insert(payload.end(), tag.begin(), tag.end());
@@ -745,7 +819,7 @@ int main() {
     {
         HMODULE dll = GetModuleHandleW(L"HkdfGuardV1.dll");
         Check(dll != nullptr, "the HkdfGuard DLL is loaded in this test process");
-        const DWORD ids[] = {1000, 1001, 1002, 1003, 2000, 2002, 2003, 2004, 2005, 2006};
+        const DWORD ids[] = {1000, 1001, 1002, 1003, 2000, 2002, 2003, 2004, 2005, 2006, 2007};
         bool allPresent = dll != nullptr;
         for (DWORD id : ids) {
             if (dll == nullptr) break;
@@ -816,6 +890,76 @@ int main() {
 
     rc = hkdfguard_create_kek(nullptr);
     Check(rc == HKDFGUARD_ERR_INVALID_SERVICE_NAME, "create_kek rejects null service");
+
+    // ---- 0c2. Setup calls are deliberately slow and serialized. ----
+    // The DLL reads the floor from HKLM\...\SetupMinDelayMs like any
+    // deployment, so the expected value is read the same way (1000 ms when
+    // the value is absent). The value-to-setting rule is checked first,
+    // without the registry.
+    {
+        using hkdfguard::ParseSetupMinDelayMs;
+        Check(ParseSetupMinDelayMs(false, 0, 0) == 1000, "SetupMinDelayMs: absent means 1000 ms");
+        Check(ParseSetupMinDelayMs(true, REG_DWORD, 0) == 0, "SetupMinDelayMs: 0 disables the floor");
+        Check(ParseSetupMinDelayMs(true, REG_DWORD, 250) == 250, "SetupMinDelayMs: an in-range DWORD is used as is");
+        Check(ParseSetupMinDelayMs(true, REG_DWORD, 60000) == 60000, "SetupMinDelayMs: 60000 is the largest honored");
+        Check(ParseSetupMinDelayMs(true, REG_DWORD, 60001) == 1000, "SetupMinDelayMs: above 60000 keeps the 1000 ms default");
+        Check(ParseSetupMinDelayMs(true, REG_DWORD, 0xFFFFFFFFu) == 1000, "SetupMinDelayMs: 0xFFFFFFFF keeps the default");
+        Check(ParseSetupMinDelayMs(true, REG_SZ, 0) == 1000, "SetupMinDelayMs: the wrong type keeps the default");
+        Check(ParseSetupMinDelayMs(true, REG_QWORD, 5) == 1000, "SetupMinDelayMs: a QWORD keeps the default");
+
+        const unsigned long floor_ms = hkdfguard::LoadSetupMinDelayMs();
+        std::printf("    (setup floor on this machine: %lu ms)\n", floor_ms);
+        auto elapsed_ms = [](auto&& call) {
+            const auto start = std::chrono::steady_clock::now();
+            call();
+            return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+        };
+
+        int32_t timed_exists = -1;
+        long long t = elapsed_ms([&] { rc = hkdfguard_kek_exists(kServiceNoKek, &timed_exists); });
+        Check(rc == HKDFGUARD_OK && timed_exists == 0, "kek_exists (timed) reports no KEK for an unprovisioned service");
+        Check(t >= static_cast<long long>(floor_ms), "kek_exists takes at least the setup floor when there is no KEK");
+        if (t < static_cast<long long>(floor_ms)) std::printf("    (took %lld ms)\n", t);
+
+        t = elapsed_ms([&] { rc = hkdfguard_kek_exists(kServiceLifecycle, &timed_exists); });
+        Check(t >= static_cast<long long>(floor_ms), "kek_exists takes at least the setup floor whatever it finds");
+
+        // Not elevated, a new KEK can't be created: KEK_ACCESS_DENIED. Elevated,
+        // this is the idempotent verify of an existing KEK. Either way, the
+        // floor applies to the outcome.
+        t = elapsed_ms([&] { rc = hkdfguard_create_kek(kServiceLifecycle); });
+        Check(t >= static_cast<long long>(floor_ms), "create_kek takes at least the setup floor, success or failure");
+
+        if (floor_ms >= 200) {
+            t = elapsed_ms([&] { rc = hkdfguard_kek_exists(nullptr, &timed_exists); });
+            Check(rc == HKDFGUARD_ERR_INVALID_SERVICE_NAME && t < static_cast<long long>(floor_ms) / 2,
+                  "an argument error returns immediately, without the setup floor");
+            t = elapsed_ms([&] { rc = hkdfguard_create_kek("..bad"); });
+            Check(rc == HKDFGUARD_ERR_INVALID_SERVICE_NAME && t < static_cast<long long>(floor_ms) / 2,
+                  "an invalid service name returns immediately, without the setup floor");
+            // wrap is the hot path and is never slowed.
+            std::vector<uint8_t> fast(HKDFGUARD_WRAPPED_LEN);
+            int32_t fast_len = static_cast<int32_t>(fast.size());
+            t = elapsed_ms([&] {
+                rc = hkdfguard_wrap_dek(kServiceNoKek, dek.data(), static_cast<int32_t>(dek.size()), fast.data(), &fast_len);
+            });
+            Check(rc == HKDFGUARD_ERR_KEK_NOT_FOUND && t < static_cast<long long>(floor_ms) / 2,
+                  "wrap is not slowed by the setup floor (KEK_NOT_FOUND at once)");
+
+            // Two threads at once: serialized, so together at least twice the floor.
+            int32_t a_exists = -1, b_exists = -1;
+            t = elapsed_ms([&] {
+                std::thread a([&] { hkdfguard_kek_exists(kServiceNoKek, &a_exists); });
+                std::thread b([&] { hkdfguard_kek_exists(kServiceLifecycle, &b_exists); });
+                a.join();
+                b.join();
+            });
+            Check(t >= 2 * static_cast<long long>(floor_ms), "concurrent setup calls run one at a time");
+            if (t < 2 * static_cast<long long>(floor_ms)) std::printf("    (two concurrent calls took %lld ms)\n", t);
+        } else {
+            Skip("setup-floor fast paths and serialization (SetupMinDelayMs is below 200 ms on this machine)");
+        }
+    }
 
     // ---- 0d. Key-use group policy (HKLM\Software\Policies\HkdfGuard\ ----
     //          KeyUseGroups). Which principals may unwrap is machine policy,
@@ -1373,6 +1517,36 @@ int main() {
         kNonAsciiService, dek.data(), static_cast<int32_t>(dek.size()), scratch.data(), &non_ascii_out_len);
     Check(rc == HKDFGUARD_ERR_INVALID_SERVICE_NAME, "wrap rejects a well-formed but non-ASCII UTF-8 service name");
 
+    // ---- 18b. Dot rules: no leading '.', no "..". ----
+    // The same list the Linux library's tests reject. Validation runs before
+    // any KEK is opened, so none of this needs elevation. A single trailing
+    // '.' stays legal, as on Linux: kek_exists must answer for it (OK, not
+    // INVALID_SERVICE_NAME).
+    for (const char *bad : {".", "..", "...", ".hidden", ".com.example", "..parent", "com..example",
+                            "com.example..", "a...b"}) {
+        const std::string label = std::string(" \"") + bad + "\"";
+        int32_t dot_exists = -1;
+        Check(hkdfguard_kek_exists(bad, &dot_exists) == HKDFGUARD_ERR_INVALID_SERVICE_NAME,
+              ("kek_exists rejects" + label).c_str());
+        Check(hkdfguard_create_kek(bad) == HKDFGUARD_ERR_INVALID_SERVICE_NAME,
+              ("create_kek rejects" + label).c_str());
+        int32_t dot_out_len = static_cast<int32_t>(scratch.size());
+        Check(hkdfguard_wrap_dek(bad, dek.data(), static_cast<int32_t>(dek.size()), scratch.data(), &dot_out_len) ==
+              HKDFGUARD_ERR_INVALID_SERVICE_NAME,
+              ("wrap rejects" + label).c_str());
+        std::vector<uint8_t> dot_wrapped(HKDFGUARD_WRAPPED_LEN, 0);
+        std::vector<uint8_t> dot_unwrapped(HKDFGUARD_DEK_LEN, 0);
+        int32_t dot_unwrap_len = static_cast<int32_t>(dot_unwrapped.size());
+        Check(hkdfguard_unwrap_dek(bad, dot_wrapped.data(), static_cast<int32_t>(dot_wrapped.size()),
+                                   dot_unwrapped.data(), &dot_unwrap_len) == HKDFGUARD_ERR_INVALID_SERVICE_NAME,
+              ("unwrap rejects" + label).c_str());
+    }
+    {
+        int32_t trailing_exists = -1;
+        Check(hkdfguard_kek_exists("hkdfguardwin.test.trailing.", &trailing_exists) == HKDFGUARD_OK,
+              "kek_exists accepts a single trailing '.'");
+    }
+
     // ---- 19. Null-pointer argument validation, unwrap side. ----
     int32_t null_unwrap_out_len = static_cast<int32_t>(unwrapped.size());
     rc = hkdfguard_unwrap_dek(kService, wrapped.data(), wrapped_len, unwrapped.data(), nullptr);
@@ -1694,6 +1868,95 @@ int main() {
                       "a valid payload with one trailing byte is too long");
         expectFailure(fileFor(L"len4096.key", std::vector<uint8_t>(4096, 0x00)), HKDFGUARD_ERR_FILE_TOO_LONG,
                       "a 4096-byte file is too long");
+
+        // A DEK written as text is a plaintext key too, whatever the
+        // surrounding whitespace - the same forms the Linux build refuses.
+        // The DEK starts FB EF BE FF FF FF so its standard and URL-safe
+        // encodings really differ ("++++////" vs "----____").
+        {
+            std::vector<uint8_t> text_dek = {0xFB, 0xEF, 0xBE, 0xFF, 0xFF, 0xFF};
+            for (uint8_t b = 0; text_dek.size() < HKDFGUARD_DEK_LEN; ++b) text_dek.push_back(static_cast<uint8_t>(b * 37 + 11));
+            const std::pair<const char*, std::string> forms[] = {
+                {"base64", Base64Of(text_dek, false, true)},
+                {"base64, no padding", Base64Of(text_dek, false, false)},
+                {"URL-safe base64", Base64Of(text_dek, true, true)},
+                {"URL-safe base64, no padding", Base64Of(text_dek, true, false)},
+                {"hex", HexOf(text_dek, false)},
+                {"HEX", HexOf(text_dek, true)},
+            };
+            int n = 0;
+            for (const auto& [what, text] : forms) {
+                for (const char* ws : {"", "\n", "\r\n", " \t", "\f"}) {
+                    std::wstring name = L"text" + std::to_wstring(n++) + L".key";
+                    expectFailure(fileFor(name.c_str(), BytesOf(std::string(ws) + text + ws)),
+                                  HKDFGUARD_ERR_FILE_PLAINTEXT_KEY,
+                                  std::string("a DEK as ") + what + " (whitespace variant) is a plaintext key");
+                }
+            }
+            const std::string hex = HexOf(text_dek, false);
+            const std::string near_misses[] = {
+                Base64Of(std::vector<uint8_t>(31, 0x5A), false, true),  // base64, but of 31 bytes
+                Base64Of(std::vector<uint8_t>(33, 0x5A), false, true),  // base64, but of 33 bytes
+                std::string(44, '!'),                                   // 44 bytes, not base64
+                hex.substr(1),                                          // 63 hex digits
+                hex.substr(1) + "g",                                    // 64 characters, one not hex
+                hex.substr(0, 32) + "\n" + hex.substr(32),              // hex split by a newline inside
+            };
+            for (const std::string& miss : near_misses) {
+                std::wstring name = L"near" + std::to_wstring(n++) + L".key";
+                expectFailure(fileFor(name.c_str(), BytesOf(miss)), HKDFGUARD_ERR_FILE_TOO_SHORT,
+                              "a near miss of a text DEK (" + std::to_string(miss.size()) + " bytes) is just too short");
+            }
+        }
+
+        // Who could have written the file: an ACE letting Everyone write it,
+        // or a folder letting Everyone delete its entries, is refused; a
+        // folder letting Everyone only create entries (C:\ProgramData-style)
+        // is fine. The owner is this account either way (or Administrators,
+        // elevated), both trusted; owners that would need privileges to set
+        // are covered by section 24d. The content is the golden payload
+        // (section 29): well-formed without any KEK, so the accepted cases
+        // mean something on a non-elevated run too, where `wrapped` is empty.
+        {
+            const std::vector<uint8_t> well_formed = FromHex(kGoldenPayloadHex);
+            const std::wstring me = CurrentUserSidString();
+            Check(!me.empty(), "test setup: read this account's SID");
+            const std::wstring trusted_aces = L"(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;" + me + L")";
+
+            const std::string writable = fileFor(L"everyone-writes.key", well_formed);
+            Check(SetProtectedDacl(dir + L"\\everyone-writes.key", L"D:" + trusted_aces + L"(A;;FW;;;WD)"),
+                  "test setup: let Everyone write everyone-writes.key");
+            expectFailure(writable, HKDFGUARD_ERR_FILE_UNTRUSTED, "a file Everyone may write is untrusted");
+
+            const std::string readable = fileFor(L"everyone-reads.key", well_formed);
+            Check(SetProtectedDacl(dir + L"\\everyone-reads.key", L"D:" + trusted_aces + L"(A;;FR;;;WD)"),
+                  "test setup: let Everyone read everyone-reads.key");
+            r = open(readable);
+            Check(r.rc == HKDFGUARD_OK && r.out == well_formed, "a file Everyone may only read is trusted (it's ciphertext)");
+
+            const std::wstring sub = dir + L"\\acl-folder";
+            Check(CreateDirectoryW(sub.c_str(), nullptr) != FALSE, "test setup: create acl-folder");
+            const std::wstring sub_key = sub + L"\\in-folder.key";
+            Check(WriteTestFile(sub_key, well_formed), "test setup: write acl-folder\\in-folder.key");
+            Check(SetProtectedDacl(sub_key, L"D:" + trusted_aces), "test setup: protect in-folder.key");
+
+            Check(SetProtectedDacl(sub, L"D:" + trusted_aces + L"(A;;0x40;;;WD)"),
+                  "test setup: let Everyone delete entries in acl-folder");
+            expectFailure(ToUtf8(sub_key), HKDFGUARD_ERR_FILE_UNTRUSTED,
+                          "a file in a folder where Everyone may delete entries is untrusted");
+            Check(SetProtectedDacl(sub, L"D:" + trusted_aces + L"(A;;SD;;;WD)"),
+                  "test setup: let Everyone delete acl-folder itself");
+            expectFailure(ToUtf8(sub_key), HKDFGUARD_ERR_FILE_UNTRUSTED,
+                          "a file in a folder Everyone may delete or rename is untrusted");
+            Check(SetProtectedDacl(sub, L"D:" + trusted_aces + L"(A;;0x116;;;WD)"),
+                  "test setup: let Everyone only create entries in acl-folder");
+            r = open(ToUtf8(sub_key));
+            Check(r.rc == HKDFGUARD_OK && r.out == well_formed,
+                  "a file in a folder where Everyone may only create entries is trusted");
+
+            DeleteFileW(sub_key.c_str());
+            RemoveDirectoryW(sub.c_str());
+        }
 
         // Right size, wrong contents.
         std::vector<uint8_t> bad_version = wrapped;
@@ -2021,6 +2284,103 @@ int main() {
             DeleteFileW(path.c_str());
         }
         RemoveDirectoryW(dir.c_str());
+    }
+
+    // ---- 24d. The key-file trust rule and plaintext detector, directly. ----
+    // CheckKeyFileSecurity on descriptors built from SDDL, so owners that
+    // would need SeRestorePrivilege to set on a real file can be tried
+    // without elevation; and the plaintext detector on edge cases that
+    // never need a file.
+    {
+        const std::wstring me = CurrentUserSidString();
+        const std::wstring trusted_installer = L"S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
+        auto verdict = [](const std::wstring& sddl, bool folder) {
+            PSECURITY_DESCRIPTOR sd = nullptr;
+            if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.c_str(), SDDL_REVISION_1, &sd, nullptr)) {
+                return static_cast<int32_t>(1); // the test's own SDDL is wrong
+            }
+            int32_t code = CodeOf([&] { hkdfguard::CheckKeyFileSecurity(sd, folder); });
+            LocalFree(sd);
+            return code;
+        };
+        struct Case {
+            std::wstring sddl;
+            bool folder;
+            int32_t want;
+            const char* what;
+        };
+        const Case cases[] = {
+            // Owners.
+            {L"O:SYD:P(A;;FA;;;SY)", false, HKDFGUARD_OK, "a file owned by SYSTEM is trusted"},
+            {L"O:BAD:P(A;;FA;;;BA)", false, HKDFGUARD_OK, "a file owned by Administrators is trusted"},
+            {L"O:" + trusted_installer + L"D:P(A;;FA;;;SY)", false, HKDFGUARD_OK, "a file owned by TrustedInstaller is trusted"},
+            {L"O:" + me + L"D:P(A;;FA;;;" + me + L")", false, HKDFGUARD_OK, "a file owned by this account is trusted"},
+            {L"O:BUD:P(A;;FA;;;SY)", false, HKDFGUARD_ERR_FILE_UNTRUSTED, "a file owned by BUILTIN\\Users is untrusted"},
+            {L"O:WDD:P(A;;FA;;;SY)", false, HKDFGUARD_ERR_FILE_UNTRUSTED, "a file owned by Everyone is untrusted"},
+            {L"O:BUD:P(A;;FA;;;SY)", true, HKDFGUARD_ERR_FILE_UNTRUSTED, "a folder owned by BUILTIN\\Users is untrusted"},
+            {L"O:LSD:P(A;;FA;;;SY)", true, HKDFGUARD_ERR_FILE_UNTRUSTED, "a folder owned by LocalService is untrusted"},
+            // No DACL, or a NULL one, is unrestricted access.
+            {L"O:SY", false, HKDFGUARD_ERR_FILE_UNTRUSTED, "a file with no DACL is untrusted"},
+            {L"O:SYD:NO_ACCESS_CONTROL", false, HKDFGUARD_ERR_FILE_UNTRUSTED, "a file with a NULL DACL is untrusted"},
+            {L"O:SYD:P", false, HKDFGUARD_OK, "a file with an empty DACL is trusted (only its owner can change it)"},
+            // File rights, one at a time.
+            {L"O:SYD:P(A;;FR;;;WD)", false, HKDFGUARD_OK, "Everyone reading a file is fine (it's ciphertext)"},
+            {L"O:SYD:P(A;;0x2;;;BU)", false, HKDFGUARD_ERR_FILE_UNTRUSTED, "Users with FILE_WRITE_DATA on a file is untrusted"},
+            {L"O:SYD:P(A;;0x4;;;BU)", false, HKDFGUARD_ERR_FILE_UNTRUSTED, "Users with FILE_APPEND_DATA on a file is untrusted"},
+            {L"O:SYD:P(A;;0x10;;;BU)", false, HKDFGUARD_ERR_FILE_UNTRUSTED, "Users with FILE_WRITE_EA on a file is untrusted"},
+            {L"O:SYD:P(A;;0x100;;;BU)", false, HKDFGUARD_ERR_FILE_UNTRUSTED, "Users with FILE_WRITE_ATTRIBUTES on a file is untrusted"},
+            {L"O:SYD:P(A;;SD;;;AU)", false, HKDFGUARD_ERR_FILE_UNTRUSTED, "Authenticated Users with DELETE on a file is untrusted"},
+            {L"O:SYD:P(A;;WD;;;BU)", false, HKDFGUARD_ERR_FILE_UNTRUSTED, "Users with WRITE_DAC on a file is untrusted"},
+            {L"O:SYD:P(A;;WO;;;BU)", false, HKDFGUARD_ERR_FILE_UNTRUSTED, "Users with WRITE_OWNER on a file is untrusted"},
+            {L"O:SYD:P(A;;GW;;;BU)", false, HKDFGUARD_ERR_FILE_UNTRUSTED, "Users with GENERIC_WRITE on a file is untrusted"},
+            {L"O:SYD:P(A;;GA;;;BU)", false, HKDFGUARD_ERR_FILE_UNTRUSTED, "Users with GENERIC_ALL on a file is untrusted"},
+            {L"O:SYD:P(A;;FA;;;S-1-5-21-1-2-3-1001)", false, HKDFGUARD_ERR_FILE_UNTRUSTED, "another user with full control of a file is untrusted"},
+            // Trusted principals may hold any right.
+            {L"O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;" + trusted_installer + L")(A;;FA;;;" + me + L")(A;;FA;;;OW)", false,
+             HKDFGUARD_OK, "SYSTEM, Administrators, TrustedInstaller, this account and OWNER RIGHTS may write a file"},
+            // ACE kinds.
+            {L"O:SYD:P(D;;FA;;;WD)(A;;FA;;;SY)", false, HKDFGUARD_OK, "a deny ACE is never a reason to refuse"},
+            {L"O:SYD:P(A;OIIO;FA;;;WD)", true, HKDFGUARD_OK, "an inherit-only ACE does not apply to the folder itself"},
+            {L"O:SYD:P(XA;;FA;;;WD;(Member_of {SID(BA)}))", false, HKDFGUARD_ERR_FILE_UNTRUSTED,
+             "a conditional allow ACE is judged as if its condition held"},
+            // Folder rights: replacing entries is refused, creating them is not.
+            {L"O:SYD:P(A;;0x40;;;BU)", true, HKDFGUARD_ERR_FILE_UNTRUSTED, "Users with FILE_DELETE_CHILD on a folder is untrusted"},
+            {L"O:SYD:P(A;;SD;;;BU)", true, HKDFGUARD_ERR_FILE_UNTRUSTED, "Users with DELETE on a folder is untrusted"},
+            {L"O:SYD:P(A;;WD;;;BU)", true, HKDFGUARD_ERR_FILE_UNTRUSTED, "Users with WRITE_DAC on a folder is untrusted"},
+            {L"O:SYD:P(A;;WO;;;BU)", true, HKDFGUARD_ERR_FILE_UNTRUSTED, "Users with WRITE_OWNER on a folder is untrusted"},
+            {L"O:SYD:P(A;;0x1301bf;;;AU)", true, HKDFGUARD_ERR_FILE_UNTRUSTED,
+             "Authenticated Users: Modify on a folder (what a new folder under C:\\ inherits) is untrusted"},
+            {L"O:SYD:P(A;;0x116;;;BU)", true, HKDFGUARD_OK,
+             "Users creating files and folders in a folder (C:\\ProgramData-style) is fine"},
+            {L"O:SYD:P(A;;0x116;;;BU)", false, HKDFGUARD_ERR_FILE_UNTRUSTED, "...but the same mask on a file is write access"},
+            {L"O:SYD:P(A;;GW;;;BU)", true, HKDFGUARD_OK, "GENERIC_WRITE on a folder maps only to creating entries"},
+            // C:\ as it ships.
+            {L"O:" + trusted_installer + L"D:P(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;0x1200a9;;;BU)"
+                                         L"(A;OICIIO;SDGXGWGR;;;AU)(A;;0x4;;;AU)", true, HKDFGUARD_OK,
+             "the system drive root's shipped ACL is trusted"},
+        };
+        for (const Case& c : cases) {
+            int32_t got = verdict(c.sddl, c.folder);
+            Check(got == c.want, (std::string("key-file trust: ") + c.what).c_str());
+            if (got != c.want) std::printf("    (CheckKeyFileSecurity returned %d)\n", got);
+        }
+
+        auto plain = [](const std::string& s) {
+            return hkdfguard::LooksLikePlaintextKeyForTest(reinterpret_cast<const uint8_t*>(s.data()), s.size());
+        };
+        std::vector<uint8_t> zeros(HKDFGUARD_DEK_LEN, 0);
+        const std::string b64 = Base64Of(zeros, false, true); // "AAAA...A="
+        Check(plain(b64), "detector: base64 of a DEK");
+        Check(plain(std::string(30, ' ') + b64 + std::string(22, '\n')), "detector: base64 with 96 bytes in all");
+        Check(!plain(std::string(31, ' ') + b64 + std::string(22, '\n')), "detector: nothing over 96 bytes is a text DEK");
+        Check(!plain(b64.substr(0, 42) + "B="), "detector: base64 whose unused trailing bits are set is not a DEK");
+        Check(plain(b64.substr(0, 42) + "E="), "detector: base64 ending in a character with zero trailing bits is a DEK");
+        Check(plain("+" + b64.substr(1, 41) + "A"), "detector: 43 characters of standard-alphabet base64 is a DEK");
+        Check(!plain("+" + b64.substr(1, 40) + "-A"), "detector: base64 mixing the standard and URL-safe alphabets is not a DEK");
+        Check(!plain(b64.substr(0, 42) + "=="), "detector: 44 characters ending \"==\" is not a 32-byte DEK");
+        Check(!plain(b64 + "="), "detector: an extra '=' is not a DEK");
+        Check(!plain("\v" + b64), "detector: vertical tab is not trimmed (as Rust's trim_ascii)");
+        Check(plain(std::string(HKDFGUARD_DEK_LEN, '\0')), "detector: any 32 raw bytes");
     }
 
     // ---- 25. KeyStoragePolicy is honored for all three values, forced via ----

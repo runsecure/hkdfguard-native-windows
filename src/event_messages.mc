@@ -71,3 +71,9 @@ SymbolicName=HKDFGUARD_EVT_PLAINTEXT_KEY_FILE
 Language=English
 %1
 .
+
+MessageId=2007
+SymbolicName=HKDFGUARD_EVT_SETUP_CALLS_EXCEEDED
+Language=English
+%1
+.

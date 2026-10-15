@@ -10,6 +10,7 @@
 #include "errors.h"
 #include "event_log.h"
 #include "policy.h" // LoadAuditUnwrapSuccess
+#include "process_hardening.h" // HardenProcess - hkdfguard_harden_process's implementation
 #include "kek_store.h"
 #include "key_file.h" // ReadWrappedKeyFile - hkdfguard_open_file's implementation
 #include "secure_buffer.h"
@@ -21,7 +22,10 @@
 // new DEK's randomness). cstring: strnlen, memcpy. string: std::wstring.
 #include <windows.h>
 #include <bcrypt.h>
+#include <atomic>
+#include <chrono>
 #include <cstring>
+#include <mutex>
 #include <string>
 
 // `using namespace hkdfguard;` brings every name declared inside `namespace
@@ -39,6 +43,63 @@ using namespace hkdfguard;
 // what this construct does).
 namespace {
     constexpr size_t kMaxServiceLen = 128; // bytes, excluding the null terminator
+
+    // Serializes every setup call (hkdfguard_create_kek,
+    // hkdfguard_kek_exists) so that, with the floor in GatedSetup, their
+    // combined rate is capped at one per LoadSetupMinDelayMs() however many
+    // threads call in.
+    std::mutex g_setup_gate;
+
+    // How many setup calls this process has made. They're meant to happen
+    // once per application startup, so a count well beyond that is the
+    // signature of a caller looping on them.
+    std::atomic<unsigned long> g_setup_calls{0};
+
+    // Setup-call count past which event 2007 is logged (once). Generous
+    // enough for a multi-service application's genuine startup, small
+    // enough that a hot loop trips it within seconds. Same as Linux.
+    constexpr unsigned long kSetupCallsWarnAt = 10;
+
+    // Runs `f` - the provider-touching part of a setup call - serialized
+    // against every other setup call, and doesn't return (or let `f`'s
+    // exception out) until at least LoadSetupMinDelayMs() has passed since
+    // it was entered, whatever `f` did and however fast. Callers validate
+    // their arguments first, so a bad pointer or service name still fails
+    // at once; only calls that would reach a provider pay the floor. The
+    // Linux build's gated_setup, step for step.
+    //
+    // Why: create_kek and kek_exists each open a fresh key storage provider
+    // handle (and on the TPM, a PCP session), so a buggy or hot-looping
+    // caller could otherwise drive the TPM as fast as it can call. The
+    // floor is about load, not secrecy: hkdfguard_wrap_dek, the hot path,
+    // is not slowed, and answers KEK_NOT_FOUND at once for a service with
+    // no KEK.
+    template <typename F>
+    void GatedSetup(F &&f) {
+        std::lock_guard<std::mutex> serialized(g_setup_gate);
+        const auto entered = std::chrono::steady_clock::now();
+        const unsigned long floor_ms = LoadSetupMinDelayMs();
+
+        // Waits out the rest of the floor on every way out of this
+        // function, a throw from `f` included.
+        struct Floor {
+            std::chrono::steady_clock::time_point until;
+            ~Floor() {
+                for (auto now = std::chrono::steady_clock::now(); now < until;
+                     now = std::chrono::steady_clock::now()) {
+                    auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(until - now).count();
+                    Sleep(static_cast<DWORD>(remaining > 0 ? remaining : 1));
+                }
+            }
+        } floor{entered + std::chrono::milliseconds(floor_ms)};
+
+        const unsigned long count = g_setup_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (count == kSetupCallsWarnAt + 1) {
+            LogSetupCallsExceeded(kSetupCallsWarnAt, floor_ms);
+        }
+
+        f();
+    }
 
     // Validates that the incoming servicename is alphanumeric or period(dot)
     bool IsValidServiceChar(char c) noexcept {
@@ -72,7 +133,8 @@ namespace {
     // didn't match exactly.
     //
     // Throws HkdfGuardError(HKDFGUARD_ERR_INVALID_SERVICE_NAME) if `service` is null,
-    // empty, too long, or contains a character outside the allowed charset.
+    // empty, too long, contains a character outside the allowed charset,
+    // starts with '.', or contains "..".
     std::string NormalizeService(const char *service) {
         if (service == nullptr) {
             throw HkdfGuardError(HKDFGUARD_ERR_INVALID_SERVICE_NAME, "service is null");
@@ -100,6 +162,19 @@ namespace {
                     "service contains invalid characters");
             }
             c = ToLowerServiceChar(c);
+        }
+
+        // Dot rules, the same as the Linux library's: a service name may not
+        // start with '.' and may not contain two consecutive dots. Nothing on
+        // Windows uses the name as a path today, but holding one rule on every
+        // platform means a service name valid on one is valid on all, and it
+        // keeps names from ever spelling ".", "..", a hidden-file name, or an
+        // empty label between dots. A single trailing '.' is allowed, as on
+        // Linux.
+        if (normalized.front() == '.' || normalized.find("..") != std::string::npos) {
+            throw HkdfGuardError(
+                HKDFGUARD_ERR_INVALID_SERVICE_NAME,
+                "service may not start with '.' or contain \"..\"");
         }
         return normalized;
     }
@@ -204,19 +279,26 @@ namespace {
         uint8_t fingerprint[kFingerprintLen];
         ComputeKekFingerprint(kek.key.get(), fingerprint);
 
-        // AAD = normalized service name || KEK fingerprint. None of it is
-        // secret; it just has to be reproduced byte-for-byte on unwrap.
-        std::vector<uint8_t> aad(normalized_service.begin(), normalized_service.end());
-        aad.insert(aad.end(), fingerprint, fingerprint + kFingerprintLen);
-
         // A fresh random salt for this payload: it selects the point H(salt)
         // the KEK's private key is combined with, and is HKDF's salt, so
-        // every payload gets its own Z and its own wrapping key.
+        // every payload gets its own Z and its own wrapping key. Generated
+        // before the AAD, because the salt is part of the header the AAD
+        // authenticates.
         uint8_t salt[kSaltLen];
         NTSTATUS salt_status = BCryptGenRandom(nullptr, salt, static_cast<ULONG>(kSaltLen), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
         if (!BCRYPT_SUCCESS(salt_status)) {
             throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO_ERROR, "BCryptGenRandom(salt) failed");
         }
+
+        // AAD = header || KEK fingerprint || normalized service name (see
+        // wire_format.h). The header is built here exactly as
+        // SerializeWrappedDek will write it below - both go through
+        // SerializeWrappedDekHeader - so the version, provider type and KeyId
+        // the payload carries are the ones the tag covers. None of it is
+        // secret; unwrap rebuilds it from the received bytes.
+        uint8_t header[kHeaderLen];
+        SerializeWrappedDekHeader(kek.provider_type, kek.key_id, salt, header);
+        std::vector<uint8_t> aad = BuildWrappedDekAad(header, fingerprint, normalized_service);
         // `nonce`/`ciphertext`/`tag` are declared here, *outside* the nested
         // block below, because they're needed again afterward (by
         // SerializeWrappedDek) - none of the three is secret (they're all meant
@@ -258,8 +340,9 @@ namespace {
             // in case would resolve to the same KEK but produce/expect
             // different AAD, and unwrap would fail authentication. The
             // fingerprint component binds the ciphertext to the specific
-            // KEK, so neither the service nor the routing can be swapped
-            // undetected.
+            // KEK, and the header component binds the routing fields
+            // (provider type, KeyId) and the version, so neither the service
+            // nor the routing nor the format can be swapped undetected.
             AesGcmEncrypt(
                 wrapping_key.data(), dek, static_cast<unsigned long>(dek_len),
                 aad.data(), static_cast<unsigned long>(aad.size()),
@@ -333,7 +416,9 @@ extern "C" HKDFGUARD_API int32_t hkdfguard_kek_exists(
         std::wstring service_name =
                 ValidateAndConvertService(service);
 
-        *out_exists = KekExists(service_name) ? 1 : 0;
+        // Slow on purpose - see GatedSetup. "Exists" and "doesn't exist"
+        // take the same time.
+        GatedSetup([&] { *out_exists = KekExists(service_name) ? 1 : 0; });
 
         return HKDFGUARD_OK;
     } catch (const HkdfGuardError &e) {
@@ -352,7 +437,8 @@ extern "C" HKDFGUARD_API int32_t hkdfguard_create_kek(
         // Who may use the resulting KEK comes from machine policy (see
         // hkdfguard.h and policy.h's LoadKeyUseGroupsPolicy), read and
         // validated inside CreateKek - nothing about access is caller-chosen.
-        CreateKek(service_name);
+        // Slow on purpose - see GatedSetup.
+        GatedSetup([&] { CreateKek(service_name); });
 
         return HKDFGUARD_OK;
     } catch (const HkdfGuardError &e) {
@@ -466,10 +552,12 @@ extern "C" HKDFGUARD_API int32_t hkdfguard_unwrap_dek(
             throw HkdfGuardError(HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH, "payload was not wrapped under this KEK");
         }
 
-        // Same AAD construction as WrapDekCore: normalized service name ||
-        // the payload's (now verified) fingerprint.
-        std::vector<uint8_t> aad(normalized_service.begin(), normalized_service.end());
-        aad.insert(aad.end(), parsed.fingerprint, parsed.fingerprint + kFingerprintLen);
+        // Same AAD construction as WrapDekCore: the header exactly as
+        // received || the payload's (now verified) fingerprint || normalized
+        // service name. The header is taken from the received bytes, not
+        // re-serialized from the parsed fields, so the tag check covers what
+        // was actually presented.
+        std::vector<uint8_t> aad = BuildWrappedDekAad(parsed.header, parsed.fingerprint, normalized_service);
 
         {
             // Same reasoning as the wrap side above: `wrapping_key` is
@@ -553,7 +641,7 @@ extern "C" HKDFGUARD_API int32_t hkdfguard_open_file(
 
     // Mostly not audited: the event log records failures against a
     // service's KEK, and a file read involves neither. The one exception is
-    // a DEK-sized file (HKDFGUARD_ERR_FILE_PLAINTEXT_KEY) - a possible key
+    // a file that looks like an unwrapped DEK (HKDFGUARD_ERR_FILE_PLAINTEXT_KEY) - a possible key
     // exposure an administrator needs to hear about, logged below.
     try {
         if (path == nullptr || out == nullptr) {
@@ -582,5 +670,18 @@ extern "C" HKDFGUARD_API int32_t hkdfguard_open_file(
         return code;
     } catch (...) {
         return fail(HKDFGUARD_ERR_INTERNAL_ERROR);
+    }
+}
+
+extern "C" HKDFGUARD_API int32_t hkdfguard_harden_process(void) {
+    // Not audited: no service is involved. Anything that escapes
+    // HardenProcess - even an allocation failure while building a DACL -
+    // still means the process was left less hardened than asked, so every
+    // failure maps to the one documented code.
+    try {
+        HardenProcess();
+        return HKDFGUARD_OK;
+    } catch (...) {
+        return HKDFGUARD_ERR_PROCESS_HARDENING_FAILED;
     }
 }

@@ -85,3 +85,18 @@ add_test(
 set_tests_properties(cli PROPERTIES
     ENVIRONMENT "PATH=$<TARGET_FILE_DIR:hkdfguard>\\;${HKDFGUARD_TEST_PATH}"
 )
+
+# test_harden_process checks hkdfguard_harden_process from outside the
+# hardened process - the only vantage point where a process DACL is visible
+# - by starting a copy of itself as a child and probing it (see the comment
+# at the top of the .cpp). Public ABI only, so no src/ files are compiled
+# in. dbghelp.lib: MiniDumpWriteDump; wer.lib: WerGetFlags. Exit code 77
+# means it ran as SYSTEM, which the hardened DACL deliberately lets through,
+# so there is nothing to test.
+add_executable(test_harden_process test_harden_process.cpp)
+target_link_libraries(test_harden_process PRIVATE hkdfguard dbghelp.lib wer.lib)
+add_test(NAME harden_process COMMAND test_harden_process)
+set_tests_properties(harden_process PROPERTIES
+    ENVIRONMENT "PATH=$<TARGET_FILE_DIR:hkdfguard>\\;${HKDFGUARD_TEST_PATH}"
+    SKIP_RETURN_CODE 77
+)

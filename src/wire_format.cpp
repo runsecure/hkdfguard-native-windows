@@ -6,19 +6,15 @@
 #include <cstring>
 
 namespace hkdfguard {
-    // Builds the 132-byte wire payload by writing each field at its known
-    // offset. Every field here is public information (metadata, the
-    // salt, ciphertext, and an auth tag) - nothing in this function
-    // handles a secret, so there's no zeroing concern in this file.
-    void SerializeWrappedDek(
+    // Writes the authenticated header - Version through Salt - by writing
+    // each field at its known offset. Every field here is public information
+    // (metadata and the salt) - nothing in this file handles a secret, so
+    // there's no zeroing concern here.
+    void SerializeWrappedDekHeader(
         uint8_t provider_type,
         uint32_t key_id,
         const uint8_t salt[kSaltLen],
-        const uint8_t nonce[kNonceLen],
-        const uint8_t ciphertext[kCiphertextLen],
-        const uint8_t tag[kTagLen],
-        const uint8_t fingerprint[kFingerprintLen],
-        uint8_t out[kTotalLen]) {
+        uint8_t out[kHeaderLen]) {
         // Single-byte fields: just assign directly at their offset.
         out[kVersionOffset] = kFormatVersion1;
         out[kProviderTypeOffset] = provider_type;
@@ -43,15 +39,46 @@ namespace hkdfguard {
         out[kKeyIdOffset + 2] = static_cast<uint8_t>((key_id >> 16) & 0xFF);
         out[kKeyIdOffset + 3] = static_cast<uint8_t>((key_id >> 24) & 0xFF);
 
-        // The remaining fields are already raw byte arrays of the right length,
-        // so they're just block-copied into place: destination pointer
-        // (`out + <offset>`, i.e. pointer arithmetic - "the address `offset`
-        // bytes past the start of `out`"), source pointer, and byte count.
+        // The salt is already a raw byte array of the right length, so it's
+        // just block-copied into place: destination pointer (`out + <offset>`,
+        // i.e. pointer arithmetic - "the address `offset` bytes past the start
+        // of `out`"), source pointer, and byte count.
         memcpy(out + kSaltOffset, salt, kSaltLen);
+    }
+
+    // Builds the 132-byte wire payload: the header first, through the same
+    // function wrap used to build its AAD, so the bytes authenticated and the
+    // bytes stored cannot drift apart; then the remaining fields at their
+    // offsets.
+    void SerializeWrappedDek(
+        uint8_t provider_type,
+        uint32_t key_id,
+        const uint8_t salt[kSaltLen],
+        const uint8_t nonce[kNonceLen],
+        const uint8_t ciphertext[kCiphertextLen],
+        const uint8_t tag[kTagLen],
+        const uint8_t fingerprint[kFingerprintLen],
+        uint8_t out[kTotalLen]) {
+        SerializeWrappedDekHeader(provider_type, key_id, salt, out);
         memcpy(out + kNonceOffset, nonce, kNonceLen);
         memcpy(out + kCiphertextOffset, ciphertext, kCiphertextLen);
         memcpy(out + kTagOffset, tag, kTagLen);
         memcpy(out + kFingerprintOffset, fingerprint, kFingerprintLen);
+    }
+
+    // header || fingerprint || normalized_service. The two fixed-length
+    // parts come first, so the variable-length service at the end needs no
+    // length prefix for the encoding to be unambiguous.
+    std::vector<uint8_t> BuildWrappedDekAad(
+        const uint8_t header[kHeaderLen],
+        const uint8_t fingerprint[kFingerprintLen],
+        const std::string &normalized_service) {
+        std::vector<uint8_t> aad;
+        aad.reserve(kHeaderLen + kFingerprintLen + normalized_service.size());
+        aad.insert(aad.end(), header, header + kHeaderLen);
+        aad.insert(aad.end(), fingerprint, fingerprint + kFingerprintLen);
+        aad.insert(aad.end(), normalized_service.begin(), normalized_service.end());
+        return aad;
     }
 
     // Validates a caller-supplied buffer really is a well-formed WrappedDekV1
@@ -127,13 +154,14 @@ namespace hkdfguard {
 
         // `ParsedWrappedDek parsed{};` default-constructs the struct with every
         // member zero-initialized (the `{}` is "empty brace-init"), then each
-        // field is filled in explicitly below. The four pointer fields are set
+        // field is filled in explicitly below. The six pointer fields are set
         // to `wrapped + <offset>` - pointer arithmetic again, computing the
         // address of each field *inside* the caller's original buffer, rather
         // than copying those bytes anywhere new.
         ParsedWrappedDek parsed{};
         parsed.provider_type = provider_type;
         parsed.key_id = key_id;
+        parsed.header = wrapped; // the header is the payload's first kHeaderLen bytes
         parsed.salt = wrapped + kSaltOffset;
         parsed.nonce = wrapped + kNonceOffset;
         parsed.ciphertext = wrapped + kCiphertextOffset;

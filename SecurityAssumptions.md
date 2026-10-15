@@ -39,7 +39,7 @@ defended against:
   roll back to a previous release and still recover that release's DEK.
   The consequence is accepted: anyone who can replace the wrapped-key file
   can substitute an older payload for the same service, and unwrap will
-  return that older DEK. The defense is the wrapped file's ACL (owner
+  return that older DEK. The defense is the wrapped file's ACL, which `hkdfguard_open_file` enforces (section 15) (owner
   read/write, one group read-only - see the CLI's `--group`), not the
   payload format. An application that needs to refuse old DEKs must check
   that itself, after unwrapping.
@@ -210,6 +210,23 @@ administrator.
   test (`test_roundtrip.cpp` section -2); the switch's effect on a real
   unwrap is not exercised, since that would mean changing this machine's
   HKLM policy during a test run.
+- `SetupMinDelayMs` is the floor on `hkdfguard_create_kek` /
+  `hkdfguard_kek_exists`: 1000 ms when absent, a REG_DWORD of 0..60000 used
+  as is (0 disables it), and anything else, including above 60000, also
+  1000 ms. This is the Linux build's `setup_min_delay_ms`, with the same
+  numbers. Setup calls are serialized by a process-wide mutex. The floor is
+  waited out by a scope guard, so a throwing call pays it too. Argument
+  errors return before the gate. **Verified** by test section 0c2:
+  - the value-to-setting rule;
+  - both calls take at least the floor, with and without a KEK and on a
+    failing `create_kek`;
+  - argument errors and `hkdfguard_wrap_dek` return in under half the floor;
+  - two concurrent calls take at least twice it.
+
+  This is a **design decision** about load, not secrecy:
+  `hkdfguard_wrap_dek` still answers `KEK_NOT_FOUND` at once. The floor
+  bounds the rate per process, not per machine: separate processes each
+  have their own gate.
 - The default `PreferTpm` fallback to software is a **design decision**:
   the policy is the administrator's to set. It falls back only when the TPM
   is provably unusable for the service: the TPM provider cannot be opened,
@@ -317,8 +334,17 @@ use) are still granted by *name*, now restricted to local groups.
 
 ## 10. Payload integrity and the KEK fingerprint (verified where noted)
 
-- AES-256-GCM authenticates `normalized service name || SHA-256(KEK public
-  key, raw X||Y)`. The fingerprint also travels in the payload and is
+- AES-256-GCM authenticates `header || SHA-256(KEK public key, raw X||Y) ||
+  normalized service name`, where the header is payload bytes 0..39
+  (`Version`, `ProviderType`, `Reserved`, `KeyId`, `Salt`). Every field a
+  parser reads or routes on is therefore covered by the tag; unwrap builds
+  the AAD from the header bytes exactly as received. The `Nonce` is not in
+  the AAD - it is generated inside the encrypt call, after the AAD is
+  fixed - and needs no AAD coverage: GCM authenticates it inherently.
+  **Verified** by the golden-payload test (section 29 of
+  `tests/test_roundtrip.cpp`), whose frozen value was cross-checked against
+  an independent .NET implementation of the construction.
+  The fingerprint also travels in the payload and is
   compared, before any ECDH, against the fingerprint of the KEK the
   payload's routing fields select; mismatch is `HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH`.
   It is a check on the selected key, never a lookup - searching for a key
@@ -326,10 +352,10 @@ use) are still granted by *name*, now restricted to local groups.
   key selection. **Verified** by tests for the mismatch path (elevated).
 - The comparison is a plain `memcmp`, deliberately: both operands are
   hashes of *public* keys, so timing reveals nothing secret.
-- `Version` and `Reserved` are not in the AAD. `Reserved` is required to be
-  zero and `Version` to be `1`, so neither can currently be varied at all;
-  if a second version is ever introduced, `Version` should be added to the
-  AAD at that point.
+- `Reserved` is required to be zero, `Version` to be `1` and `KeyId` to be
+  `1`, so none can currently be varied in a payload that still parses. They
+  are authenticated anyway, so that introducing a second version later can
+  never let an existing payload be relabelled as it.
 - Each wrap draws a fresh random 32-byte salt, which yields a fresh `Z` and
   is HKDF's salt, and therefore a fresh AES key; the random 96-bit nonce
   would have to repeat under the *same* salt to matter (probability of a
@@ -349,7 +375,8 @@ use) are still granted by *name*, now restricted to local groups.
   `hkdfguard_create_kek` race cannot clobber an existing key - the second
   finalize is expected to fail with `NTE_EXISTS` and the caller to retry.
   **Assumed / not verified**: the race itself has not been exercised.
-- Service names are restricted to ASCII letters, digits and `.`, lowercased,
+- Service names are restricted to ASCII letters, digits and `.` (no leading
+  `.`, no `..`), lowercased,
   and used inside a fixed prefix/suffix to form the persisted key name. The
   Software KSP and PCP store keys under a hash of the container name, so
   `.` cannot form a path. **Assumed / not verified** beyond standard
@@ -446,3 +473,170 @@ keys and, elevated, machine keys:
 tested (no Windows guest was available). Note for diagnostics: on the
 Software KSP an unauthorized caller gets `NTE_BAD_KEYSET`, the same status
 as a missing key.
+
+## 14. Process hardening keeps same-user processes out (verified)
+
+**Claim.** After `hkdfguard_harden_process`, another process running as the
+same account cannot read or write the caller's memory, dump it, inject a
+thread or duplicate its handles. It also cannot read or change the context
+of any thread that existed at the time of the call, and it cannot undo any
+of this by rewriting the DACLs. Windows Error Reporting leaves the heap out
+of the crash reports it collects. This is the counterpart of the Linux
+build's `RLIMIT_CORE = 0` plus `PR_SET_DUMPABLE = 0`. It is opt-in, because
+it changes process-wide state that belongs to the host.
+
+**How.** `src/process_hardening.cpp`:
+
+- It calls `WerSetFlags(WER_FAULT_REPORTING_FLAG_NOHEAP)`.
+- It sets a protected DACL on the process and on every thread in a Toolhelp
+  snapshot. SYSTEM is granted the object type's all-access mask. The
+  account's SID and OWNER RIGHTS (`S-1-3-4`) are both granted query,
+  synchronize and, for the process, terminate. The threads also keep
+  `READ_CONTROL`.
+- The OWNER RIGHTS ACE replaces the owner's implicit `READ_CONTROL | WRITE_DAC`.
+  Without it, a same-user process could simply restore the old DACL.
+- The masks are explicit rather than generic `GA`, because the kernel stores
+  `GA` mapped to specific rights.
+- A repeat call cannot reopen an already-hardened thread for `WRITE_DAC`.
+  It reads that thread's DACL back and accepts it only if it is protected
+  and matches ACE for ACE, which is what makes the call idempotent.
+
+**Verified how.** `tests/test_harden_process.cpp` starts a copy of itself as a
+child process. The child starts a worker thread, calls the function twice
+(both calls must return `HKDFGUARD_OK`) and confirms `WerGetFlags` reports
+NOHEAP. It then confirms it still works from the inside: it starts another
+thread and runs `hkdfguard_kek_exists` against the key storage provider. The
+parent, with `SeDebugPrivilege` explicitly disabled, then probes the child:
+
+- These process rights are refused with `ERROR_ACCESS_DENIED`:
+  - `PROCESS_VM_READ`;
+  - `PROCESS_VM_WRITE | PROCESS_VM_OPERATION`;
+  - `PROCESS_CREATE_THREAD`, `PROCESS_DUP_HANDLE`, `PROCESS_SET_INFORMATION` and `PROCESS_SUSPEND_RESUME`;
+  - `READ_CONTROL`, `WRITE_DAC` and `WRITE_OWNER`;
+  - `PROCESS_ALL_ACCESS`.
+- These process rights still succeed: query (plain and limited),
+  `SYNCHRONIZE` and `PROCESS_TERMINATE`.
+- A full-memory `MiniDumpWriteDump` fails.
+- On both pre-existing threads, `THREAD_GET_CONTEXT`, `THREAD_SET_CONTEXT`,
+  suspend/resume, terminate, `WRITE_DAC` and `WRITE_OWNER` are refused.
+  Limited query and `SYNCHRONIZE` still succeed.
+
+The test passed non-elevated at Medium integrity on the development machine
+on 2026-10-15. The first run caught the `GA` mapping above, which had made
+the second call fail. The test exits with ctest's skip code when run as
+SYSTEM.
+
+**Residual risk.** This is a same-user barrier. Under section 1,
+administrators and SYSTEM are trusted anyway. Specifically:
+
+- **Bypasses:** an administrator with `SeDebugPrivilege` enabled, SYSTEM and
+  kernel code all get past it.
+- **Later threads:** a thread created after the call gets the token's
+  default DACL, so its registers are readable by the same account; the
+  process memory is not. The test pins this. The token default DACL is
+  deliberately left alone, because it applies to every unnamed object the
+  host creates. Hosts should call the function again after starting worker
+  threads.
+- **Existing handles:** handles opened before the call keep their granted
+  access.
+- **Outside its reach:** memory paged out or written to `hiberfil.sys`, and
+  machine-wide dump configuration (WER `LocalDumps`, kernel and live kernel
+  dumps).
+- **Not yet run:** elevated, in the Server 2022/2025 containers and on
+  ARM64.
+
+## 15. `hkdfguard_open_file`: who could have written the key file (design decision + verified)
+
+**Claim.** `hkdfguard_open_file` refuses a key file with
+`HKDFGUARD_ERR_FILE_UNTRUSTED` (-39) unless the file and every folder above it,
+up to the drive root, are owned by SYSTEM, BUILTIN\Administrators,
+TrustedInstaller or the process's own account, and no other account holds a
+right that would let it change what the path names. This is the Linux build's
+owner and mode check (`key_file.rs`: owned by root or this user, not group- or
+other-writable, sticky folders allowed), in ACL form. It also refuses a DEK
+saved as text, in the same forms the Linux build does, with
+`HKDFGUARD_ERR_FILE_PLAINTEXT_KEY` (-37).
+
+**Why.** A wrapped DEK is ciphertext, so reading it gains nothing, and read
+access for other accounts is never refused. *Replacing* it does gain
+something. Any key-use principal can wrap (section 1). One that can also put a
+file at the key's path can make the service run with a DEK it chose.
+
+**How.** `src/key_file.cpp`. These checks run on the open handle, after the
+link, short-name and local-drive checks, so the file that is judged is the
+file that is read:
+
+- **Owner.** It must be SYSTEM, Administrators, TrustedInstaller (which owns
+  `C:\`) or the process token's user. Administrators is included because an
+  elevated administrator's files are owned by the group. That is how the CLI's
+  `wrap` writes them when run elevated (TokenOwner).
+- **File rights.** No ACE for another principal may grant write data, append,
+  write EA or attributes, `DELETE`, `WRITE_DAC`, `WRITE_OWNER`,
+  `GENERIC_WRITE` or `GENERIC_ALL`.
+- **Folder rights.** No ACE for another principal may grant
+  `FILE_DELETE_CHILD`, `DELETE`, `WRITE_DAC`, `WRITE_OWNER` or `GENERIC_ALL`.
+  Creating entries is allowed. A new entry can't displace an existing one: that
+  takes `DELETE` on the entry, or `FILE_DELETE_CHILD` on its folder. This is the
+  Windows counterpart of the sticky-folder allowance, and it is why
+  `C:\ProgramData` (Users: `WD,AD,WEA,WA`) and `C:\` (Authenticated Users: `AD`)
+  pass.
+- **Ignored ACEs.** Deny ACEs and inherit-only ACEs are skipped. A conditional
+  (callback) allow ACE is judged as if its condition held. Any other
+  allow-ACE type is refused, as one this code can't read.
+- **Special principals.** OWNER RIGHTS counts as the (already checked)
+  owner. CREATOR OWNER and CREATOR GROUP match nobody outside an inherit-only
+  ACE.
+- **Missing DACL.** A missing or NULL DACL is refused, since it means
+  unrestricted access.
+- **Folder walk.** Each folder is opened without following reparse points and
+  must still be a plain folder. Any folder whose security can't be read is
+  refused (the file itself being unreadable is still -33).
+- **Text keys.** A file of 96 bytes or fewer, other than 32, is read into a
+  `SecureBuffer` that is wiped when it goes out of scope. After trimming
+  whitespace the way Rust's `trim_ascii` does, it is a plaintext key if it is
+  64 hex digits, or 43 characters of standard or URL-safe base64 (not mixed,
+  with zero trailing bits, optionally followed by one `=`). That matches what
+  the Rust base64 decoders the Linux build uses accept. It is decided without
+  decoding, so the key is never rebuilt. None of it reaches the caller. A
+  32-byte file is still refused unread.
+
+**Verified how.** Test sections 24c and 24d:
+
+- **Real files and folders.** A file Everyone may write is refused, while one
+  Everyone may only read opens. A folder granting Everyone
+  `FILE_DELETE_CHILD`, or `DELETE` on itself, is refused, while one granting
+  only create rights (`0x116`) opens.
+- **Synthetic descriptors** (`CheckKeyFileSecurity` on SDDL):
+  - **Owners:** Users, Everyone and LocalService are refused; SYSTEM,
+    Administrators, TrustedInstaller and this account pass.
+  - **DACLs:** a missing or NULL DACL is refused.
+  - **Rights:** each forbidden right is refused one at a time, on files and
+    on folders.
+  - **ACE kinds:** deny, inherit-only and conditional ACEs are handled as
+    described above.
+  - **Shipped ACLs:** the system drive root's ACL passes, and the
+    `Authenticated Users: Modify` that a new folder under `C:\` inherits is
+    refused.
+- **Plaintext detector.** All six text forms (base64 padded or not, URL-safe
+  padded or not, hex in either case) are refused, each with five whitespace
+  variants. These near misses are refused as merely too short: 31 or 33 bytes
+  as base64, 63 hex digits, a non-hex character, a newline inside the hex,
+  mixed alphabets, set trailing bits, `==`, more than 96 bytes, and a
+  vertical tab, which Rust doesn't trim either.
+
+These passed non-elevated on the development machine on 2026-10-15. The
+positive cases use the golden payload, so they don't depend on a KEK.
+
+**Residual risk.**
+
+- **What isn't checked.** Folders that intermediate links point into are not
+  walked: links anywhere in the path are refused outright. Neither are
+  hard-link siblings: they share the file's own ACL, which is checked.
+- **Window between check and read.** A folder's ACL could in principle be
+  widened between the check and the read, but only by someone who already
+  holds `WRITE_DAC` on it, which is what was just checked for.
+- **Configurations now refused.** Anything already in place that grants other
+  accounts delete rights is refused, by design, including a folder created
+  directly under `C:\`. `docs/admin-guide.md` shows how to narrow it.
+- **Not yet run:** elevated, and in the Server 2022/2025 containers, where
+  ContainerAdministrator's ownership of `C:\` needs to be confirmed.

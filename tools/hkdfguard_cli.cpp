@@ -458,7 +458,7 @@ namespace {
             case HKDFGUARD_ERR_PAYLOAD_MALFORMED: return "wrapped payload is not valid";
             case HKDFGUARD_ERR_PAYLOAD_UNSUPPORTED: return "wrapped payload uses a format version this build does not understand";
             case HKDFGUARD_ERR_INTERNAL_ERROR: return "an internal error occurred in HkdfGuardV1.dll";
-            case HKDFGUARD_ERR_INVALID_SERVICE_NAME: return "service name is missing or malformed (ASCII letters, digits and '.' only, 1-128 bytes)";
+            case HKDFGUARD_ERR_INVALID_SERVICE_NAME: return "service name is missing or malformed (ASCII letters, digits and '.' only, 1-128 bytes, not starting with '.', no \"..\")";
             case HKDFGUARD_ERR_POLICY_INVALID: return "invalid key storage policy";
             case HKDFGUARD_ERR_WIN_GROUP_INVALID: return "a KeyUseGroups policy entry is unresolvable, not a group, over-broad, or not host-local";
             case HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH: return "wrapped payload was not produced under this service's current KEK";
@@ -470,9 +470,9 @@ namespace {
             case HKDFGUARD_ERR_FILE_IO: return "the wrapped-key file is not a regular file, is open for writing, or could not be read";
             case HKDFGUARD_ERR_FILE_TOO_SHORT: return "the wrapped-key file is shorter than a wrapped key";
             case HKDFGUARD_ERR_FILE_TOO_LONG: return "the wrapped-key file is longer than a wrapped key";
-            case HKDFGUARD_ERR_FILE_PLAINTEXT_KEY: return "the file is exactly the size of an unwrapped 32-byte key - it may hold a plaintext key; treat it as exposed";
+            case HKDFGUARD_ERR_FILE_PLAINTEXT_KEY: return "the file looks like an UNWRAPPED 32-byte key (raw, or its hex or base64) - it may hold a plaintext key; treat it as exposed";
             case HKDFGUARD_ERR_FILE_MALFORMED: return "the wrapped-key file is the right size but does not hold a valid wrapped key";
-            case HKDFGUARD_ERR_FILE_UNTRUSTED: return "the wrapped-key path is, or passes through, a symbolic link, junction or other reparse point, uses an 8.3 short name, or is not on a local drive (UNC, mapped or SUBST drive, device)";
+            case HKDFGUARD_ERR_FILE_UNTRUSTED: return "the wrapped-key path is, or passes through, a symbolic link, junction or other reparse point, uses an 8.3 short name, or is not on a local drive (UNC, mapped or SUBST drive, device); or the file or a folder above it is owned by, or lets, an account other than SYSTEM, Administrators, TrustedInstaller or the caller write or replace it";
             default: return "unknown status code " + std::to_string(code);
         }
     }
@@ -555,7 +555,9 @@ namespace {
 
     // Enforces that --service-name - the exact value passed to
     // the hkdfguard_* calls as `service` - contains only ASCII alphanumeric
-    // characters or '.', matching this project's macOS/Linux tools.
+    // characters or '.', does not start with '.', and does not contain "..",
+    // matching this project's macOS/Linux tools. The library enforces the
+    // same rules; checking here first gives the operator a specific message.
     void ValidateServiceCharset(const std::string &service) {
         for (wchar_t c: service) {
             bool isAsciiAlnum = (c >= L'0' && c <= L'9') || (c >= L'A' && c <= L'Z') || (c >= L'a' && c <= L'z');
@@ -563,6 +565,10 @@ namespace {
                 throw CliError(
                     "combined service name \"" + service + "\" must contain only alphanumeric characters or '.'");
             }
+        }
+        if (!service.empty() && (service.front() == '.' || service.find("..") != std::string::npos)) {
+            throw CliError(
+                "combined service name \"" + service + "\" may not start with '.' or contain \"..\"");
         }
     }
 

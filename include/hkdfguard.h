@@ -131,7 +131,7 @@ extern "C" {
 #define HKDFGUARD_ERR_KEK_NOT_FOUND             (-17) /* no KEK is provisioned for this service (call hkdfguard_create_kek first) */
 #define HKDFGUARD_ERR_KEK_ACCESS_DENIED         (-18) /* this KEK exists, but the calling account is not authorized to use it (or, for a new KEK, the process is not elevated) */
 #define HKDFGUARD_ERR_KEK_INVALID               (-19) /* an existing KEK is unusable as found: on Windows, its ACL is missing, lacks SYSTEM/Administrators, or grants an over-broad principal */
-#define HKDFGUARD_ERR_PROCESS_HARDENING_FAILED  (-20) /* the library could not harden the calling process; not returned on Windows */
+#define HKDFGUARD_ERR_PROCESS_HARDENING_FAILED  (-20) /* hkdfguard_harden_process: a hardening step failed (steps already applied stay applied) */
 /* -21..-31 reserved */
 // ---- Key file, hkdfguard_open_file (-32..-39) ----
 #define HKDFGUARD_ERR_FILE_NOT_FOUND            (-32) /* hkdfguard_open_file: the file (or a folder in its path) does not exist */
@@ -139,9 +139,9 @@ extern "C" {
 #define HKDFGUARD_ERR_FILE_IO                   (-34) /* hkdfguard_open_file: not a regular file, in use by a writer, or a read failed */
 #define HKDFGUARD_ERR_FILE_TOO_SHORT            (-35) /* hkdfguard_open_file: file is shorter than HKDFGUARD_WRAPPED_LEN */
 #define HKDFGUARD_ERR_FILE_TOO_LONG             (-36) /* hkdfguard_open_file: file is longer than HKDFGUARD_WRAPPED_LEN */
-#define HKDFGUARD_ERR_FILE_PLAINTEXT_KEY        (-37) /* hkdfguard_open_file: file is exactly HKDFGUARD_DEK_LEN bytes - likely an unwrapped key */
+#define HKDFGUARD_ERR_FILE_PLAINTEXT_KEY        (-37) /* hkdfguard_open_file: file holds what looks like an unwrapped key - HKDFGUARD_DEK_LEN raw bytes, or its hex or base64 */
 #define HKDFGUARD_ERR_FILE_MALFORMED            (-38) /* hkdfguard_open_file: file is the right size but its contents are not a valid WrappedDekV1 payload (including an unknown version) */
-#define HKDFGUARD_ERR_FILE_UNTRUSTED            (-39) /* hkdfguard_open_file: path is, or passes through, a symbolic link, junction or other reparse point, uses an 8.3 short name, or is not on a local drive (UNC, mapped or SUBST drive, device) */
+#define HKDFGUARD_ERR_FILE_UNTRUSTED            (-39) /* hkdfguard_open_file: path is, or passes through, a symbolic link, junction or other reparse point, uses an 8.3 short name, or is not on a local drive (UNC, mapped or SUBST drive, device); or the file or a folder above it is owned by, or lets, an account other than SYSTEM, Administrators, TrustedInstaller or the caller write or replace it */
 /* -40..-63 reserved for future common codes */
 // ---- Windows-specific (-64..-79) ----
 #define HKDFGUARD_ERR_WIN_GROUP_INVALID         (-64) /* refines HKDFGUARD_ERR_POLICY_INVALID: a KeyUseGroups policy entry is unresolvable, not a group, not host-local, or over-broad */
@@ -155,7 +155,9 @@ extern "C" {
 
 /*
  * Reports whether a persistent KEK already exists for `service`, without
- * creating or modifying anything.
+ * creating or modifying anything. Subject to the same setup latency floor
+ * and serialization as hkdfguard_create_kek below; "exists" and "doesn't
+ * exist" take the same time.
  *
  * service     - see hkdfguard_wrap_dek.
  * out_exists  - caller-owned output. On success, set to 1 if the KEK exists,
@@ -175,6 +177,21 @@ HKDFGUARD_API int32_t hkdfguard_kek_exists(
  * Creates the persistent KEK for `service` if it does not already exist, or
  * verifies its properties if it does. Safe to call more than once for the
  * same service.
+ *
+ * Deliberately slow: this and hkdfguard_kek_exists are setup calls, meant
+ * to run once per application startup. Each takes at least one second of
+ * wall-clock time, whatever its outcome, and they run one at a time across
+ * threads. The floor is the REG_DWORD value
+ *
+ *     HKLM\Software\Policies\HkdfGuard\SetupMinDelayMs
+ *
+ * in milliseconds: 1000 when absent, 0 disables it, at most 60000. A value
+ * of the wrong type or above 60000 keeps the 1000 ms default. Do not call
+ * them per request; call once at startup and then use hkdfguard_wrap_dek /
+ * hkdfguard_unwrap_dek, which are not slowed. Argument errors (null
+ * pointer, invalid service name) return immediately. After more than 10
+ * setup calls in one process, event 2007 is logged once. This matches the
+ * Linux build's startup_behavior.setup_min_delay_ms.
  *
  * Which principals may use (unwrap with) the KEK is machine policy, not a
  * caller choice. SYSTEM and BUILTIN\Administrators always receive full
@@ -244,7 +261,8 @@ HKDFGUARD_API int32_t hkdfguard_create_kek(
  *             a payload produced with it; the service name itself is not
  *             recorded in the wrapped payload. Must be non-null, non-empty,
  *             and at most 128 bytes (excluding the null terminator), and may
- *             only contain ASCII letters, digits, and '.'; anything else
+ *             only contain ASCII letters, digits, and '.', may not start with
+ *             '.' and may not contain ".."; anything else
  *             (including NULL) fails with HKDFGUARD_ERR_INVALID_SERVICE_NAME,
  *             on this and every other function taking `service`.
  *             Case-insensitive: normalized to lowercase internally, so
@@ -353,6 +371,22 @@ HKDFGUARD_API int32_t hkdfguard_generate_and_wrap_dek(
  *           read-only, sharing read access only, so a file that another
  *           process has open for writing is refused rather than read
  *           mid-write.
+ *           The file, and every folder above it up to the drive root,
+ *           must be owned by SYSTEM, BUILTIN\Administrators,
+ *           TrustedInstaller or the account this process runs as, and
+ *           must grant no other account the right to change it: on the
+ *           file, write, append, write attributes or extended attributes,
+ *           delete, change permissions or take ownership; on a folder,
+ *           delete entries in it, delete the folder itself, change its
+ *           permissions or take ownership. (Creating new entries in a
+ *           folder is fine - C:\ProgramData lets Users do that.)
+ *           Otherwise HKDFGUARD_ERR_FILE_UNTRUSTED: reading a wrapped DEK
+ *           gains nothing, but anyone able to replace it, and to wrap
+ *           under the service's KEK, could plant a DEK they know. A folder
+ *           created directly under C:\ inherits "Authenticated Users:
+ *           Modify" and fails this until its permissions are narrowed.
+ *           Read access for other accounts is never a reason to refuse:
+ *           the file is ciphertext.
  * out     - caller-owned output buffer.
  * out_len - in: capacity of out, in bytes (must be >= HKDFGUARD_WRAPPED_LEN).
  *           out: on success, the number of bytes read (always
@@ -366,7 +400,11 @@ HKDFGUARD_API int32_t hkdfguard_generate_and_wrap_dek(
  *       the size of an *unwrapped* DEK, so most likely a plaintext key
  *       written to disk by mistake. Treat it as a key exposure. The file's
  *       contents are never read, so the possible key never enters this
- *       process.
+ *       process. Also returned for a DEK written as text: 64 hex digits
+ *       (either case) or base64 (standard or URL-safe, with or without its
+ *       '=' padding), with any leading or trailing whitespace. To tell, a
+ *       file of 96 bytes or fewer is read into a buffer that is wiped
+ *       afterwards; none of it is returned.
  *   HKDFGUARD_ERR_FILE_TOO_SHORT - any other size below HKDFGUARD_WRAPPED_LEN,
  *       including an empty file.
  *   HKDFGUARD_ERR_FILE_TOO_LONG - more than HKDFGUARD_WRAPPED_LEN bytes.
@@ -388,6 +426,48 @@ HKDFGUARD_API int32_t hkdfguard_generate_and_wrap_dek(
 HKDFGUARD_API int32_t hkdfguard_open_file(
     const char* path,
     uint8_t* out, int32_t* out_len);
+
+/*
+ * Hardens the calling process against disclosure of its memory - where DEKs
+ * and wrapping keys live while a call is in progress. The Windows
+ * counterpart of the Linux build's function of the same name (which turns
+ * off core dumps and ptrace attach). Opt-in: the library never calls this
+ * itself, since it changes process-wide state the host owns. Call it once,
+ * early - before handling any key material, and ideally before starting
+ * worker threads (see below).
+ *
+ * It does three things:
+ *   1. Windows Error Reporting leaves the heap out of any crash report it
+ *      collects for this process (WerSetFlags NOHEAP).
+ *   2. The process object's DACL is replaced: only SYSTEM may read or write
+ *      its memory, inject threads, duplicate its handles, or change its
+ *      security. The account it runs as - from any of its processes - keeps
+ *      only query, synchronize and terminate access, so tools can still list
+ *      it, wait on it and stop it, but cannot dump it (Task Manager's "Create
+ *      dump file", procdump, MiniDumpWriteDump) or attach a debugger.
+ *   3. Every thread that exists at the time of the call is restricted the
+ *      same way, so its registers can't be read or its execution redirected.
+ *
+ * Limits - this is a same-user barrier, not a boundary against
+ * administrators:
+ *   - Administrators holding SeDebugPrivilege, SYSTEM, and kernel code
+ *     bypass a DACL entirely.
+ *   - Threads created after the call keep the default thread DACL; their
+ *     registers stay readable by the same user (the process's memory does
+ *     not). Call again after starting threads to cover them.
+ *   - Handles to the process or its threads opened *before* the call keep
+ *     the access they were opened with.
+ *   - Memory paged to the page file, or written to hiberfil.sys, is outside
+ *     the process's control; so are full dumps configured machine-wide by an
+ *     administrator (WER LocalDumps, kernel dumps).
+ *
+ * Idempotent: safe to call more than once.
+ *
+ * Returns HKDFGUARD_OK, or HKDFGUARD_ERR_PROCESS_HARDENING_FAILED if any
+ * step failed. Steps applied before the failure stay applied - there is no
+ * rollback.
+ */
+HKDFGUARD_API int32_t hkdfguard_harden_process(void);
 
 // Closes the extern "C" block opened above.
 #ifdef __cplusplus

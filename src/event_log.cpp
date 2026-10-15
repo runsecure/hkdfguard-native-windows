@@ -70,6 +70,7 @@ namespace hkdfguard {
         constexpr DWORD kEvtPolicyInvalid = 2004;
         constexpr DWORD kEvtOperationFailed = 2005;
         constexpr DWORD kEvtPlaintextKeyFile = 2006;
+        constexpr DWORD kEvtSetupCallsExceeded = 2007;
 
         const wchar_t *CodeName(int32_t code) noexcept {
             switch (code) {
@@ -324,11 +325,24 @@ namespace hkdfguard {
             // needs an administrator's attention.
             Write(EVENTLOG_ERROR_TYPE, kEvtPlaintextKeyFile,
                   L"hkdfguard_open_file refused '" + path + L"': " + CodeName(HKDFGUARD_ERR_FILE_PLAINTEXT_KEY) +
-                  L" (" + std::to_wstring(HKDFGUARD_ERR_FILE_PLAINTEXT_KEY) + L") - the file is exactly " +
-                  std::to_wstring(HKDFGUARD_DEK_LEN) +
-                  L" bytes, the size of an unwrapped DEK, so it may be a plaintext key written to disk by "
-                  L"mistake. Its contents were not read. Treat that key as exposed: find out how the file was "
-                  L"written, remove it, and re-mint the DEK.");
+                  L" (" + std::to_wstring(HKDFGUARD_ERR_FILE_PLAINTEXT_KEY) + L") - the file holds what looks "
+                  L"like an unwrapped DEK (" + std::to_wstring(HKDFGUARD_DEK_LEN) +
+                  L" raw bytes, or its hex or base64), so it may be a plaintext key written to disk by "
+                  L"mistake. None of its contents were returned. Treat that key as exposed: find out how the "
+                  L"file was written, remove it, and re-mint the DEK.");
+        } catch (...) {
+        }
+    }
+
+    void LogSetupCallsExceeded(unsigned long calls, unsigned long floor_ms) noexcept {
+        try {
+            Write(EVENTLOG_WARNING_TYPE, kEvtSetupCallsExceeded,
+                  L"This process has made more than " + std::to_wstring(calls) +
+                  L" hkdfguard_create_kek / hkdfguard_kek_exists calls. These are meant to run once per "
+                  L"application startup; each costs a fresh key storage provider connection plus at least " +
+                  std::to_wstring(floor_ms) +
+                  L" ms, and they run one at a time. A caller is probably calling them per request or in a "
+                  L"loop: call them once at startup, then use hkdfguard_wrap_dek / hkdfguard_unwrap_dek.");
         } catch (...) {
         }
     }
