@@ -11,7 +11,7 @@
     2. Configures and builds the project (cmake -G Ninja).
     3. Runs the project's own ctest suite (roundtrip).
     4. Generates a random 32-byte DEK, wraps it with the CLI tool
-       (tools/hkdfguard-v1-initialize.exe), then independently unwraps the
+       (tools/hkdfguard.exe), then independently unwraps the
        resulting file via a direct P/Invoke call into HkdfGuardV1.dll's public
        hkdfguard_unwrap_dek and confirms the recovered bytes match the
        original DEK - i.e. verifies the CLI's wrap output is unwrappable by
@@ -114,7 +114,7 @@ if ($LASTEXITCODE -ne 0) { throw "build failed (exit $LASTEXITCODE)" }
 Write-Ok "build succeeded"
 
 $dllPath = Join-Path $RepoRoot "build\HkdfGuardV1.dll"
-$cliPath = Join-Path $RepoRoot "build\tools\hkdfguard-v1-initialize.exe"
+$cliPath = Join-Path $RepoRoot "build\tools\hkdfguard.exe"
 foreach ($p in $dllPath, $cliPath) {
     if (-not (Test-Path $p)) { throw "expected build output missing: $p" }
 }
@@ -161,7 +161,7 @@ Write-Section "CLI provision + wrap + DLL unwrap round-trip verification"
 $verifyDir = Join-Path $RepoRoot "build\verify"
 New-Item -ItemType Directory -Force -Path $verifyDir | Out-Null
 $keyFile = Join-Path $verifyDir "verify.key"
-# Alphanumeric only - hkdfguard-v1-initialize.exe's ValidateServiceCharset
+# Alphanumeric only - hkdfguard.exe's ValidateServiceCharset
 # rejects anything else (including hyphens) in --service-name.
 $serviceName = "hkdfguardverifyscript"
 $service = $serviceName
@@ -177,7 +177,7 @@ $auditStart = (Get-Date).AddSeconds(-2)
 
 if (Test-Path $keyFile) { Remove-Item -Force $keyFile }
 
-# hkdfguard-v1-initialize.exe (build\tools\) links against HkdfGuardV1.dll
+# hkdfguard.exe (build\tools\) links against HkdfGuardV1.dll
 # (build\), a different directory - Windows won't find the DLL by default,
 # so prepend its directory to PATH for both calls below, same as
 # tests/CMakeLists.txt already does for ctest via ENVIRONMENT PATH.
@@ -189,7 +189,7 @@ try {
     & $cliPath provision --service-name $serviceName
     $provisionExit = $LASTEXITCODE
     if ($provisionExit -ne 0) {
-        Write-Bad "hkdfguard-v1-initialize.exe provision exited $provisionExit"
+        Write-Bad "hkdfguard.exe provision exited $provisionExit"
     } else {
         Write-Ok "KEK provisioned for service '$service'"
     }
@@ -197,7 +197,7 @@ try {
     if ($provisionExit -eq 0) {
         Write-Host "Wrapping a random 32-byte DEK via the CLI (service '$service')..."
         # The DEK is fed to "wrap" as base64 text on stdin (--dek-stdin), not
-        # as a command-line argument - see hkdfguard-v1-initialize.cpp's
+        # as a command-line argument - see hkdfguard_cli.cpp's
         # header comment on why.
         $dekBase64 | & $cliPath wrap --key-file-path $keyFile --service-name $serviceName `
             --dek-stdin --group $Group --force
@@ -210,7 +210,7 @@ try {
 }
 if ($provisionExit -eq 0) {
     if ($cliExit -ne 0) {
-        Write-Bad "hkdfguard-v1-initialize.exe wrap exited $cliExit"
+        Write-Bad "hkdfguard.exe wrap exited $cliExit"
     } else {
         Write-Ok "CLI wrapped the DEK to $keyFile"
     }

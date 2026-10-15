@@ -149,7 +149,7 @@ left unchanged except on `HKDFGUARD_ERR_BUFFER_TOO_SMALL`, as with wrap and unwr
 
 ## Command-line tool
 
-`tools/hkdfguard-v1-initialize.cpp` builds `hkdfguard-v1-initialize.exe`, a thin
+`tools/hkdfguard_cli.cpp` builds `hkdfguard.exe`, a thin
 wrapper around the ABI above with two subcommands:
 
 - **`provision`** - always calls `hkdfguard_create_kek`, which creates the KEK if it
@@ -160,7 +160,7 @@ wrapper around the ABI above with two subcommands:
   verifying an existing one reads its ACL, which a key-use-only account cannot do.
 
   ```
-  hkdfguard-v1-initialize.exe provision --service-name|-sn <name>
+  hkdfguard.exe provision --service-name|-sn <name>
   ```
 
 - **`wrap`** - calls `hkdfguard_wrap_dek` only, against an *already-provisioned* KEK;
@@ -171,7 +171,7 @@ wrapper around the ABI above with two subcommands:
   it via a command-line/process listing (e.g. a WMI query) for the life of the run.
 
   ```
-  hkdfguard-v1-initialize.exe wrap --key-file-path|-kf <path> --service-name|-sn <name> --dek-stdin --group|-g <name> [--force|-f]
+  hkdfguard.exe wrap --key-file-path|-kf <path> --service-name|-sn <name> --dek-stdin --group|-g <name> [--force|-f]
   ```
 
   `--group|-g` sets the wrapped **file's** Windows ACL (owner read/write, that group
@@ -203,7 +203,7 @@ freshly-generated DEK under it on every later release:
 
 ```powershell
 # One-time, elevated: create the KEK for this service if it doesn't already exist.
-.\hkdfguard-v1-initialize.exe provision --service-name myapp
+.\hkdfguard.exe provision --service-name myapp
 
 # One-time: a dedicated local group for the account that will read the wrapped file.
 net localgroup App_1234 /add
@@ -214,7 +214,7 @@ net localgroup App_1234 "NT SERVICE\MyAppService" /add
 $dekBytes = New-Object byte[] 32
 [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($dekBytes)
 $dekBase64 = [Convert]::ToBase64String($dekBytes)
-$dekBase64 | .\hkdfguard-v1-initialize.exe wrap `
+$dekBase64 | .\hkdfguard.exe wrap `
     --key-file-path C:\secrets\myapp.v1.key --service-name myapp `
     --dek-stdin --group App_1234 --force
 ```
@@ -281,7 +281,7 @@ name is used, and that creation step fails outright without elevation - see "Dep
 model" above.
 
 This produces `build/HkdfGuardV1.dll` (+ its `.lib` import library) and
-`build/tools/hkdfguard-v1-initialize.exe`, and registers two tests with `ctest`:
+`build/tools/hkdfguard.exe`, and registers two tests with `ctest`:
 
 - **`roundtrip`** (`tests/test_roundtrip.cpp`, built to `build/tests/test_roundtrip.exe`)
   exercises the public ABI end to end, by linking directly against the built DLL: KEK
@@ -302,7 +302,7 @@ This produces `build/HkdfGuardV1.dll` (+ its `.lib` import library) and
   build\tests\test_roundtrip.exe
   ```
 
-- **`cli`** (`tests/test_cli.ps1`) exercises `hkdfguard-v1-initialize.exe`'s own
+- **`cli`** (`tests/test_cli.ps1`) exercises `hkdfguard.exe`'s own
   subcommand dispatch, argument parsing, validation, and file-handling by spawning the
   real built `.exe` as a subprocess - including, when elevated, a full
   provision-then-wrap-then-`--force`-overwrite run through it, and (unconditionally,
@@ -311,7 +311,7 @@ This produces `build/HkdfGuardV1.dll` (+ its `.lib` import library) and
   as a required parameter, so it can also be pointed at any build of the tool:
 
   ```powershell
-  powershell -ExecutionPolicy Bypass -File tests\test_cli.ps1 -CliExePath build\tools\hkdfguard-v1-initialize.exe
+  powershell -ExecutionPolicy Bypass -File tests\test_cli.ps1 -CliExePath build\tools\hkdfguard.exe
   ```
 
 Both tests delete any KEKs they create once they finish, so repeated runs don't
@@ -552,7 +552,7 @@ The MSI does four things:
 Then, once per service, elevated:
 
 ```
-"C:\Program Files\HkdfGuard\v1\hkdfguard-v1-initialize.exe" provision --service-name myapp
+"C:\Program Files\HkdfGuard\v1\hkdfguard.exe" provision --service-name myapp
 ```
 
 **Upgrades** remove the previous version before installing the new one. A service with

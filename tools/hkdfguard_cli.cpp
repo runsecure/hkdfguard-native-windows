@@ -90,12 +90,12 @@
 #pragma comment(lib, "advapi32.lib")
 
 namespace {
-    constexpr wchar_t kProgramName[] = L"hkdfguard-v1-initialize";
+    constexpr wchar_t kProgramName[] = L"hkdfguard";
     // Narrow-string twin of kProgramName, for use in narrow (std::string)
     // error/hint text - everything in this tool that isn't a PrintUsage-style
     // fwprintf is narrow, matching the non-UNICODE Win32 API variants and
     // std::string this tool uses throughout.
-    constexpr char kProgramNameNarrow[] = "hkdfguard-v1-initialize";
+    constexpr char kProgramNameNarrow[] = "hkdfguard";
     constexpr size_t kDekLen = 32;
     // Generous starting capacity for the wrapped payload - retried once at the
     // library-reported size on HKDFGUARD_ERR_BUFFER_TOO_SMALL, so this only

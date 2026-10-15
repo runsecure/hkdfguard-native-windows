@@ -25,7 +25,7 @@ set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS OFF)
 # Statically link the MSVC/UCRT runtime (/MT, /MTd for Debug) into every
 # binary this project produces, instead of the CMake/MSVC default of
 # dynamically linking it (/MD, /MDd). Without this, HkdfGuardV1.dll and
-# hkdfguard-v1-initialize.exe depend on MSVCP140.dll/VCRUNTIME140*.dll/the
+# hkdfguard.exe depend on MSVCP140.dll/VCRUNTIME140*.dll/the
 # api-ms-win-crt-*.dll forwarders at load time, none of which ship with a
 # bare Windows install - a machine without the Visual C++ Redistributable
 # (or Visual Studio itself) installed fails to load them. Statically linking
@@ -211,7 +211,7 @@ endfunction()
 
 hkdfguard_apply_hardening(hkdfguard)
 
-# tools/CMakeLists.txt declares hkdfguard-v1-initialize, the standalone CLI
+# tools/CMakeLists.txt declares hkdfguard-cli, the standalone CLI
 # utility that wraps a DEK and writes it to a file - see that file for why
 # it's a separate add_subdirectory rather than folded into this one.
 add_subdirectory(tools)

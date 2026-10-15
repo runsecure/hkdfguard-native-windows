@@ -1,4 +1,4 @@
-﻿#include "key_acl.h"
+#include "key_acl.h"
 #include "errors.h"
 
 #include <windows.h>
@@ -82,7 +82,7 @@ namespace hkdfguard {
             WinConsoleLogonSid,     // S-1-2-1 "CONSOLE LOGON": every console user
         };
 
-        // tools/hkdfguard-v1-initialize.cpp keeps a copy of both lists for its
+        // tools/hkdfguard_cli.cpp keeps a copy of both lists for its
         // --group check (it depends only on the public ABI); keep them in sync.
         //
         // Over-broad principals with no WELL_KNOWN_SID_TYPE constant of their

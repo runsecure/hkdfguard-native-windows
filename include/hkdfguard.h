@@ -323,7 +323,7 @@ HKDFGUARD_API int32_t hkdfguard_generate_and_wrap_dek(
     uint8_t* out, int32_t* out_len);
 
 /*
- * Reads a wrapped-key file (e.g. one written by hkdfguard-v1-initialize.exe
+ * Reads a wrapped-key file (e.g. one written by hkdfguard.exe
  * wrap) and returns its WRAPPED DEK bytes in `out`, exactly as stored on
  * disk. Reads exactly HKDFGUARD_WRAPPED_LEN bytes and checks they are a
  * well-formed WrappedDekV1 payload. This call never unwraps: nothing is

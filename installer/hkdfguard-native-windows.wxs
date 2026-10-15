@@ -3,7 +3,7 @@
   Built by scripts/Build-Msi.ps1 - see that script for the parameters below.
 
   What it does:
-    - Installs HkdfGuardV1.dll and hkdfguard-v1-initialize.exe
+    - Installs HkdfGuardV1.dll and hkdfguard.exe
       side by side into  %ProgramFiles%\HkdfGuard\v1\ .
     - Writes that folder to
         HKLM\Software\hkdfguard-native-windows  InstallPath  (REG_SZ)
@@ -73,7 +73,7 @@
         <File Id="HkdfGuardDllFile" Source="$(SourceDir)\HkdfGuardV1.dll" KeyPath="yes" />
       </Component>
       <Component Id="HkdfGuardCli">
-        <File Id="HkdfGuardCliFile" Source="$(SourceDir)\hkdfguard-v1-initialize.exe" KeyPath="yes" />
+        <File Id="HkdfGuardCliFile" Source="$(SourceDir)\hkdfguard.exe" KeyPath="yes" />
       </Component>
       <Component Id="HkdfGuardInstallPathValue">
         <RegistryValue

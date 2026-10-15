@@ -32,7 +32,7 @@ You install two files:
 | File | Used by | Purpose |
 |---|---|---|
 | `HkdfGuardV1.dll` | Applications | Wraps and unwraps DEKs. Applications load it at runtime. |
-| `hkdfguard-v1-initialize.exe` | Administrators | Creates a service's KEK (`provision`) and wraps a DEK to a file (`wrap`). |
+| `hkdfguard.exe` | Administrators | Creates a service's KEK (`provision`) and wraps a DEK to a file (`wrap`). |
 
 The usual flow is:
 
@@ -108,7 +108,7 @@ with a restart required. For anything else, see `install.log`.
 
 | Change | Detail |
 |---|---|
-| Files | `C:\Program Files\HkdfGuard\v1\HkdfGuardV1.dll` and `hkdfguard-v1-initialize.exe`. The folder inherits the Program Files ACL, so only Administrators, SYSTEM and TrustedInstaller can write to it. The location can't be changed. |
+| Files | `C:\Program Files\HkdfGuard\v1\HkdfGuardV1.dll` and `hkdfguard.exe`. The folder inherits the Program Files ACL, so only Administrators, SYSTEM and TrustedInstaller can write to it. The location can't be changed. |
 | Registry | `HKLM\Software\hkdfguard-native-windows`, value `InstallPath` (`REG_SZ`). Applications read it to find the DLL. |
 | Event log | Registers the Application log source `hkdfguard-native-windows`. |
 | Local group | Creates `HkdfGuardUsers` if it doesn't already exist. |
@@ -122,7 +122,7 @@ machine policy, such as Group Policy, Intune or SCCM.
 Get-ItemProperty HKLM:\Software\hkdfguard-native-windows | Select-Object InstallPath
 Get-ChildItem "C:\Program Files\HkdfGuard\v1"
 net localgroup HkdfGuardUsers
-& "C:\Program Files\HkdfGuard\v1\hkdfguard-v1-initialize.exe" --help
+& "C:\Program Files\HkdfGuard\v1\hkdfguard.exe" --help
 ```
 
 ## Set up a service
@@ -173,7 +173,7 @@ Both groups must be local groups on this machine. The installer never creates
 ### 2. Provision the KEK (elevated, once per service)
 
 ```powershell
-& "C:\Program Files\HkdfGuard\v1\hkdfguard-v1-initialize.exe" provision --service-name myapp
+& "C:\Program Files\HkdfGuard\v1\hkdfguard.exe" provision --service-name myapp
 ```
 
 `provision` creates the KEK if it's missing. If the KEK already exists, `provision` checks
@@ -192,7 +192,7 @@ the owner can read and write, the named group can only read, and no one else has
 Use a dedicated group whose members are only the service's account.
 
 ```powershell
-$exe = "C:\Program Files\HkdfGuard\v1\hkdfguard-v1-initialize.exe"
+$exe = "C:\Program Files\HkdfGuard\v1\hkdfguard.exe"
 
 # One-time: a group for the account that reads the key file.
 net localgroup App_1234 /add

@@ -1,5 +1,5 @@
 <#
-Exercises hkdfguard-v1-initialize.exe's own behavior - subcommand dispatch,
+Exercises hkdfguard.exe's own behavior - subcommand dispatch,
 argument parsing, base64/length validation, --group resolution, and the
 "don't touch an existing file without --force" guarantee - none of which is
 covered by test_roundtrip.exe (which only calls into HkdfGuardV1.dll directly,
@@ -13,7 +13,7 @@ an already-provisioned KEK; the DEK is fed to it as base64 text on stdin via
 
 Most scenarios below are reachable without ever creating a machine-wide KEK
 (each one fails - by design - before RunWrap()/RunProvision() in
-hkdfguard-v1-initialize.cpp ever calls into HkdfGuardV1.dll), so this test
+hkdfguard_cli.cpp ever calls into HkdfGuardV1.dll), so this test
 passes whether or not the process is elevated. This includes "wrap" against a
 service that was never provisioned - opening a nonexistent key fails
 (NTE_BAD_KEYSET -> HKDFGUARD_ERR_KEK_NOT_FOUND) regardless of privilege
@@ -42,7 +42,7 @@ function Check($condition, $what) {
 }
 
 # Quotes a single argument for Win32's CreateProcess command-line convention
-# (the same one hkdfguard-v1-initialize.exe's own wmain/CommandLineToArgvW
+# (the same one hkdfguard.exe's own wmain/CommandLineToArgvW
 # parses): wrapped in double quotes, with any embedded double quote escaped
 # as \" - whenever the argument is empty or contains a space or quote.
 # ProcessStartInfo.ArgumentList (which would avoid needing this entirely) is

@@ -95,7 +95,7 @@ Write-Section "Installing $(Split-Path -Leaf $msi)"
 $proc = Start-Process msiexec.exe -ArgumentList @("/i", "`"$msi`"", "/qn", "/norestart", "/l*v", "`"$Out\install.log`"") -Wait -PassThru
 Check (Test-MsiSuccess $proc.ExitCode) "msiexec /i succeeds (exit $($proc.ExitCode); 0 or 3010)"
 
-foreach ($f in "HkdfGuardV1.dll", "hkdfguard-v1-initialize.exe") {
+foreach ($f in "HkdfGuardV1.dll", "hkdfguard.exe") {
     Check (Test-Path (Join-Path $InstallDir $f)) "installed $InstallDir\$f"
 }
 $installPath = (Get-ItemProperty -Path $InstallKey -Name InstallPath -ErrorAction SilentlyContinue).InstallPath
@@ -129,7 +129,7 @@ Check ($roundtripExit -eq 0) "test_roundtrip.exe exits 0 (got $roundtripExit, $(
 # ---- 3. test_cli.ps1 against the installed CLI ----------------------------------
 Write-Section "test_cli.ps1 (installed CLI)"
 & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Payload "test_cli.ps1") `
-    -CliExePath (Join-Path $InstallDir "hkdfguard-v1-initialize.exe") 2>&1 |
+    -CliExePath (Join-Path $InstallDir "hkdfguard.exe") 2>&1 |
     Tee-Object -FilePath "$Out\test_cli.log" | Out-Host
 $cliExit = $LASTEXITCODE
 Check ($cliExit -eq 0) "test_cli.ps1 exits 0 (got $cliExit)"
@@ -139,7 +139,7 @@ Check ($cliExit -eq 0) "test_cli.ps1 exits 0 (got $cliExit)"
 # file, and code loading the installed DLL by full path reads it back with
 # hkdfguard_open_file (still wrapped) and unwraps it in a separate call.
 Write-Section "CLI wrap -> hkdfguard_open_file -> hkdfguard_unwrap_dek (installed binaries)"
-$cli = Join-Path $InstallDir "hkdfguard-v1-initialize.exe"
+$cli = Join-Path $InstallDir "hkdfguard.exe"
 $dll = Join-Path $InstallDir "HkdfGuardV1.dll"
 $chainService = "hkdfguardcontainerchain"
 $keyFile = Join-Path $work "chain.key"
@@ -249,7 +249,7 @@ $proc = Start-Process msiexec.exe -ArgumentList @(
     "/x", "`"$msi`"", "/qn", "/norestart", "MSIRESTARTMANAGERCONTROL=Disable", "/l*v", "`"$Out\uninstall.log`"") -Wait -PassThru
 Check (Test-MsiSuccess $proc.ExitCode) "msiexec /x succeeds (exit $($proc.ExitCode); 0 or 3010)"
 Check (-not (Test-Path (Join-Path $InstallDir "HkdfGuardV1.dll"))) "installed DLL removed"
-Check (-not (Test-Path (Join-Path $InstallDir "hkdfguard-v1-initialize.exe"))) "installed CLI removed"
+Check (-not (Test-Path (Join-Path $InstallDir "hkdfguard.exe"))) "installed CLI removed"
 $afterInstallPath = (Get-ItemProperty -Path $InstallKey -Name InstallPath -ErrorAction SilentlyContinue).InstallPath
 Check (-not $afterInstallPath) "InstallPath registry value removed"
 Check (-not (Test-Path $EventSourceKey)) "event source registration removed"

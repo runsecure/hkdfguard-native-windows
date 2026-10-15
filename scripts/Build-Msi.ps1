@@ -80,7 +80,7 @@ $StageDir = Join-Path $RepoRoot "dist\win-$ArchLower"
 $WixArch = if ($Arch -eq "ARM64") { "arm64" } else { "x64" }
 $MsiPath = Join-Path $RepoRoot "dist\hkdfguard-native-windows-$Version-win-$ArchLower.msi"
 $WxsPath = Join-Path $RepoRoot "installer\hkdfguard-native-windows.wxs"
-$Binaries = "HkdfGuardV1.dll", "hkdfguard-v1-initialize.exe"
+$Binaries = "HkdfGuardV1.dll", "hkdfguard.exe"
 
 function Write-Section($title) {
     Write-Host ""
