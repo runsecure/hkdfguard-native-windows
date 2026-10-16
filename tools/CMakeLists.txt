@@ -1,5 +1,5 @@
 # hkdfguard-cli (built as hkdfguard.exe): a standalone command-line utility that wraps a
-# caller-supplied DEK and writes it to a file, using HkdfGuardV1.dll purely
+# caller-supplied DEK and writes it to a file, using HkdfGuard.dll purely
 # through its public C ABI (include/hkdfguard.h) - deliberately not linked
 # against anything in src/, matching this project's macOS and Linux
 # equivalents (which also only ever go through their platform's public C
@@ -13,7 +13,7 @@ add_executable(hkdfguard-cli hkdfguard_cli.cpp)
 target_link_libraries(hkdfguard-cli PRIVATE hkdfguard bcrypt.lib crypt32.lib advapi32.lib)
 
 # The executable is hkdfguard.exe. The CMake *target* can't share that name:
-# "hkdfguard" is already the DLL's target (output HkdfGuardV1.dll), so the
+# "hkdfguard" is already the DLL's target (output HkdfGuard.dll), so the
 # target is hkdfguard-cli and only its output file is renamed.
 set_target_properties(hkdfguard-cli PROPERTIES OUTPUT_NAME "hkdfguard")
 

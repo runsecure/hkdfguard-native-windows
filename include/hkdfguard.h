@@ -7,11 +7,14 @@
 #define HKDFGUARD_H
 
 // stdint.h (the C header; <cstdint> is the C++-flavored equivalent) gives us
-// fixed-width integer types like uint8_t (unsigned, exactly 8 bits) and
-// int32_t (signed, exactly 32 bits). Windows' own type names (BYTE, DWORD,
-// ...) intentionally do NOT appear anywhere in this file - the whole point
-// of this header is to be usable from C, C#, Python, Java, Go, etc., none of
-// which know what a DWORD is.
+// uint8_t (unsigned, exactly 8 bits) for byte buffers. Lengths, status codes
+// and flags are plain `int` / `unsigned int`, the same as the Linux and
+// macOS headers, so one caller's code compiles against all three; `int` is
+// 32 bits on every platform this ABI targets (Windows x64/ARM64, Linux,
+// macOS), so bindings declare them as 32-bit integers. Windows' own type
+// names (BYTE, DWORD, ...) intentionally do NOT appear anywhere in this file -
+// the whole point of this header is to be usable from C, C#, Python, Java,
+// Go, etc., none of which know what a DWORD is.
 #include <stdint.h>
 
 // __declspec(dllexport) / __declspec(dllimport) are MSVC-specific keywords
@@ -71,7 +74,13 @@ extern "C" {
 // ever runs. This is the traditional C way of naming a constant so it can
 // also be used where the language requires a compile-time literal.
 #define HKDFGUARD_DEK_LEN     32
-#define HKDFGUARD_WRAPPED_LEN 132 /* fixed size of a WrappedDekV1 payload (incl. 32-byte salt and 32-byte KEK fingerprint) */
+/* Largest wrapped payload hkdfguard_wrap_dek / hkdfguard_generate_and_wrap_dek
+ * can produce - the same name as on Linux and macOS, so a buffer of this size
+ * never needs a retry on any of them. On Windows every payload is exactly this
+ * size (a WrappedDekV1 payload, incl. 32-byte salt and 32-byte KEK
+ * fingerprint); the Linux and macOS values differ, since a payload is only
+ * ever unwrapped on the host that wrapped it. */
+#define HKDFGUARD_WRAPPED_MAX_LEN 132
 
 // Status codes. HKDFGUARD_OK is 0 (following the common C convention that
 // "0 means success"); every failure is a distinct *negative* number, so a
@@ -131,14 +140,14 @@ extern "C" {
 #define HKDFGUARD_ERR_KEK_NOT_FOUND             (-17) /* no KEK is provisioned for this service (call hkdfguard_create_kek first) */
 #define HKDFGUARD_ERR_KEK_ACCESS_DENIED         (-18) /* this KEK exists, but the calling account is not authorized to use it (or, for a new KEK, the process is not elevated) */
 #define HKDFGUARD_ERR_KEK_INVALID               (-19) /* an existing KEK is unusable as found: on Windows, its ACL is missing, lacks SYSTEM/Administrators, or grants an over-broad principal */
-#define HKDFGUARD_ERR_PROCESS_HARDENING_FAILED  (-20) /* hkdfguard_harden_process: a hardening step failed (steps already applied stay applied) */
+#define HKDFGUARD_ERR_PROCESS_HARDENING_FAILED  (-20) /* hkdfguard_harden_process(_with_flags): a hardening step failed (steps already applied stay applied), or (with HKDFGUARD_HARDEN_REQUIRE_PROTECTED_SIGNATURE) the process could not be closed to its own user */
 /* -21..-31 reserved */
 // ---- Key file, hkdfguard_open_file (-32..-39) ----
 #define HKDFGUARD_ERR_FILE_NOT_FOUND            (-32) /* hkdfguard_open_file: the file (or a folder in its path) does not exist */
 #define HKDFGUARD_ERR_FILE_ACCESS_DENIED        (-33) /* hkdfguard_open_file: the calling account may not read the file */
 #define HKDFGUARD_ERR_FILE_IO                   (-34) /* hkdfguard_open_file: not a regular file, in use by a writer, or a read failed */
-#define HKDFGUARD_ERR_FILE_TOO_SHORT            (-35) /* hkdfguard_open_file: file is shorter than HKDFGUARD_WRAPPED_LEN */
-#define HKDFGUARD_ERR_FILE_TOO_LONG             (-36) /* hkdfguard_open_file: file is longer than HKDFGUARD_WRAPPED_LEN */
+#define HKDFGUARD_ERR_FILE_TOO_SHORT            (-35) /* hkdfguard_open_file: file is shorter than HKDFGUARD_WRAPPED_MAX_LEN */
+#define HKDFGUARD_ERR_FILE_TOO_LONG             (-36) /* hkdfguard_open_file: file is longer than HKDFGUARD_WRAPPED_MAX_LEN */
 #define HKDFGUARD_ERR_FILE_PLAINTEXT_KEY        (-37) /* hkdfguard_open_file: file holds what looks like an unwrapped key - HKDFGUARD_DEK_LEN raw bytes, or its hex or base64 */
 #define HKDFGUARD_ERR_FILE_MALFORMED            (-38) /* hkdfguard_open_file: file is the right size but its contents are not a valid WrappedDekV1 payload (including an unknown version) */
 #define HKDFGUARD_ERR_FILE_UNTRUSTED            (-39) /* hkdfguard_open_file: path is, or passes through, a symbolic link, junction or other reparse point, uses an 8.3 short name, or is not on a local drive (UNC, mapped or SUBST drive, device); or the file or a folder above it is owned by, or lets, an account other than SYSTEM, Administrators, TrustedInstaller or the caller write or replace it */
@@ -169,9 +178,9 @@ extern "C" {
  * be determined, as opposed to *out_exists being a reliable 0).
  * *out_exists is left untouched on failure.
  */
-HKDFGUARD_API int32_t hkdfguard_kek_exists(
+HKDFGUARD_API int hkdfguard_kek_exists(
     const char* service,
-    int32_t* out_exists);
+    int* out_exists);
 
 /*
  * Creates the persistent KEK for `service` if it does not already exist, or
@@ -242,7 +251,7 @@ HKDFGUARD_API int32_t hkdfguard_kek_exists(
  * process - opening/using an existing one does not; see the "Deployment
  * model" note in README.md).
  */
-HKDFGUARD_API int32_t hkdfguard_create_kek(
+HKDFGUARD_API int hkdfguard_create_kek(
     const char* service);
 
 /*
@@ -274,12 +283,18 @@ HKDFGUARD_API int32_t hkdfguard_create_kek(
  *             service's KEK; this function never creates one.
  * dek       - pointer to exactly HKDFGUARD_DEK_LEN bytes of plaintext DEK.
  * dek_len   - must equal HKDFGUARD_DEK_LEN.
- * out       - caller-owned output buffer.
- * out_len   - in: capacity of out, in bytes.
+ * out       - caller-owned output buffer. May be NULL only if *out_len is
+ *             0, to probe the required size; a NULL `out` with a positive
+ *             *out_len returns HKDFGUARD_ERR_INVALID_ARGUMENT.
+ * out_len   - in: capacity of out, in bytes. Negative returns
+ *             HKDFGUARD_ERR_INVALID_ARGUMENT.
  *             out: on success, the number of bytes written (always
- *             HKDFGUARD_WRAPPED_LEN). On HKDFGUARD_ERR_BUFFER_TOO_SMALL,
- *             the required capacity (HKDFGUARD_WRAPPED_LEN). Left
- *             unchanged on every other failure.
+ *             HKDFGUARD_WRAPPED_MAX_LEN). On HKDFGUARD_ERR_BUFFER_TOO_SMALL,
+ *             the required capacity (HKDFGUARD_WRAPPED_MAX_LEN), answered
+ *             at once without reaching a provider - after the service name
+ *             is checked, so an invalid one is reported first. Left
+ *             unchanged on every other failure. The same contract as the
+ *             Linux and macOS builds.
  *
  * Returns HKDFGUARD_OK on success, or a negative HKDFGUARD_ERR_* code -
  * notably HKDFGUARD_ERR_KEK_NOT_FOUND if hkdfguard_create_kek has not yet
@@ -289,10 +304,10 @@ HKDFGUARD_API int32_t hkdfguard_create_kek(
  * output is left in the caller's buffer.
 */
 
-HKDFGUARD_API int32_t hkdfguard_wrap_dek(
+HKDFGUARD_API int hkdfguard_wrap_dek(
     const char* service,
-    const uint8_t* dek, int32_t dek_len,
-    uint8_t* out, int32_t* out_len);
+    const uint8_t* dek, int dek_len,
+    uint8_t* out, int* out_len);
 
 /*
  * Unwraps a payload produced by hkdfguard_wrap_dek back into a 32-byte DEK.
@@ -301,14 +316,20 @@ HKDFGUARD_API int32_t hkdfguard_wrap_dek(
  *               when this payload was produced; see hkdfguard_wrap_dek.
  * wrapped     - pointer to the wrapped payload.
  * wrapped_len - length of the wrapped payload in bytes.
- * out         - caller-owned output buffer.
- * out_len     - in: capacity of out, in bytes (must be >= HKDFGUARD_DEK_LEN).
+ * out         - caller-owned output buffer. May be NULL only if *out_len
+ *               is 0, to probe the required size.
+ * out_len     - in: capacity of out, in bytes (must be >= HKDFGUARD_DEK_LEN;
+ *               negative returns HKDFGUARD_ERR_INVALID_ARGUMENT).
  *               out: on success, the number of plaintext bytes written
  *               (always HKDFGUARD_DEK_LEN). On
  *               HKDFGUARD_ERR_BUFFER_TOO_SMALL, the required capacity
- *               (HKDFGUARD_DEK_LEN). Left unchanged on every other failure.
+ *               (HKDFGUARD_DEK_LEN), reported after the service name is
+ *               checked but before the payload is even parsed - no
+ *               provider is reached. Left unchanged on every other failure.
  *
- * Returns HKDFGUARD_OK on success, or a negative HKDFGUARD_ERR_* code.
+ * Returns HKDFGUARD_OK on success, or a negative HKDFGUARD_ERR_* code -
+ * HKDFGUARD_ERR_INVALID_ARGUMENT for a null `wrapped` or `out_len`, or a
+ * negative `wrapped_len`.
  * HKDFGUARD_ERR_PAYLOAD_MALFORMED means a structurally invalid payload
  * (wrong length, nonzero reserved bytes, unknown provider type or KeyId).
  * The salt has no structure: a changed salt yields a different wrapping
@@ -325,10 +346,10 @@ HKDFGUARD_API int32_t hkdfguard_wrap_dek(
  * On any failure (including authentication failure), the output buffer is
  * zeroed before returning; no plaintext is left behind.
  */
-HKDFGUARD_API int32_t hkdfguard_unwrap_dek(
+HKDFGUARD_API int hkdfguard_unwrap_dek(
     const char* service,
-    const uint8_t* wrapped, int32_t wrapped_len,
-    uint8_t* out, int32_t* out_len);
+    const uint8_t* wrapped, int wrapped_len,
+    uint8_t* out, int* out_len);
 
 /*
  * Generates a fresh random 32-byte DEK and wraps it, in one call; the
@@ -336,14 +357,14 @@ HKDFGUARD_API int32_t hkdfguard_unwrap_dek(
  * behave exactly as on hkdfguard_wrap_dek, including the required capacity
  * reported on HKDFGUARD_ERR_BUFFER_TOO_SMALL.
  */
-HKDFGUARD_API int32_t hkdfguard_generate_and_wrap_dek(
+HKDFGUARD_API int hkdfguard_generate_and_wrap_dek(
     const char* service,
-    uint8_t* out, int32_t* out_len);
+    uint8_t* out, int* out_len);
 
 /*
  * Reads a wrapped-key file (e.g. one written by hkdfguard.exe
  * wrap) and returns its WRAPPED DEK bytes in `out`, exactly as stored on
- * disk. Reads exactly HKDFGUARD_WRAPPED_LEN bytes and checks they are a
+ * disk. Reads exactly HKDFGUARD_WRAPPED_MAX_LEN bytes and checks they are a
  * well-formed WrappedDekV1 payload. This call never unwraps: nothing is
  * decrypted, no KEK is opened, and the calling account needs no access to
  * any KEK - only read access to the file. Unwrapping is a separate, later
@@ -387,13 +408,17 @@ HKDFGUARD_API int32_t hkdfguard_generate_and_wrap_dek(
  *           Modify" and fails this until its permissions are narrowed.
  *           Read access for other accounts is never a reason to refuse:
  *           the file is ciphertext.
- * out     - caller-owned output buffer.
- * out_len - in: capacity of out, in bytes (must be >= HKDFGUARD_WRAPPED_LEN).
+ * out     - caller-owned output buffer. May be NULL only if *out_len is
+ *           0, to probe the required size.
+ * out_len - in: capacity of out, in bytes (must be >= HKDFGUARD_WRAPPED_MAX_LEN;
+ *           negative returns HKDFGUARD_ERR_INVALID_ARGUMENT).
  *           out: on success, the number of bytes read (always
- *           HKDFGUARD_WRAPPED_LEN). On HKDFGUARD_ERR_BUFFER_TOO_SMALL, the
- *           required capacity (HKDFGUARD_WRAPPED_LEN). Left unchanged on
- *           every other failure - the same contract as hkdfguard_wrap_dek
- *           and hkdfguard_unwrap_dek.
+ *           HKDFGUARD_WRAPPED_MAX_LEN). On HKDFGUARD_ERR_BUFFER_TOO_SMALL, the
+ *           required capacity (HKDFGUARD_WRAPPED_MAX_LEN), answered after
+ *           `path` is checked but without opening the file. Left unchanged
+ *           on every other failure - the same contract as
+ *           hkdfguard_wrap_dek and hkdfguard_unwrap_dek, and as the Linux
+ *           and macOS builds.
  *
  * The file's size is checked before any of it is read:
  *   HKDFGUARD_ERR_FILE_PLAINTEXT_KEY - exactly HKDFGUARD_DEK_LEN (32) bytes:
@@ -405,10 +430,10 @@ HKDFGUARD_API int32_t hkdfguard_generate_and_wrap_dek(
  *       '=' padding), with any leading or trailing whitespace. To tell, a
  *       file of 96 bytes or fewer is read into a buffer that is wiped
  *       afterwards; none of it is returned.
- *   HKDFGUARD_ERR_FILE_TOO_SHORT - any other size below HKDFGUARD_WRAPPED_LEN,
+ *   HKDFGUARD_ERR_FILE_TOO_SHORT - any other size below HKDFGUARD_WRAPPED_MAX_LEN,
  *       including an empty file.
- *   HKDFGUARD_ERR_FILE_TOO_LONG - more than HKDFGUARD_WRAPPED_LEN bytes.
- * A file of exactly HKDFGUARD_WRAPPED_LEN bytes is then read and validated
+ *   HKDFGUARD_ERR_FILE_TOO_LONG - more than HKDFGUARD_WRAPPED_MAX_LEN bytes.
+ * A file of exactly HKDFGUARD_WRAPPED_MAX_LEN bytes is then read and validated
  * as hkdfguard_unwrap_dek would before touching a KEK - version, provider
  * type, reserved bytes and KeyId (the salt has no structure to check) -
  * failing with HKDFGUARD_ERR_FILE_MALFORMED otherwise. That includes an
@@ -419,13 +444,15 @@ HKDFGUARD_API int32_t hkdfguard_generate_and_wrap_dek(
  * and HKDFGUARD_ERR_FILE_IO report why the file couldn't be opened or read.
  *
  * Returns HKDFGUARD_OK on success, or a negative HKDFGUARD_ERR_* code -
- * HKDFGUARD_ERR_INVALID_ARGUMENT for a null argument, or a path that is empty,
- * not valid UTF-8, or longer than Windows allows (32,767 characters). On
- * any failure, the output buffer is zeroed before returning.
+ * HKDFGUARD_ERR_INVALID_ARGUMENT for a null `path` or `out_len`, a negative
+ * capacity, a NULL `out` with a positive capacity, or a path that is
+ * empty, not valid UTF-8, or longer than Windows allows (32,767
+ * characters). On any failure, the output buffer is zeroed before
+ * returning (unless `out_len` is NULL: then nothing is written).
  */
-HKDFGUARD_API int32_t hkdfguard_open_file(
+HKDFGUARD_API int hkdfguard_open_file(
     const char* path,
-    uint8_t* out, int32_t* out_len);
+    uint8_t* out, int* out_len);
 
 /*
  * Hardens the calling process against disclosure of its memory - where DEKs
@@ -453,21 +480,80 @@ HKDFGUARD_API int32_t hkdfguard_open_file(
  *   - Administrators holding SeDebugPrivilege, SYSTEM, and kernel code
  *     bypass a DACL entirely.
  *   - Threads created after the call keep the default thread DACL; their
- *     registers stay readable by the same user (the process's memory does
- *     not). Call again after starting threads to cover them.
+ *     registers stay readable, and their execution redirectable, by the
+ *     same user (the process's memory does not). Call again after starting
+ *     threads to cover them, or pass
+ *     HKDFGUARD_HARDEN_REQUIRE_PROTECTED_SIGNATURE (below), which covers
+ *     them for good.
  *   - Handles to the process or its threads opened *before* the call keep
  *     the access they were opened with.
  *   - Memory paged to the page file, or written to hiberfil.sys, is outside
  *     the process's control; so are full dumps configured machine-wide by an
  *     administrator (WER LocalDumps, kernel dumps).
  *
+ *   - A GUI process can still have code injected by a same-user process
+ *     on the same desktop through window hooks (SetWindowsHookEx); no
+ *     process or thread DACL covers that. Host key-handling code in a
+ *     process without windows (a service or console process).
+ *
  * Idempotent: safe to call more than once.
+ *
+ * Same as hkdfguard_harden_process_with_flags(0).
  *
  * Returns HKDFGUARD_OK, or HKDFGUARD_ERR_PROCESS_HARDENING_FAILED if any
  * step failed. Steps applied before the failure stay applied - there is no
  * rollback.
  */
-HKDFGUARD_API int32_t hkdfguard_harden_process(void);
+HKDFGUARD_API int hkdfguard_harden_process(void);
+
+/*
+ * Flags for hkdfguard_harden_process_with_flags. Shared by every platform:
+ * a flag has the same bit everywhere, and every platform accepts every
+ * flag defined here.
+ *
+ * HKDFGUARD_HARDEN_REQUIRE_PROTECTED_SIGNATURE: fail with
+ *     HKDFGUARD_ERR_PROCESS_HARDENING_FAILED unless no other process of the
+ *     same user can attach a debugger to, or inject code into, this
+ *     process.
+ *       macOS: that depends on the host executable's code signature, which
+ *         the library can only check.
+ *       Linux: PR_SET_DUMPABLE already guarantees it; no further check.
+ *       Windows: the three steps above leave threads created after the
+ *         call open (see "Limits"), so this flag adds two more, applied
+ *         first:
+ *           4. The process token's default DACL - which every unnamed
+ *              object the process creates from then on receives, threads
+ *              included - is replaced: SYSTEM keeps every right, and the
+ *              account only SYNCHRONIZE and READ_CONTROL. Later threads
+ *              are then as closed as existing ones.
+ *           5. The process token's own DACL is replaced so the account may
+ *              only query and duplicate it (the TPM key store duplicates its
+ *              own token) - otherwise a same-user process could open the
+ *              token and put the old default DACL back.
+ *         The cost is the reason it's a flag: everything the process
+ *         creates afterwards without an explicit security descriptor -
+ *         child processes, named pipes, named events and other named
+ *         objects - is closed to its own user too. A same-user client can't
+ *         connect to a pipe it created with a NULL security descriptor, and
+ *         a child process can't be stopped by Task Manager (its creator's
+ *         handle still works). Use it in a service or console process that
+ *         doesn't share objects with other processes by name. Window
+ *         hooks into a GUI process stay outside it (see "Limits").
+ */
+#define HKDFGUARD_HARDEN_REQUIRE_PROTECTED_SIGNATURE 0x1u
+
+/*
+ * hkdfguard_harden_process, with `flags` - a bitwise OR of
+ * HKDFGUARD_HARDEN_* flags, or 0 - choosing how strict it is. Idempotent
+ * in either mode, and a call without the flag after one with it leaves the
+ * stricter state in place.
+ *
+ * Returns HKDFGUARD_OK; HKDFGUARD_ERR_INVALID_ARGUMENT if `flags` has a
+ * bit this library doesn't know (checked before anything is changed, so a
+ * newer flag is never silently ignored); or
+ * HKDFGUARD_ERR_PROCESS_HARDENING_FAILED.
+ */
+HKDFGUARD_API int hkdfguard_harden_process_with_flags(unsigned int flags);
 
 // Closes the extern "C" block opened above.
 #ifdef __cplusplus

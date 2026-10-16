@@ -66,19 +66,16 @@ namespace hkdfguard {
         memcpy(out + kFingerprintOffset, fingerprint, kFingerprintLen);
     }
 
-    // header || fingerprint || normalized_service. The two fixed-length
-    // parts come first, so the variable-length service at the end needs no
-    // length prefix for the encoding to be unambiguous.
-    std::vector<uint8_t> BuildWrappedDekAad(
+    // header || fingerprint: both fixed-length, so the encoding is
+    // unambiguous as it stands.
+    std::vector<uint8_t> BuildWrappedDekAuthenticated(
         const uint8_t header[kHeaderLen],
-        const uint8_t fingerprint[kFingerprintLen],
-        const std::string &normalized_service) {
-        std::vector<uint8_t> aad;
-        aad.reserve(kHeaderLen + kFingerprintLen + normalized_service.size());
-        aad.insert(aad.end(), header, header + kHeaderLen);
-        aad.insert(aad.end(), fingerprint, fingerprint + kFingerprintLen);
-        aad.insert(aad.end(), normalized_service.begin(), normalized_service.end());
-        return aad;
+        const uint8_t fingerprint[kFingerprintLen]) {
+        std::vector<uint8_t> authenticated;
+        authenticated.reserve(kAuthenticatedLen);
+        authenticated.insert(authenticated.end(), header, header + kHeaderLen);
+        authenticated.insert(authenticated.end(), fingerprint, fingerprint + kFingerprintLen);
+        return authenticated;
     }
 
     // Validates a caller-supplied buffer really is a well-formed WrappedDekV1

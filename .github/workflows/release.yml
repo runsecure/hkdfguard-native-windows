@@ -157,9 +157,9 @@ jobs:
           . .\scripts\ArtifactSigning.ps1
           $config = Initialize-ArtifactSigning
           Invoke-ArtifactSigning -Config $config -Files @(
-            "dist\win-x64\HkdfGuardV1.dll",
+            "dist\win-x64\HkdfGuard.dll",
             "dist\win-x64\hkdfguard.exe",
-            "dist\win-arm64\HkdfGuardV1.dll",
+            "dist\win-arm64\HkdfGuard.dll",
             "dist\win-arm64\hkdfguard.exe")
 
       # Packages the signed binaries (already signed, so not re-signed), then
@@ -204,9 +204,9 @@ jobs:
           subject-path: |
             release-assets/*.zip
             release-assets/*.msi
-            dist/win-x64/HkdfGuardV1.dll
+            dist/win-x64/HkdfGuard.dll
             dist/win-x64/hkdfguard.exe
-            dist/win-arm64/HkdfGuardV1.dll
+            dist/win-arm64/HkdfGuard.dll
             dist/win-arm64/hkdfguard.exe
 
       - name: Upload the signed release assets

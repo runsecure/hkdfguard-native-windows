@@ -19,7 +19,7 @@ namespace hkdfguard {
 #endif
 
         // The NCrypt provider name used for everything "TPM" in this file.
-        // Always MS_PLATFORM_CRYPTO_PROVIDER in HkdfGuardV1.dll; a test build
+        // Always MS_PLATFORM_CRYPTO_PROVIDER in HkdfGuard.dll; a test build
         // may point it at a nonexistent provider to exercise the "no TPM on
         // this machine" paths deterministically on hardware that has one.
         LPCWSTR TpmProviderName()
@@ -34,7 +34,7 @@ namespace hkdfguard {
         }
 
         // Test seam hooks (see TestTpmFaults in kek_store.h). In
-        // HkdfGuardV1.dll these compile to "return the real status" and
+        // HkdfGuard.dll these compile to "return the real status" and
         // "never fail", so the shipped library behaves exactly as without
         // them.
         SECURITY_STATUS ApplyTestTpmOpenStatus(LPCWSTR providerName, SECURITY_STATUS actual)

@@ -2,15 +2,20 @@
 // effect is visible: a process always has full access to itself through
 // GetCurrentProcess(), whatever its DACL says. So this .exe runs twice:
 //
-//   test_harden_process.exe          - the parent: starts a copy of itself as
-//                                      the child, then probes it
-//   test_harden_process.exe child    - the child: starts a worker thread,
-//                                      hardens itself, checks what it can
-//                                      check from the inside, and reports
+//   test_harden_process.exe              - the parent: starts a copy of
+//                                          itself as the child, probes it,
+//                                          then does the same in strict mode
+//   test_harden_process.exe child        - the child: starts a worker
+//                                          thread, hardens itself, checks
+//                                          what it can check from the
+//                                          inside, and reports
+//   test_harden_process.exe child-strict - the same, hardening with
+//                                          HKDFGUARD_HARDEN_REQUIRE_PROTECTED_SIGNATURE
 //
 // The child reports one line on stdout - "READY <main tid> <worker tid>
-// <late tid>" or "FAIL <reason>" - then waits for its stdin to close before
-// exiting, so it stays alive while the parent probes it.
+// <late tid> <mid tid>" (mid is 0 outside strict mode) or "FAIL <reason>" -
+// then waits for its stdin to close before exiting, so it stays alive while
+// the parent probes it.
 //
 // Same hand-rolled PASS/FAIL style as test_roundtrip.cpp. Exits 0 when every
 // check passes, 1 otherwise, and 77 (ctest's SKIP_RETURN_CODE, see
@@ -56,7 +61,7 @@ int ChildFail(const char *reason) {
     return 1;
 }
 
-int RunChild() {
+int RunChild(bool strict) {
     g_release = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     DWORD workerId = 0;
     HANDLE worker = CreateThread(nullptr, 0, Park, nullptr, 0, &workerId);
@@ -64,12 +69,46 @@ int RunChild() {
         return ChildFail("could not start the worker thread");
     }
 
-    if (hkdfguard_harden_process() != HKDFGUARD_OK) {
-        return ChildFail("hkdfguard_harden_process did not return HKDFGUARD_OK");
+    // Unknown flag bits are refused before anything is changed, so a flag a
+    // newer caller relies on is never silently ignored: WER's NOHEAP, the
+    // first step, must still be off afterwards.
+    if (hkdfguard_harden_process_with_flags(~HKDFGUARD_HARDEN_REQUIRE_PROTECTED_SIGNATURE) !=
+            HKDFGUARD_ERR_INVALID_ARGUMENT ||
+        hkdfguard_harden_process_with_flags(0x80000000u) != HKDFGUARD_ERR_INVALID_ARGUMENT) {
+        return ChildFail("unknown flag bits did not return HKDFGUARD_ERR_INVALID_ARGUMENT");
     }
-    // Idempotency: a second call finds its own DACLs already in place.
-    if (hkdfguard_harden_process() != HKDFGUARD_OK) {
-        return ChildFail("a second hkdfguard_harden_process call did not return HKDFGUARD_OK");
+    DWORD before = 0;
+    if (SUCCEEDED(WerGetFlags(GetCurrentProcess(), &before)) && (before & WER_FAULT_REPORTING_FLAG_NOHEAP) != 0) {
+        return ChildFail("a call refused for unknown flag bits still changed the process");
+    }
+
+    DWORD midId = 0;
+    HANDLE mid = nullptr;
+    if (!strict) {
+        if (hkdfguard_harden_process() != HKDFGUARD_OK) {
+            return ChildFail("hkdfguard_harden_process did not return HKDFGUARD_OK");
+        }
+        // Idempotency: a second call finds its own DACLs already in place.
+        if (hkdfguard_harden_process() != HKDFGUARD_OK) {
+            return ChildFail("a second hkdfguard_harden_process call did not return HKDFGUARD_OK");
+        }
+    } else {
+        if (hkdfguard_harden_process_with_flags(HKDFGUARD_HARDEN_REQUIRE_PROTECTED_SIGNATURE) != HKDFGUARD_OK) {
+            return ChildFail("strict hardening did not return HKDFGUARD_OK");
+        }
+        // A thread started between calls is created under the strict
+        // default DACL; repeat calls, strict or not, must accept it (it
+        // denies them WRITE_DAC) and the already-locked token.
+        mid = CreateThread(nullptr, 0, Park, nullptr, 0, &midId);
+        if (mid == nullptr) {
+            return ChildFail("could not start a thread between strict hardening calls");
+        }
+        if (hkdfguard_harden_process_with_flags(HKDFGUARD_HARDEN_REQUIRE_PROTECTED_SIGNATURE) != HKDFGUARD_OK) {
+            return ChildFail("a second strict hardening call did not return HKDFGUARD_OK");
+        }
+        if (hkdfguard_harden_process() != HKDFGUARD_OK) {
+            return ChildFail("hkdfguard_harden_process after strict hardening did not return HKDFGUARD_OK");
+        }
     }
 
     DWORD flags = 0;
@@ -85,11 +124,12 @@ int RunChild() {
         return ChildFail("could not start a thread after hardening");
     }
     int32_t exists = -1;
-    if (hkdfguard_kek_exists("hkdfguard.hardentest.absent", &exists) != HKDFGUARD_OK || exists != 0) {
-        return ChildFail("hkdfguard_kek_exists failed after hardening");
+    int32_t kek_rc = hkdfguard_kek_exists("hkdfguard.hardentest.absent", &exists);
+    if (kek_rc != HKDFGUARD_OK || exists != 0) {
+        return ChildFail(("hkdfguard_kek_exists failed after hardening (rc " + std::to_string(kek_rc) + ")").c_str());
     }
 
-    std::printf("READY %lu %lu %lu\n", GetCurrentThreadId(), workerId, lateId);
+    std::printf("READY %lu %lu %lu %lu\n", GetCurrentThreadId(), workerId, lateId, midId);
     std::fflush(stdout);
 
     // Block until the parent closes our stdin.
@@ -98,8 +138,8 @@ int RunChild() {
     while (ReadFile(GetStdHandle(STD_INPUT_HANDLE), buf, sizeof(buf), &read, nullptr) && read != 0) {
     }
     SetEvent(g_release);
-    HANDLE threads[] = {worker, late};
-    WaitForMultipleObjects(2, threads, TRUE, 5000);
+    HANDLE threads[] = {worker, late, mid};
+    WaitForMultipleObjects(mid != nullptr ? 3 : 2, threads, TRUE, 5000);
     return 0;
 }
 
@@ -187,7 +227,39 @@ void CheckThreadHardened(DWORD tid, const char *name) {
           (prefix + "THREAD_QUERY_LIMITED_INFORMATION | SYNCHRONIZE still allowed").c_str());
 }
 
-void ProbeChild(DWORD pid, DWORD mainTid, DWORD workerTid, DWORD lateTid) {
+// A thread created under the strict default DACL: the account keeps only
+// SYNCHRONIZE (and READ_CONTROL) - not even query.
+void CheckThreadStrict(DWORD tid, const char *name) {
+    std::string prefix = std::string(name) + " thread: ";
+    Check(OpenThreadDenied(tid, THREAD_GET_CONTEXT), (prefix + "THREAD_GET_CONTEXT denied").c_str());
+    Check(OpenThreadDenied(tid, THREAD_SET_CONTEXT), (prefix + "THREAD_SET_CONTEXT denied (no execution redirect)").c_str());
+    Check(OpenThreadDenied(tid, THREAD_SUSPEND_RESUME), (prefix + "THREAD_SUSPEND_RESUME denied").c_str());
+    Check(OpenThreadDenied(tid, THREAD_TERMINATE), (prefix + "THREAD_TERMINATE denied").c_str());
+    Check(OpenThreadDenied(tid, WRITE_DAC), (prefix + "WRITE_DAC denied").c_str());
+    Check(OpenThreadDenied(tid, WRITE_OWNER), (prefix + "WRITE_OWNER denied").c_str());
+    Check(OpenThreadDenied(tid, THREAD_QUERY_LIMITED_INFORMATION), (prefix + "THREAD_QUERY_LIMITED_INFORMATION denied").c_str());
+    Check(CanOpenThread(tid, SYNCHRONIZE), (prefix + "SYNCHRONIZE still allowed").c_str());
+}
+
+// Opens the child's primary token with `access`: true if allowed, and sets
+// `denied` if it failed because access was denied (not for another reason).
+bool OpenChildToken(DWORD pid, DWORD access, bool &denied) {
+    denied = false;
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (process == nullptr) {
+        return false;
+    }
+    HANDLE token = nullptr;
+    bool ok = OpenProcessToken(process, access, &token) != FALSE;
+    denied = !ok && GetLastError() == ERROR_ACCESS_DENIED;
+    if (ok) {
+        CloseHandle(token);
+    }
+    CloseHandle(process);
+    return ok;
+}
+
+void ProbeChild(bool strict, DWORD pid, DWORD mainTid, DWORD workerTid, DWORD lateTid, DWORD midTid) {
     // The process: memory, threads, handles and security all denied...
     Check(OpenProcessDenied(pid, PROCESS_VM_READ), "process: PROCESS_VM_READ denied");
     Check(OpenProcessDenied(pid, PROCESS_VM_WRITE | PROCESS_VM_OPERATION), "process: PROCESS_VM_WRITE | PROCESS_VM_OPERATION denied");
@@ -230,27 +302,46 @@ void ProbeChild(DWORD pid, DWORD mainTid, DWORD workerTid, DWORD lateTid) {
     CheckThreadHardened(mainTid, "main");
     CheckThreadHardened(workerTid, "worker");
 
-    // The documented limit: a thread started after the call keeps the
-    // token's default DACL. Pinned here so a change in that behavior - in
-    // either direction - is noticed and the documentation updated.
-    Check(CanOpenThread(lateTid, THREAD_GET_CONTEXT),
-          "late thread (started after hardening) keeps the default DACL, as documented");
+    bool denied = false;
+    if (!strict) {
+        // The documented limit: a thread started after the call keeps the
+        // token's default DACL. Pinned here so a change in that behavior - in
+        // either direction - is noticed and the documentation updated.
+        Check(CanOpenThread(lateTid, THREAD_GET_CONTEXT),
+              "late thread (started after hardening) keeps the default DACL, as documented");
+        // And the token is left alone outside strict mode.
+        Check(OpenChildToken(pid, TOKEN_ADJUST_DEFAULT, denied),
+              "token: TOKEN_ADJUST_DEFAULT still allowed without the strict flag, as documented");
+        return;
+    }
+
+    // Strict: threads started after the call - between two strict calls,
+    // and after all of them - are closed too.
+    CheckThreadStrict(midTid, "strict mid (started between calls)");
+    CheckThreadStrict(lateTid, "strict late (started after hardening)");
+
+    // The token can't be used to undo it.
+    Check(!OpenChildToken(pid, TOKEN_ADJUST_DEFAULT, denied) && denied,
+          "strict token: TOKEN_ADJUST_DEFAULT denied (the old default DACL cannot be put back)");
+    Check(!OpenChildToken(pid, WRITE_DAC, denied) && denied, "strict token: WRITE_DAC denied");
+    Check(!OpenChildToken(pid, WRITE_OWNER, denied) && denied, "strict token: WRITE_OWNER denied");
+    Check(!OpenChildToken(pid, TOKEN_ADJUST_PRIVILEGES, denied) && denied, "strict token: TOKEN_ADJUST_PRIVILEGES denied");
+    Check(OpenChildToken(pid, TOKEN_QUERY, denied), "strict token: TOKEN_QUERY still allowed");
+    // The TPM key store duplicates its own process token on every key open
+    // (NTE_PERM without it), so this stays - see HardenToken.
+    Check(OpenChildToken(pid, TOKEN_DUPLICATE, denied), "strict token: TOKEN_DUPLICATE still allowed (the TPM key store needs it)");
 }
 
-int RunParent() {
-    if (RunningAsSystem()) {
-        std::printf("[SKIP] running as SYSTEM, which the hardened DACL grants full access by design\n");
-        return kSkip;
-    }
-    DisableDebugPrivilege();
-
+// Starts the child in one mode, probes it, and collects its exit code.
+void RunChildAndProbe(bool strict) {
+    std::printf("\n--- %s ---\n", strict ? "strict (HKDFGUARD_HARDEN_REQUIRE_PROTECTED_SIGNATURE)" : "default");
     SECURITY_ATTRIBUTES inherit{sizeof(inherit), nullptr, TRUE};
     HANDLE childStdinRead = nullptr, childStdinWrite = nullptr;
     HANDLE childStdoutRead = nullptr, childStdoutWrite = nullptr;
     if (!CreatePipe(&childStdinRead, &childStdinWrite, &inherit, 0) ||
         !CreatePipe(&childStdoutRead, &childStdoutWrite, &inherit, 0)) {
-        std::printf("[FAIL] CreatePipe failed\n");
-        return 1;
+        Check(false, "CreatePipe");
+        return;
     }
     // Our own ends must not be inherited, or the child's stdin never closes.
     SetHandleInformation(childStdinWrite, HANDLE_FLAG_INHERIT, 0);
@@ -258,10 +349,10 @@ int RunParent() {
 
     wchar_t self[MAX_PATH];
     if (GetModuleFileNameW(nullptr, self, MAX_PATH) == 0 || GetLastError() == ERROR_INSUFFICIENT_BUFFER) {
-        std::printf("[FAIL] GetModuleFileName failed\n");
-        return 1;
+        Check(false, "GetModuleFileName");
+        return;
     }
-    std::wstring commandLine = L"\"" + std::wstring(self) + L"\" child";
+    std::wstring commandLine = L"\"" + std::wstring(self) + (strict ? L"\" child-strict" : L"\" child");
 
     STARTUPINFOW si{};
     si.cb = sizeof(si);
@@ -272,7 +363,8 @@ int RunParent() {
     PROCESS_INFORMATION pi{};
     if (!CreateProcessW(self, commandLine.data(), nullptr, nullptr, TRUE, 0, nullptr, nullptr, &si, &pi)) {
         std::printf("[FAIL] could not start the child (error %lu)\n", GetLastError());
-        return 1;
+        ++g_failures;
+        return;
     }
     CloseHandle(childStdinRead);
     CloseHandle(childStdoutWrite);
@@ -288,13 +380,14 @@ int RunParent() {
         line.pop_back();
     }
 
-    unsigned long mainTid = 0, workerTid = 0, lateTid = 0;
-    bool ready = std::sscanf(line.c_str(), "READY %lu %lu %lu", &mainTid, &workerTid, &lateTid) == 3;
-    Check(ready, ("child hardened itself twice, has WER NOHEAP set and still works (\"" + line + "\")").c_str());
+    unsigned long mainTid = 0, workerTid = 0, lateTid = 0, midTid = 0;
+    bool ready = std::sscanf(line.c_str(), "READY %lu %lu %lu %lu", &mainTid, &workerTid, &lateTid, &midTid) == 4;
+    Check(ready, ("child refused unknown flags, hardened itself repeatedly, has WER NOHEAP set and still works (\"" +
+                  line + "\")").c_str());
     if (ready) {
         // pi.hProcess / pi.hThread were opened before hardening and keep
         // full access (another documented limit) - every probe opens anew.
-        ProbeChild(pi.dwProcessId, mainTid, workerTid, lateTid);
+        ProbeChild(strict, pi.dwProcessId, mainTid, workerTid, lateTid, midTid);
     }
 
     // Release the child and collect its exit code.
@@ -309,6 +402,17 @@ int RunParent() {
     CloseHandle(childStdoutRead);
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
+}
+
+int RunParent() {
+    if (RunningAsSystem()) {
+        std::printf("[SKIP] running as SYSTEM, which the hardened DACL grants full access by design\n");
+        return kSkip;
+    }
+    DisableDebugPrivilege();
+
+    RunChildAndProbe(false);
+    RunChildAndProbe(true);
 
     std::printf("\n%d failure(s)\n", g_failures);
     return g_failures == 0 ? 0 : 1;
@@ -318,7 +422,10 @@ int RunParent() {
 
 int main(int argc, char **argv) {
     if (argc == 2 && std::strcmp(argv[1], "child") == 0) {
-        return RunChild();
+        return RunChild(false);
+    }
+    if (argc == 2 && std::strcmp(argv[1], "child-strict") == 0) {
+        return RunChild(true);
     }
     return RunParent();
 }

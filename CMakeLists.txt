@@ -24,7 +24,7 @@ set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS OFF)
 
 # Statically link the MSVC/UCRT runtime (/MT, /MTd for Debug) into every
 # binary this project produces, instead of the CMake/MSVC default of
-# dynamically linking it (/MD, /MDd). Without this, HkdfGuardV1.dll and
+# dynamically linking it (/MD, /MDd). Without this, HkdfGuard.dll and
 # hkdfguard.exe depend on MSVCP140.dll/VCRUNTIME140*.dll/the
 # api-ms-win-crt-*.dll forwarders at load time, none of which ship with a
 # bare Windows install - a machine without the Visual C++ Redistributable
@@ -84,16 +84,17 @@ if(MSVC)
     target_include_directories(hkdfguard PRIVATE ${HKDFGUARD_MC_OUT})
 endif()
 
-# Names the actual output files HkdfGuardV1.dll and its companion
-# HkdfGuardV1.lib import library - "V1" being the wire-format/wrap-protocol
-# version they implement. (The event log source and the MSI's product
+# Names the actual output files HkdfGuard.dll and its companion
+# HkdfGuard.lib import library - no version in the name, as on Linux
+# (libhkdfguard.so): the wrap format is identified by the payload's
+# version byte, not by the library. (The event log source and the MSI's product
 # name, hkdfguard-native-windows, are separate identifiers - see
 # installer/.) Only
 # changes what lands on disk - the CMake target itself is still named
 # "hkdfguard" everywhere else in this file and in tests/CMakeLists.txt
 # (e.g. target_link_libraries, $<TARGET_FILE_DIR:hkdfguard>), so nothing
 # else needs to change when this name does.
-set_target_properties(hkdfguard PROPERTIES OUTPUT_NAME "HkdfGuardV1")
+set_target_properties(hkdfguard PROPERTIES OUTPUT_NAME "HkdfGuard")
 
 # PRIVATE compile definitions apply only while compiling hkdfguard's own
 # .cpp files, not to anything that later links against it. HKDFGUARD_EXPORTS
@@ -106,7 +107,7 @@ target_compile_definitions(hkdfguard PRIVATE HKDFGUARD_EXPORTS UNICODE _UNICODE)
 # PUBLIC include dirs are inherited by anything that links against this
 # target (like the test_roundtrip executable in tests/) - here, that's
 # include/, so consumers can #include "hkdfguard.h". PRIVATE include dirs
-# (src/) are only visible while building HkdfGuardV1.dll's own sources, kept
+# (src/) are only visible while building HkdfGuard.dll's own sources, kept
 # private since e.g. wire_format.h's byte-offset constants are internal
 # implementation detail, not part of the public ABI contract.
 target_include_directories(hkdfguard

@@ -97,7 +97,7 @@ Write-Section "Verifying every signed artifact"
 $artifacts = @()
 foreach ($a in $archs) {
     $lower = $a.ToLower()
-    $artifacts += Join-Path $RepoRoot "dist\win-$lower\HkdfGuardV1.dll"
+    $artifacts += Join-Path $RepoRoot "dist\win-$lower\HkdfGuard.dll"
     $artifacts += Join-Path $RepoRoot "dist\win-$lower\hkdfguard.exe"
     if ($Msi) { $artifacts += Join-Path $RepoRoot "dist\hkdfguard-native-windows-$Version-win-$lower.msi" }
 }

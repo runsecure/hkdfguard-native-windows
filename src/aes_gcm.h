@@ -13,11 +13,12 @@ namespace hkdfguard {
     // `plaintext` and writes directly into `ciphertext_out` - no additional
     // staging buffer. Throws HkdfGuardError on failure.
     //
-    // hkdfguard.cpp passes `header || KEK fingerprint || normalized service
-    // name` as `aad` here (built by wire_format.h's BuildWrappedDekAad - see
-    // that file for why): it binds a wrapped payload to its version and
-    // routing fields, the specific KEK it was wrapped under, and the exact
-    // service.
+    // hkdfguard.cpp passes the payload's authenticated bytes, `header || KEK
+    // fingerprint`, as `aad` here (built by wire_format.h's
+    // BuildWrappedDekAuthenticated - see that file for why): it binds a
+    // wrapped payload to its version and routing fields and the specific KEK
+    // it was wrapped under. The service is bound through the key itself
+    // (ecdh_hkdf.h).
     //
     // `unsigned long` (rather than this project's usual uint32_t/int32_t) is
     // used for the length parameters purely because that's the literal type

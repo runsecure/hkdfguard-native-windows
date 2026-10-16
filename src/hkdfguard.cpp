@@ -126,11 +126,11 @@ namespace {
     // `service` argument passes through, means two callers who differ only
     // in case (e.g. "MyApp" and "myapp") are treated as the exact same
     // service everywhere downstream: the same persisted KEK name (see
-    // ServiceToWide/kek_store.cpp's KeyName) and the same AES-GCM AAD bytes
+    // ServiceToWide/kek_store.cpp's KeyName) and the same HKDF info bytes
     // (see WrapDekCore/hkdfguard_unwrap_dek below) - not just a
-    // case-insensitive KEK lookup with case-sensitive AAD underneath it,
-    // which would make wrap/unwrap fail whenever the two calls' casing
-    // didn't match exactly.
+    // case-insensitive KEK lookup with a case-sensitive key derivation
+    // underneath it, which would make wrap/unwrap fail whenever the two
+    // calls' casing didn't match exactly.
     //
     // Throws HkdfGuardError(HKDFGUARD_ERR_INVALID_SERVICE_NAME) if `service` is null,
     // empty, too long, contains a character outside the allowed charset,
@@ -228,7 +228,7 @@ namespace {
 
     // Convenience wrapper for callers (hkdfguard_kek_exists, hkdfguard_create_kek)
     // that only need the normalized wide key-name form, not the normalized
-    // narrow form WrapDekCore/hkdfguard_unwrap_dek also need for AAD.
+    // narrow form WrapDekCore/hkdfguard_unwrap_dek also need for HKDF's info.
     std::wstring ValidateAndConvertService(const char *service) {
         return ServiceToWide(NormalizeService(service));
     }
@@ -242,9 +242,10 @@ namespace {
     // `op` only labels the success audit event (Wrap vs GenerateAndWrap).
     int32_t WrapDekCore(
         AuditOp op, const char *service, const uint8_t *dek, int32_t dek_len, uint8_t *out, int32_t *out_len) {
-        // Basic null-pointer validation before touching any of the pointers.
-        // `dek_len`/`out_len` themselves are validated next.
-        if (dek == nullptr || out == nullptr || out_len == nullptr) {
+        // Argument checks in the Linux build's order, so the same mistake
+        // gets the same code on both. `out` is checked later: it may be
+        // NULL for a size probe.
+        if (dek == nullptr || out_len == nullptr) {
             return HKDFGUARD_ERR_INVALID_ARGUMENT;
         }
         if (dek_len != HKDFGUARD_DEK_LEN) {
@@ -252,16 +253,27 @@ namespace {
         }
         // `*out_len` dereferences the pointer to read the caller-supplied
         // buffer capacity (the "in" half of this in/out parameter - see
-        // hkdfguard.h's note on this pattern). Checked before doing any real
-        // work, so a too-small buffer fails fast. The required size is
-        // reported back through *out_len, so a caller can allocate exactly
-        // that and retry (the CLI's WrapDek does).
-        if (*out_len < HKDFGUARD_WRAPPED_LEN) {
-            *out_len = HKDFGUARD_WRAPPED_LEN;
-            return HKDFGUARD_ERR_BUFFER_TOO_SMALL;
+        // hkdfguard.h's note on this pattern).
+        const int32_t capacity = *out_len;
+        if (capacity < 0) {
+            return HKDFGUARD_ERR_INVALID_ARGUMENT; // a negative capacity makes no sense
         }
 
         std::string normalized_service = NormalizeService(service);
+
+        // Buffer checks, before any provider work: a size probe (NULL `out`,
+        // capacity 0) or a buffer that could never hold the result costs no
+        // TPM round trip. The required size is reported back through
+        // *out_len, so a caller can allocate exactly that and retry (the
+        // CLI's WrapDek does).
+        if (out == nullptr && capacity > 0) {
+            return HKDFGUARD_ERR_INVALID_ARGUMENT; // a declared capacity with nowhere to write
+        }
+        if (capacity < HKDFGUARD_WRAPPED_MAX_LEN) {
+            *out_len = HKDFGUARD_WRAPPED_MAX_LEN;
+            return HKDFGUARD_ERR_BUFFER_TOO_SMALL;
+        }
+
         std::wstring service_name = ServiceToWide(normalized_service);
 
         // Opens this service's machine-wide persistent KEK, preferring the
@@ -273,7 +285,7 @@ namespace {
         ResolvedKek kek = OpenKekForWrap(service_name);
 
         // Fingerprint of the KEK this payload is being wrapped under: stamped
-        // into the payload and bound into the AAD below, so unwrap can both
+        // into the payload and bound into the key and the AAD below, so unwrap can both
         // check it explicitly (before any ECDH) and authenticate it (see
         // wire_format.h's layout comment).
         uint8_t fingerprint[kFingerprintLen];
@@ -290,15 +302,16 @@ namespace {
             throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO_ERROR, "BCryptGenRandom(salt) failed");
         }
 
-        // AAD = header || KEK fingerprint || normalized service name (see
-        // wire_format.h). The header is built here exactly as
+        // The authenticated bytes = header || KEK fingerprint (see
+        // wire_format.h): the AES-GCM AAD, and with the normalized service
+        // name, HKDF's info. The header is built here exactly as
         // SerializeWrappedDek will write it below - both go through
         // SerializeWrappedDekHeader - so the version, provider type and KeyId
-        // the payload carries are the ones the tag covers. None of it is
-        // secret; unwrap rebuilds it from the received bytes.
+        // the payload carries are the ones bound into the key and the tag.
+        // None of it is secret; unwrap rebuilds it from the received bytes.
         uint8_t header[kHeaderLen];
         SerializeWrappedDekHeader(kek.provider_type, kek.key_id, salt, header);
-        std::vector<uint8_t> aad = BuildWrappedDekAad(header, fingerprint, normalized_service);
+        std::vector<uint8_t> authenticated = BuildWrappedDekAuthenticated(header, fingerprint);
         // `nonce`/`ciphertext`/`tag` are declared here, *outside* the nested
         // block below, because they're needed again afterward (by
         // SerializeWrappedDek) - none of the three is secret (they're all meant
@@ -325,27 +338,27 @@ namespace {
             // derivation unwrap runs. Wrapping uses the KEK's *private* key
             // (inside the TPM for a TPM-backed KEK), which is what makes a
             // payload impossible to forge from the public key alone.
-            DeriveWrappingKey(kek.provider.get(), kek.key.get(), salt, wrapping_key);
+            // HKDF's info binds the case-normalized `normalized_service`
+            // bytes (not the caller's original-case `service`, and not the
+            // wide NCrypt-key-name form `service_name` above): the key is
+            // tied to the exact (case-insensitive) service it was wrapped
+            // for. Using the normalized form - the same one ServiceToWide
+            // derived `service_name` from - is what makes wrap/unwrap
+            // genuinely case-insensitive end to end: with the raw `service`
+            // bytes, two calls differing only in case would resolve to the
+            // same KEK but derive different keys, and unwrap would fail.
+            DeriveWrappingKey(kek.provider.get(), kek.key.get(), normalized_service, authenticated, wrapping_key);
 
             // AES-256-GCM directly from the caller's dek pointer - no
-            // intermediate plaintext staging buffer. The AAD's service
-            // component is the case-normalized `normalized_service` bytes
-            // (not the caller's original-case `service`, and not the wide
-            // NCrypt-key-name form `service_name` above): it binds this
-            // ciphertext to the exact (case-insensitive) service it was
-            // wrapped for. Using the normalized form - the same one
-            // ServiceToWide derived `service_name` from - is what makes
-            // wrap/unwrap genuinely case-insensitive end to end: if the raw
-            // `service` bytes were used instead, two calls that differ only
-            // in case would resolve to the same KEK but produce/expect
-            // different AAD, and unwrap would fail authentication. The
-            // fingerprint component binds the ciphertext to the specific
-            // KEK, and the header component binds the routing fields
-            // (provider type, KeyId) and the version, so neither the service
-            // nor the routing nor the format can be swapped undetected.
+            // intermediate plaintext staging buffer. The AAD is the
+            // authenticated bytes: the fingerprint binds the ciphertext to
+            // the specific KEK, and the header the routing fields (provider
+            // type, KeyId) and the version, so neither the service (through
+            // the key) nor the routing nor the format can be swapped
+            // undetected.
             AesGcmEncrypt(
                 wrapping_key.data(), dek, static_cast<unsigned long>(dek_len),
-                aad.data(), static_cast<unsigned long>(aad.size()),
+                authenticated.data(), static_cast<unsigned long>(authenticated.size()),
                 nonce, ciphertext, tag);
         } // <- wrapping_key's destructor (zeroing it) runs here, right now.
 
@@ -371,10 +384,10 @@ namespace {
 // __declspec(dllexport) here specifically because CMakeLists.txt defines
 // HKDFGUARD_EXPORTS only while compiling this DLL's own sources (see
 // hkdfguard.h's comment on that macro).
-extern "C" HKDFGUARD_API int32_t hkdfguard_wrap_dek(
+extern "C" HKDFGUARD_API int hkdfguard_wrap_dek(
     const char *service,
-    const uint8_t *dek, int32_t dek_len,
-    uint8_t *out, int32_t *out_len) {
+    const uint8_t *dek, int dek_len,
+    uint8_t *out, int *out_len) {
     // The entire body lives inside one `try` block: this is what makes it
     // possible for every internal helper WrapDekCore calls
     // (NormalizeService, ServiceToWide, OpenKekForWrap,
@@ -405,9 +418,9 @@ extern "C" HKDFGUARD_API int32_t hkdfguard_wrap_dek(
     }
 }
 
-extern "C" HKDFGUARD_API int32_t hkdfguard_kek_exists(
+extern "C" HKDFGUARD_API int hkdfguard_kek_exists(
     const char *service,
-    int32_t *out_exists) {
+    int *out_exists) {
     if (out_exists == nullptr) {
         return HKDFGUARD_ERR_INVALID_ARGUMENT;
     }
@@ -428,7 +441,7 @@ extern "C" HKDFGUARD_API int32_t hkdfguard_kek_exists(
     }
 }
 
-extern "C" HKDFGUARD_API int32_t hkdfguard_create_kek(
+extern "C" HKDFGUARD_API int hkdfguard_create_kek(
     const char *service) {
     try {
         std::wstring service_name =
@@ -448,9 +461,9 @@ extern "C" HKDFGUARD_API int32_t hkdfguard_create_kek(
     }
 }
 
-extern "C" HKDFGUARD_API int32_t hkdfguard_generate_and_wrap_dek(
+extern "C" HKDFGUARD_API int hkdfguard_generate_and_wrap_dek(
     const char *service,
-    uint8_t *out, int32_t *out_len) {
+    uint8_t *out, int *out_len) {
     try {
         // `dek` is a SecureBuffer, not a plain stack array: it's zeroed by
         // its own destructor the instant this function returns (any exit
@@ -479,10 +492,10 @@ extern "C" HKDFGUARD_API int32_t hkdfguard_generate_and_wrap_dek(
     }
 }
 
-extern "C" HKDFGUARD_API int32_t hkdfguard_unwrap_dek(
+extern "C" HKDFGUARD_API int hkdfguard_unwrap_dek(
     const char *service,
-    const uint8_t *wrapped, int32_t wrapped_len,
-    uint8_t *out, int32_t *out_len) {
+    const uint8_t *wrapped, int wrapped_len,
+    uint8_t *out, int *out_len) {
     // out_len must be checked before anything else - every other line in
     // this function (including the `fail` helper defined just below) needs
     // to be able to dereference it safely.
@@ -517,16 +530,28 @@ extern "C" HKDFGUARD_API int32_t hkdfguard_unwrap_dek(
     };
 
     try {
-        if (out == nullptr || wrapped == nullptr) {
+        // The Linux build's order: arguments, then the service name, then
+        // the buffer - so the same mistake gets the same code on both.
+        if (wrapped == nullptr) {
             return fail(HKDFGUARD_ERR_INVALID_ARGUMENT);
         }
-        if (capacity < HKDFGUARD_DEK_LEN) {
-            // Same contract as the wrap side: report the required size.
-            *out_len = HKDFGUARD_DEK_LEN;
-            return fail(HKDFGUARD_ERR_BUFFER_TOO_SMALL);
+        if (wrapped_len < 0 || capacity < 0) {
+            return fail(HKDFGUARD_ERR_INVALID_ARGUMENT);
         }
 
         std::string normalized_service = NormalizeService(service);
+
+        // The DEK is always HKDFGUARD_DEK_LEN bytes, so whether it fits is
+        // known before the payload is even parsed. Checked before `out`, so
+        // a size probe (NULL `out`, capacity 0) gets the required size.
+        if (capacity < HKDFGUARD_DEK_LEN) {
+            *out_len = HKDFGUARD_DEK_LEN;
+            return fail(HKDFGUARD_ERR_BUFFER_TOO_SMALL);
+        }
+        if (out == nullptr) {
+            return fail(HKDFGUARD_ERR_INVALID_ARGUMENT); // a declared capacity with nowhere to write
+        }
+
         std::wstring service_name = ServiceToWide(normalized_service);
 
         // Validates the payload's shape/version and hands back pointers
@@ -552,12 +577,13 @@ extern "C" HKDFGUARD_API int32_t hkdfguard_unwrap_dek(
             throw HkdfGuardError(HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH, "payload was not wrapped under this KEK");
         }
 
-        // Same AAD construction as WrapDekCore: the header exactly as
-        // received || the payload's (now verified) fingerprint || normalized
-        // service name. The header is taken from the received bytes, not
-        // re-serialized from the parsed fields, so the tag check covers what
-        // was actually presented.
-        std::vector<uint8_t> aad = BuildWrappedDekAad(parsed.header, parsed.fingerprint, normalized_service);
+        // Same authenticated bytes as WrapDekCore: the header exactly as
+        // received || the payload's (now verified) fingerprint. Taken from
+        // the received bytes, not re-serialized from the parsed fields, so
+        // the key and the tag check cover what was actually presented - and
+        // copied once, here, so the salt DeriveWrappingKey reads from them
+        // is the salt the AAD covers.
+        std::vector<uint8_t> authenticated = BuildWrappedDekAuthenticated(parsed.header, parsed.fingerprint);
 
         {
             // Same reasoning as the wrap side above: `wrapping_key` is
@@ -569,17 +595,17 @@ extern "C" HKDFGUARD_API int32_t hkdfguard_unwrap_dek(
             // ECDH(KEK private key, H(salt)) (may execute inside a
             // TPM/vTPM) + HKDF-SHA512 -> the same 32-byte wrapping key
             // derived at wrap time, from the payload's salt.
-            DeriveWrappingKey(kek.provider.get(), kek.key.get(), parsed.salt, wrapping_key);
+            DeriveWrappingKey(kek.provider.get(), kek.key.get(), normalized_service, authenticated, wrapping_key);
 
             // Decrypt directly into the caller's buffer - no intermediate
-            // plaintext staging buffer. AAD must match what AesGcmEncrypt
-            // used at wrap time (see WrapDekCore's comment on why the
-            // normalized service form, not the caller's original-case
-            // `service`, is what's used).
+            // plaintext staging buffer. The AAD must match what
+            // AesGcmEncrypt used at wrap time, and the key the service
+            // (see WrapDekCore's comment on why the normalized service form,
+            // not the caller's original-case `service`, is what's used).
             AesGcmDecrypt(
                 wrapping_key.data(), parsed.nonce, parsed.ciphertext,
                 static_cast<unsigned long>(kCiphertextLen),
-                aad.data(), static_cast<unsigned long>(aad.size()),
+                authenticated.data(), static_cast<unsigned long>(authenticated.size()),
                 parsed.tag, out);
         } // <- wrapping_key's destructor (zeroing it) runs here, right now.
 
@@ -619,9 +645,9 @@ extern "C" HKDFGUARD_API int32_t hkdfguard_unwrap_dek(
     }
 }
 
-extern "C" HKDFGUARD_API int32_t hkdfguard_open_file(
+extern "C" HKDFGUARD_API int hkdfguard_open_file(
     const char *path,
-    uint8_t *out, int32_t *out_len) {
+    uint8_t *out, int *out_len) {
     if (out_len == nullptr) {
         return HKDFGUARD_ERR_INVALID_ARGUMENT;
     }
@@ -644,16 +670,26 @@ extern "C" HKDFGUARD_API int32_t hkdfguard_open_file(
     // a file that looks like an unwrapped DEK (HKDFGUARD_ERR_FILE_PLAINTEXT_KEY) - a possible key
     // exposure an administrator needs to hear about, logged below.
     try {
-        if (path == nullptr || out == nullptr) {
+        // The Linux build's order: capacity, then the path (null, empty,
+        // too long or not UTF-8), then the buffer - all before anything is
+        // opened, so a size probe (NULL `out`, capacity 0) touches no file.
+        if (capacity < 0) {
             return fail(HKDFGUARD_ERR_INVALID_ARGUMENT);
         }
-        if (capacity < HKDFGUARD_WRAPPED_LEN) {
-            *out_len = HKDFGUARD_WRAPPED_LEN;
+        if (path == nullptr) {
+            return fail(HKDFGUARD_ERR_INVALID_ARGUMENT);
+        }
+        KeyFilePathToWide(path); // throws HKDFGUARD_ERR_INVALID_ARGUMENT
+        if (capacity < HKDFGUARD_WRAPPED_MAX_LEN) {
+            *out_len = HKDFGUARD_WRAPPED_MAX_LEN;
             return fail(HKDFGUARD_ERR_BUFFER_TOO_SMALL);
+        }
+        if (out == nullptr) {
+            return fail(HKDFGUARD_ERR_INVALID_ARGUMENT); // a declared capacity with nowhere to write
         }
 
         ReadWrappedKeyFile(path, out);
-        *out_len = HKDFGUARD_WRAPPED_LEN;
+        *out_len = HKDFGUARD_WRAPPED_MAX_LEN;
         return HKDFGUARD_OK;
     } catch (const HkdfGuardError &e) {
         // Zero first, log second, as hkdfguard_unwrap_dek does.
@@ -673,13 +709,24 @@ extern "C" HKDFGUARD_API int32_t hkdfguard_open_file(
     }
 }
 
-extern "C" HKDFGUARD_API int32_t hkdfguard_harden_process(void) {
+extern "C" HKDFGUARD_API int hkdfguard_harden_process(void) {
+    return hkdfguard_harden_process_with_flags(0);
+}
+
+extern "C" HKDFGUARD_API int hkdfguard_harden_process_with_flags(unsigned int flags) {
+    // Every HKDFGUARD_HARDEN_* flag this build knows. Any other bit is
+    // refused before anything is changed, so a flag added later is never
+    // silently ignored by an older DLL - as on Linux.
+    constexpr unsigned int kKnownFlags = HKDFGUARD_HARDEN_REQUIRE_PROTECTED_SIGNATURE;
+    if ((flags & ~kKnownFlags) != 0) {
+        return HKDFGUARD_ERR_INVALID_ARGUMENT;
+    }
     // Not audited: no service is involved. Anything that escapes
     // HardenProcess - even an allocation failure while building a DACL -
     // still means the process was left less hardened than asked, so every
     // failure maps to the one documented code.
     try {
-        HardenProcess();
+        HardenProcess((flags & HKDFGUARD_HARDEN_REQUIRE_PROTECTED_SIGNATURE) != 0);
         return HKDFGUARD_OK;
     } catch (...) {
         return HKDFGUARD_ERR_PROCESS_HARDENING_FAILED;

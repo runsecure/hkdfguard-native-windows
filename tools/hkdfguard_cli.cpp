@@ -22,7 +22,7 @@
 //       via a command-line/process listing (e.g. a WMI query) for the life
 //       of this process, unlike a plain --dek=<value> argument would be.
 //
-// Calls into HkdfGuardV1.dll through its stable C ABI - hkdfguard_kek_exists,
+// Calls into HkdfGuard.dll through its stable C ABI - hkdfguard_kek_exists,
 // hkdfguard_create_kek, and hkdfguard_wrap_dek - the same interface any
 // other-language caller uses; this tool links only against
 // include/hkdfguard.h and the hkdfguard import library, nothing from src/.
@@ -334,27 +334,131 @@ namespace {
         return ParseOutcome::Run;
     }
 
-    // MARK: - Base64 / stdin
+    // MARK: - The DEK's one buffer
 
-    // Decodes `input` (standard base64) into raw bytes via CNG's Crypt32
-    // string-conversion API - no third-party dependency needed, matching this
-    // project's general preference for native platform APIs over external
-    // crates/packages. CRYPT_STRING_BASE64 tolerates embedded whitespace
-    // (spaces, tabs, CR, LF), so a trailing newline from how `input` was
+    // Upper bound on how much stdin "wrap --dek-stdin" will accept. A 32-byte
+    // DEK is 44 base64 characters; this leaves generous room for line breaks
+    // and whitespace while letting DekScratch be one fixed allocation.
+    constexpr size_t kMaxDekStdinLen = 4096;
+
+    // Every copy of the DEK this program makes - the base64 text it reads
+    // from stdin, and the bytes that decodes to - lives in one fixed
+    // allocation, never grown or moved, wiped before it's freed. It is
+    // locked into RAM with VirtualLock, so the DEK is never written to the
+    // page file: the Linux CLI's DekScratch, with VirtualLock for mlock. Two
+    // pages, well inside the default minimum working set VirtualLock draws
+    // on. One allocation, not one per buffer, for the same reason as on
+    // Linux: locks work on whole pages.
+    //
+    // This covers the CLI's own copies. Windows has no counterpart of
+    // Linux's mlockall, so the library's transient copies (on its stack,
+    // while it wraps) are not locked; process hardening (see main) still
+    // keeps them out of crash dumps and away from same-user processes.
+    class DekScratch {
+    public:
+        // One byte more than accepted, so over-long input is detected
+        // without reading past the buffer.
+        static constexpr size_t kTextCapacity = kMaxDekStdinLen + 1;
+        // Enough for any base64 decoding of kMaxDekStdinLen characters.
+        static constexpr size_t kDecodedCapacity = (kMaxDekStdinLen / 4) * 3 + 3;
+
+        DekScratch() {
+            base_ = static_cast<BYTE *>(VirtualAlloc(nullptr, kSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+            if (base_ == nullptr) {
+                throw CliError("could not allocate the DEK's buffer: " + FormatWin32Error(GetLastError()));
+            }
+            locked_ = VirtualLock(base_, kSize) != FALSE;
+            if (!locked_) {
+                fprintf(stderr,
+                        "warning: could not lock the DEK's buffer into memory (VirtualLock: %s); it could be "
+                        "written to the page file\n",
+                        FormatWin32Error(GetLastError()).c_str());
+            }
+        }
+
+        ~DekScratch() {
+            SecureZeroMemory(base_, kSize);
+            if (locked_) {
+                VirtualUnlock(base_, kSize);
+            }
+            VirtualFree(base_, 0, MEM_RELEASE);
+        }
+
+        DekScratch(const DekScratch &) = delete;
+        DekScratch &operator=(const DekScratch &) = delete;
+
+        char *text() { return reinterpret_cast<char *>(base_); }
+        BYTE *decoded() { return base_ + kTextCapacity; }
+
+        // Wipes the base64 text as soon as it has been decoded.
+        void WipeText() {
+            SecureZeroMemory(base_, kTextCapacity);
+            textLen = 0;
+        }
+
+        size_t textLen = 0;
+        size_t decodedLen = 0;
+
+    private:
+        static constexpr size_t kSize = kTextCapacity + kDecodedCapacity;
+        BYTE *base_ = nullptr;
+        bool locked_ = false;
+    };
+
+    // Reads all of stdin (expected to be base64 text for the DEK) into
+    // `scratch`. Used only by "wrap --dek-stdin", specifically so the DEK
+    // never appears in this process's argv - see this file's header comment.
+    // ReadFile on the stdin handle, not the C runtime's fread: the CRT keeps
+    // its own buffer for a FILE stream, which would hold a copy of the DEK
+    // text this code could neither lock nor wipe.
+    void ReadDekBase64FromStdin(DekScratch &scratch) {
+        HANDLE in = GetStdHandle(STD_INPUT_HANDLE);
+        if (in == nullptr || in == INVALID_HANDLE_VALUE) {
+            throw CliError("no stdin to read the DEK from for --dek-stdin");
+        }
+        for (;;) {
+            DWORD got = 0;
+            DWORD room = static_cast<DWORD>(DekScratch::kTextCapacity - scratch.textLen);
+            if (!ReadFile(in, scratch.text() + scratch.textLen, room, &got, nullptr)) {
+                DWORD err = GetLastError();
+                if (err == ERROR_BROKEN_PIPE) {
+                    break; // the writing end of a pipe closed: end of input
+                }
+                throw CliError("failed to read DEK from stdin: " + FormatWin32Error(err));
+            }
+            if (got == 0) {
+                break;
+            }
+            scratch.textLen += got;
+            if (scratch.textLen > kMaxDekStdinLen) {
+                throw CliError(
+                    "stdin for --dek-stdin is larger than " + std::to_string(kMaxDekStdinLen) +
+                    " bytes; expected a base64-encoded 32-byte DEK");
+            }
+        }
+        if (scratch.textLen == 0) {
+            throw CliError("no data read from stdin for --dek-stdin");
+        }
+    }
+
+    // Decodes scratch's base64 text (standard base64) into its decoded
+    // bytes via Crypt32's string-conversion API - no third-party dependency
+    // needed, matching this project's general preference for native
+    // platform APIs. CRYPT_STRING_BASE64 tolerates embedded whitespace
+    // (spaces, tabs, CR, LF), so a trailing newline from how the text was
     // produced (e.g. piped from a shell) needs no separate trimming here.
     //
     // A leading UTF-8 byte-order mark (EF BB BF) is skipped: some PowerShell
     // and .NET configurations prepend one when piping a string to a native
     // process's stdin (whenever [Console]::InputEncoding is UTF-8 with a
     // preamble), and CRYPT_STRING_BASE64 would otherwise reject the whole
-    // input as invalid. It is skipped by offset, not erased from `input`:
-    // erasing would shift the DEK text left inside the same buffer and leave
-    // stale copies of its last bytes past the new end, out of reach of the
-    // caller's wipe. A UTF-16 byte-order mark is reported as such rather
+    // input as invalid. A UTF-16 byte-order mark is reported as such rather
     // than as "not valid base64", since the fix there is on the sending side.
-    std::vector<BYTE> Base64Decode(const std::string &input) {
-        const char *text = input.data();
-        size_t textLen = input.size();
+    // Decodes straight into the locked buffer, so no decoded byte is ever
+    // anywhere else.
+    void DecodeDek(DekScratch &scratch) {
+        const char *text = scratch.text();
+        size_t textLen = scratch.textLen;
 
         if (textLen >= 3 &&
             static_cast<unsigned char>(text[0]) == 0xEF &&
@@ -370,79 +474,13 @@ namespace {
                 "(for example, set [Console]::OutputEncoding or $OutputEncoding to UTF-8 in PowerShell)");
         }
 
-        DWORD size = 0;
+        DWORD size = static_cast<DWORD>(DekScratch::kDecodedCapacity);
         if (!CryptStringToBinary(
-            text, static_cast<DWORD>(textLen), CRYPT_STRING_BASE64, nullptr, &size, nullptr,
+            text, static_cast<DWORD>(textLen), CRYPT_STRING_BASE64, scratch.decoded(), &size, nullptr,
             nullptr)) {
             throw CliError("DEK is not valid base64: " + FormatWin32Error(GetLastError()));
         }
-        std::vector<BYTE> out(size);
-        if (!CryptStringToBinary(
-            text, static_cast<DWORD>(textLen), CRYPT_STRING_BASE64, out.data(), &size, nullptr,
-            nullptr)) {
-            DWORD err = GetLastError();
-            // A partial decode may already be in `out`; wipe it before it is
-            // freed, since the caller's DekGuard never sees this vector.
-            SecureZeroMemory(out.data(), out.size());
-            throw CliError("DEK is not valid base64: " + FormatWin32Error(err));
-        }
-        out.resize(size);
-        return out;
-    }
-
-    // Upper bound on how much stdin "wrap --dek-stdin" will accept. A 32-byte
-    // DEK is 44 base64 characters; this leaves generous room for line breaks
-    // and whitespace while letting the reader below use one fixed allocation.
-    constexpr size_t kMaxDekStdinLen = 4096;
-
-    // Reads all of stdin (expected to be base64 text for the DEK) into a
-    // std::string. Used only by "wrap --dek-stdin", specifically so the DEK
-    // never appears in this process's argv - see this file's header comment.
-    //
-    // Everything this function touches holds DEK text, so it is written to
-    // leave no unwiped copy behind:
-    //   - `result` reserves its full capacity up front and input beyond
-    //     kMaxDekStdinLen is refused, so the string never reallocates - a
-    //     reallocation would free the old buffer with DEK text still in it,
-    //     out of reach of the caller's later SecureZeroMemory.
-    //   - The stack read buffer `buf` is wiped on every exit path,
-    //     including the throws, by `bufGuard`.
-    //   - On any failure `result` is wiped before it is discarded.
-    // On success the caller owns `result` (moved out, not copied) and wipes
-    // it - see RunWrap.
-    std::string ReadDekBase64FromStdin() {
-        std::string result;
-        result.reserve(kMaxDekStdinLen);
-
-        char buf[512];
-        struct BufGuard {
-            char *p;
-            size_t n;
-            ~BufGuard() { SecureZeroMemory(p, n); }
-        } bufGuard{buf, sizeof(buf)};
-
-        auto failWiped = [&result](const std::string &message) -> CliError {
-            SecureZeroMemory(result.data(), result.size());
-            result.clear();
-            return CliError(message);
-        };
-
-        size_t n;
-        while ((n = fread(buf, 1, sizeof(buf), stdin)) > 0) {
-            if (result.size() + n > kMaxDekStdinLen) {
-                throw failWiped(
-                    "stdin for --dek-stdin is larger than " + std::to_string(kMaxDekStdinLen) +
-                    " bytes; expected a base64-encoded 32-byte DEK");
-            }
-            result.append(buf, n);
-        }
-        if (ferror(stdin)) {
-            throw failWiped("failed to read DEK from stdin");
-        }
-        if (result.empty()) {
-            throw failWiped("no data read from stdin for --dek-stdin");
-        }
-        return result;
+        scratch.decodedLen = size;
     }
 
     // MARK: - Wrap / provision
@@ -457,7 +495,8 @@ namespace {
             case HKDFGUARD_ERR_PAYLOAD_AUTH_FAILED: return "AES-GCM authentication failed";
             case HKDFGUARD_ERR_PAYLOAD_MALFORMED: return "wrapped payload is not valid";
             case HKDFGUARD_ERR_PAYLOAD_UNSUPPORTED: return "wrapped payload uses a format version this build does not understand";
-            case HKDFGUARD_ERR_INTERNAL_ERROR: return "an internal error occurred in HkdfGuardV1.dll";
+            case HKDFGUARD_ERR_INTERNAL_ERROR: return "an internal error occurred in HkdfGuard.dll";
+            case HKDFGUARD_ERR_PROCESS_HARDENING_FAILED: return "could not harden this process against memory disclosure (crash-report heap, same-user debugging and code injection)";
             case HKDFGUARD_ERR_INVALID_SERVICE_NAME: return "service name is missing or malformed (ASCII letters, digits and '.' only, 1-128 bytes, not starting with '.', no \"..\")";
             case HKDFGUARD_ERR_POLICY_INVALID: return "invalid key storage policy";
             case HKDFGUARD_ERR_WIN_GROUP_INVALID: return "a KeyUseGroups policy entry is unresolvable, not a group, over-broad, or not host-local";
@@ -482,18 +521,18 @@ namespace {
     // macOS/Linux tools' own wrap helper. Never provisions a KEK - a missing
     // KEK surfaces as HKDFGUARD_ERR_KEK_NOT_FOUND, with a hint pointing at
     // this tool's "provision" subcommand.
-    std::vector<uint8_t> WrapDek(const std::string &service, const std::vector<BYTE> &dek) {
+    std::vector<uint8_t> WrapDek(const std::string &service, const BYTE *dek, size_t dekLen) {
         std::vector<uint8_t> wrapped(static_cast<size_t>(kInitialWrappedCapacity));
         int32_t wrappedLen = static_cast<int32_t>(wrapped.size());
 
         int32_t rc = hkdfguard_wrap_dek(
-            service.c_str(), dek.data(), static_cast<int32_t>(dek.size()), wrapped.data(), &wrappedLen);
+            service.c_str(), dek, static_cast<int32_t>(dekLen), wrapped.data(), &wrappedLen);
 
         if (rc == HKDFGUARD_ERR_BUFFER_TOO_SMALL) {
             // wrappedLen now holds the size the library actually needs; retry once at that size.
             wrapped.assign(static_cast<size_t>(wrappedLen), 0);
             rc = hkdfguard_wrap_dek(
-                service.c_str(), dek.data(), static_cast<int32_t>(dek.size()), wrapped.data(), &wrappedLen);
+                service.c_str(), dek, static_cast<int32_t>(dekLen), wrapped.data(), &wrappedLen);
         }
 
         if (rc != HKDFGUARD_OK) {
@@ -840,7 +879,7 @@ namespace {
     // check (3) above.
     //
     // 8.3 short names ("PROGRA~1") are refused rather than expanded, here
-    // and in HkdfGuardV1.dll's hkdfguard_open_file alike: they are a second,
+    // and in HkdfGuard.dll's hkdfguard_open_file alike: they are a second,
     // auto-generated name for the same file, with a history of checks that
     // matched one spelling but not the other. The test is exact, not a guess
     // from "~" characters: GetLongPathName walks the path through the
@@ -1266,67 +1305,35 @@ namespace {
         std::vector<uint8_t> wrapped;
         {
             // Both the base64 *text* read from stdin and the decoded
-            // plaintext DEK *bytes* (`dek`) are secret, and both are scoped as
-            // tightly as possible around exactly the statements that need
-            // them: read+decode, wipe the text immediately (it has now served
-            // its one purpose), validate the byte length, wrap, then `dek` is
-            // wiped by `dekGuard` the instant this block ends -- immediately
-            // after WrapDek is done with it, not at the end of RunWrap()
-            // (which would otherwise leave it sitting in memory, unused but
-            // unwiped, through the potentially-slow 8-pass secure-overwrite
-            // and the final file write below). Matches the "shrink the scope
-            // to shrink the lifetime" technique this project's own DLL uses
-            // for the exact same reason (e.g. hkdfguard.cpp's `wrapping_key`,
-            // ecdh_hkdf.cpp's `prk`/`t1`) -- hkdfguard_wrap_dek itself reads
-            // the plaintext DEK directly from whatever pointer it's given and
-            // never copies or zeroes it internally (see aes_gcm.cpp's own
-            // comment on this), so this caller-side zeroing is not optional
-            // defense-in-depth -- it is the only place this ever happens at
-            // all.
-            std::string dekBase64 = ReadDekBase64FromStdin();
-            std::vector<BYTE> dek = Base64Decode(dekBase64);
+            // plaintext DEK *bytes* are secret. Both live only in `scratch`
+            // (locked into RAM, see DekScratch), which is wiped the instant
+            // this block ends - immediately after WrapDek is done with it,
+            // not at the end of RunWrap() (which would otherwise leave it in
+            // memory through the potentially-slow 8-pass secure-overwrite and
+            // the final file write below). hkdfguard_wrap_dek reads the
+            // plaintext DEK directly from the pointer it's given and never
+            // copies or zeroes it (see aes_gcm.cpp), so this caller-side
+            // wiping is the only place it happens at all.
+            DekScratch scratch;
+            ReadDekBase64FromStdin(scratch);
+            DecodeDek(scratch);
+            // The base64 text has served its only purpose.
+            scratch.WipeText();
 
-            // The base64 text has now served its only purpose: wipe this
-            // process's one owned copy of it right here rather than leaving
-            // it sitting around, unused but unwiped, until dekBase64's
-            // destructor runs (which does not zero its buffer, it only
-            // deallocates it).
-            SecureZeroMemory(dekBase64.data(), dekBase64.size());
-            dekBase64.clear();
-
-            // Zeroes `dek` -- up to its *capacity*, not just its current
-            // size -- the instant this block ends, on every exit path (the
-            // length-validation throw immediately below, or falling off the
-            // end after a successful WrapDek call). Capacity rather than size
-            // because Base64Decode's std::vector<BYTE> is sized once from
-            // CryptStringToBinaryW's size query and then (in the extremely
-            // unlikely case the real decode reports fewer bytes than that
-            // query did) shrunk with resize(), which reduces size() but is not
-            // guaranteed to reduce the underlying allocation -- zeroing only
-            // up to size() in that edge case would leave a few stale plaintext
-            // bytes sitting in the still-allocated tail of the buffer.
-            struct DekGuard {
-                std::vector<BYTE> &buf;
-
-                ~DekGuard() {
-                    SecureZeroMemory(buf.data(), buf.capacity());
-                }
-            } dekGuard{dek};
-
-            if (dek.size() != kDekLen) {
+            if (scratch.decodedLen != kDekLen) {
                 throw CliError(
                     "DEK must decode to exactly " + std::to_string(kDekLen) + " bytes, got " +
-                    std::to_string(dek.size()));
+                    std::to_string(scratch.decodedLen));
             }
 
             // No provisioning happens here - "wrap" only ever opens an
             // existing KEK. If none exists yet for this service, WrapDek's
             // HKDFGUARD_ERR_KEK_NOT_FOUND path below reports that and points
             // at "provision".
-            wrapped = WrapDek(service, dek);
-            // dekGuard zeroes `dek` here, as this block ends -- immediately
-            // after WrapDek returns the wrapped (encrypted, no longer secret)
-            // form, which is the only thing that survives past this point.
+            wrapped = WrapDek(service, scratch.decoded(), scratch.decodedLen);
+            // `scratch` is wiped, unlocked and freed here, as this block
+            // ends - only the wrapped (encrypted, no longer secret) form
+            // survives past this point.
         }
 
         if (args.force) {
@@ -1342,6 +1349,20 @@ namespace {
 } // namespace
 
 int main(int argc, char *argv[]) {
+    // Before anything is read: this process holds a plaintext DEK, so it
+    // must not be dumpable, debuggable or injectable by other processes of
+    // the same user - including through threads the key storage provider
+    // starts later, which is what the strict flag adds on Windows (see
+    // hkdfguard_harden_process_with_flags). Refuse to run rather than handle
+    // a DEK unprotected - the same rule as the Linux CLI.
+    {
+        int rc = hkdfguard_harden_process_with_flags(HKDFGUARD_HARDEN_REQUIRE_PROTECTED_SIGNATURE);
+        if (rc != HKDFGUARD_OK) {
+            fprintf(stderr, "error: %s; refusing to handle key material\n", DescribeStatus(rc).c_str());
+            return 1;
+        }
+    }
+
     if (argc < 2) {
         PrintUsage();
         return 2;

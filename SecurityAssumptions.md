@@ -334,16 +334,33 @@ use) are still granted by *name*, now restricted to local groups.
 
 ## 10. Payload integrity and the KEK fingerprint (verified where noted)
 
-- AES-256-GCM authenticates `header || SHA-256(KEK public key, raw X||Y) ||
-  normalized service name`, where the header is payload bytes 0..39
-  (`Version`, `ProviderType`, `Reserved`, `KeyId`, `Salt`). Every field a
-  parser reads or routes on is therefore covered by the tag; unwrap builds
-  the AAD from the header bytes exactly as received. The `Nonce` is not in
-  the AAD - it is generated inside the encrypt call, after the AAD is
-  fixed - and needs no AAD coverage: GCM authenticates it inherently.
-  **Verified** by the golden-payload test (section 29 of
-  `tests/test_roundtrip.cpp`), whose frozen value was cross-checked against
-  an independent .NET implementation of the construction.
+- The payload's *authenticated bytes* are `header || SHA-256(KEK public
+  key, raw X||Y)`, where the header is payload bytes 0..39 (`Version`,
+  `ProviderType`, `Reserved`, `KeyId`, `Salt`). They are the AES-256-GCM
+  AAD, **and** they end HKDF's info: `"hkdfguard-wrap-v1:" ||
+  u16le(len(service)) || normalized service || authenticated bytes`. This
+  is the Linux build's construction (`derive_wrapping_key`,
+  `Payload::authenticated_bytes`), adopted so both builds have one spec.
+  Every field a parser reads or routes on, the KEK, and the service are
+  therefore bound into the wrapping key itself, not only checked by the
+  tag. AES-GCM doesn't commit to its key, but here a payload's context
+  selects its own key: no context can be swapped and still find a key the
+  tag accepts. The service is bound through the key alone, so a wrong
+  service fails at the tag. Unwrap builds the authenticated bytes once,
+  from the header exactly as received, and DeriveWrappingKey reads the salt
+  from that same copy. The `Nonce` is not authenticated bytes - it is
+  generated inside the encrypt call, after they are fixed - and needs no
+  coverage: GCM authenticates it inherently. **Verified** in three ways:
+  - The golden-payload test (section 29 of `tests/test_roundtrip.cpp`)
+    reproduces the frozen payload from an implementation of the spec written
+    in the test, independent of `src/`.
+  - The frozen value was computed separately with .NET's `HKDF` and `AesGcm`.
+  - Its wrapping key (`4de2f10c...`) is what the Linux crate's own
+    `derive_wrapping_key` returns for the same Z, salt, service and
+    authenticated bytes.
+
+  The library's `DeriveWrappingKey` is checked against that key without
+  elevation, on the golden KEK imported as an in-memory Software KSP key.
   The fingerprint also travels in the payload and is
   compared, before any ECDH, against the fingerprint of the KEK the
   payload's routing fields select; mismatch is `HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH`.
@@ -544,6 +561,83 @@ administrators and SYSTEM are trusted anyway. Specifically:
   dumps).
 - **Not yet run:** elevated, in the Server 2022/2025 containers and on
   ARM64.
+- **Window hooks:** a GUI process can be injected into by a same-user
+  process on the same desktop through `SetWindowsHookEx`. No process or
+  thread DACL covers that, with or without the strict flag below.
+
+**Strict mode: `hkdfguard_harden_process_with_flags(HKDFGUARD_HARDEN_REQUIRE_PROTECTED_SIGNATURE)`
+(verified).**
+
+**Claim.** With this flag, the "later threads" gap above is closed too. A same-user
+process can't read or redirect any thread of the process, including ones started
+after the call, and can't undo that through the process token. It is the same
+cross-platform flag the Linux and macOS builds take (bit `0x1`, unknown bits
+refused with `INVALID_ARGUMENT` before anything changes). On Linux
+`PR_SET_DUMPABLE` already guarantees it; on Windows it takes two more steps.
+
+**How** (`HardenToken` in `src/process_hardening.cpp`, run before the steps
+above):
+
+- **Default DACL.** The token's default DACL becomes `SY: 0x1FFFFF`,
+  `OW: 0x120000`, user `0x120000`: SYSTEM all rights, and the account and OWNER
+  RIGHTS only `SYNCHRONIZE | READ_CONTROL`. The account gets only standard
+  rights, because a specific bit means something different per object type.
+- **Token DACL.** The token's own DACL becomes protected: SYSTEM gets
+  `TOKEN_ALL_ACCESS`, and the account and OWNER RIGHTS get `TOKEN_QUERY |
+  TOKEN_QUERY_SOURCE | TOKEN_DUPLICATE | READ_CONTROL`.
+- **Why `TOKEN_DUPLICATE` stays.** The Platform Crypto Provider duplicates its
+  own process token on every key open and returns `NTE_PERM` without it. This
+  was found by a probe on the development machine, granting rights one at a
+  time. The Software KSP needs nothing.
+- **Idempotency.** A repeat call can't open the token to change it any more.
+  It verifies both DACLs instead. The thread sweep accepts a thread created
+  under the strict default DACL, which also denies it `WRITE_DAC`, as already
+  hardened. So strict and non-strict calls can follow each other in any order.
+
+**Verified how.** `tests/test_harden_process.cpp` runs the child twice, in
+default and in strict mode. Both children first confirm that unknown flag bits
+return `INVALID_ARGUMENT` and leave WER's NOHEAP off. The strict child then:
+
+- hardens itself;
+- starts a thread;
+- hardens again, strict and then non-strict, with all calls returning OK;
+- starts another thread;
+- runs `hkdfguard_kek_exists` against the real providers.
+
+The parent then checks both later threads, and the token:
+
+- **Later threads:** `GET_CONTEXT`, `SET_CONTEXT`, suspend, terminate,
+  `WRITE_DAC`, `WRITE_OWNER` and even `QUERY_LIMITED` are denied;
+  `SYNCHRONIZE` is allowed.
+- **Token:** `TOKEN_ADJUST_DEFAULT`, `WRITE_DAC`, `WRITE_OWNER` and
+  `TOKEN_ADJUST_PRIVILEGES` are denied; `TOKEN_QUERY` and `TOKEN_DUPLICATE`
+  are allowed.
+
+In default mode it pins the documented gaps: a later thread allows
+`GET_CONTEXT`, and the token allows `TOKEN_ADJUST_DEFAULT`. This passed
+non-elevated on the development machine on 2026-10-15.
+
+**The CLI uses it.** `hkdfguard.exe` calls the strict form first thing in
+`main`, before parsing arguments, and exits with "refusing to handle key
+material" if it fails, matching the Linux CLI. Every copy of the DEK the CLI makes lives in
+one `VirtualAlloc` buffer (`DekScratch`): the stdin text, read with
+`ReadFile` rather than the CRT's buffered `fread`, and the decoded bytes,
+decoded straight into it. The buffer is locked with `VirtualLock` and wiped
+before it is freed. If the lock fails, the CLI prints a warning, as on Linux.
+`tests/test_cli.ps1` passes non-elevated with this in place, through to
+the `hkdfguard_wrap_dek` call. **Not yet run elevated:** `provision` and a
+full `wrap` against a real KEK under strict hardening still need that run.
+
+**Residual risk (strict).** These are the cost of the flag, documented in the
+header:
+
+- **Same-user access is lost:** everything the process creates afterwards
+  without an explicit security descriptor is closed to its own account. That
+  includes child processes, named pipes and other named objects.
+- **Process-scoped:** an impersonating thread's objects follow the
+  impersonation token's default DACL, not this one.
+- **Not yet run:** elevated, in containers, and with hosts (.NET, JVM) that
+  open their own threads or processes by ID.
 
 ## 15. `hkdfguard_open_file`: who could have written the key file (design decision + verified)
 

@@ -33,28 +33,34 @@ namespace hkdfguard {
     // Anonymous namespace = internal linkage = "private to this file"; see
     // aes_gcm.cpp's comment on the same construct for the full explanation.
     namespace {
-        // Fixed context string at the start of the HKDF "info" parameter, for
-        // *domain separation*: it ties the derived wrapping key to this exact
-        // protocol, so the derivation can never collide with some unrelated
-        // use of the same ECDH inputs elsewhere.
-        //
-        // FROZEN - do not rename. "HkdfGuardWin" is this project's former
-        // name, but this string is cryptographic input, not a label: every
-        // wrapped payload is derived with it, so changing it makes every
-        // existing payload undecryptable. The golden-payload test
-        // (tests/test_roundtrip.cpp section 29) fails if it changes.
-        constexpr char kHkdfContext[] = "HkdfGuardWin-DEK-Wrap-v1";
+        // Fixed prefix of the HKDF "info" parameter, for *domain separation*:
+        // it ties the derived wrapping key to this exact protocol, so the
+        // derivation can never collide with some unrelated use of the same
+        // ECDH inputs. The same string as the Linux build's HKDF_INFO_PREFIX;
+        // its "v1" is the wrap protocol's version, matching the payload's
+        // version byte. Cryptographic input: changing it changes every
+        // wrapping key, and the golden-payload test (tests/test_roundtrip.cpp
+        // section 29) fails.
+        constexpr char kHkdfInfoPrefix[] = "hkdfguard-wrap-v1:";
         constexpr size_t kSharedSecretLen = 32; // P-256 ECDH shared secret (X-coordinate)
 
-        // HKDF info = context string || the KEK's public key (raw X || Y),
-        // binding the wrapping key to the specific KEK as well as to the salt
-        // (which is HKDF's salt). Not secret - both are public - so a plain
-        // vector rather than a SecureBuffer.
-        std::vector<uint8_t> BuildHkdfInfo(const uint8_t kek_pub[kPublicPointLen]) {
-            constexpr size_t context_len = sizeof(kHkdfContext) - 1; // exclude NUL
-            std::vector<uint8_t> info(context_len + kPublicPointLen);
-            memcpy(info.data(), kHkdfContext, context_len);
-            memcpy(info.data() + context_len, kek_pub, kPublicPointLen);
+        // HKDF info = prefix || u16le(len(service)) || service ||
+        // authenticated (header || KEK fingerprint) - the Linux build's
+        // derive_wrapping_key, byte for byte. The length prefix keeps the
+        // concatenation unambiguous. Not secret - all of it is public - so a
+        // plain vector rather than a SecureBuffer.
+        std::vector<uint8_t> BuildHkdfInfo(const std::string &service, const std::vector<uint8_t> &authenticated) {
+            constexpr size_t prefix_len = sizeof(kHkdfInfoPrefix) - 1; // exclude NUL
+            if (service.size() > 0xFFFF) {
+                throw HkdfGuardError(HKDFGUARD_ERR_INTERNAL_ERROR, "service name too long for the HKDF info");
+            }
+            std::vector<uint8_t> info;
+            info.reserve(prefix_len + 2 + service.size() + authenticated.size());
+            info.insert(info.end(), kHkdfInfoPrefix, kHkdfInfoPrefix + prefix_len);
+            info.push_back(static_cast<uint8_t>(service.size() & 0xFF));
+            info.push_back(static_cast<uint8_t>((service.size() >> 8) & 0xFF));
+            info.insert(info.end(), service.begin(), service.end());
+            info.insert(info.end(), authenticated.begin(), authenticated.end());
             return info;
         }
 
@@ -334,14 +340,17 @@ namespace hkdfguard {
     void DeriveWrappingKey(
         NCRYPT_PROV_HANDLE provider,
         NCRYPT_KEY_HANDLE kek_key,
-        const uint8_t salt[kSaltLen],
+        const std::string &service,
+        const std::vector<uint8_t> &authenticated,
         SecureBuffer<32> &wrapping_key_out) {
-        // On unwrap `salt` points into the caller's payload buffer, which
-        // another thread in the host process could change between reads.
-        // Copied exactly once, here: every later use - the point, and HKDF's
-        // salt - reads this copy, so both are derived from the same bytes.
-        uint8_t salt_copy[kSaltLen];
-        memcpy(salt_copy, salt, kSaltLen);
+        if (authenticated.size() != kAuthenticatedLen) {
+            throw HkdfGuardError(HKDFGUARD_ERR_INTERNAL_ERROR, "authenticated bytes have the wrong length");
+        }
+        // The salt is the header's, read from `authenticated` - the caller's
+        // own copy, built once from the payload - so the point, HKDF's salt
+        // and HKDF's info are all derived from the same bytes, whatever
+        // another thread does to the caller's payload buffer meanwhile.
+        const uint8_t *salt_copy = authenticated.data() + kSaltOffset;
 
         // H(salt): a P-256 point nobody knows the discrete log of. It is
         // computed here, not taken from the payload, so no attacker-chosen
@@ -353,10 +362,6 @@ namespace hkdfguard {
         if (!IsValidP256Point(point)) {
             throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO_ERROR, "hash-to-curve produced a point not on P-256");
         }
-
-        // The KEK's public key, for the HKDF info string.
-        uint8_t kek_pub[kPublicPointLen];
-        ExportNCryptEccPublicKey(kek_key, kek_pub);
 
         // Import H(salt) on the KEK's own provider, to pair with the KEK's
         // private key. NCRYPT_SILENT_FLAG on both calls: a key with a
@@ -396,10 +401,10 @@ namespace hkdfguard {
             z.data()[i] = z_little_endian.data()[kSharedSecretLen - 1 - i];
         }
 
-        // HKDF-SHA512(salt = the payload's salt, IKM = Z, info = context ||
-        // KEK public key) -> the 32-byte AES-256-GCM wrapping key, written
-        // straight into the caller's buffer.
-        std::vector<uint8_t> info = BuildHkdfInfo(kek_pub);
+        // HKDF-SHA512(salt = the payload's salt, IKM = Z, info = prefix ||
+        // service || authenticated) -> the 32-byte AES-256-GCM wrapping key,
+        // written straight into the caller's buffer.
+        std::vector<uint8_t> info = BuildHkdfInfo(service, authenticated);
         HkdfSha512(salt_copy, kSaltLen, z.data(), z.size(), info, wrapping_key_out);
         // `z` and `z_little_endian` are wiped by their destructors as this
         // function returns.

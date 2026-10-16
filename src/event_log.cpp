@@ -300,6 +300,7 @@ namespace hkdfguard {
                                   : L"an entry in HKLM\\Software\\Policies\\HkdfGuard\\KeyUseGroups is "
                                     L"unresolvable, not a group, over-broad, or not host-local";
                     break;
+                case HKDFGUARD_ERR_PROVIDER_UNAVAILABLE:
                 case HKDFGUARD_ERR_PROVIDER_ERROR:
                 case HKDFGUARD_ERR_CRYPTO_ERROR:
                 case HKDFGUARD_ERR_INTERNAL_ERROR:

@@ -4,23 +4,35 @@
 #include "secure_buffer.h" // SecureBuffer<N>
 #include "wire_format.h"   // kSaltLen, kPublicPointLen, kFingerprintLen
 #include <cstdint>
+#include <string>
+#include <vector>
 
 namespace hkdfguard {
-    // Derives the 32-byte AES-256-GCM wrapping key for a payload with salt
-    // `salt`, for wrap and unwrap alike:
+    // Derives the 32-byte AES-256-GCM wrapping key for a payload, for wrap
+    // and unwrap alike - the Linux build's construction, byte for byte:
     //
-    //   H = PayloadEcdhPoint(salt)                          (hash_to_curve.h)
-    //   Z = ECDH(KEK private key, H)                        (NCryptSecretAgreement)
-    //   wrapping key = HKDF-SHA512(salt, Z big-endian,
-    //                              "HkdfGuardWin-DEK-Wrap-v1" || KEK public key)
+    //   salt = authenticated[kSaltOffset .. +kSaltLen]      (the header's salt)
+    //   H    = PayloadEcdhPoint(salt)                       (hash_to_curve.h)
+    //   Z    = ECDH(KEK private key, H)                     (NCryptSecretAgreement)
+    //   info = "hkdfguard-wrap-v1:" || u16le(len(service)) || service
+    //          || authenticated
+    //   wrapping key = HKDF-SHA512(salt, Z big-endian, info), first 32 bytes
+    //
+    // `authenticated` is the payload's header || KEK fingerprint
+    // (BuildWrappedDekAuthenticated in wire_format.h) - every non-ciphertext
+    // byte, which is also the AES-GCM associated data. So the service, the
+    // version, the provider type, the KeyId, the salt and the KEK are all
+    // bound into the key itself, not only checked by the tag. `service` is
+    // the normalized service name.
     //
     // `kek_key` is the KEK opened on `provider` - the agreement is the step
     // that runs inside the TPM for a Platform Crypto Provider KEK, and it
     // needs the KEK's private key, which is what makes a payload unforgeable
-    // from the public key (see wire_format.h). The salt is copied once before
-    // use, so a payload buffer changed by another thread can't make the point
-    // and HKDF see different bytes. The shared secret and every intermediate
-    // buffer are wiped before returning.
+    // from the public key (see wire_format.h). The salt is read from
+    // `authenticated` - the caller's own copy, built once - so the point,
+    // HKDF's salt and its info all see the same bytes even if a payload
+    // buffer is changed by another thread. The shared secret and every
+    // intermediate buffer are wiped before returning.
     //
     // `SecureBuffer<32>& wrapping_key_out` is an output parameter passed by
     // reference: the caller (hkdfguard.cpp) owns the one copy of the wrapping
@@ -30,7 +42,8 @@ namespace hkdfguard {
     void DeriveWrappingKey(
         NCRYPT_PROV_HANDLE provider,
         NCRYPT_KEY_HANDLE kek_key,
-        const uint8_t salt[kSaltLen],
+        const std::string &service,
+        const std::vector<uint8_t> &authenticated,
         SecureBuffer<32> &wrapping_key_out);
 
     // Whether `pub` (raw X||Y, 64 bytes) is a genuine point on P-256, judged
@@ -49,7 +62,7 @@ namespace hkdfguard {
     // DeriveWrappingKey can be tested. Same compile-time scope and caveats as
     // kek_store.h's SetTestTpmFaults: compiled in only when
     // HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE is defined (tests/CMakeLists.txt,
-    // for test_roundtrip's own copy of this file), never in HkdfGuardV1.dll;
+    // for test_roundtrip's own copy of this file), never in HkdfGuard.dll;
     // not thread-safe, by design.
     void SetTestEcdhProviderFault(bool failOpen);
 #endif

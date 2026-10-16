@@ -86,33 +86,55 @@ namespace hkdfguard {
                    L")";
         }
 
-        // Whether thread `id` already has exactly `expected` as a protected
-        // DACL - i.e. an earlier call hardened it.
-        bool AlreadyHardened(DWORD id, PACL expected) {
+        // Whether `dacl` holds exactly `expected`'s ACEs, in order. The stored
+        // ACL's allocated size (AclSize) needn't match the one built here,
+        // but its entries must.
+        bool SameAces(PACL dacl, PACL expected) {
+            if (dacl == nullptr || dacl->AceCount != expected->AceCount) {
+                return false;
+            }
+            for (WORD i = 0; i < expected->AceCount; ++i) {
+                void *got = nullptr, *want = nullptr;
+                if (!GetAce(dacl, i, &got) || !GetAce(expected, i, &want) ||
+                    static_cast<ACE_HEADER *>(got)->AceSize != static_cast<ACE_HEADER *>(want)->AceSize ||
+                    memcmp(got, want, static_cast<ACE_HEADER *>(want)->AceSize) != 0) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        // Whether `object` (opened with READ_CONTROL) carries exactly
+        // `expected` as its DACL - protected from inheritance, if
+        // `require_protected`.
+        bool HasDacl(HANDLE object, PACL expected, bool require_protected) {
+            PACL dacl = nullptr;
+            PSECURITY_DESCRIPTOR sd = nullptr;
+            if (GetSecurityInfo(object, SE_KERNEL_OBJECT, DACL_SECURITY_INFORMATION, nullptr, nullptr, &dacl,
+                                nullptr, &sd) != ERROR_SUCCESS) {
+                return false;
+            }
+            SECURITY_DESCRIPTOR_CONTROL control = 0;
+            DWORD revision = 0;
+            bool same = GetSecurityDescriptorControl(sd, &control, &revision) &&
+                        (!require_protected || (control & SE_DACL_PROTECTED) != 0) && SameAces(dacl, expected);
+            LocalFree(sd);
+            return same;
+        }
+
+        // Whether thread `id` was already hardened: by an earlier call
+        // (`hardened`, protected), or by having been created under the
+        // strict default DACL (`strict_default`, copied from the token, so
+        // not protected). Either way it denies WRITE_DAC to this account,
+        // so it can't be redone - and both are what it should be.
+        bool AlreadyHardened(DWORD id, PACL hardened, PACL strict_default) {
             HANDLE thread = OpenThread(READ_CONTROL, FALSE, id);
             if (thread == nullptr) {
                 return false;
             }
-            PACL dacl = nullptr;
-            PSECURITY_DESCRIPTOR sd = nullptr;
-            DWORD rc = GetSecurityInfo(thread, SE_KERNEL_OBJECT, DACL_SECURITY_INFORMATION, nullptr, nullptr, &dacl,
-                                       nullptr, &sd);
+            bool done = HasDacl(thread, hardened, true) || HasDacl(thread, strict_default, false);
             CloseHandle(thread);
-            SECURITY_DESCRIPTOR_CONTROL control = 0;
-            DWORD revision = 0;
-            bool same = rc == ERROR_SUCCESS && dacl != nullptr &&
-                        GetSecurityDescriptorControl(sd, &control, &revision) && (control & SE_DACL_PROTECTED) != 0 &&
-                        dacl->AceCount == expected->AceCount;
-            // ACE by ACE: the stored ACL's allocated size (AclSize) needn't
-            // match the one built here, but its entries must.
-            for (WORD i = 0; same && i < expected->AceCount; ++i) {
-                void *got = nullptr, *want = nullptr;
-                same = GetAce(dacl, i, &got) && GetAce(expected, i, &want) &&
-                       static_cast<ACE_HEADER *>(got)->AceSize == static_cast<ACE_HEADER *>(want)->AceSize &&
-                       memcmp(got, want, static_cast<ACE_HEADER *>(want)->AceSize) == 0;
-            }
-            LocalFree(sd);
-            return same;
+            return done;
         }
 
         void Apply(HANDLE object, PACL dacl, const char *what) {
@@ -123,15 +145,81 @@ namespace hkdfguard {
                 Fail(what);
             }
         }
+        // The default DACL strict mode gives the process token: every unnamed
+        // object created from then on - threads and child processes
+        // included - gets it. SYSTEM gets every specific and standard right
+        // (0x1FFFFF, the all-access mask of any object type); the account
+        // and OWNER RIGHTS only SYNCHRONIZE and READ_CONTROL (0x120000).
+        // Only standard rights for the account, never specific ones: a
+        // specific bit means something different for every object type
+        // (0x40 is a thread's QUERY_INFORMATION but a process's DUP_HANDLE).
+        std::wstring StrictDefaultDacl(const std::wstring &user) {
+            return L"D:(A;;0x1fffff;;;SY)(A;;0x120000;;;OW)(A;;0x120000;;;" + user + L")";
+        }
+
+        // Steps 4 and 5 (see process_hardening.h): the token's default DACL,
+        // then the token's own DACL - in that order, since the second takes
+        // away the access the first needs. On a repeat call the token can no
+        // longer be opened to change either, so both are verified instead.
+        //
+        // The account keeps query and TOKEN_DUPLICATE on the token. The
+        // Platform Crypto Provider (the TPM key store) duplicates its own
+        // process token on every key open, and fails with NTE_PERM without
+        // it. Duplicating gains a same-user process nothing: the copy is a
+        // separate token, and changing its default DACL changes nothing here.
+        // What would undo step 4 - TOKEN_ADJUST_DEFAULT, WRITE_DAC,
+        // WRITE_OWNER - stays SYSTEM's alone.
+        void HardenToken(const std::wstring &user, PACL default_dacl) {
+            LocalSecurityDescriptor tokenSd(RestrictedDacl(
+                    TOKEN_ALL_ACCESS, TOKEN_QUERY | TOKEN_QUERY_SOURCE | TOKEN_DUPLICATE | READ_CONTROL, user));
+            PACL tokenDacl = tokenSd.Dacl();
+
+            HANDLE token = nullptr;
+            if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_DEFAULT | WRITE_DAC, &token)) {
+                TOKEN_DEFAULT_DACL value{default_dacl};
+                bool ok = SetTokenInformation(token, TokenDefaultDacl, &value, sizeof(value)) != FALSE &&
+                          SetSecurityInfo(token, SE_KERNEL_OBJECT,
+                                          DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION, nullptr,
+                                          nullptr, tokenDacl, nullptr) == ERROR_SUCCESS;
+                CloseHandle(token);
+                if (!ok) {
+                    Fail("could not restrict the process token's default DACL and its own DACL");
+                }
+                return;
+            }
+            if (GetLastError() != ERROR_ACCESS_DENIED ||
+                !OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | READ_CONTROL, &token)) {
+                Fail("OpenProcessToken failed");
+            }
+            bool done = HasDacl(token, tokenDacl, true);
+            DWORD needed = 0;
+            GetTokenInformation(token, TokenDefaultDacl, nullptr, 0, &needed);
+            std::vector<BYTE> buffer(needed);
+            done = done && needed != 0 &&
+                   GetTokenInformation(token, TokenDefaultDacl, buffer.data(), needed, &needed) &&
+                   SameAces(reinterpret_cast<TOKEN_DEFAULT_DACL *>(buffer.data())->DefaultDacl, default_dacl);
+            CloseHandle(token);
+            if (!done) {
+                Fail("the process token can't be changed, and isn't already hardened");
+            }
+        }
     } // namespace
 
-    void HardenProcess() {
+    void HardenProcess(bool strict) {
         // 1. Crash reports: no heap. Per process, no elevation needed.
         if (FAILED(WerSetFlags(WER_FAULT_REPORTING_FLAG_NOHEAP))) {
             Fail("WerSetFlags(WER_FAULT_REPORTING_FLAG_NOHEAP) failed");
         }
 
         const std::wstring user = CurrentUserSidString();
+        LocalSecurityDescriptor strictDefaultSd(StrictDefaultDacl(user));
+        PACL strictDefault = strictDefaultSd.Dacl();
+
+        // 4 and 5 (strict only), before anything else: a thread started from
+        // here on is created under the strict default DACL.
+        if (strict) {
+            HardenToken(user, strictDefault);
+        }
 
         // 2. The process. Kept: terminate (as on Linux, the same user can
         // still kill a hardened process), query (plain and limited - tools
@@ -147,9 +235,9 @@ namespace hkdfguard {
         // 3. Every thread that exists now. Kept: query and synchronize. Gone:
         // get/set context, suspend/resume, impersonate, terminate,
         // READ_CONTROL and WRITE_DAC. Threads created after this call get
-        // the token's default DACL, which this deliberately leaves alone: it
-        // is also the DACL of every other unnamed object the host creates,
-        // whose access rights mean something different per object type.
+        // the token's default DACL, which this leaves alone unless `strict`
+        // (step 4): it is also the DACL of every other unnamed object the
+        // host creates, so changing it is the caller's choice.
         // READ_CONTROL (reading the DACL) is kept so a repeat call can
         // recognize a thread it already hardened - see below.
         constexpr DWORD kThreadLimited =
@@ -174,11 +262,12 @@ namespace hkdfguard {
                 DWORD error = GetLastError();
                 // A thread that exited since the snapshot is fine. Access
                 // denied is expected on a repeat call - a hardened thread
-                // denies WRITE_DAC to everyone but SYSTEM - and is fine
-                // exactly when the thread already carries this DACL. Any
+                // denies WRITE_DAC to everyone but SYSTEM, as does one
+                // created under the strict default DACL - and is fine
+                // exactly when the thread carries one of those two. Any
                 // other failure means a thread was left unprotected.
                 if (error == ERROR_ACCESS_DENIED) {
-                    failed = failed || !AlreadyHardened(entry.th32ThreadID, threadDacl);
+                    failed = failed || !AlreadyHardened(entry.th32ThreadID, threadDacl, strictDefault);
                 } else if (error != ERROR_INVALID_PARAMETER) {
                     failed = true;
                 }

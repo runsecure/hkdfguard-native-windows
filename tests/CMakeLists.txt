@@ -1,4 +1,4 @@
-# test_roundtrip exercises the public DLL ABI (HkdfGuardV1.dll) for wrap/unwrap,
+# test_roundtrip exercises the public DLL ABI (HkdfGuard.dll) for wrap/unwrap,
 # and additionally compiles kek_store.cpp/wire_format.cpp directly so it can
 # call the internal DeleteKek() helper to remove any KEKs it creates once the
 # test finishes - those helpers are not part of the public C ABI.
@@ -6,7 +6,7 @@
 # Compiling kek_store.cpp/wire_format.cpp a second time here (they're also
 # compiled once already as part of the hkdfguard DLL target in the parent
 # CMakeLists.txt) is intentional and harmless: each ends up in a separate
-# binary (HkdfGuardV1.dll vs. test_roundtrip.exe), so there's no linker
+# binary (HkdfGuard.dll vs. test_roundtrip.exe), so there's no linker
 # conflict from the same function existing in both.
 add_executable(test_roundtrip
     test_roundtrip.cpp
@@ -47,10 +47,10 @@ target_compile_definitions(test_roundtrip PRIVATE HKDFGUARD_ENABLE_TEST_POLICY_O
 # `ctest` (see README.md) actually runs.
 add_test(NAME roundtrip COMMAND test_roundtrip)
 # Windows only searches a fixed set of locations for a DLL an .exe depends
-# on, and the directory containing HkdfGuardV1.dll (the build output directory
+# on, and the directory containing HkdfGuard.dll (the build output directory
 # for that target) isn't necessarily one of them when ctest launches
 # test_roundtrip.exe directly. This prepends that directory onto PATH for
-# just this one test's process, so the OS loader can find HkdfGuardV1.dll at
+# just this one test's process, so the OS loader can find HkdfGuard.dll at
 # startup. $<TARGET_FILE_DIR:hkdfguard> is a CMake "generator expression" -
 # evaluated at build-configuration time to the real output path, whatever it
 # ends up being for the chosen build type/generator.
@@ -68,13 +68,13 @@ set_tests_properties(roundtrip PROPERTIES
 
 # test_cli.ps1 exercises hkdfguard.exe's own argument parsing,
 # validation, and file-handling behavior - none of which test_roundtrip
-# covers, since that only calls into HkdfGuardV1.dll directly and never spawns
+# covers, since that only calls into HkdfGuard.dll directly and never spawns
 # the CLI. Registered as an ordinary ctest test whose "command" happens to be
 # powershell.exe running a script, the same way any other test executable
 # would be; $<TARGET_FILE:hkdfguard-cli> resolves to the CLI's real
 # built path (whatever it ends up being for the chosen generator/config),
 # passed as that script's -CliExePath argument. hkdfguard.exe
-# needs HkdfGuardV1.dll to be findable too (same reason as roundtrip/
+# needs HkdfGuard.dll to be findable too (same reason as roundtrip/
 # direct_aead above), so this test gets the identical PATH treatment.
 add_test(
     NAME cli

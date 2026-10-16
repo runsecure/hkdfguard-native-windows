@@ -12,7 +12,7 @@
       1. msiexec /i the MSI; check the files, the InstallPath value, the event
          log source registration and the HkdfGuardUsers group it creates.
       2. Run test_roundtrip.exe with only the installed folder on the DLL
-         search path, so it exercises the installed HkdfGuardV1.dll.
+         search path, so it exercises the installed HkdfGuard.dll.
       3. Run tests\test_cli.ps1 against the installed CLI.
       4. Check the audit events render through the registered event source.
       5. msiexec /x; check the files and InstallPath are gone and the
@@ -72,7 +72,7 @@ trap {
 # file was in use) - both are installs or removals that took effect.
 function Test-MsiSuccess([int]$code) { return $code -eq 0 -or $code -eq 3010 }
 
-$InstallDir = Join-Path $env:ProgramFiles "HkdfGuard\v1"
+$InstallDir = Join-Path $env:ProgramFiles "HkdfGuard"
 $InstallKey = "HKLM:\Software\hkdfguard-native-windows"
 $EventSourceKey = "HKLM:\SYSTEM\CurrentControlSet\Services\EventLog\Application\hkdfguard-native-windows"
 New-Item -ItemType Directory -Force -Path $Out | Out-Null
@@ -95,13 +95,13 @@ Write-Section "Installing $(Split-Path -Leaf $msi)"
 $proc = Start-Process msiexec.exe -ArgumentList @("/i", "`"$msi`"", "/qn", "/norestart", "/l*v", "`"$Out\install.log`"") -Wait -PassThru
 Check (Test-MsiSuccess $proc.ExitCode) "msiexec /i succeeds (exit $($proc.ExitCode); 0 or 3010)"
 
-foreach ($f in "HkdfGuardV1.dll", "hkdfguard.exe") {
+foreach ($f in "HkdfGuard.dll", "hkdfguard.exe") {
     Check (Test-Path (Join-Path $InstallDir $f)) "installed $InstallDir\$f"
 }
 $installPath = (Get-ItemProperty -Path $InstallKey -Name InstallPath -ErrorAction SilentlyContinue).InstallPath
 Check ($installPath -and ($installPath.TrimEnd('\') -eq $InstallDir)) "InstallPath registry value points at $InstallDir (got '$installPath')"
 $msgFile = (Get-ItemProperty -Path $EventSourceKey -Name EventMessageFile -ErrorAction SilentlyContinue).EventMessageFile
-Check ($msgFile -and ([Environment]::ExpandEnvironmentVariables($msgFile) -eq (Join-Path $InstallDir "HkdfGuardV1.dll"))) "event source registered with the installed DLL as its message file"
+Check ($msgFile -and ([Environment]::ExpandEnvironmentVariables($msgFile) -eq (Join-Path $InstallDir "HkdfGuard.dll"))) "event source registered with the installed DLL as its message file"
 & net.exe localgroup HkdfGuardUsers *> $null
 Check ($LASTEXITCODE -eq 0) "local group HkdfGuardUsers exists"
 
@@ -109,7 +109,7 @@ $testStart = Get-Date
 
 # ---- 2. test_roundtrip against the installed DLL -------------------------------
 # Copied to its own folder with no DLL beside it, and only the install folder
-# added to PATH, so the loader can only find the installed HkdfGuardV1.dll.
+# added to PATH, so the loader can only find the installed HkdfGuard.dll.
 Write-Section "test_roundtrip.exe (installed DLL)"
 $work = $Work
 New-Item -ItemType Directory -Force -Path $work | Out-Null
@@ -140,7 +140,7 @@ Check ($cliExit -eq 0) "test_cli.ps1 exits 0 (got $cliExit)"
 # hkdfguard_open_file (still wrapped) and unwraps it in a separate call.
 Write-Section "CLI wrap -> hkdfguard_open_file -> hkdfguard_unwrap_dek (installed binaries)"
 $cli = Join-Path $InstallDir "hkdfguard.exe"
-$dll = Join-Path $InstallDir "HkdfGuardV1.dll"
+$dll = Join-Path $InstallDir "HkdfGuard.dll"
 $chainService = "hkdfguardcontainerchain"
 $keyFile = Join-Path $work "chain.key"
 & $cli provision --service-name $chainService *> "$Out\chain-provision.log"
@@ -157,7 +157,7 @@ $plainFile = Join-Path $work "plain.key"
 
 # The P/Invoke calls run in a CHILD PowerShell process, never in this one:
 # a DLL loaded into a process stays loaded until that process exits, so
-# loading the installed HkdfGuardV1.dll here would hold it in use through
+# loading the installed HkdfGuard.dll here would hold it in use through
 # the uninstall below - and on a machine with an interactive session (the
 # hosted CI runners), Windows Installer's Restart Manager then shuts down
 # the application holding it: this script. The child exits, and unloads
@@ -248,7 +248,7 @@ Write-Section "Uninstalling"
 $proc = Start-Process msiexec.exe -ArgumentList @(
     "/x", "`"$msi`"", "/qn", "/norestart", "MSIRESTARTMANAGERCONTROL=Disable", "/l*v", "`"$Out\uninstall.log`"") -Wait -PassThru
 Check (Test-MsiSuccess $proc.ExitCode) "msiexec /x succeeds (exit $($proc.ExitCode); 0 or 3010)"
-Check (-not (Test-Path (Join-Path $InstallDir "HkdfGuardV1.dll"))) "installed DLL removed"
+Check (-not (Test-Path (Join-Path $InstallDir "HkdfGuard.dll"))) "installed DLL removed"
 Check (-not (Test-Path (Join-Path $InstallDir "hkdfguard.exe"))) "installed CLI removed"
 $afterInstallPath = (Get-ItemProperty -Path $InstallKey -Name InstallPath -ErrorAction SilentlyContinue).InstallPath
 Check (-not $afterInstallPath) "InstallPath registry value removed"

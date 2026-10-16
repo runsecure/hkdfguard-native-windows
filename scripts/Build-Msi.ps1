@@ -80,7 +80,7 @@ $StageDir = Join-Path $RepoRoot "dist\win-$ArchLower"
 $WixArch = if ($Arch -eq "ARM64") { "arm64" } else { "x64" }
 $MsiPath = Join-Path $RepoRoot "dist\hkdfguard-native-windows-$Version-win-$ArchLower.msi"
 $WxsPath = Join-Path $RepoRoot "installer\hkdfguard-native-windows.wxs"
-$Binaries = "HkdfGuardV1.dll", "hkdfguard.exe"
+$Binaries = "HkdfGuard.dll", "hkdfguard.exe"
 
 function Write-Section($title) {
     Write-Host ""
@@ -194,10 +194,8 @@ Expect ((($files | Sort-Object) -join ',') -eq (($Binaries | Sort-Object) -join 
 
 $dirs = Get-Rows "SELECT ``Directory``, ``Directory_Parent``, ``DefaultDir`` FROM ``Directory``" 3
 $installDir = $dirs | Where-Object { $_[0] -eq 'HkdfGuardInstallDir' }
-$rootDir = $dirs | Where-Object { $_[0] -eq 'HkdfGuardRootDir' }
 # DefaultDir is either "LongName" or "SHORT~1|LongName"; match the long name.
-Expect ($installDir -and $installDir[1] -eq 'HkdfGuardRootDir' -and $installDir[2] -match '(^|\|)v1$') "install folder is ...\HkdfGuard\v1"
-Expect ($rootDir -and $rootDir[1] -eq 'ProgramFiles64Folder' -and $rootDir[2] -match '(^|\|)HkdfGuard$') "under the native Program Files folder, in HkdfGuard"
+Expect ($installDir -and $installDir[1] -eq 'ProgramFiles64Folder' -and $installDir[2] -match '(^|\|)HkdfGuard$') "install folder is the native Program Files folder's HkdfGuard (no version subfolder)"
 # A public (all-uppercase) directory id could be redirected from the
 # msiexec command line into a user-writable folder, undoing the ACL
 # protection the install location exists for.

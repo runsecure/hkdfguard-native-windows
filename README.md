@@ -61,32 +61,33 @@ No Windows handle, CNG/NCrypt type, or COM interface crosses that boundary, and 
 exception ever escapes it - every call returns an integer status code.
 
 ```c
-int32_t hkdfguard_kek_exists(
+int hkdfguard_kek_exists(
     const char* service,
-    int32_t* out_exists);
+    int* out_exists);
 
-int32_t hkdfguard_create_kek(
+int hkdfguard_create_kek(
     const char* service);
 
-int32_t hkdfguard_wrap_dek(
+int hkdfguard_wrap_dek(
     const char* service,
-    const uint8_t* dek, int32_t dek_len,
-    uint8_t* out, int32_t* out_len);
+    const uint8_t* dek, int dek_len,
+    uint8_t* out, int* out_len);
 
-int32_t hkdfguard_unwrap_dek(
+int hkdfguard_unwrap_dek(
     const char* service,
-    const uint8_t* wrapped, int32_t wrapped_len,
-    uint8_t* out, int32_t* out_len);
+    const uint8_t* wrapped, int wrapped_len,
+    uint8_t* out, int* out_len);
 
-int32_t hkdfguard_generate_and_wrap_dek(
+int hkdfguard_generate_and_wrap_dek(
     const char* service,
-    uint8_t* out, int32_t* out_len);
+    uint8_t* out, int* out_len);
 
-int32_t hkdfguard_open_file(
+int hkdfguard_open_file(
     const char* path,
-    uint8_t* out, int32_t* out_len);
+    uint8_t* out, int* out_len);
 
-int32_t hkdfguard_harden_process(void);
+int hkdfguard_harden_process(void);
+int hkdfguard_harden_process_with_flags(unsigned int flags);
 ```
 
 `service` is a null-terminated UTF-8 string (non-empty, at most 128 bytes, ASCII letters/
@@ -105,9 +106,16 @@ an older payload for the same service. Protect the file itself, which is what th
 `--group` ACL is for. If your application must refuse older DEKs, it has to check that
 after unwrapping.
 
-`dek_len` must be exactly 32 (`HKDFGUARD_DEK_LEN`). A wrapped payload is always exactly
-132 bytes (`HKDFGUARD_WRAPPED_LEN`) - a fixed size regardless of which KEK provider
-produced it - so callers can allocate output buffers without a size-query round trip.
+`dek_len` must be exactly 32 (`HKDFGUARD_DEK_LEN`). On Windows a wrapped payload is always
+exactly 132 bytes (`HKDFGUARD_WRAPPED_MAX_LEN`), whichever KEK provider produced it, so a
+buffer of that size never needs a retry. The constant has the same name on Linux and
+macOS, where its value differs: a payload is only ever unwrapped on the host that wrapped
+it. The buffer rules match those builds too. `out` may be NULL only with `*out_len` 0, a
+size probe that returns `HKDFGUARD_ERR_BUFFER_TOO_SMALL` with the size to allocate, before
+any provider is reached or file opened. A negative capacity or `wrapped_len` is
+`HKDFGUARD_ERR_INVALID_ARGUMENT`. An invalid service name is reported before a too-small
+buffer. `*out_len` is left unchanged on every failure except `BUFFER_TOO_SMALL`. Lengths
+and status codes are plain `int` in every platform's header (32 bits on all of them).
 See `include/hkdfguard.h` for the full set of `HKDFGUARD_ERR_*` status codes. The table
 is shared number for number with the Linux and macOS builds of this ABI: general codes
 (-1..-7), service name and policy (-8, -9), wrapped payload (-10..-12), KEK and process
@@ -179,15 +187,54 @@ procdump or `MiniDumpWriteDump`, and so does attaching a debugger.
 
 This is a same-user barrier only. Administrators holding `SeDebugPrivilege`, SYSTEM and
 the kernel bypass it. Threads started after the call keep the default thread DACL, so call
-it again once worker threads are running. Handles that were opened before the call keep
-their access. The page file, hibernation and machine-wide dump settings (WER `LocalDumps`)
-are outside its reach. The call is idempotent. It returns `HKDFGUARD_OK` or
-`HKDFGUARD_ERR_PROCESS_HARDENING_FAILED`, and steps applied before a failure stay applied.
+it again once worker threads are running, or use the strict flag below. Handles that were
+opened before the call keep their access. A GUI process can still be injected into
+through window hooks (`SetWindowsHookEx`) by a same-user process on the same desktop, so
+host key handling in a service or console process. The page file, hibernation and
+machine-wide dump settings (WER `LocalDumps`) are outside its reach. The call is
+idempotent. It returns `HKDFGUARD_OK` or `HKDFGUARD_ERR_PROCESS_HARDENING_FAILED`, and
+steps applied before a failure stay applied.
+
+`hkdfguard_harden_process_with_flags(flags)` is the same call with options, as on Linux
+and macOS; `hkdfguard_harden_process()` is `..._with_flags(0)`. Unknown flag bits return
+`HKDFGUARD_ERR_INVALID_ARGUMENT` before anything is changed. The one flag,
+`HKDFGUARD_HARDEN_REQUIRE_PROTECTED_SIGNATURE` (`0x1`), requires that no other process of
+the same user can debug or inject code into this one. On macOS that depends on the code
+signature, and on Linux it's already true. On Windows it adds two steps, applied first:
+
+- It replaces the process token's **default DACL**, which every unnamed object the process
+  creates from then on receives. SYSTEM keeps every right; the account keeps only
+  `SYNCHRONIZE` and `READ_CONTROL`. Threads started later are then closed like the
+  existing ones.
+- It replaces the **token's own DACL**, so the account can only query and duplicate it.
+  Without this, a same-user process could open the token and put the old default DACL
+  back. Duplicate is kept because the TPM key store duplicates its own process token on
+  every key open.
+
+The cost is why it's a flag. Everything the process creates afterwards without an explicit
+security descriptor is closed to its own account too: child processes (Task Manager can't
+stop them; the creator's own handle still can), and named pipes, events and other named
+objects. A same-user client can't connect to a pipe created with a NULL security
+descriptor. Pass it in a service or console process that doesn't share objects by name
+with other processes. Window hooks into a GUI process stay outside it.
 
 ## Command-line tool
 
 `tools/hkdfguard_cli.cpp` builds `hkdfguard.exe`, a thin
-wrapper around the ABI above with two subcommands:
+wrapper around the ABI above with two subcommands.
+
+It hardens itself before reading anything, as the Linux CLI does. It calls
+`hkdfguard_harden_process_with_flags(HKDFGUARD_HARDEN_REQUIRE_PROTECTED_SIGNATURE)`, so
+crash reports leave out the heap, and no same-user process can dump, debug or inject into
+it, including through threads the key storage provider starts later. If hardening
+fails, the CLI refuses to run. Every copy of the DEK the CLI makes, both the base64 text
+and the decoded bytes, lives in one buffer. That buffer is locked into RAM with
+`VirtualLock`, so it is never written to the page file, and it is wiped before it is
+freed. Stdin is read with `ReadFile`, not through the C runtime's buffered stream, which
+would keep a copy that can't be wiped. If the lock fails, the CLI warns and continues,
+as on Linux. Windows has no counterpart to Linux's `mlockall`, so the library's own
+transient copies while it wraps are not locked. Hardening still keeps them out of crash
+reports and away from other processes.
 
 - **`provision`** - always calls `hkdfguard_create_kek`, which creates the KEK if it
   is missing and otherwise re-verifies the existing key's properties and ACL (failing
@@ -317,7 +364,7 @@ creates a machine-wide KEK (`NCRYPT_MACHINE_KEY_FLAG`) the first time a given se
 name is used, and that creation step fails outright without elevation - see "Deployment
 model" above.
 
-This produces `build/HkdfGuardV1.dll` (+ its `.lib` import library) and
+This produces `build/HkdfGuard.dll` (+ its `.lib` import library) and
 `build/tools/hkdfguard.exe`, and registers two tests with `ctest`:
 
 - **`roundtrip`** (`tests/test_roundtrip.cpp`, built to `build/tests/test_roundtrip.exe`)
@@ -411,7 +458,7 @@ including the impersonated client when a service acts on someone's behalf.
 | 2002 | Error | `KEK_INVALID`: an existing KEK under the service name has an ACL this library would never create. Investigate it. |
 | 2003 | Warning | `PAYLOAD_AUTH_FAILED`, `KEK_FINGERPRINT_MISMATCH`, `PAYLOAD_MALFORMED` or `PAYLOAD_UNSUPPORTED` on unwrap: a tampered, corrupted, misdirected or unknown-version payload. |
 | 2004 | Error | `POLICY_INVALID` or `WIN_GROUP_INVALID`: the registry policy is misconfigured, so calls fail closed. |
-| 2005 | Error | `PROVIDER_ERROR`, `CRYPTO_ERROR` or `INTERNAL_ERROR`: the key storage provider or crypto layer failed. |
+| 2005 | Error | `PROVIDER_UNAVAILABLE`, `PROVIDER_ERROR`, `CRYPTO_ERROR` or `INTERNAL_ERROR`: the key storage provider or crypto layer failed. |
 | 2006 | Error | `hkdfguard_open_file` refused a file that looks like an unwrapped DEK (32 raw bytes, or its hex or base64), so possibly a plaintext key on disk. Names the file; none of its contents are logged or returned. Investigate it. |
 | 2007 | Warning | A process made more than 10 `hkdfguard_create_kek` / `hkdfguard_kek_exists` calls. They are meant to run once at startup, so a caller is probably looping on them. Logged once per process. |
 
@@ -491,16 +538,20 @@ It is read on every setup call.
   secret `Z = ECDH(KEK private key, H(salt))` is computed by `NCryptSecretAgreement` on the
   KEK's own provider - inside the TPM for a Platform Crypto Provider KEK - for wrap and
   unwrap alike, taken out raw (`BCRYPT_KDF_RAW_SECRET`) and reversed to big-endian, then
-  fed to one self-contained HKDF-SHA512 implementation (salt = the payload salt, info =
-  a fixed context string and the KEK's public key). Nobody knows the discrete log of
+  fed to one self-contained HKDF-SHA512 implementation: salt = the payload salt, info =
+  `"hkdfguard-wrap-v1:"` || `u16le(len(service))` || normalized service || the payload's
+  header (bytes 0..39) || KEK fingerprint - the Linux build's derivation byte for byte,
+  confirmed by running the Linux crate's own `derive_wrapping_key` on the golden test's
+  inputs. Nobody knows the discrete log of
   `H(salt)`, so **only an account authorized to use the KEK can create a payload**:
   knowing the KEK's public key is not enough to forge one. Every wrap is therefore a use
   of the KEK's private key - a TPM operation of about 10 ms for a TPM-backed KEK. See
-  `src/ecdh_hkdf.cpp` for the derivation design note. The AES-256-GCM step authenticates the normalized `service`
-  name followed by a SHA-256 fingerprint of the KEK's public key as additional
-  authenticated data (`src/aes_gcm.cpp`'s `AesGcmEncrypt`/`AesGcmDecrypt`, called from
-  `src/hkdfguard.cpp`) - binding a wrapped payload to both the exact service and the
-  specific KEK it was wrapped under. The fingerprint also travels in the payload and is
+  `src/ecdh_hkdf.cpp` for the derivation design note. The AES-256-GCM step authenticates
+  the same header || fingerprint bytes as additional authenticated data
+  (`src/aes_gcm.cpp`'s `AesGcmEncrypt`/`AesGcmDecrypt`, called from `src/hkdfguard.cpp`).
+  So the service, the version, the routing fields and the specific KEK are bound into
+  the wrapping key itself, and every header byte is also checked by the tag - as on
+  Linux. The fingerprint also travels in the payload and is
   checked against the opened KEK before any ECDH or decryption, so "wrong KEK"
   (`HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH`) is distinguishable from tampering
   (`HKDFGUARD_ERR_PAYLOAD_AUTH_FAILED`).
@@ -596,7 +647,7 @@ msiexec /i hkdfguard-native-windows-0.9.0-win-x64.msi /qn /l*v install.log
 
 The MSI does four things:
 
-- **Installs both files** to `C:\Program Files\HkdfGuard\v1\`. That folder
+- **Installs both files** to `C:\Program Files\HkdfGuard\`. That folder
   inherits the Program Files ACL, where only Administrators, SYSTEM and TrustedInstaller
   can write. This is what stops a less-privileged user from planting a fake DLL next to
   the CLI and getting code execution the next time an administrator runs the elevated
@@ -616,7 +667,7 @@ The MSI does four things:
 Then, once per service, elevated:
 
 ```
-"C:\Program Files\HkdfGuard\v1\hkdfguard.exe" provision --service-name myapp
+"C:\Program Files\HkdfGuard\hkdfguard.exe" provision --service-name myapp
 ```
 
 **Upgrades** remove the previous version before installing the new one. A service with
@@ -639,10 +690,10 @@ already manages machine policy (Group Policy, Intune, SCCM).
 
 This repository only implements the native Windows library and its C ABI. To call it
 from C#, Python, Java, Go, or Node, install the MSI above and bind to the installed
-`HkdfGuardV1.dll` with the platform's standard FFI mechanism.
+`HkdfGuard.dll` with the platform's standard FFI mechanism.
 
 **Load it by its full, known path - never by a bare filename.** Every binding below that
-accepts just a name (`"HkdfGuardV1.dll"`, `Native.load("HkdfGuardV1", ...)`, a bare-name
+accepts just a name (`"HkdfGuard.dll"`, `Native.load("HkdfGuard", ...)`, a bare-name
 `[DllImport]`, ...) resolves it through the operating system's standard DLL search order,
 which - depending on the host process's configuration - can include the current working
 directory or other locations a lower-privileged or otherwise unexpected file could
@@ -670,17 +721,17 @@ loading it.
   using var key = hklm.OpenSubKey(@"Software\hkdfguard-native-windows")
       ?? throw new InvalidOperationException("hkdfguard-native-windows is not installed");
   string dir = (string)key.GetValue("InstallPath")!;
-  IntPtr lib = NativeLibrary.Load(Path.Combine(dir, "HkdfGuardV1.dll"));
+  IntPtr lib = NativeLibrary.Load(Path.Combine(dir, "HkdfGuard.dll"));
   ```
-- **Python**: `ctypes.WinDLL(r"<absolute-path>\HkdfGuardV1.dll")`
+- **Python**: `ctypes.WinDLL(r"<absolute-path>\HkdfGuard.dll")`
 - **Java**: JNA's `NativeLibrary.getInstance("<absolute-path>")`, or a thin JNI shim that
   calls `LoadLibraryW` with an absolute path
-- **Go**: `cgo` linking against `HkdfGuardV1.lib` (resolved at link time, not
+- **Go**: `cgo` linking against `HkdfGuard.lib` (resolved at link time, not
   a runtime search - the safest option of all here), or, for dynamic loading,
   `golang.org/x/sys/windows.LoadLibraryEx(absPath, 0,
   LOAD_LIBRARY_SEARCH_APPLICATION_DIR)`
 - **Node**: `ffi-napi`/`koffi` given an absolute path, or a native addon (N-API) linking
-  `HkdfGuardV1.lib`
+  `HkdfGuard.lib`
 
 All five bindings map directly onto the seven exported functions
 (`hkdfguard_kek_exists`, `hkdfguard_create_kek`, `hkdfguard_wrap_dek`,

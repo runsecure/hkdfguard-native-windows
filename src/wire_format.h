@@ -2,8 +2,7 @@
 
 #include <cstddef> // size_t
 #include <cstdint> // uint8_t, uint32_t
-#include <string> // std::string (BuildWrappedDekAad's service parameter)
-#include <vector> // std::vector (BuildWrappedDekAad's result)
+#include <vector> // std::vector (BuildWrappedDekAuthenticated's result)
 
 namespace hkdfguard {
     // WrappedDekV1 layout (all integers little-endian; total 132 bytes,
@@ -31,23 +30,29 @@ namespace hkdfguard {
     // The salt is also HKDF's salt, and is otherwise unstructured - any 32
     // bytes are a well-formed salt.
     //
-    // The AES-GCM AAD is the header || KekFingerprint || normalized service
-    // name (see BuildWrappedDekAad). The header is bytes 0..39 - Version,
-    // ProviderType, Reserved, KeyId and Salt - so every field a parser reads
-    // or routes on is authenticated: a payload whose version, provider type
-    // or KeyId was rewritten fails the tag even when the rewritten value
-    // would itself parse, which is what keeps a future second format version
-    // from being able to relabel a payload as the first. The Nonce is not in
-    // the AAD: AesGcmEncrypt generates it, so it does not exist yet when the
-    // AAD is fixed, and GCM authenticates it inherently (a different nonce
-    // changes both the keystream and the tag). The Ciphertext and Tag are
-    // what the AAD is authenticated *with*. The service name goes last, after
-    // the fixed-length fields, so the AAD encoding is unambiguous without a
-    // length prefix.
+    // The payload's *authenticated bytes* are header || KekFingerprint (see
+    // BuildWrappedDekAuthenticated) - every byte except the Nonce,
+    // Ciphertext and Tag - and they are used twice, as on Linux (whose
+    // Payload::authenticated_bytes is the same idea over its own layout):
+    // as the AES-GCM AAD, and inside HKDF's info, after the normalized
+    // service name (see ecdh_hkdf.h). So every field is bound into the
+    // wrapping key itself, not only checked by the tag. The header is bytes
+    // 0..39 - Version, ProviderType, Reserved, KeyId and Salt - so every
+    // field a parser reads or routes on is authenticated: a payload whose
+    // version, provider type or KeyId was rewritten fails even when the
+    // rewritten value would itself parse, which is what keeps a future
+    // second format version from being able to relabel a payload as the
+    // first. The service name is bound through the key (HKDF info), not the
+    // AAD: unwrapped under the wrong service, the key is wrong and the tag
+    // fails. The Nonce is not authenticated bytes: AesGcmEncrypt generates
+    // it, so it does not exist yet when they are fixed, and GCM
+    // authenticates it inherently (a different nonce changes both the
+    // keystream and the tag). The Ciphertext and Tag are what everything
+    // else is authenticated *with*.
     //
     // KekFingerprint identifies which KEK produced the payload. It is both
-    // (a) authenticated - it is part of the AES-GCM AAD, alongside the
-    // header and the service name - and (b) checked explicitly on unwrap, before any ECDH
+    // (a) authenticated - it is part of the authenticated bytes, alongside
+    // the header - and (b) checked explicitly on unwrap, before any ECDH
     // or decryption: the KEK selected by (service, ProviderType, KeyId) is
     // opened, its public key fingerprinted the same way, and a mismatch is
     // rejected as HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH. That turns "wrong key" into a
@@ -127,6 +132,9 @@ namespace hkdfguard {
     // what was parsed out of them.
     constexpr size_t kHeaderLen = kNonceOffset; // 40
 
+    // header || KekFingerprint: the AES-GCM AAD, and the tail of HKDF's info.
+    constexpr size_t kAuthenticatedLen = kHeaderLen + kFingerprintLen; // 72
+
     // A plain C++ `struct` (equivalent to a `class` whose members default to
     // `public`) used purely to bundle the parsed-out pieces of a wrapped
     // payload for easy return from ParseWrappedDek below. None of these fields
@@ -187,14 +195,14 @@ namespace hkdfguard {
         const uint8_t salt[kSaltLen],
         uint8_t out[kHeaderLen]);
 
-    // The AES-GCM AAD: header || fingerprint || normalized_service (see the
-    // layout comment above). Wrap passes the header it is about to
-    // serialize; unwrap passes ParsedWrappedDek::header, the received bytes.
-    // None of it is secret.
-    std::vector<uint8_t> BuildWrappedDekAad(
+    // The payload's authenticated bytes: header || fingerprint
+    // (kAuthenticatedLen bytes; see the layout comment above). Used as the
+    // AES-GCM AAD and passed to DeriveWrappingKey for HKDF's info. Wrap
+    // passes the header it is about to serialize; unwrap passes
+    // ParsedWrappedDek::header, the received bytes. None of it is secret.
+    std::vector<uint8_t> BuildWrappedDekAuthenticated(
         const uint8_t header[kHeaderLen],
-        const uint8_t fingerprint[kFingerprintLen],
-        const std::string &normalized_service);
+        const uint8_t fingerprint[kFingerprintLen]);
 
     // Validates and parses a wrapped payload. Throws HkdfGuardError with
     // HKDFGUARD_ERR_PAYLOAD_UNSUPPORTED if the version is not recognized,
