@@ -11,7 +11,7 @@
 //       This is the *only* subcommand that may create a KEK.
 //
 //   wrap --key-file-path|-kf <path> --service-name|-sn <name> \
-//        --dek-stdin --group|-g <name> [--force|-f]
+//        (--dek-stdin | --dek-file <path>) [--group|-g <name>] [--force|-f]
 //       Calls hkdfguard_wrap_dek against the service's *existing* KEK and
 //       writes the wrapped payload to <path>. Never provisions a KEK - if
 //       none exists yet for this service, this fails with KEK_NOT_FOUND and
@@ -39,12 +39,14 @@
 // subject to the key's ACL.
 //
 // The wrapped payload is written to <key-file-path> with an explicit,
-// non-inherited DACL: the calling account (the process token's owner SID)
-// gets read+write, --group's account gets read-only, and no one else is
-// granted anything - the Windows analog of this project's macOS/Linux
-// tools' POSIX 0640 (owner rw, one group r, no one else). Set atomically
-// at file-creation time via CreateFileW's own security-attributes
-// parameter, not applied after the fact. --group is a "wrap"-only concept:
+// non-inherited DACL: the calling account (the process token's owner SID -
+// Administrators when run elevated) gets read+write and no one else is
+// granted anything - the Windows analog of the Linux tool's POSIX 0600.
+// With --group, that group also gets read-only: the analog of the Linux
+// tool's --group, mode 0640 (owner rw, one group r, no one else). Set
+// atomically at file-creation time via CreateFileW's own
+// security-attributes parameter, not applied after the fact. --group is a
+// "wrap"-only concept:
 // it governs the wrapped-key *file's* ACL, not the KEK's - which principals
 // may use the KEK is a separate, machine-level registry policy
 // (KeyUseGroups; see include/hkdfguard.h), not something either subcommand
@@ -71,8 +73,8 @@
 #include "hkdfguard.h"
 
 #include <windows.h>
+#include <aclapi.h> // SetSecurityInfo - protecting the key file's DACL on its handle
 #include <bcrypt.h>
-#include <wincrypt.h>
 #include <sddl.h> // ConvertStringSidToSidA - over-broad --group check
 
 #include <algorithm>
@@ -81,12 +83,12 @@
 #include <cstdlib>
 #include <cstring> // _stricmp
 #include <exception>
+#include <cctype>
 #include <optional>
 #include <string>
 #include <vector>
 
 #pragma comment(lib, "bcrypt.lib")
-#pragma comment(lib, "crypt32.lib")
 #pragma comment(lib, "advapi32.lib")
 
 namespace {
@@ -193,50 +195,41 @@ namespace {
     struct WrapArgs {
         std::string keyFilePath;
         std::string serviceName;
-        std::string groupName;
+        std::optional<std::string> groupName; // --group: who besides the owner may read the file
         bool force = false;
         bool dekStdin = false;
+        std::optional<std::string> dekFile; // --dek-file: read the DEK from this file instead of stdin
     };
 
     enum class ParseOutcome { Run, Help };
 
+    // The one usage text, printed for every help request and after every
+    // usage error - the Linux tool's, line for line, with this platform's
+    // paths and examples.
     void PrintUsage() {
         fwprintf(
             stderr,
             L"Usage:\n"
             L"  %ls provision --service-name|-sn <name>\n"
-            L"  %ls wrap --key-file-path|-kf <path> --service-name|-sn <name> "
-            L"--dek-stdin --group|-g <name> [--force|-f]\n"
+            L"  %ls wrap --key-file-path|-kf <path> --service-name|-sn <name> (--dek-stdin | --dek-file <path>)\n"
+            L"       [--group|-g <name>] [--force|-f]\n"
             L"\n"
-            L"The DEK for \"wrap\" is 32 raw bytes, base64-encoded, read from stdin.\n"
-            L"Run \"%ls provision --help\" or \"%ls wrap --help\" for details.\n",
-            kProgramName, kProgramName, kProgramName, kProgramName);
-    }
-
-    void PrintProvisionUsage() {
-        fwprintf(
-            stderr,
-            L"Usage: %ls provision --service-name|-sn <name>\n"
+            L"provision  ensures a KEK exists for the service. Run once, at deployment time, from an\n"
+            L"           elevated prompt; this is the only command that makes the (deliberately slow)\n"
+            L"           setup calls.\n"
+            L"wrap       wraps a DEK under the service's existing KEK and writes the payload to\n"
+            L"           --key-file-path, readable by its owner only, or also by --group's\n"
+            L"           members (read-only). Fails if the KEK has not been provisioned.\n"
             L"\n"
-            L"Ensures the named service's machine-wide KEK exists and passes\n"
-            L"verification: calls hkdfguard_create_kek, which creates the KEK if\n"
-            L"missing, or re-verifies an existing KEK's properties and ACL. Never\n"
-            L"wraps a DEK, never touches a file. Run it from an elevated process.\n",
-            kProgramName);
-    }
-
-    void PrintWrapUsage() {
-        fwprintf(
-            stderr,
-            L"Usage: %ls wrap --key-file-path|-kf <path> --service-name|-sn <name> "
-            L"--dek-stdin --group|-g <name> [--force|-f]\n"
+            L"The DEK is base64 of exactly 32 bytes, read from stdin or a file -- never\n"
+            L"from a command-line argument or an environment variable, both of which are\n"
+            L"readable by other processes of the same user.\n"
             L"\n"
-            L"Wraps the DEK (32 raw bytes, base64-encoded, read from stdin) under\n"
-            L"the named service's existing machine-wide KEK and writes the\n"
-            L"wrapped payload to <path>. Never creates a KEK - run\n"
-            L"\"%ls provision --service-name|-sn <name>\" first if one does not\n"
-            L"yet exist for this service.\n",
-            kProgramName, kProgramName);
+            L"Examples:\n"
+            L"  %ls provision -sn svc\n"
+            L"  $dekBase64 | %ls wrap -kf C:\\ProgramData\\app\\key.bin -sn svc --dek-stdin\n"
+            L"  %ls wrap -kf C:\\ProgramData\\app\\key.bin -sn svc --dek-file C:\\ProgramData\\app\\dek.b64\n",
+            kProgramName, kProgramName, kProgramName, kProgramName, kProgramName);
     }
 
     // Throws CliError on any parse failure; returns ParseOutcome::Help if
@@ -260,12 +253,15 @@ namespace {
                     throw CliError("--service-name must not be empty");
                 }
                 serviceName = value;
+            } else if (arg == "--key-file-path" || arg == "-kf" || arg == "--dek-stdin" || arg == "--dek-file" ||
+                       arg == "--force" || arg == "-f" || arg == "--group" || arg == "-g") {
+                throw CliError(arg + " is not valid for `provision`; it belongs to `wrap`");
             } else {
-                throw CliError("unrecognized argument: " + arg);
+                throw CliError("unrecognized argument for `provision`: " + arg);
             }
         }
 
-        if (!serviceName) throw CliError("missing required --service-name|-sn");
+        if (!serviceName) throw CliError("provision: missing required --service-name|-sn");
 
         out.serviceName = *serviceName;
         return ParseOutcome::Run;
@@ -278,6 +274,15 @@ namespace {
         std::optional<std::string> groupName;
         bool force = false;
         bool dekStdin = false;
+        std::optional<std::string> dekFile;
+        // Rejects a second DEK source rather than letting the last one win:
+        // silently ignoring one of two explicitly requested inputs is exactly
+        // the kind of ambiguity that leads to wrapping the wrong key.
+        auto oneSource = [&]() {
+            if (dekStdin || dekFile) {
+                throw CliError("give exactly one of --dek-stdin or --dek-file");
+            }
+        };
 
         for (int i = 2; i < argc; ++i) {
             std::string arg = argv[i];
@@ -286,7 +291,18 @@ namespace {
             } else if (arg == "--force" || arg == "-f") {
                 force = true;
             } else if (arg == "--dek-stdin") {
+                oneSource();
                 dekStdin = true;
+            } else if (arg == "--dek-file") {
+                if (i + 1 >= argc) {
+                    throw CliError(arg + " requires a value");
+                }
+                std::string value = argv[++i];
+                if (value.empty()) {
+                    throw CliError("--dek-file must not be empty");
+                }
+                oneSource();
+                dekFile = value;
             } else if (arg == "--key-file-path" || arg == "-kf") {
                 if (i + 1 >= argc) {
                     throw CliError(arg + " requires a value");
@@ -313,33 +329,52 @@ namespace {
                 if (value.empty()) {
                     throw CliError("--group must not be empty");
                 }
+                if (groupName) {
+                    throw CliError("give --group at most once");
+                }
                 groupName = value;
             } else {
-                throw CliError("unrecognized argument: " + arg);
+                throw CliError("unrecognized argument for `wrap`: " + arg);
             }
         }
 
-        if (!keyFilePath) throw CliError("missing required --key-file-path|-kf");
-        if (!serviceName) throw CliError("missing required --service-name|-sn");
-        if (!groupName) throw CliError("missing required --group|-g");
-        if (!dekStdin) {
-            throw CliError("missing required --dek-stdin (the DEK must be provided as base64 text on stdin)");
-        }
+        if (!keyFilePath) throw CliError("wrap: missing required --key-file-path|-kf");
+        if (!serviceName) throw CliError("wrap: missing required --service-name|-sn");
+        if (!dekStdin && !dekFile) throw CliError("wrap: missing required --dek-stdin or --dek-file <path>");
 
         out.keyFilePath = *keyFilePath;
         out.serviceName = *serviceName;
-        out.groupName = *groupName;
+        out.groupName = groupName;
         out.force = force;
         out.dekStdin = dekStdin;
+        out.dekFile = dekFile;
         return ParseOutcome::Run;
     }
 
     // MARK: - The DEK's one buffer
 
-    // Upper bound on how much stdin "wrap --dek-stdin" will accept. A 32-byte
-    // DEK is 44 base64 characters; this leaves generous room for line breaks
-    // and whitespace while letting DekScratch be one fixed allocation.
-    constexpr size_t kMaxDekStdinLen = 4096;
+    // Upper bound on how much stdin "wrap --dek-stdin" will accept - the
+    // Linux tool's MAX_DEK_INPUT_LEN. A 32-byte DEK is 44 base64 characters;
+    // 64 leaves room for a UTF-8 byte-order mark and a trailing CRLF, and
+    // nothing longer can be a valid DEK under the rules DecodeDek applies.
+    constexpr size_t kMaxDekStdinLen = 64;
+
+    // Any DEK input that isn't strict, padded, standard base64 - the Linux
+    // tool's wording. Deliberately fixed: it names no character, offset or
+    // bit pattern, so a mistyped DEK never puts part of itself into a log.
+    constexpr char kInvalidBase64DekMessage[] =
+            "the DEK input is not valid base64 (standard alphabet, padded, at most one trailing newline)";
+
+    // Refusing to read the DEK from an interactive console - the Linux
+    // tool's wording, with this tool's own example.
+    constexpr char kTerminalDekMessage[] =
+            "refusing to read the DEK from an interactive terminal, where it would be echoed and kept in the "
+            "scrollback; pipe it in instead, e.g. $dekBase64 | hkdfguard.exe wrap ... --dek-stdin";
+
+    // Refusing UTF-16 input - the Linux tool's wording.
+    constexpr char kUtf16DekMessage[] =
+            "the DEK input is UTF-16 encoded; send it as ASCII or UTF-8 base64 text "
+            "(in PowerShell, set [Console]::OutputEncoding or $OutputEncoding to UTF-8)";
 
     // Every copy of the DEK this program makes - the base64 text it reads
     // from stdin, and the bytes that decodes to - lives in one fixed
@@ -411,11 +446,10 @@ namespace {
     // ReadFile on the stdin handle, not the C runtime's fread: the CRT keeps
     // its own buffer for a FILE stream, which would hold a copy of the DEK
     // text this code could neither lock nor wipe.
-    void ReadDekBase64FromStdin(DekScratch &scratch) {
-        HANDLE in = GetStdHandle(STD_INPUT_HANDLE);
-        if (in == nullptr || in == INVALID_HANDLE_VALUE) {
-            throw CliError("no stdin to read the DEK from for --dek-stdin");
-        }
+    // Reads at most kMaxDekStdinLen bytes from `in` into scratch's text
+    // buffer, refusing more. `what` names the source in errors, as the Linux
+    // tool's read_bounded does ("the DEK on stdin", "--dek-file").
+    void ReadBoundedInto(HANDLE in, const std::string &what, DekScratch &scratch) {
         for (;;) {
             DWORD got = 0;
             DWORD room = static_cast<DWORD>(DekScratch::kTextCapacity - scratch.textLen);
@@ -424,63 +458,159 @@ namespace {
                 if (err == ERROR_BROKEN_PIPE) {
                     break; // the writing end of a pipe closed: end of input
                 }
-                throw CliError("failed to read DEK from stdin: " + FormatWin32Error(err));
+                throw CliError("failed to read " + what + ": " + FormatWin32Error(err));
             }
             if (got == 0) {
                 break;
             }
             scratch.textLen += got;
             if (scratch.textLen > kMaxDekStdinLen) {
+                // UTF-16 doubles the text, so it is over the limit long
+                // before DecodeDek could say why: name it here instead.
+                const auto *bytes = reinterpret_cast<const unsigned char *>(scratch.text());
+                if ((bytes[0] == 0xFF && bytes[1] == 0xFE) || (bytes[0] == 0xFE && bytes[1] == 0xFF)) {
+                    throw CliError(kUtf16DekMessage);
+                }
                 throw CliError(
-                    "stdin for --dek-stdin is larger than " + std::to_string(kMaxDekStdinLen) +
-                    " bytes; expected a base64-encoded 32-byte DEK");
+                    what + " is longer than " + std::to_string(kMaxDekStdinLen) +
+                    " bytes; expected base64 of a 32-byte DEK");
             }
         }
-        if (scratch.textLen == 0) {
-            throw CliError("no data read from stdin for --dek-stdin");
-        }
+        // Empty input is reported by DecodeDek, as on Linux.
     }
 
-    // Decodes scratch's base64 text (standard base64) into its decoded
-    // bytes via Crypt32's string-conversion API - no third-party dependency
-    // needed, matching this project's general preference for native
-    // platform APIs. CRYPT_STRING_BASE64 tolerates embedded whitespace
-    // (spaces, tabs, CR, LF), so a trailing newline from how the text was
-    // produced (e.g. piped from a shell) needs no separate trimming here.
+    void ReadDekBase64FromStdin(DekScratch &scratch) {
+        HANDLE in = GetStdHandle(STD_INPUT_HANDLE);
+        if (in == nullptr || in == INVALID_HANDLE_VALUE) {
+            throw CliError("no stdin to read the DEK from for --dek-stdin");
+        }
+        // A DEK typed or pasted at a console is echoed and stays in the
+        // console's scrollback: refuse a console outright rather than read
+        // it. GetConsoleMode succeeds only on a console input handle - a pipe
+        // or a file fails it - so this doesn't refuse NUL or other character
+        // devices, which are not consoles.
+        DWORD consoleMode = 0;
+        if (GetConsoleMode(in, &consoleMode)) {
+            throw CliError(kTerminalDekMessage);
+        }
+        ReadBoundedInto(in, "the DEK on stdin", scratch);
+    }
+
+    // All ones if `a` and `b` are both negative, else zero - without a
+    // branch: their AND is negative exactly then, and its sign bit, taken
+    // through an unsigned shift (fully defined, unlike a signed one), is
+    // stretched into a mask by negation.
+    inline int32_t BothNegativeMask(int32_t a, int32_t b) {
+        return -static_cast<int32_t>(static_cast<uint32_t>(a & b) >> 31);
+    }
+
+    // The 6-bit value of a standard-alphabet base64 character, or -1 - in
+    // constant time: no branch and no table lookup depends on `c`, which is
+    // a character of the secret DEK text. The same arithmetic as RustCrypto's
+    // base64ct (which the Linux tool uses) and libsodium: start at -1 and,
+    // for each range, add a correction masked to apply only when `c` is in
+    // it. Every term is computed for every character.
+    inline int32_t Base64ValueCt(uint8_t c) {
+        const int32_t ch = c;
+        int32_t value = -1;
+        value += BothNegativeMask(('A' - 1) - ch, ch - ('Z' + 1)) & (ch - 'A' + 1);      // 'A'..'Z' -> 0..25
+        value += BothNegativeMask(('a' - 1) - ch, ch - ('z' + 1)) & (ch - 'a' + 26 + 1); // 'a'..'z' -> 26..51
+        value += BothNegativeMask(('0' - 1) - ch, ch - ('9' + 1)) & (ch - '0' + 52 + 1); // '0'..'9' -> 52..61
+        value += BothNegativeMask(('+' - 1) - ch, ch - ('+' + 1)) & (62 + 1);            // '+' -> 62
+        value += BothNegativeMask(('/' - 1) - ch, ch - ('/' + 1)) & (63 + 1);            // '/' -> 63
+        return value;
+    }
+
+    // Decodes scratch's base64 text into its decoded bytes, by the Linux
+    // tool's rules exactly, so the same input is accepted or refused on both:
     //
-    // A leading UTF-8 byte-order mark (EF BB BF) is skipped: some PowerShell
-    // and .NET configurations prepend one when piping a string to a native
-    // process's stdin (whenever [Console]::InputEncoding is UTF-8 with a
-    // preamble), and CRYPT_STRING_BASE64 would otherwise reject the whole
-    // input as invalid. A UTF-16 byte-order mark is reported as such rather
-    // than as "not valid base64", since the fix there is on the sending side.
-    // Decodes straight into the locked buffer, so no decoded byte is ever
-    // anywhere else.
+    //   - A leading UTF-8 byte-order mark (EF BB BF) is skipped: some
+    //     PowerShell and .NET configurations prepend one when piping text to
+    //     a native process. A UTF-16 byte-order mark is refused as such, since
+    //     the fix there is on the sending side.
+    //   - Exactly one trailing newline (LF or CRLF) is tolerated, as written
+    //     by `echo`, `printf '%s\n'` or an editor. Nothing else: no other
+    //     whitespace, anywhere.
+    //   - Then strict standard base64 (RFC 4648 section 4, the `+/` alphabet)
+    //     with canonical padding: a length that's a multiple of 4, `=` only
+    //     as the last one or two characters, and the unused bits before the
+    //     padding zero - what base64ct, which the Linux tool uses, accepts.
+    //
+    // Constant time with respect to the secret text, as base64ct is on
+    // Linux: every character goes through Base64ValueCt, problems are
+    // collected into one flag rather than reported where they're found, and
+    // the flag is checked once, after the whole input has been processed.
+    // Only public facts decide anything earlier: the length, where the
+    // padding is, the byte-order mark and the trailing newline. Any malformed
+    // input gets the same fixed message, which names no character, offset or
+    // bit pattern. Decodes straight into the locked buffer, so no decoded
+    // byte is ever anywhere else, and wipes its own temporaries.
     void DecodeDek(DekScratch &scratch) {
-        const char *text = scratch.text();
-        size_t textLen = scratch.textLen;
+        const unsigned char *text = reinterpret_cast<const unsigned char *>(scratch.text());
+        size_t len = scratch.textLen;
 
-        if (textLen >= 3 &&
-            static_cast<unsigned char>(text[0]) == 0xEF &&
-            static_cast<unsigned char>(text[1]) == 0xBB &&
-            static_cast<unsigned char>(text[2]) == 0xBF) {
+        if (len >= 3 && text[0] == 0xEF && text[1] == 0xBB && text[2] == 0xBF) {
             text += 3;
-            textLen -= 3;
-        } else if (textLen >= 2 &&
-                   ((static_cast<unsigned char>(text[0]) == 0xFF && static_cast<unsigned char>(text[1]) == 0xFE) ||
-                    (static_cast<unsigned char>(text[0]) == 0xFE && static_cast<unsigned char>(text[1]) == 0xFF))) {
-            throw CliError(
-                "DEK on stdin is UTF-16 encoded; send it as ASCII or UTF-8 base64 text "
-                "(for example, set [Console]::OutputEncoding or $OutputEncoding to UTF-8 in PowerShell)");
+            len -= 3;
+        } else if (len >= 2 && ((text[0] == 0xFF && text[1] == 0xFE) || (text[0] == 0xFE && text[1] == 0xFF))) {
+            throw CliError(kUtf16DekMessage);
+        }
+        if (len >= 1 && text[len - 1] == '\n') {
+            --len;
+            if (len >= 1 && text[len - 1] == '\r') {
+                --len;
+            }
+        }
+        if (len == 0) {
+            throw CliError("the DEK input is empty");
+        }
+        if (len % 4 != 0) {
+            throw CliError(kInvalidBase64DekMessage);
+        }
+        // How many '=' end the input. A valid DEK always ends in exactly one,
+        // so this decides nothing about the key; a data character there just
+        // means no padding, and is decoded like any other.
+        const size_t padding = (text[len - 1] == '=') ? ((text[len - 2] == '=') ? 2 : 1) : 0;
+        const size_t decodedLen = len / 4 * 3 - padding;
+        if (decodedLen > DekScratch::kDecodedCapacity) {
+            throw CliError(kInvalidBase64DekMessage);
         }
 
-        DWORD size = static_cast<DWORD>(DekScratch::kDecodedCapacity);
-        if (!CryptStringToBinary(
-            text, static_cast<DWORD>(textLen), CRYPT_STRING_BASE64, scratch.decoded(), &size, nullptr,
-            nullptr)) {
-            throw CliError("DEK is not valid base64: " + FormatWin32Error(GetLastError()));
+        BYTE *out = scratch.decoded();
+        size_t written = 0;
+        uint32_t bad = 0;    // nonzero once anything is wrong; checked only at the end
+        int32_t v[4] = {};   // the current group's four 6-bit values
+        uint32_t group = 0;  // and the 24 bits they make
+        for (size_t i = 0; i < len; i += 4) {
+            const bool last = (i + 4 == len);
+            for (size_t j = 0; j < 4; ++j) {
+                // Padding positions (public: fixed by the length and the
+                // count above) decode as 0. Everywhere else, including any
+                // '=' out of place, the constant-time lookup decides, and -1
+                // sets the flag.
+                const bool isPadding = last && j >= 4 - padding;
+                v[j] = isPadding ? 0 : Base64ValueCt(text[i + j]);
+                bad |= static_cast<uint32_t>(v[j]) >> 31;
+            }
+            group = (static_cast<uint32_t>(v[0] & 0x3F) << 18) | (static_cast<uint32_t>(v[1] & 0x3F) << 12) |
+                    (static_cast<uint32_t>(v[2] & 0x3F) << 6) | static_cast<uint32_t>(v[3] & 0x3F);
+            if (last) {
+                // Canonical: the bits the padding leaves unused must be zero.
+                const uint32_t unusedBits = (padding == 2) ? 0xFFFFu : (padding == 1) ? 0xFFu : 0u;
+                bad |= (group & unusedBits);
+            }
+            out[written++] = static_cast<BYTE>(group >> 16);
+            if (!(last && padding == 2)) out[written++] = static_cast<BYTE>(group >> 8);
+            if (!(last && padding >= 1)) out[written++] = static_cast<BYTE>(group);
         }
-        scratch.decodedLen = size;
+        SecureZeroMemory(v, sizeof(v));
+        SecureZeroMemory(&group, sizeof(group));
+        if (bad != 0) {
+            // The partly decoded bytes stay in the locked buffer, which its
+            // destructor wipes as this exception unwinds.
+            throw CliError(kInvalidBase64DekMessage);
+        }
+        scratch.decodedLen = written;
     }
 
     // MARK: - Wrap / provision
@@ -536,11 +666,14 @@ namespace {
         }
 
         if (rc != HKDFGUARD_OK) {
-            std::string message = "hkdfguard_wrap_dek failed: " + DescribeStatus(rc);
+            // The Linux tool's wording for the one failure an operator is most
+            // likely to hit, with the command that fixes it.
             if (rc == HKDFGUARD_ERR_KEK_NOT_FOUND) {
-                message += std::string(" (run \"") + kProgramNameNarrow +
-                           " provision --service-name " + service + "\" first)";
+                throw CliError(
+                    "no KEK is provisioned for service \"" + service + "\"; run `" + kProgramNameNarrow +
+                    " provision --service-name " + service + "` first");
             }
+            std::string message = "hkdfguard_wrap_dek failed: " + DescribeStatus(rc);
             throw CliError(message);
         }
 
@@ -585,10 +718,11 @@ namespace {
             throw CliError(message);
         }
 
+        // The Linux tool's wording.
         if (exists != 0) {
-            fprintf(stdout, "verified existing KEK for service \"%s\"\n", service.c_str());
+            fprintf(stdout, "KEK already provisioned for service \"%s\"; verified, nothing to do\n", service.c_str());
         } else {
-            fprintf(stdout, "created KEK for service \"%s\"\n", service.c_str());
+            fprintf(stdout, "KEK provisioned for service \"%s\"\n", service.c_str());
         }
     }
 
@@ -738,22 +872,22 @@ namespace {
         return sid;
     }
 
-    // Owns every buffer a security descriptor granting "owner read/write, one
-    // group read-only, no one else, no inherited ACEs" needs to stay alive for
-    // as long as it's in use - a self-contained bundle rather than several
-    // out-parameters the caller would otherwise have to keep in sync by hand.
-    // The Windows analog of this project's macOS/Linux tools' POSIX 0640
-    // (owner rw, one group r, no one else).
-    class OwnerReadWriteGroupReadSecurity {
+    // Owns every buffer a security descriptor granting "owner read/write,
+    // optionally one group read-only, no one else, no inherited ACEs" needs
+    // to stay alive for as long as it's in use - a self-contained bundle
+    // rather than several out-parameters the caller would otherwise have to
+    // keep in sync by hand. The Windows analog of the Linux tool's POSIX 0600
+    // (no group) and 0640 (with --group: owner rw, one group r, no one else).
+    class KeyFileSecurity {
     public:
-        OwnerReadWriteGroupReadSecurity(std::vector<BYTE> ownerSid, std::vector<BYTE> groupSid)
-            : ownerSid_(std::move(ownerSid)), groupSid_(std::move(groupSid)) {
+        KeyFileSecurity(std::vector<BYTE> ownerSid, std::optional<std::vector<BYTE>> groupSid)
+            : ownerSid_(std::move(ownerSid)), groupSid_(groupSid ? std::move(*groupSid) : std::vector<BYTE>{}) {
             PSID owner = SidPtr(ownerSid_);
-            PSID group = SidPtr(groupSid_);
+            PSID group = groupSid_.empty() ? nullptr : SidPtr(groupSid_);
 
             DWORD aclSize = static_cast<DWORD>(
-                sizeof(ACL) + 2 * (sizeof(ACCESS_ALLOWED_ACE) - sizeof(DWORD)) + GetLengthSid(owner) +
-                GetLengthSid(group));
+                sizeof(ACL) + (sizeof(ACCESS_ALLOWED_ACE) - sizeof(DWORD)) + GetLengthSid(owner) +
+                (group ? (sizeof(ACCESS_ALLOWED_ACE) - sizeof(DWORD)) + GetLengthSid(group) : 0));
             // ACL buffers must be DWORD-aligned, per Windows' own documented
             // requirement; round up rather than trust the sum above to already
             // land on a boundary.
@@ -767,7 +901,7 @@ namespace {
             if (!AddAccessAllowedAce(acl, ACL_REVISION, FILE_GENERIC_READ | FILE_GENERIC_WRITE, owner)) {
                 throw CliError("AddAccessAllowedAce(owner) failed: " + FormatWin32Error(GetLastError()));
             }
-            if (!AddAccessAllowedAce(acl, ACL_REVISION, FILE_GENERIC_READ, group)) {
+            if (group != nullptr && !AddAccessAllowedAce(acl, ACL_REVISION, FILE_GENERIC_READ, group)) {
                 throw CliError("AddAccessAllowedAce(group) failed: " + FormatWin32Error(GetLastError()));
             }
 
@@ -782,7 +916,7 @@ namespace {
             }
             // Blocks this DACL from being merged with any inherited ACEs from
             // the parent directory - without this, a permissive parent-folder
-            // ACL could silently widen access beyond the two ACEs just set.
+            // ACL could silently widen access beyond the ACEs just set.
             if (!SetSecurityDescriptorControl(&sd_, SE_DACL_PROTECTED, SE_DACL_PROTECTED)) {
                 throw CliError("SetSecurityDescriptorControl failed: " + FormatWin32Error(GetLastError()));
             }
@@ -792,6 +926,9 @@ namespace {
         // SECURITY_ATTRIBUTES' lpSecurityDescriptor points at this object's own
         // sd_ member, which in turn points into ownerSid_/groupSid_/aclBuf_,
         // all owned together right here.
+        // The DACL itself, for re-applying it as protected on the open file.
+        PACL Dacl() const { return reinterpret_cast<PACL>(const_cast<BYTE *>(aclBuf_.data())); }
+
         SECURITY_ATTRIBUTES attributes() const {
             SECURITY_ATTRIBUTES sa{};
             sa.nLength = sizeof(sa);
@@ -1225,10 +1362,10 @@ namespace {
     // mismatch the just-created (still empty) file is deleted through its
     // own handle before anything is written to it.
     void WriteWrappedKeyFile(
-        const std::string &path, const std::vector<uint8_t> &bytes, const OwnerReadWriteGroupReadSecurity &security) {
+        const std::string &path, const std::vector<uint8_t> &bytes, const KeyFileSecurity &security) {
         SECURITY_ATTRIBUTES sa = security.attributes();
         ScopedFileHandle file(CreateFile(
-            path.c_str(), GENERIC_WRITE | DELETE, 0, &sa, CREATE_NEW,
+            path.c_str(), GENERIC_WRITE | DELETE | WRITE_DAC, 0, &sa, CREATE_NEW,
             FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
         if (!file.valid()) {
             DWORD err = GetLastError();
@@ -1249,6 +1386,25 @@ namespace {
             throw;
         }
 
+        // Protect the DACL on the file itself, before a byte is written. The
+        // descriptor CreateFile was given carries SE_DACL_PROTECTED, but a
+        // new file's descriptor is built by the kernel from it, and the
+        // protection bit isn't reliably kept: an unprotected DACL would pick
+        // up a parent folder's inheritable ACEs the next time someone
+        // propagates that folder's permissions to its children. Re-applied
+        // through the handle with PROTECTED_DACL_SECURITY_INFORMATION, it
+        // stays exactly the ACEs built above. Failing that, the (still
+        // empty) file is removed.
+        DWORD protectError = SetSecurityInfo(
+            file.get(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION, nullptr,
+            nullptr, security.Dacl(), nullptr);
+        if (protectError != ERROR_SUCCESS) {
+            FILE_DISPOSITION_INFO disposition{};
+            disposition.DeleteFile = TRUE;
+            SetFileInformationByHandle(file.get(), FileDispositionInfo, &disposition, sizeof(disposition));
+            throw CliError("failed to protect the ACL of " + path + ": " + FormatWin32Error(protectError));
+        }
+
         DWORD totalWritten = 0;
         const DWORD bytesSize = static_cast<DWORD>(bytes.size());
         while (totalWritten < bytesSize) {
@@ -1258,6 +1414,181 @@ namespace {
             }
             totalWritten += written;
         }
+    }
+
+    // MARK: - Reading the DEK from a file
+
+    // The SID of the account this process runs as (TokenUser), as an owned
+    // buffer - for the --dek-file trust check, which accepts the file's own
+    // user, as the Linux tool accepts a file owned by its euid.
+    std::vector<BYTE> GetProcessUserSid() {
+        HANDLE hToken = nullptr;
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) {
+            throw CliError("OpenProcessToken failed: " + FormatWin32Error(GetLastError()));
+        }
+        DWORD size = 0;
+        GetTokenInformation(hToken, TokenUser, nullptr, 0, &size);
+        std::vector<BYTE> buf(size);
+        BOOL ok = size != 0 && GetTokenInformation(hToken, TokenUser, buf.data(), size, &size);
+        DWORD err = ok ? 0 : GetLastError();
+        CloseHandle(hToken);
+        if (!ok) {
+            throw CliError("GetTokenInformation(TokenUser) failed: " + FormatWin32Error(err));
+        }
+        PSID user = reinterpret_cast<TOKEN_USER *>(buf.data())->User.Sid;
+        std::vector<BYTE> sid(GetLengthSid(user));
+        if (!CopySid(static_cast<DWORD>(sid.size()), sid.data(), user)) {
+            throw CliError("CopySid(user) failed: " + FormatWin32Error(GetLastError()));
+        }
+        return sid;
+    }
+
+    // An account's name for an error message ("DOMAIN\\name"), or its SID
+    // string when it can't be resolved.
+    std::string AccountNameOf(PSID sid) {
+        char name[256], domain[256];
+        DWORD nameLen = sizeof(name), domainLen = sizeof(domain);
+        SID_NAME_USE use;
+        if (LookupAccountSidA(nullptr, sid, name, &nameLen, domain, &domainLen, &use)) {
+            return domainLen > 0 ? std::string(domain) + "\\" + name : std::string(name);
+        }
+        LPSTR text = nullptr;
+        if (ConvertSidToStringSidA(sid, &text)) {
+            std::string s(text);
+            LocalFree(text);
+            return s;
+        }
+        return "(unknown account)";
+    }
+
+    // A --dek-file holds the plaintext DEK, so it must be readable by
+    // nobody but the accounts that could read it anyway - the Linux tool's
+    // "owned by root or this user, no group or other bits at all", in ACL
+    // form. Judged on the open handle, so it's the file actually read:
+    //   - the owner is SYSTEM, Administrators or this account;
+    //   - the DACL grants nothing (any right, read included) to anyone else.
+    //     Deny and inherit-only ACEs don't count; OWNER RIGHTS is the owner,
+    //     checked above; CREATOR OWNER and CREATOR GROUP match nobody outside
+    //     an inherit-only ACE; any other kind of allow ACE can't be vouched
+    //     for, so it is refused.
+    // Stricter than the key-file rule, which allows others to read: a key
+    // file is ciphertext, this is not.
+    void RequireTrustedDekFile(HANDLE file, const std::string &path) {
+        PSID owner = nullptr;
+        PACL dacl = nullptr;
+        PSECURITY_DESCRIPTOR sd = nullptr;
+        DWORD rc = GetSecurityInfo(file, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                                   &owner, nullptr, &dacl, nullptr, &sd);
+        if (rc != ERROR_SUCCESS) {
+            throw CliError("failed to read the security of --dek-file " + path + ": " + FormatWin32Error(rc));
+        }
+        struct FreeSd {
+            PSECURITY_DESCRIPTOR p;
+            ~FreeSd() { LocalFree(p); }
+        } freeSd{sd};
+
+        std::vector<BYTE> user = GetProcessUserSid();
+        auto trusted = [&](PSID sid) {
+            return IsWellKnownSid(sid, WinLocalSystemSid) || IsWellKnownSid(sid, WinBuiltinAdministratorsSid) ||
+                   EqualSid(sid, user.data());
+        };
+        const std::string fix =
+                "; a plaintext DEK file must be readable by SYSTEM, Administrators and this account only "
+                "(for example: icacls \"" + path + "\" /inheritance:r /grant:r \"%USERNAME%:R\")";
+        if (owner == nullptr || !trusted(owner)) {
+            throw CliError(
+                "--dek-file " + path + " is owned by " + (owner ? AccountNameOf(owner) : std::string("no one")) +
+                ", which is neither SYSTEM, Administrators nor this account" + fix);
+        }
+        if (dacl == nullptr) {
+            throw CliError("--dek-file " + path + " has no DACL, so every account can read it" + fix);
+        }
+        for (DWORD i = 0; i < dacl->AceCount; ++i) {
+            void *ace = nullptr;
+            if (!GetAce(dacl, i, &ace)) {
+                throw CliError("failed to read the ACL of --dek-file " + path + ": " + FormatWin32Error(GetLastError()));
+            }
+            const auto *header = static_cast<const ACE_HEADER *>(ace);
+            if (header->AceFlags & INHERIT_ONLY_ACE) {
+                continue;
+            }
+            switch (header->AceType) {
+                case ACCESS_DENIED_ACE_TYPE:
+                case ACCESS_DENIED_OBJECT_ACE_TYPE:
+                case ACCESS_DENIED_CALLBACK_ACE_TYPE:
+                case ACCESS_DENIED_CALLBACK_OBJECT_ACE_TYPE:
+                    continue;
+                case ACCESS_ALLOWED_ACE_TYPE:
+                case ACCESS_ALLOWED_CALLBACK_ACE_TYPE: {
+                    PSID sid = const_cast<DWORD *>(&static_cast<const ACCESS_ALLOWED_ACE *>(ace)->SidStart);
+                    if (!trusted(sid) && !IsWellKnownSid(sid, WinCreatorOwnerRightsSid) &&
+                        !IsWellKnownSid(sid, WinCreatorOwnerSid) && !IsWellKnownSid(sid, WinCreatorGroupSid)) {
+                        throw CliError("--dek-file " + path + " grants access to " + AccountNameOf(sid) + fix);
+                    }
+                    continue;
+                }
+                default:
+                    throw CliError("--dek-file " + path + " has an access-allowed ACE of an unexpected type" + fix);
+            }
+        }
+    }
+
+    // Reads the DEK's base64 text from --dek-file into `scratch`. The path
+    // rules are the key file's (see "The output path must be a real file"
+    // above), checked before and on the open handle:
+    //   - on a local drive: never UNC, a mapped network drive or a device,
+    //     decided before anything is opened, so this process never connects
+    //     or authenticates to a server named in the path;
+    //   - no 8.3 short name anywhere in it;
+    //   - a regular file, opened without following a reparse point, and at
+    //     the spelled path: no symbolic link or junction at it or above it;
+    // then RequireTrustedDekFile, then at most kMaxDekStdinLen bytes. Opened
+    // with read sharing only, so nobody can change it while it's read.
+    // Unlike the key file, a hard link isn't refused: nothing here writes
+    // through it, and the Linux tool doesn't refuse one either.
+    void ReadDekFile(const std::string &path, DekScratch &scratch) {
+        char fullBuf[MAX_PATH * 4];
+        DWORD fullLen = GetFullPathNameA(path.c_str(), static_cast<DWORD>(sizeof(fullBuf)), fullBuf, nullptr);
+        if (fullLen == 0 || fullLen >= sizeof(fullBuf)) {
+            throw CliError("failed to resolve --dek-file " + path + ": " + FormatWin32Error(GetLastError()));
+        }
+        const std::string full(fullBuf, fullLen);
+        const bool driveLetter = full.size() >= 3 && std::isalpha(static_cast<unsigned char>(full[0])) &&
+                                 full[1] == ':' && full[2] == '\\';
+        if (!driveLetter || GetDriveTypeA(full.substr(0, 3).c_str()) == DRIVE_REMOTE) {
+            throw CliError(
+                "--dek-file " + path + " is not on a local drive (UNC paths, mapped network drives and devices "
+                "are refused)");
+        }
+        const std::string expected = FullLongPath(path); // refuses 8.3 short names
+
+        ScopedFileHandle file(CreateFile(
+            path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION, nullptr));
+        if (!file.valid()) {
+            throw CliError("failed to open --dek-file " + path + ": " + FormatWin32Error(GetLastError()));
+        }
+        if (GetFileType(file.get()) != FILE_TYPE_DISK) {
+            throw CliError("--dek-file " + path + " is not a regular file");
+        }
+        BY_HANDLE_FILE_INFORMATION info{};
+        if (!GetFileInformationByHandle(file.get(), &info)) {
+            throw CliError("failed to examine --dek-file " + path + ": " + FormatWin32Error(GetLastError()));
+        }
+        if (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
+            throw CliError("--dek-file " + path + " is a symbolic link, junction or other reparse point; refusing to follow it");
+        }
+        if (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            throw CliError("--dek-file " + path + " is not a regular file");
+        }
+        const std::string actual = TrimTrailingSeparators(FinalPathOfHandle(file.get(), path));
+        if (_stricmp(actual.c_str(), TrimTrailingSeparators(expected).c_str()) != 0) {
+            throw CliError(
+                "--dek-file " + path + " resolves through a symbolic link, junction, SUBST or mapped drive to \"" +
+                actual + "\"; give its real local path");
+        }
+        RequireTrustedDekFile(file.get(), path);
+        ReadBoundedInto(file.get(), "--dek-file", scratch);
     }
 
     // MARK: - Run: provision
@@ -1293,8 +1624,10 @@ namespace {
         // Resolved before any TPM/Software Key Storage Provider work, so a bad
         // --group name fails fast rather than after an expensive (and, with
         // --force, destructive) operation has already run. Doesn't touch any
-        // secret material either way.
-        OwnerReadWriteGroupReadSecurity security(GetProcessOwnerSid(), ResolveGroupSid(args.groupName));
+        // secret material either way. Without --group: owner-only.
+        KeyFileSecurity security(
+            GetProcessOwnerSid(),
+            args.groupName ? std::optional<std::vector<BYTE>>(ResolveGroupSid(*args.groupName)) : std::nullopt);
 
         // `service` (and its UTF-8 form) is not secret -- it's a logical
         // identifier, not key material -- so both live for the rest of this
@@ -1315,14 +1648,18 @@ namespace {
             // copies or zeroes it (see aes_gcm.cpp), so this caller-side
             // wiping is the only place it happens at all.
             DekScratch scratch;
-            ReadDekBase64FromStdin(scratch);
+            if (args.dekFile) {
+                ReadDekFile(*args.dekFile, scratch);
+            } else {
+                ReadDekBase64FromStdin(scratch);
+            }
             DecodeDek(scratch);
             // The base64 text has served its only purpose.
             scratch.WipeText();
 
             if (scratch.decodedLen != kDekLen) {
                 throw CliError(
-                    "DEK must decode to exactly " + std::to_string(kDekLen) + " bytes, got " +
+                    "the DEK must decode to exactly " + std::to_string(kDekLen) + " bytes, got " +
                     std::to_string(scratch.decodedLen));
             }
 
@@ -1342,9 +1679,12 @@ namespace {
 
         WriteWrappedKeyFile(args.keyFilePath, wrapped, security);
 
+        // The same wording as the Linux tool.
+        const std::string access =
+                args.groupName ? "owner read/write + " + *args.groupName + " read-only" : std::string("owner read/write");
         fprintf(
-            stdout, "wrapped key written to %s (%zu bytes, owner read/write + %s read-only, service \"%s\")\n",
-            args.keyFilePath.c_str(), wrapped.size(), args.groupName.c_str(), service.c_str());
+            stdout, "wrapped key written to %s (%zu bytes, %s, service \"%s\")\n",
+            args.keyFilePath.c_str(), wrapped.size(), access.c_str(), service.c_str());
     }
 } // namespace
 
@@ -1364,12 +1704,13 @@ int main(int argc, char *argv[]) {
     }
 
     if (argc < 2) {
+        fprintf(stderr, "error: missing subcommand: expected `provision` or `wrap`\n");
         PrintUsage();
         return 2;
     }
 
     std::string command = argv[1];
-    if (command == "--help" || command == "-h") {
+    if (command == "--help" || command == "-h" || command == "help") {
         PrintUsage();
         return 0;
     }
@@ -1378,12 +1719,12 @@ int main(int argc, char *argv[]) {
         ProvisionArgs args;
         try {
             if (ParseProvisionArgs(argc, argv, args) == ParseOutcome::Help) {
-                PrintProvisionUsage();
+                PrintUsage();
                 return 0;
             }
         } catch (const CliError &e) {
             fprintf(stderr, "error: %s\n", e.message.c_str());
-            PrintProvisionUsage();
+            PrintUsage();
             return 2;
         }
 
@@ -1403,12 +1744,12 @@ int main(int argc, char *argv[]) {
         WrapArgs args;
         try {
             if (ParseWrapArgs(argc, argv, args) == ParseOutcome::Help) {
-                PrintWrapUsage();
+                PrintUsage();
                 return 0;
             }
         } catch (const CliError &e) {
             fprintf(stderr, "error: %s\n", e.message.c_str());
-            PrintWrapUsage();
+            PrintUsage();
             return 2;
         }
 
@@ -1424,7 +1765,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    fprintf(stderr, "error: unrecognized command \"%s\"\n", command.c_str());
+    fprintf(stderr, "error: unknown subcommand \"%s\": expected `provision` or `wrap`\n", command.c_str());
     PrintUsage();
     return 2;
 }

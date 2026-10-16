@@ -253,13 +253,31 @@ reports and away from other processes.
   **stdin** rather than a command-line argument, specifically so it never appears in
   this process's `argv`, where another process on the same host could otherwise read
   it via a command-line/process listing (e.g. a WMI query) for the life of the run.
+  The input rules are the Linux tool's, exactly: strict standard base64 (`+/`, padded,
+  as `[Convert]::ToBase64String` writes it), at most 64 bytes, with one trailing newline
+  (LF or CRLF) allowed and no other whitespace. A leading UTF-8 byte-order mark is
+  skipped, and UTF-16 input is refused with a message saying so.
+  `--dek-file <path>` reads the same text from a file instead, by the Linux tool's rules
+  in ACL form. The file must be on a local drive, a regular file with no link, junction or
+  8.3 name at or above it, and owned by SYSTEM, Administrators or you. Its DACL must grant
+  nothing to anyone else, not even read, since it holds the plaintext DEK. All of this is
+  checked on the open handle; a refusal says how to fix the ACL with `icacls`. Decoding is constant
+  time with respect to the DEK text (no branch or table lookup depends on it, as with
+  RustCrypto's `base64ct` on Linux), and any malformed input gets one fixed message that
+  names no character or offset, so a mistyped DEK never ends up in a log. `--dek-stdin`
+  refuses an interactive console: pipe the DEK in rather than typing or pasting it, so
+  it isn't echoed or kept in the scrollback.
 
   ```
-  hkdfguard.exe wrap --key-file-path|-kf <path> --service-name|-sn <name> --dek-stdin --group|-g <name> [--force|-f]
+  hkdfguard.exe wrap --key-file-path|-kf <path> --service-name|-sn <name> (--dek-stdin | --dek-file <path>)
+                     [--group|-g <name>] [--force|-f]
   ```
 
-  `--group|-g` sets the wrapped **file's** Windows ACL (owner read/write, that group
-  read-only, no one else) - it has nothing to do with the KEK's own ACL, which is
+  The wrapped **file's** Windows ACL is protected (nothing inherited) and grants the
+  owner read/write and no one else. The owner is the token owner, so Administrators when
+  `wrap` runs elevated. That matches the Linux tool's `0600`. The optional `--group|-g`
+  adds that group, read-only, matching the Linux tool's `--group` and `0640`. This has
+  nothing to do with the KEK's own ACL, which is
   governed entirely by machine policy (see "Deployment model" above), not by anything
   passed on this command line. Name a dedicated group for the service that will read
   the file, for example a local group `App_1234` whose only member is that service's

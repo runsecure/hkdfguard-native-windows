@@ -188,9 +188,12 @@ needed.** Deleting it makes every DEK wrapped under it unrecoverable.
 ### 3. Wrap a DEK into a key file (every release)
 
 `wrap` uses an existing KEK and never creates one. It reads the DEK as base64 from
-**stdin**, so the key never appears on a command line. `--group` sets the key file's ACL:
-the owner can read and write, the named group can only read, and no one else has access.
-Use a dedicated group whose members are only the service's account.
+**stdin**, so the key never appears on a command line. The key file's ACL lets the owner
+read and write and no one else (the owner is Administrators when `wrap` runs elevated).
+The optional `--group` adds one group that can only read it. Use it when the application
+runs as a different account, and use a dedicated group whose members are only the
+service's account. Without `--group`, only the owner can read the file, so an
+application running as another account can't open it.
 
 ```powershell
 $exe = "C:\Program Files\HkdfGuard\hkdfguard.exe"
