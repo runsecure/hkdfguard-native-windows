@@ -319,9 +319,28 @@ namespace hkdfguard {
         }
     } // namespace
 
+#if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
+    namespace {
+        // See SetTestEcdhProviderFault in ecdh_hkdf.h. Off by default, so a
+        // test binary that never sets it behaves exactly like the DLL.
+        bool g_testEcdhProviderFault = false;
+    }
+
+    void SetTestEcdhProviderFault(bool failOpen) {
+        g_testEcdhProviderFault = failOpen;
+    }
+#endif
+
     void ValidateEphemeralPublicKey(const uint8_t pub[kEphemeralPubLen]) {
         ScopedBCryptAlg ecdh_alg;
         NTSTATUS status = BCryptOpenAlgorithmProvider(ecdh_alg.put(), BCRYPT_ECDH_P256_ALGORITHM, nullptr, 0);
+#if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
+        if (g_testEcdhProviderFault) {
+            // As if the open had failed. The real handle (if any) is
+            // released by ecdh_alg's destructor as usual.
+            status = static_cast<NTSTATUS>(0xC0000225L); // STATUS_NOT_FOUND
+        }
+#endif
         if (!BCRYPT_SUCCESS(status)) {
             // Infrastructure failure (can't even open the software provider),
             // not a verdict on the point - reported as CRYPTO, not MALFORMED,

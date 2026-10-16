@@ -121,7 +121,18 @@ function Invoke-Cli {
     return [PSCustomObject]@{ ExitCode = $proc.ExitCode; StdOut = $stdout; StdErr = $stderr }
 }
 
-$workDir = Join-Path $env:TEMP ("hkdfguard-cli-test-" + [Guid]::NewGuid().ToString("N"))
+# %TEMP% itself may be spelled with an 8.3 short name - on GitHub's hosted
+# runners it is C:\Users\RUNNER~1\... - and the CLI refuses short names, so
+# it's expanded to its long form (GetLongPathName) before any path is built
+# from it.
+Add-Type -Namespace HkdfGuardCliTest -Name Path -MemberDefinition @"
+[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+public static extern uint GetLongPathNameW(string shortPath, System.Text.StringBuilder longPath, uint size);
+"@
+$tempLong = New-Object System.Text.StringBuilder 32768
+$tempLen = [HkdfGuardCliTest.Path]::GetLongPathNameW($env:TEMP, $tempLong, 32768)
+$tempDir = if ($tempLen -gt 0 -and $tempLen -lt 32768) { $tempLong.ToString() } else { $env:TEMP }
+$workDir = Join-Path $tempDir ("hkdfguard-cli-test-" + [Guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Force -Path $workDir | Out-Null
 
 try {
@@ -218,6 +229,30 @@ try {
         "--group", $narrowGroup) -StdIn $validB64
     Check ($r.ExitCode -eq 1) "wrap existing file without --force exits 1"
     Check ((Get-Content -Path $existingFile -Raw) -eq "pre-existing content") "wrap existing file without --force is left untouched"
+
+    # ---- 11a. 8.3 short names are refused, never expanded - even when they ----
+    #           name a perfectly real folder - before any KEK or DEK work.
+    #           Where the volume doesn't generate short names, an elevated run
+    #           assigns one with fsutil; skipped only when neither works.
+    $longDir = Join-Path $workDir "long-folder-name-for-short-name-test"
+    New-Item -ItemType Directory -Force -Path $longDir | Out-Null
+    $fso = New-Object -ComObject Scripting.FileSystemObject
+    $shortDir = $fso.GetFolder($longDir).ShortPath
+    if ((-not $shortDir) -or ($shortDir -eq $longDir)) {
+        & fsutil.exe file setshortname $longDir "HKCLIS~1" *> $null
+        $shortDir = $fso.GetFolder($longDir).ShortPath
+    }
+    if ($shortDir -and ($shortDir -ne $longDir)) {
+        $viaShort = Join-Path $shortDir "new.key"
+        $r = Invoke-Cli @(
+            "wrap", "--key-file-path", $viaShort, "--service-name", "svc", "--dek-stdin",
+            "--group", $narrowGroup) -StdIn $validB64
+        Check ($r.ExitCode -eq 1) "wrap to a path with an 8.3 short folder name exits 1"
+        Check ($r.StdErr -match "8\.3 short name") "wrap to a short-name path names the 8.3 short name as the reason"
+        Check (-not (Test-Path (Join-Path $longDir "new.key"))) "wrap to a short-name path creates nothing"
+    } else {
+        Write-Host "[SKIP] wrap refuses 8.3 short names (this volume doesn't generate them)" -ForegroundColor Yellow
+    }
 
     # ---- 11b. The wrapped-key path must be a real file at a real location: ----
     #           a junction (creatable without any privilege, unlike a file

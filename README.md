@@ -41,7 +41,9 @@ itself (e.g. `myapp.v2`), not by rotating anything under the existing one.
 Creating a KEK for the first time requires the calling process to be elevated -
 opening/using an already-created one does not. Who else may use it is machine policy,
 not something either the creating tool or a caller chooses: SYSTEM and
-`BUILTIN\Administrators` always get full control, and every entry of the `REG_MULTI_SZ`
+`BUILTIN\Administrators` always get full control; the local groups `HkdfGuardAdmins` (full
+control) and `HkdfGuardUsers` (use access) are granted if they exist when the KEK is created
+(the MSI creates `HkdfGuardUsers`, never `HkdfGuardAdmins`); and every entry of the `REG_MULTI_SZ`
 registry value `HKLM\Software\Policies\HkdfGuard\KeyUseGroups` is granted use (unwrap)
 access when the KEK is created - each entry must resolve to a real, host-local group
 (this machine's own SAM, `BUILTIN`, `NT AUTHORITY`, or `NT SERVICE`; domain groups are
@@ -54,7 +56,7 @@ If you need per-user isolation instead, that means leaving `NCRYPT_MACHINE_KEY_F
 unset (current-user scope) - not offered as a build option here, since this project
 targets the shared-service deployment model above.
 
-The library exposes a small, stable C ABI (`include/hkdfguard.h`) with five functions.
+The library exposes a small, stable C ABI (`include/hkdfguard.h`) with six functions.
 No Windows handle, CNG/NCrypt type, or COM interface crosses that boundary, and no C++
 exception ever escapes it - every call returns an integer status code.
 
@@ -78,6 +80,10 @@ int32_t hkdfguard_unwrap_dek(
 
 int32_t hkdfguard_generate_and_wrap_dek(
     const char* service,
+    uint8_t* out, int32_t* out_len);
+
+int32_t hkdfguard_open_file(
+    const char* path,
     uint8_t* out, int32_t* out_len);
 ```
 
@@ -107,6 +113,32 @@ See `include/hkdfguard.h` for the full set of `HKDFGUARD_ERR_*` status codes.
 Ephemeral Data Protection Key - the plaintext DEK never crosses back out to the caller;
 it's zeroed internally the moment it's wrapped. Recover it later via
 `hkdfguard_unwrap_dek` on the resulting payload, with the same `service`.
+
+`hkdfguard_open_file` reads a wrapped-key file, such as one written by the CLI's `wrap`,
+and returns its 164 bytes **still wrapped**, ready for a later, separate
+`hkdfguard_unwrap_dek` call. It never unwraps, opens no KEK, and needs only read access to
+the file. `path` is UTF-8, absolute or relative to the current directory, and follows the
+same rules as the CLI's `--key-file-path`: it must be a real file on a local drive, reached
+through real directories. A symbolic link, junction or other reparse point at the path or
+anywhere above it is refused, never followed, and so are 8.3 short names (`PROGRA~1`),
+UNC paths, mapped and SUBST drives and device paths - all with
+`HKDFGUARD_ERR_FILE_PATH_REJECTED`, and the network and device cases before anything
+is opened, so the process never connects to a server named in a path. Configure key-file
+paths as full long paths, and don't build them from `%TEMP%` or other environment variables
+without first expanding them with `GetLongPathNameW`: Windows can set those variables with
+short names (for example `C:\Users\RUNNER~1\AppData\Local\Temp` on GitHub-hosted runners),
+and a path containing one is refused. It checks the file's size before reading anything, and
+fails
+with `HKDFGUARD_ERR_FILE_PLAINTEXT_KEY` for a file of exactly 32 bytes (the size of an
+*unwrapped* DEK, so probably a plaintext key written to disk - treat it as exposed; its
+contents are never read), `HKDFGUARD_ERR_FILE_TOO_SHORT` for any other size under 164, and
+`HKDFGUARD_ERR_FILE_TOO_LONG` for anything over. A 164-byte file must also pass the same
+structural and P-256 point checks unwrap applies, or it fails with
+`HKDFGUARD_ERR_MALFORMED`. `HKDFGUARD_ERR_FILE_NOT_FOUND`,
+`HKDFGUARD_ERR_FILE_ACCESS_DENIED` and `HKDFGUARD_ERR_FILE_IO` cover a file that can't be
+opened or read; directories, pipes and devices are refused, and so is a file another
+process has open for writing. On any failure the output buffer is zeroed; `*out_len` is
+left unchanged except on `HKDFGUARD_ERR_BUFFER_TOO_SMALL`, as with wrap and unwrap.
 
 ## Command-line tool
 
@@ -152,7 +184,10 @@ wrapper around the ABI above with two subcommands:
   is refused, never followed, with or without `--force` - so a link planted in the
   output directory cannot redirect a (possibly elevated) `wrap --force` at some other
   file. Paths through a SUBST or mapped network drive are refused for the same
-  reason; put the file on a real local path. An existing file with more than one
+  reason; put the file on a real local path. So is a path that spells any folder with
+  its 8.3 short name (`PROGRA~1`): use full names, and expand a path taken from `%TEMP%` or
+  another environment variable first, since Windows can set those with short names. An
+  existing file with more than one
   hard link is refused too, so `--force` cannot overwrite a file at some other path
   that shares its data.
 
@@ -282,6 +317,14 @@ software fallback. The Software Key Storage Provider path (`provider_type` 2) sh
 same code apart from which NCrypt provider name is opened, and is exercised by the same
 suite's `SoftwareOnly` policy check regardless of whether a TPM is present.
 
+**TPM tests are the developer's and maintainer's responsibility.** CI runners and the
+container tests have no TPM, so the TPM-only checks there print `[SKIP]` - a CI pass
+does not cover them. Developers changing key storage code, and the maintainer before
+tagging every release, must run `scripts\run-build-test-verify.bat -Configuration Release`
+on a machine with an active TPM and confirm `TPM provider available: yes` and no
+`[SKIP]` lines for the TPM sections (`PreferTpm, TPM probe error` and
+`PreferTpm, existing TPM KEK fails verification`) in the roundtrip output.
+
 ## Testing and compatibility
 
 This library has been exercised end to end - KEK creation, wrap, unwrap, and
@@ -325,6 +368,7 @@ including the impersonated client when a service acts on someone's behalf.
 | 2003 | Warning | `AUTH_FAILED`, `KEK_MISMATCH` or `MALFORMED` on unwrap: a tampered, corrupted, or misdirected payload. |
 | 2004 | Error | `INVALID_POLICY` or `GROUP_INVALID`: the registry policy is misconfigured, so calls fail closed. |
 | 2005 | Error | `PROVIDER`, `CRYPTO` or `INTERNAL`: the key storage provider or crypto layer failed. |
+| 2006 | Error | `hkdfguard_open_file` refused a file of exactly 32 bytes - the size of an unwrapped DEK, so possibly a plaintext key on disk. Names the file; its contents were not read. Investigate it. |
 
 The wrap and unwrap events also record the KEK's fingerprint and a SHA-256 of the
 wrapped payload. Both are public values that reveal nothing about the DEK. Because the
@@ -335,7 +379,9 @@ older payload visible, which matters because the format deliberately allows roll
 comparison: `(Get-FileHash <file> -Algorithm SHA256).Hash.ToLower()`.
 
 Deliberately not logged: caller mistakes (`INVALID_ARG`, `BUFFER_TOO_SMALL`,
-`SERVICE_NAME_INVALID`) and `KEK_NOT_FOUND`. No key material is ever logged. Every
+`SERVICE_NAME_INVALID`) and `KEK_NOT_FOUND`. `hkdfguard_open_file` writes only event 2006;
+its other failures (a missing, unreadable, wrong-sized or malformed file, or a rejected
+path) involve no KEK and are reported to the caller alone. No key material is ever logged. Every
 successful wrap and unwrap writes one event, which suits deployment-time wrapping and
 unwrap-at-service-start.
 
@@ -402,7 +448,7 @@ Get-WinEvent -LogName Application -FilterXPath "*[System[Provider[@Name='hkdfgua
 - **Memory security**: `src/secure_buffer.h` (RAII `SecureZeroMemory` wrapper) and
   `src/handle_traits.h` (RAII closers for every NCrypt/BCrypt handle type) ensure key
   material and handles are wiped/closed on every exit path, including exceptions. All
-  five ABI entry points in `src/hkdfguard.cpp` catch every exception; `hkdfguard_unwrap_dek`
+  six ABI entry points in `src/hkdfguard.cpp` catch every exception; `hkdfguard_unwrap_dek`
   additionally zeros the caller's output buffer on any failure (it calls into a CNG
   function - `BCryptDecrypt` - that can write unauthenticated plaintext before reporting
   a tag mismatch).
@@ -486,7 +532,9 @@ The MSI does four things:
 - **Creates the local group `HkdfGuardUsers`** if it doesn't already exist. KEKs created
   while the group exists grant it use access, so add the accounts that need to wrap or
   unwrap to it. The group has to exist before a service's KEK is provisioned to be
-  included, so install the MSI first.
+  included, so install the MSI first. The MSI does not create the optional
+  `HkdfGuardAdmins` group (full control of KEKs created while it exists); create it
+  yourself, before provisioning, only if you want to delegate key administration.
 
 Then, once per service, elevated:
 
@@ -557,9 +605,9 @@ loading it.
 - **Node**: `ffi-napi`/`koffi` given an absolute path, or a native addon (N-API) linking
   `HkdfGuardV1.lib`
 
-All five bindings map directly onto the five exported functions
+All five bindings map directly onto the six exported functions
 (`hkdfguard_kek_exists`, `hkdfguard_create_kek`, `hkdfguard_wrap_dek`,
-`hkdfguard_unwrap_dek`, `hkdfguard_generate_and_wrap_dek`) and the status codes in
+`hkdfguard_unwrap_dek`, `hkdfguard_generate_and_wrap_dek`, `hkdfguard_open_file`) and the status codes in
 `include/hkdfguard.h`; none of them need to know anything about TPMs, CNG, or NCrypt.
 
 ## License

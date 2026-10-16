@@ -67,6 +67,7 @@ namespace hkdfguard {
         constexpr DWORD kEvtIntegrityFailure = 2003;
         constexpr DWORD kEvtPolicyInvalid = 2004;
         constexpr DWORD kEvtOperationFailed = 2005;
+        constexpr DWORD kEvtPlaintextKeyFile = 2006;
 
         const wchar_t *CodeName(int32_t code) noexcept {
             switch (code) {
@@ -85,6 +86,13 @@ namespace hkdfguard {
                 case HKDFGUARD_ERR_KEK_NOT_FOUND: return L"HKDFGUARD_ERR_KEK_NOT_FOUND";
                 case HKDFGUARD_ERR_ACCESS_DENIED: return L"HKDFGUARD_ERR_ACCESS_DENIED";
                 case HKDFGUARD_ERR_KEK_ACL_INVALID: return L"HKDFGUARD_ERR_KEK_ACL_INVALID";
+                case HKDFGUARD_ERR_FILE_NOT_FOUND: return L"HKDFGUARD_ERR_FILE_NOT_FOUND";
+                case HKDFGUARD_ERR_FILE_ACCESS_DENIED: return L"HKDFGUARD_ERR_FILE_ACCESS_DENIED";
+                case HKDFGUARD_ERR_FILE_IO: return L"HKDFGUARD_ERR_FILE_IO";
+                case HKDFGUARD_ERR_FILE_TOO_SHORT: return L"HKDFGUARD_ERR_FILE_TOO_SHORT";
+                case HKDFGUARD_ERR_FILE_TOO_LONG: return L"HKDFGUARD_ERR_FILE_TOO_LONG";
+                case HKDFGUARD_ERR_FILE_PLAINTEXT_KEY: return L"HKDFGUARD_ERR_FILE_PLAINTEXT_KEY";
+                case HKDFGUARD_ERR_FILE_PATH_REJECTED: return L"HKDFGUARD_ERR_FILE_PATH_REJECTED";
                 default: return L"(unknown code)";
             }
         }
@@ -296,6 +304,21 @@ namespace hkdfguard {
             Write(type, eventId,
                   std::wstring(OpName(op)) + L" failed for service " + serviceText + L": " + CodeName(code) +
                   L" (" + std::to_wstring(code) + L") - " + meaning + L".");
+        } catch (...) {
+        }
+    }
+
+    void LogPlaintextKeyFile(const std::wstring &path) noexcept {
+        try {
+            // An error, like 2002: not a failed operation but a finding that
+            // needs an administrator's attention.
+            Write(EVENTLOG_ERROR_TYPE, kEvtPlaintextKeyFile,
+                  L"hkdfguard_open_file refused '" + path + L"': " + CodeName(HKDFGUARD_ERR_FILE_PLAINTEXT_KEY) +
+                  L" (" + std::to_wstring(HKDFGUARD_ERR_FILE_PLAINTEXT_KEY) + L") - the file is exactly " +
+                  std::to_wstring(HKDFGUARD_DEK_LEN) +
+                  L" bytes, the size of an unwrapped DEK, so it may be a plaintext key written to disk by "
+                  L"mistake. Its contents were not read. Treat that key as exposed: find out how the file was "
+                  L"written, remove it, and re-mint the DEK.");
         } catch (...) {
         }
     }

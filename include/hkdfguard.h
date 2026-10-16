@@ -97,6 +97,13 @@ extern "C" {
 #define HKDFGUARD_ERR_KEK_NOT_FOUND   (-12) /* no KEK is provisioned for this service (call hkdfguard_create_kek first) */
 #define HKDFGUARD_ERR_ACCESS_DENIED   (-13) /* this KEK exists, but the calling account is not authorized to use it */
 #define HKDFGUARD_ERR_KEK_ACL_INVALID (-14) /* an existing KEK's ACL is missing, lacks SYSTEM/Administrators, or grants an over-broad principal */
+#define HKDFGUARD_ERR_FILE_NOT_FOUND  (-15) /* hkdfguard_open_file: the file (or a folder in its path) does not exist */
+#define HKDFGUARD_ERR_FILE_ACCESS_DENIED (-16) /* hkdfguard_open_file: the calling account may not read the file */
+#define HKDFGUARD_ERR_FILE_IO         (-17) /* hkdfguard_open_file: not a regular file, in use by a writer, or a read failed */
+#define HKDFGUARD_ERR_FILE_TOO_SHORT  (-18) /* hkdfguard_open_file: file is shorter than HKDFGUARD_WRAPPED_LEN */
+#define HKDFGUARD_ERR_FILE_TOO_LONG   (-19) /* hkdfguard_open_file: file is longer than HKDFGUARD_WRAPPED_LEN */
+#define HKDFGUARD_ERR_FILE_PLAINTEXT_KEY (-20) /* hkdfguard_open_file: file is exactly HKDFGUARD_DEK_LEN bytes - likely an unwrapped key */
+#define HKDFGUARD_ERR_FILE_PATH_REJECTED (-21) /* hkdfguard_open_file: path is, or passes through, a symbolic link, junction or other reparse point, uses an 8.3 short name, or is not on a local drive (UNC, mapped or SUBST drive, device) */
 
 /*
  * Reports whether a persistent KEK already exists for `service`, without
@@ -123,7 +130,12 @@ HKDFGUARD_API int32_t hkdfguard_kek_exists(
  *
  * Which principals may use (unwrap with) the KEK is machine policy, not a
  * caller choice. SYSTEM and BUILTIN\Administrators always receive full
- * control. In addition, every entry of the REG_MULTI_SZ registry value
+ * control. Two optional local groups are honored if they exist - as groups
+ * in this machine's own SAM - at the moment the KEK is created:
+ * HkdfGuardAdmins receives full control and HkdfGuardUsers receives
+ * key-use access. The MSI creates HkdfGuardUsers; HkdfGuardAdmins exists
+ * only if an administrator creates it. In addition, every entry of the
+ * REG_MULTI_SZ registry value
  *
  *     HKLM\Software\Policies\HkdfGuard\KeyUseGroups
  *
@@ -248,6 +260,72 @@ HKDFGUARD_API int32_t hkdfguard_unwrap_dek(
  */
 HKDFGUARD_API int32_t hkdfguard_generate_and_wrap_dek(
     const char* service,
+    uint8_t* out, int32_t* out_len);
+
+/*
+ * Reads a wrapped-key file (e.g. one written by hkdfguard-v1-initialize.exe
+ * wrap) and returns its WRAPPED DEK bytes in `out`, exactly as stored on
+ * disk. Reads exactly HKDFGUARD_WRAPPED_LEN bytes and checks they are a
+ * well-formed WrappedDekV1 payload. This call never unwraps: nothing is
+ * decrypted, no KEK is opened, and the calling account needs no access to
+ * any KEK - only read access to the file. Unwrapping is a separate, later
+ * step (hkdfguard_unwrap_dek on the returned bytes), typically by other
+ * code.
+ *
+ * path    - null-terminated UTF-8 path to the file: absolute, or relative to
+ *           the process's current directory. The same rules as the CLI's
+ *           --key-file-path apply, and fail with
+ *           HKDFGUARD_ERR_FILE_PATH_REJECTED: it must be a real file on a
+ *           local drive ("C:\..."), reached through real directories. A
+ *           symbolic link, junction, volume mount point or other reparse
+ *           point at the path or anywhere above it is refused, never
+ *           followed - so a link planted in the key folder cannot redirect
+ *           a privileged reader to some other file. A path that spells any
+ *           folder or the file with its 8.3 short name ("PROGRA~1") is
+ *           refused too, rather than expanded; a genuine long name that
+ *           merely contains "~" is fine. (Files on volumes with
+ *           Data Deduplication enabled, and cloud placeholder files, are
+ *           reparse points too and are refused for the same reason.) UNC
+ *           paths, mapped and SUBST drives, and device paths (\\.\pipe\...,
+ *           NUL) are refused before anything is opened, so this process
+ *           never connects or authenticates to a server named in a path.
+ *           Must also name a regular file: directories are refused. Opened
+ *           read-only, sharing read access only, so a file that another
+ *           process has open for writing is refused rather than read
+ *           mid-write.
+ * out     - caller-owned output buffer.
+ * out_len - in: capacity of out, in bytes (must be >= HKDFGUARD_WRAPPED_LEN).
+ *           out: on success, the number of bytes read (always
+ *           HKDFGUARD_WRAPPED_LEN). On HKDFGUARD_ERR_BUFFER_TOO_SMALL, the
+ *           required capacity (HKDFGUARD_WRAPPED_LEN). Left unchanged on
+ *           every other failure - the same contract as hkdfguard_wrap_dek
+ *           and hkdfguard_unwrap_dek.
+ *
+ * The file's size is checked before any of it is read:
+ *   HKDFGUARD_ERR_FILE_PLAINTEXT_KEY - exactly HKDFGUARD_DEK_LEN (32) bytes:
+ *       the size of an *unwrapped* DEK, so most likely a plaintext key
+ *       written to disk by mistake. Treat it as a key exposure. The file's
+ *       contents are never read, so the possible key never enters this
+ *       process.
+ *   HKDFGUARD_ERR_FILE_TOO_SHORT - any other size below HKDFGUARD_WRAPPED_LEN,
+ *       including an empty file.
+ *   HKDFGUARD_ERR_FILE_TOO_LONG - more than HKDFGUARD_WRAPPED_LEN bytes.
+ * A file of exactly HKDFGUARD_WRAPPED_LEN bytes is then read and validated
+ * as hkdfguard_unwrap_dek would before touching a KEK - version, provider
+ * type, reserved bytes, KeyId, and that the ephemeral public key is a valid
+ * P-256 point - failing with HKDFGUARD_ERR_MALFORMED otherwise (or
+ * HKDFGUARD_ERR_CRYPTO if the software ECDH provider needed for the point
+ * check cannot be opened at all - an infrastructure failure, not a verdict
+ * on the file). HKDFGUARD_ERR_FILE_NOT_FOUND, HKDFGUARD_ERR_FILE_ACCESS_DENIED
+ * and HKDFGUARD_ERR_FILE_IO report why the file couldn't be opened or read.
+ *
+ * Returns HKDFGUARD_OK on success, or a negative HKDFGUARD_ERR_* code -
+ * HKDFGUARD_ERR_INVALID_ARG for a null argument, or a path that is empty,
+ * not valid UTF-8, or longer than Windows allows (32,767 characters). On
+ * any failure, the output buffer is zeroed before returning.
+ */
+HKDFGUARD_API int32_t hkdfguard_open_file(
+    const char* path,
     uint8_t* out, int32_t* out_len);
 
 // Closes the extern "C" block opened above.

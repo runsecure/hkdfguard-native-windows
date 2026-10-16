@@ -1,0 +1,8 @@
+# Configuration for actionlint, which ci.yml's lint job runs over every
+# workflow file.
+self-hosted-runner:
+  # Not self-hosted: GitHub's hosted Windows 11 ARM64 runner, used by
+  # build.yml's ARM64 leg. Listed because actionlint's built-in list of
+  # hosted runner labels predates it.
+  labels:
+    - windows-11-arm

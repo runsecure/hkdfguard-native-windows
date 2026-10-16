@@ -148,3 +148,16 @@ jobs:
           path: dist/${{ matrix.dist }}/
           if-no-files-found: error
           retention-days: 3
+
+      # ci.yml's install-test job runs this against the MSI-installed DLL on
+      # clean windows-2022 / windows-2025 runners. It comes from the same
+      # Release build as the binaries above, so it tests exactly what ships.
+      # x64 only: the hosted Windows Server runners are x64.
+      - name: Upload the roundtrip test executable (x64)
+        if: matrix.arch == 'x64'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: tests-win-x64
+          path: build-release-x64/tests/test_roundtrip.exe
+          if-no-files-found: error
+          retention-days: 3

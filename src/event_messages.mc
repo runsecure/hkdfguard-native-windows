@@ -65,3 +65,9 @@ SymbolicName=HKDFGUARD_EVT_OPERATION_FAILED
 Language=English
 %1
 .
+
+MessageId=2006
+SymbolicName=HKDFGUARD_EVT_PLAINTEXT_KEY_FILE
+Language=English
+%1
+.

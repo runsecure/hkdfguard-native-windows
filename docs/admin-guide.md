@@ -153,6 +153,20 @@ Because the KEK's access list names the group, you can change who has access lat
 changing the group's membership. You don't need a new KEK. A running service only picks up
 a new group membership after it restarts.
 
+`HkdfGuardAdmins` is optional and for delegating key administration: its members get full
+control of every KEK created while the group exists, including the ability to delete those
+KEKs, without being local administrators. Most deployments don't need it, since
+Administrators and SYSTEM already have full control. If you do, create it **before**
+provisioning any service, because a KEK's access list is fixed when it's created:
+
+```powershell
+net localgroup HkdfGuardAdmins /add
+net localgroup HkdfGuardAdmins "CONTOSO\KeyAdmin" /add
+```
+
+Both groups must be local groups on this machine. The installer never creates
+`HkdfGuardAdmins`.
+
 > Don't delete and recreate `HkdfGuardUsers` or `HkdfGuardAdmins`. A recreated group gets a
 > new SID, so its members would silently lose access to every KEK created earlier.
 
@@ -194,7 +208,25 @@ $dek = New-Object byte[] 32
 
 `--force` overwrites an existing key file. The wrapped file is always 164 bytes. The key
 file must be on a real local path. Symbolic links, junctions, SUBST drives, mapped network
-drives and hard-linked files are refused.
+drives and hard-linked files are refused, and so are 8.3 short names such as `PROGRA~1`:
+spell every folder with its full name. Don't build the path from `%TEMP%` or another
+environment variable without expanding it first: Windows can set those variables with short
+names (for example `C:\Users\RUNNER~1\AppData\Local\Temp` on GitHub-hosted runners), and a
+path containing one is refused.
+
+**Where to keep the key file.** Applications read it back through the library with the
+same rules, so the path must be a plain local NTFS folder, for example
+`C:\ProgramData\<app>\` or `C:\secrets\`. In addition to links and network paths, the
+library refuses files on volumes with **Data Deduplication** enabled and **cloud
+placeholder files** (OneDrive, Dropbox and similar), because Windows stores both as
+reparse points. An application that hits this reports `HKDFGUARD_ERR_FILE_PATH_REJECTED`
+(-21). Move the file to a plain local folder and wrap it again there.
+
+Configure applications with the key file's **full long path**, the same one you passed to
+`wrap`. If an application builds the path from `%TEMP%`, `%USERPROFILE%` or another
+environment variable, it must expand it to its long form first with the Windows
+`GetLongPathNameW` function, or the library refuses it with -21. Don't assume a framework's
+path helpers do this: some keep short names (PowerShell's `Resolve-Path`, for one).
 
 Protect the key file. An older key file for the same service still unwraps, so anyone who
 can replace the file can roll it back to an earlier DEK.
@@ -279,6 +311,7 @@ User field is the calling account.
 | 2003 | Warning | Unwrap rejected a tampered, corrupted or misdirected payload. |
 | 2004 | Error | Policy is misconfigured (`KeyStoragePolicy` or `KeyUseGroups`), so calls fail. |
 | 2005 | Error | The key store or cryptography layer failed. |
+| 2006 | Error | An application asked the library to read a key file that is exactly 32 bytes, the size of an *unwrapped* key, so it may be a plaintext key on disk. The event names the file; its contents were not read. **Investigate**, remove the file and re-mint that DEK. |
 
 Wrap and unwrap events include a SHA-256 of the wrapped payload, so each unwrap can be
 traced to the wrap that produced it. To compare against a key file:
@@ -291,7 +324,7 @@ Get-WinEvent -LogName Application -FilterXPath "*[System[Provider[@Name='hkdfgua
 
 Any local user can write to the Application log, so treat these events as an operational
 aid, not tamper-proof evidence. Forward them to your SIEM for retention and alerting. Events
-2002, 2003 and 1001 are good candidates for alerts.
+2002, 2006, 2003 and 1001 are good candidates for alerts.
 
 ## Upgrade
 
@@ -335,6 +368,16 @@ was attempted) and `1` for an operational failure. On failure it prints an `erro
 An application that can't load the DLL usually has an architecture mismatch (see
 [Requirements](#requirements)) or is loading by bare file name instead of the
 `InstallPath` location.
+
+Applications that read the key file through the library may report these codes, which the
+command-line tool itself never produces:
+
+| Code | Meaning | What to do |
+|---|---|---|
+| -21 `FILE_PATH_REJECTED` | The key file's path is a link, passes through a junction or SUBST drive, uses an 8.3 short name (`PROGRA~1`), is on a network or deduplicated volume, or is a cloud placeholder. | Configure the application with the full long path (if it comes from `%TEMP%` or another environment variable, expand it first), or move the file to a plain local folder. See [Where to keep the key file](#3-wrap-a-dek-into-a-key-file-every-release). |
+| -20 `FILE_PLAINTEXT_KEY` | The file is exactly 32 bytes: probably an unwrapped key on disk. Event 2006 names it. | Treat the key as exposed. Find out how the file was written, remove it, and re-mint the DEK. |
+| -18 / -19 `FILE_TOO_SHORT` / `FILE_TOO_LONG` | The file isn't 164 bytes, so it isn't a wrapped key. | Check the application is pointed at the right file; re-run `wrap`. |
+| -15 / -16 / -17 `FILE_NOT_FOUND` / `FILE_ACCESS_DENIED` / `FILE_IO` | The file is missing, the service account can't read it, or another process has it open for writing. | Check the path and the file's `--group` ACL, and that nothing is rewriting the file while the service starts. |
 
 For security assumptions and known TPM vendor behavior, see
 [SecurityAssumptions.md](../SecurityAssumptions.md).

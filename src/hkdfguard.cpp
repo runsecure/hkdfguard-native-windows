@@ -11,6 +11,7 @@
 #include "event_log.h"
 #include "policy.h" // LoadAuditUnwrapSuccess
 #include "kek_store.h"
+#include "key_file.h" // ReadWrappedKeyFile - hkdfguard_open_file's implementation
 #include "secure_buffer.h"
 #include "wire_format.h"
 
@@ -518,5 +519,59 @@ extern "C" HKDFGUARD_API int32_t hkdfguard_unwrap_dek(
         return Audit(AuditOp::Unwrap, service, fail(e.code()));
     } catch (...) {
         return Audit(AuditOp::Unwrap, service, fail(HKDFGUARD_ERR_INTERNAL));
+    }
+}
+
+extern "C" HKDFGUARD_API int32_t hkdfguard_open_file(
+    const char *path,
+    uint8_t *out, int32_t *out_len) {
+    if (out_len == nullptr) {
+        return HKDFGUARD_ERR_INVALID_ARG;
+    }
+
+    // Same shape as hkdfguard_unwrap_dek: remember the caller's capacity,
+    // and on any failure zero that much of `out`, so a rejected file never
+    // leaves partial or malformed bytes behind. *out_len is left as the
+    // caller set it, as wrap and unwrap do; only BUFFER_TOO_SMALL (the
+    // required size) and success (the bytes read) write to it.
+    const int32_t capacity = *out_len;
+    auto fail = [&](int32_t code) {
+        if (out != nullptr && capacity > 0) {
+            SecureZero(out, static_cast<size_t>(capacity));
+        }
+        return code;
+    };
+
+    // Mostly not audited: the event log records failures against a
+    // service's KEK, and a file read involves neither. The one exception is
+    // a DEK-sized file (HKDFGUARD_ERR_FILE_PLAINTEXT_KEY) - a possible key
+    // exposure an administrator needs to hear about, logged below.
+    try {
+        if (path == nullptr || out == nullptr) {
+            return fail(HKDFGUARD_ERR_INVALID_ARG);
+        }
+        if (capacity < HKDFGUARD_WRAPPED_LEN) {
+            *out_len = HKDFGUARD_WRAPPED_LEN;
+            return fail(HKDFGUARD_ERR_BUFFER_TOO_SMALL);
+        }
+
+        ReadWrappedKeyFile(path, out);
+        *out_len = HKDFGUARD_WRAPPED_LEN;
+        return HKDFGUARD_OK;
+    } catch (const HkdfGuardError &e) {
+        // Zero first, log second, as hkdfguard_unwrap_dek does.
+        const int32_t code = fail(e.code());
+        if (code == HKDFGUARD_ERR_FILE_PLAINTEXT_KEY) {
+            std::wstring loggable;
+            try {
+                loggable = KeyFilePathToWide(path); // already succeeded once to get this far
+            } catch (...) {
+                loggable = L"(unprintable path)";
+            }
+            LogPlaintextKeyFile(loggable);
+        }
+        return code;
+    } catch (...) {
+        return fail(HKDFGUARD_ERR_INTERNAL);
     }
 }
