@@ -361,6 +361,9 @@ use) are still granted by *name*, now restricted to local groups.
 
   The library's `DeriveWrappingKey` is checked against that key without
   elevation, on the golden KEK imported as an in-memory Software KSP key.
+  Elevated (2026-10-16), the shipped DLL also unwraps the frozen payload to
+  the known DEK, with the golden KEK imported as a Software KSP machine
+  key.
   The fingerprint also travels in the payload and is
   compared, before any ECDH, against the fingerprint of the KEK the
   payload's routing fields select; mismatch is `HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH`.
@@ -539,7 +542,8 @@ parent, with `SeDebugPrivilege` explicitly disabled, then probes the child:
   Limited query and `SYNCHRONIZE` still succeed.
 
 The test passed non-elevated at Medium integrity on the development machine
-on 2026-10-15. The first run caught the `GA` mapping above, which had made
+on 2026-10-15, and elevated (High integrity, `SeDebugPrivilege` disabled as
+above) on 2026-10-16. The first run caught the `GA` mapping above, which had made
 the second call fail. The test exits with ctest's skip code when run as
 SYSTEM.
 
@@ -559,8 +563,7 @@ administrators and SYSTEM are trusted anyway. Specifically:
 - **Outside its reach:** memory paged out or written to `hiberfil.sys`, and
   machine-wide dump configuration (WER `LocalDumps`, kernel and live kernel
   dumps).
-- **Not yet run:** elevated, in the Server 2022/2025 containers and on
-  ARM64.
+- **Not yet run:** in the Server 2022/2025 containers and on ARM64.
 - **Window hooks:** a GUI process can be injected into by a same-user
   process on the same desktop through `SetWindowsHookEx`. No process or
   thread DACL covers that, with or without the strict flag below.
@@ -615,7 +618,9 @@ The parent then checks both later threads, and the token:
 
 In default mode it pins the documented gaps: a later thread allows
 `GET_CONTEXT`, and the token allows `TOKEN_ADJUST_DEFAULT`. This passed
-non-elevated on the development machine on 2026-10-15.
+non-elevated on the development machine on 2026-10-15, and elevated, with a
+TPM, on 2026-10-16: the strict child's `hkdfguard_kek_exists` reached the
+Platform Crypto Provider with the token locked.
 
 **The CLI uses it.** `hkdfguard.exe` calls the strict form first thing in
 `main`, before parsing arguments, and exits with "refusing to handle key
@@ -624,9 +629,10 @@ one `VirtualAlloc` buffer (`DekScratch`): the stdin text, read with
 `ReadFile` rather than the CRT's buffered `fread`, and the decoded bytes,
 decoded straight into it. The buffer is locked with `VirtualLock` and wiped
 before it is freed. If the lock fails, the CLI prints a warning, as on Linux.
-`tests/test_cli.ps1` passes non-elevated with this in place, through to
-the `hkdfguard_wrap_dek` call. **Not yet run elevated:** `provision` and a
-full `wrap` against a real KEK under strict hardening still need that run.
+`tests/test_cli.ps1` passes with this in place: non-elevated, through to
+the `hkdfguard_wrap_dek` call; and elevated, on 2026-10-16 with a TPM,
+including `provision` creating a TPM KEK and a full `wrap` against it, all
+under strict hardening. **Verified.**
 
 **Residual risk (strict).** These are the cost of the flag, documented in the
 header:
@@ -636,8 +642,8 @@ header:
   includes child processes, named pipes and other named objects.
 - **Process-scoped:** an impersonating thread's objects follow the
   impersonation token's default DACL, not this one.
-- **Not yet run:** elevated, in containers, and with hosts (.NET, JVM) that
-  open their own threads or processes by ID.
+- **Not yet run:** in containers, and with hosts (.NET, JVM) that open
+  their own threads or processes by ID.
 
 ## 15. `hkdfguard_open_file`: who could have written the key file (design decision + verified)
 
@@ -718,8 +724,9 @@ file that is read:
   mixed alphabets, set trailing bits, `==`, more than 96 bytes, and a
   vertical tab, which Rust doesn't trim either.
 
-These passed non-elevated on the development machine on 2026-10-15. The
-positive cases use the golden payload, so they don't depend on a KEK.
+These passed non-elevated on the development machine on 2026-10-15, and
+elevated, with a TPM, on 2026-10-16. The positive cases use the golden
+payload, so they don't depend on a KEK.
 
 **Residual risk.**
 
@@ -732,5 +739,5 @@ positive cases use the golden payload, so they don't depend on a KEK.
 - **Configurations now refused.** Anything already in place that grants other
   accounts delete rights is refused, by design, including a folder created
   directly under `C:\`. `docs/admin-guide.md` shows how to narrow it.
-- **Not yet run:** elevated, and in the Server 2022/2025 containers, where
+- **Not yet run:** in the Server 2022/2025 containers, where
   ContainerAdministrator's ownership of `C:\` needs to be confirmed.
