@@ -20,7 +20,7 @@ namespace hkdfguard {
     // clears it. Same scope and caveats as policy.h's SetTestPolicyOverride:
     // compiled in only when HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE is defined
     // (tests/CMakeLists.txt, for test_roundtrip's own copy of kek_store.cpp),
-    // never in HkdfGuardV1.dll; not thread-safe, by design.
+    // never in HkdfGuard.dll; not thread-safe, by design.
 #if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
     void SetTestTpmProviderNameOverride(std::optional<std::wstring> providerName);
 
@@ -36,7 +36,7 @@ namespace hkdfguard {
         std::optional<SECURITY_STATUS> openKeyStatus;
 
         // When true, property verification of any TPM key (provider_type 1)
-        // fails with HKDFGUARD_ERR_PROVIDER - simulating an existing TPM KEK
+        // fails with HKDFGUARD_ERR_PROVIDER_ERROR - simulating an existing TPM KEK
         // that a firmware quirk or fault makes fail verification.
         bool failVerification = false;
     };
@@ -84,7 +84,7 @@ namespace hkdfguard {
     //   - Read and validate the machine key-use group policy
     //     (policy.h's LoadKeyUseGroupsPolicy + key_acl.h's
     //     ValidateKeyUseGroups) - before touching the key store, so a bad
-    //     policy fails cleanly with HKDFGUARD_ERR_GROUP_INVALID and no key
+    //     policy fails cleanly with HKDFGUARD_ERR_WIN_GROUP_INVALID and no key
     //   - Resolve effective TPM/software policy
     //   - Create KEK if missing
     //   - Apply ACLs (creation only - see hkdfguard.h)

@@ -1,4 +1,4 @@
-﻿#include "key_acl.h"
+#include "key_acl.h"
 #include "errors.h"
 
 #include <windows.h>
@@ -32,7 +32,7 @@ namespace hkdfguard {
                 sid.data(),
                 &size)) {
                 throw HkdfGuardError(
-                    HKDFGUARD_ERR_PROVIDER,
+                    HKDFGUARD_ERR_PROVIDER_ERROR,
                     "CreateWellKnownSid failed");
             }
 
@@ -82,7 +82,7 @@ namespace hkdfguard {
             WinConsoleLogonSid,     // S-1-2-1 "CONSOLE LOGON": every console user
         };
 
-        // tools/hkdfguard-v1-initialize.cpp keeps a copy of both lists for its
+        // tools/hkdfguard_cli.cpp keeps a copy of both lists for its
         // --group check (it depends only on the public ABI); keep them in sync.
         //
         // Over-broad principals with no WELL_KNOWN_SID_TYPE constant of their
@@ -107,7 +107,7 @@ namespace hkdfguard {
                 PSID known = nullptr;
                 if (!ConvertStringSidToSidW(sidString, &known)) {
                     throw HkdfGuardError(
-                        HKDFGUARD_ERR_PROVIDER,
+                        HKDFGUARD_ERR_PROVIDER_ERROR,
                         "ConvertStringSidToSidW failed for a built-in over-broad SID");
                 }
                 const bool match = EqualSid(sid, known) != FALSE;
@@ -134,7 +134,7 @@ namespace hkdfguard {
         // Resolves an account NAME to its SID, SID type, and the domain
         // Windows says it belongs to (ReferencedDomainName - the local
         // computer name for SAM accounts, "BUILTIN", "NT AUTHORITY", or a
-        // real domain's NetBIOS name). Throws HKDFGUARD_ERR_GROUP_INVALID if
+        // real domain's NetBIOS name). Throws HKDFGUARD_ERR_WIN_GROUP_INVALID if
         // the name doesn't resolve at all.
         SidBuffer ResolveAccountSid(
             const std::wstring &accountName,
@@ -154,7 +154,7 @@ namespace hkdfguard {
 
             if (sidSize == 0) {
                 throw HkdfGuardError(
-                    HKDFGUARD_ERR_GROUP_INVALID,
+                    HKDFGUARD_ERR_WIN_GROUP_INVALID,
                     "key-use policy entry does not resolve to any account");
             }
 
@@ -175,7 +175,7 @@ namespace hkdfguard {
                 &domainSize,
                 &sidType)) {
                 throw HkdfGuardError(
-                    HKDFGUARD_ERR_GROUP_INVALID,
+                    HKDFGUARD_ERR_WIN_GROUP_INVALID,
                     "key-use policy entry does not resolve to any account");
             }
 
@@ -196,7 +196,7 @@ namespace hkdfguard {
 
             if (!ConvertStringSidToSidW(sidString.c_str(), &raw)) {
                 throw HkdfGuardError(
-                    HKDFGUARD_ERR_GROUP_INVALID,
+                    HKDFGUARD_ERR_WIN_GROUP_INVALID,
                     "key-use policy entry is not a valid SID string");
             }
 
@@ -220,7 +220,7 @@ namespace hkdfguard {
 
             if (nameSize == 0) {
                 throw HkdfGuardError(
-                    HKDFGUARD_ERR_GROUP_INVALID,
+                    HKDFGUARD_ERR_WIN_GROUP_INVALID,
                     "key-use policy SID does not resolve to any account");
             }
 
@@ -236,7 +236,7 @@ namespace hkdfguard {
                 &domainSize,
                 &sidType)) {
                 throw HkdfGuardError(
-                    HKDFGUARD_ERR_GROUP_INVALID,
+                    HKDFGUARD_ERR_WIN_GROUP_INVALID,
                     "key-use policy SID does not resolve to any account");
             }
 
@@ -262,13 +262,13 @@ namespace hkdfguard {
 
             if (!IsGroupSidType(sidType)) {
                 throw HkdfGuardError(
-                    HKDFGUARD_ERR_GROUP_INVALID,
+                    HKDFGUARD_ERR_WIN_GROUP_INVALID,
                     "key-use policy entry is not a group");
             }
 
             if (IsOverBroadSid(sid.data())) {
                 throw HkdfGuardError(
-                    HKDFGUARD_ERR_GROUP_INVALID,
+                    HKDFGUARD_ERR_WIN_GROUP_INVALID,
                     "key-use policy entry is an over-broad principal");
             }
 
@@ -278,7 +278,7 @@ namespace hkdfguard {
             // caught just the same as an explicitly domain-qualified one.
             if (!IsHostLocalAccountDomain(domain)) {
                 throw HkdfGuardError(
-                    HKDFGUARD_ERR_GROUP_INVALID,
+                    HKDFGUARD_ERR_WIN_GROUP_INVALID,
                     "key-use policy entry is not a host-local group; domain principals are not permitted");
             }
 
@@ -430,7 +430,7 @@ namespace hkdfguard {
                 const_cast<BYTE *>(
                     sid.data()))) {
                 throw HkdfGuardError(
-                    HKDFGUARD_ERR_PROVIDER,
+                    HKDFGUARD_ERR_PROVIDER_ERROR,
                     "expected princip*l missing from key ACL");
             }
         }
@@ -499,7 +499,7 @@ namespace hkdfguard {
 
             if (status != ERROR_SUCCESS) {
                 throw HkdfGuardError(
-                    HKDFGUARD_ERR_PROVIDER,
+                    HKDFGUARD_ERR_PROVIDER_ERROR,
                     "SetEntriesInAclW failed");
             }
 
@@ -511,7 +511,7 @@ namespace hkdfguard {
                 LocalFree(acl);
 
                 throw HkdfGuardError(
-                    HKDFGUARD_ERR_PROVIDER,
+                    HKDFGUARD_ERR_PROVIDER_ERROR,
                     "InitializeSecurityDescriptor failed");
             }
 
@@ -523,7 +523,7 @@ namespace hkdfguard {
                 LocalFree(acl);
 
                 throw HkdfGuardError(
-                    HKDFGUARD_ERR_PROVIDER,
+                    HKDFGUARD_ERR_PROVIDER_ERROR,
                     "SetSecurityDescriptorDacl failed");
             }
 
@@ -545,7 +545,7 @@ namespace hkdfguard {
                 LocalFree(acl);
 
                 throw HkdfGuardError(
-                    HKDFGUARD_ERR_PROVIDER,
+                    HKDFGUARD_ERR_PROVIDER_ERROR,
                     "MakeSelfRelativeSD failed");
             }
 
@@ -603,7 +603,7 @@ namespace hkdfguard {
 
         if (status != ERROR_SUCCESS) {
             throw HkdfGuardError(
-                HKDFGUARD_ERR_PROVIDER,
+                HKDFGUARD_ERR_PROVIDER_ERROR,
                 "failed to apply key ACL");
         }
     }
@@ -614,7 +614,7 @@ namespace hkdfguard {
         // that PACL. Throws `missingCode` if the key has no DACL at all, or a
         // NULL DACL - which Windows treats as "everyone, full access" and is
         // therefore never acceptable on a KEK. A read refused by the provider
-        // as access-denied is reported as HKDFGUARD_ERR_ACCESS_DENIED, not
+        // as access-denied is reported as HKDFGUARD_ERR_KEK_ACCESS_DENIED, not
         // as a provider fault.
         PACL ReadKeyDacl(
             NCRYPT_KEY_HANDLE key,
@@ -644,13 +644,13 @@ namespace hkdfguard {
             if (status == NTE_PERM ||
                 status == static_cast<SECURITY_STATUS>(ERROR_ACCESS_DENIED)) {
                 throw HkdfGuardError(
-                    HKDFGUARD_ERR_ACCESS_DENIED,
+                    HKDFGUARD_ERR_KEK_ACCESS_DENIED,
                     "not authorized to read the key ACL");
             }
 
             if (status != ERROR_SUCCESS) {
                 throw HkdfGuardError(
-                    HKDFGUARD_ERR_PROVIDER,
+                    HKDFGUARD_ERR_PROVIDER_ERROR,
                     "unable to read key ACL");
             }
 
@@ -665,7 +665,7 @@ namespace hkdfguard {
                 &acl,
                 &defaulted)) {
                 throw HkdfGuardError(
-                    HKDFGUARD_ERR_PROVIDER,
+                    HKDFGUARD_ERR_PROVIDER_ERROR,
                     "unable to parse key ACL");
             }
 
@@ -682,7 +682,7 @@ namespace hkdfguard {
     void VerifyExistingKeyAcl(
         NCRYPT_KEY_HANDLE key) {
         std::vector<BYTE> descriptor;
-        PACL acl = ReadKeyDacl(key, descriptor, HKDFGUARD_ERR_KEK_ACL_INVALID);
+        PACL acl = ReadKeyDacl(key, descriptor, HKDFGUARD_ERR_KEK_INVALID);
 
         // The two principals every KEK this library creates grants, whatever
         // the policy was at the time.
@@ -693,7 +693,7 @@ namespace hkdfguard {
         for (const SidBuffer &sid: required) {
             if (!DaclContainsSid(acl, const_cast<BYTE *>(sid.data()))) {
                 throw HkdfGuardError(
-                    HKDFGUARD_ERR_KEK_ACL_INVALID,
+                    HKDFGUARD_ERR_KEK_INVALID,
                     "existing KEK's ACL is missing SYSTEM or Administrators - not created by this library");
             }
         }
@@ -714,7 +714,7 @@ namespace hkdfguard {
             void *ace = nullptr;
             if (!GetAce(acl, i, &ace)) {
                 throw HkdfGuardError(
-                    HKDFGUARD_ERR_KEK_ACL_INVALID,
+                    HKDFGUARD_ERR_KEK_INVALID,
                     "existing KEK's ACL contains an unreadable entry");
             }
             auto *header = static_cast<ACE_HEADER *>(ace);
@@ -733,7 +733,7 @@ namespace hkdfguard {
                 case ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE:
                 case ACCESS_ALLOWED_COMPOUND_ACE_TYPE:
                     throw HkdfGuardError(
-                        HKDFGUARD_ERR_KEK_ACL_INVALID,
+                        HKDFGUARD_ERR_KEK_INVALID,
                         "existing KEK's ACL contains an object or compound allow entry");
                 default:
                     continue; // deny, audit, alarm, label: grants nothing
@@ -741,7 +741,7 @@ namespace hkdfguard {
 
             if (IsOverBroadSid(sid)) {
                 throw HkdfGuardError(
-                    HKDFGUARD_ERR_KEK_ACL_INVALID,
+                    HKDFGUARD_ERR_KEK_INVALID,
                     "existing KEK's ACL grants access to an over-broad principal");
             }
         }
@@ -755,7 +755,7 @@ namespace hkdfguard {
         //
 
         std::vector<BYTE> descriptor;
-        PACL acl = ReadKeyDacl(key, descriptor, HKDFGUARD_ERR_PROVIDER);
+        PACL acl = ReadKeyDacl(key, descriptor, HKDFGUARD_ERR_PROVIDER_ERROR);
 
         //
         // Verify SYSTEM

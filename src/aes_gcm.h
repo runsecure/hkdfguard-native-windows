@@ -13,11 +13,12 @@ namespace hkdfguard {
     // `plaintext` and writes directly into `ciphertext_out` - no additional
     // staging buffer. Throws HkdfGuardError on failure.
     //
-    // hkdfguard.cpp passes `normalized service name || KEK fingerprint` as
-    // `aad` here - see its call sites and wire_format.h for why: it's what
-    // binds a wrapped payload to both the exact service and the specific KEK
-    // it was wrapped under, matching the construction this project's macOS
-    // and Linux implementations use.
+    // hkdfguard.cpp passes the payload's authenticated bytes, `header || KEK
+    // fingerprint`, as `aad` here (built by wire_format.h's
+    // BuildWrappedDekAuthenticated - see that file for why): it binds a
+    // wrapped payload to its version and routing fields and the specific KEK
+    // it was wrapped under. The service is bound through the key itself
+    // (ecdh_hkdf.h).
     //
     // `unsigned long` (rather than this project's usual uint32_t/int32_t) is
     // used for the length parameters purely because that's the literal type
@@ -38,8 +39,8 @@ namespace hkdfguard {
     // bytes), authenticating `aad_len` bytes of `aad` alongside it (`aad` may
     // be null iff `aad_len` is 0, and must match what was passed to
     // AesGcmEncrypt or authentication fails). Writes the plaintext directly
-    // into `plaintext_out`. Throws HkdfGuardError(HKDFGUARD_ERR_AUTH_FAILED) if
-    // the tag does not verify, or HkdfGuardError(HKDFGUARD_ERR_CRYPTO) on any
+    // into `plaintext_out`. Throws HkdfGuardError(HKDFGUARD_ERR_PAYLOAD_AUTH_FAILED) if
+    // the tag does not verify, or HkdfGuardError(HKDFGUARD_ERR_CRYPTO_ERROR) on any
     // other failure. Callers must not trust the contents of `plaintext_out`
     // unless this function returns normally.
     void AesGcmDecrypt(

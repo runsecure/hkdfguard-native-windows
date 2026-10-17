@@ -11,8 +11,8 @@
     2. Configures and builds the project (cmake -G Ninja).
     3. Runs the project's own ctest suite (roundtrip).
     4. Generates a random 32-byte DEK, wraps it with the CLI tool
-       (tools/hkdfguard-v1-initialize.exe), then independently unwraps the
-       resulting file via a direct P/Invoke call into HkdfGuardV1.dll's public
+       (tools/hkdfguard.exe), then independently unwraps the
+       resulting file via a direct P/Invoke call into HkdfGuard.dll's public
        hkdfguard_unwrap_dek and confirms the recovered bytes match the
        original DEK - i.e. verifies the CLI's wrap output is unwrappable by
        the DLL, not just by the CLI itself.
@@ -72,7 +72,7 @@ $env:PATH = "$env:PATH;$installerDir"
 
 # Builds for the architecture of *this PowerShell process*, natively: the
 # tests below have to run what was built, and the DLL unwrap check loads
-# HkdfGuardV1.dll into this very process via P/Invoke, which only works when
+# HkdfGuard.dll into this very process via P/Invoke, which only works when
 # the two architectures match. On ARM64 Windows that means ARM64 binaries
 # from a native ARM64 powershell.exe (an x64 powershell.exe running under
 # emulation reports AMD64 and gets x64 binaries, which it can load).
@@ -113,8 +113,8 @@ cmake --build build --config $Configuration
 if ($LASTEXITCODE -ne 0) { throw "build failed (exit $LASTEXITCODE)" }
 Write-Ok "build succeeded"
 
-$dllPath = Join-Path $RepoRoot "build\HkdfGuardV1.dll"
-$cliPath = Join-Path $RepoRoot "build\tools\hkdfguard-v1-initialize.exe"
+$dllPath = Join-Path $RepoRoot "build\HkdfGuard.dll"
+$cliPath = Join-Path $RepoRoot "build\tools\hkdfguard.exe"
 foreach ($p in $dllPath, $cliPath) {
     if (-not (Test-Path $p)) { throw "expected build output missing: $p" }
 }
@@ -158,10 +158,24 @@ if ($LASTEXITCODE -eq 0) {
 # ---- CLI provision + wrap + independent DLL unwrap verification ----------
 Write-Section "CLI provision + wrap + DLL unwrap round-trip verification"
 
-$verifyDir = Join-Path $RepoRoot "build\verify"
+# The key file goes in a scratch folder under %TEMP%, not under the repo:
+# hkdfguard_open_file refuses a file when any folder above it lets another
+# account delete or replace entries, and a checkout outside a user profile
+# often does - GitHub's hosted runners use C:\a\..., which inherits
+# Authenticated Users: Modify from C:\. %TEMP% may be spelled with an 8.3
+# short name (C:\Users\RUNNER~1\... on those runners), which open_file also
+# refuses, so it's expanded to its long form first - as tests/test_cli.ps1 does.
+Add-Type -Namespace HkdfGuardVerify -Name Path -MemberDefinition @"
+[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+public static extern uint GetLongPathNameW(string shortPath, System.Text.StringBuilder longPath, uint size);
+"@
+$tempLong = New-Object System.Text.StringBuilder 32768
+$tempLen = [HkdfGuardVerify.Path]::GetLongPathNameW($env:TEMP, $tempLong, 32768)
+$tempDir = if ($tempLen -gt 0 -and $tempLen -lt 32768) { $tempLong.ToString() } else { $env:TEMP }
+$verifyDir = Join-Path $tempDir ("hkdfguard-verify-" + [Guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Force -Path $verifyDir | Out-Null
 $keyFile = Join-Path $verifyDir "verify.key"
-# Alphanumeric only - hkdfguard-v1-initialize.exe's ValidateServiceCharset
+# Alphanumeric only - hkdfguard.exe's ValidateServiceCharset
 # rejects anything else (including hyphens) in --service-name.
 $serviceName = "hkdfguardverifyscript"
 $service = $serviceName
@@ -177,7 +191,7 @@ $auditStart = (Get-Date).AddSeconds(-2)
 
 if (Test-Path $keyFile) { Remove-Item -Force $keyFile }
 
-# hkdfguard-v1-initialize.exe (build\tools\) links against HkdfGuardV1.dll
+# hkdfguard.exe (build\tools\) links against HkdfGuard.dll
 # (build\), a different directory - Windows won't find the DLL by default,
 # so prepend its directory to PATH for both calls below, same as
 # tests/CMakeLists.txt already does for ctest via ENVIRONMENT PATH.
@@ -189,7 +203,7 @@ try {
     & $cliPath provision --service-name $serviceName
     $provisionExit = $LASTEXITCODE
     if ($provisionExit -ne 0) {
-        Write-Bad "hkdfguard-v1-initialize.exe provision exited $provisionExit"
+        Write-Bad "hkdfguard.exe provision exited $provisionExit"
     } else {
         Write-Ok "KEK provisioned for service '$service'"
     }
@@ -197,7 +211,7 @@ try {
     if ($provisionExit -eq 0) {
         Write-Host "Wrapping a random 32-byte DEK via the CLI (service '$service')..."
         # The DEK is fed to "wrap" as base64 text on stdin (--dek-stdin), not
-        # as a command-line argument - see hkdfguard-v1-initialize.cpp's
+        # as a command-line argument - see hkdfguard_cli.cpp's
         # header comment on why.
         $dekBase64 | & $cliPath wrap --key-file-path $keyFile --service-name $serviceName `
             --dek-stdin --group $Group --force
@@ -210,7 +224,7 @@ try {
 }
 if ($provisionExit -eq 0) {
     if ($cliExit -ne 0) {
-        Write-Bad "hkdfguard-v1-initialize.exe wrap exited $cliExit"
+        Write-Bad "hkdfguard.exe wrap exited $cliExit"
     } else {
         Write-Ok "CLI wrapped the DEK to $keyFile"
     }
@@ -218,10 +232,10 @@ if ($provisionExit -eq 0) {
 
 if ($cliExit -eq 0) {
     $wrapped = [System.IO.File]::ReadAllBytes($keyFile)
-    if ($wrapped.Length -ne 164) {
-        Write-Bad "wrapped file is $($wrapped.Length) bytes, expected 164"
+    if ($wrapped.Length -ne 132) {
+        Write-Bad "wrapped file is $($wrapped.Length) bytes, expected 132"
     } else {
-        Write-Ok "wrapped file is the expected 164 bytes"
+        Write-Ok "wrapped file is the expected 132 bytes"
     }
 
     $providerType = $wrapped[1]
@@ -238,7 +252,7 @@ if ($cliExit -eq 0) {
 
     # P/Invoke straight into the built DLL's public hkdfguard_unwrap_dek -
     # deliberately not reusing the CLI (which only wraps) or ctest (which
-    # links the DLL at build time) - this calls the *exact* HkdfGuardV1.dll
+    # links the DLL at build time) - this calls the *exact* HkdfGuard.dll
     # the CLI just used, dynamically, the same way any external consumer
     # (C#, Python, etc. - see README.md) would.
     Add-Type -TypeDefinition @"
@@ -264,17 +278,17 @@ public static class HkdfGuardNative {
     # way a consumer would, and unwrap *those* bytes: CLI wrap -> file ->
     # open_file -> unwrap, end to end.
     $pathBytes = [System.Text.Encoding]::UTF8.GetBytes($keyFile + [char]0)
-    $fromFile = New-Object byte[] 164
-    $fromFileLen = 164
+    $fromFile = New-Object byte[] 132
+    $fromFileLen = 132
     $rc = [HkdfGuardNative]::hkdfguard_open_file($pathBytes, $fromFile, [ref]$fromFileLen)
     if ($rc -ne 0) {
         Write-Bad "hkdfguard_open_file returned status $rc (expected 0/HKDFGUARD_OK)"
-    } elseif ($fromFileLen -ne 164) {
-        Write-Bad "hkdfguard_open_file reported $fromFileLen bytes, expected 164"
+    } elseif ($fromFileLen -ne 132) {
+        Write-Bad "hkdfguard_open_file reported $fromFileLen bytes, expected 132"
     } elseif ([Convert]::ToBase64String($fromFile) -ne [Convert]::ToBase64String($wrapped)) {
         Write-Bad "hkdfguard_open_file returned different bytes than the file holds"
     } else {
-        Write-Ok "hkdfguard_open_file read the CLI's wrapped file: 164 bytes, still wrapped, identical to the file"
+        Write-Ok "hkdfguard_open_file read the CLI's wrapped file: 132 bytes, still wrapped, identical to the file"
     }
 
     $outBuf = New-Object byte[] 32
@@ -331,6 +345,9 @@ if (-not $NoCleanup) {
     if (Test-Path $keyFile) {
         Remove-Item -Force $keyFile
         Write-Host "removed $keyFile"
+    }
+    if (Test-Path $verifyDir) {
+        Remove-Item -Recurse -Force $verifyDir
     }
     if ($providerName) {
         # Matches kek_store.cpp's KeyName(): every piece of the persisted

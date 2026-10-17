@@ -15,7 +15,7 @@ existing KEK is *looked for* on. Under `RequireTpm` a payload that routes to a
 software-backed KEK is refused on unwrap as well (`VerifyKeyProperties` demands
 hardware backing), so the policy is enforced end to end, not just at creation. A value
 that is present but not one of `0`/`1`/`2` (or not a `REG_DWORD`) is a configuration
-error and fails every call with `HKDFGUARD_ERR_INVALID_POLICY` - it is deliberately
+error and fails every call with `HKDFGUARD_ERR_POLICY_INVALID` - it is deliberately
 *not* treated as the default, since a typo'd value most likely intended the stricter
 setting. The `PreferTpm` fallback is intentional and administrator-chosen: the
 `provider_type` byte in every payload records which provider actually protected it,
@@ -56,39 +56,42 @@ If you need per-user isolation instead, that means leaving `NCRYPT_MACHINE_KEY_F
 unset (current-user scope) - not offered as a build option here, since this project
 targets the shared-service deployment model above.
 
-The library exposes a small, stable C ABI (`include/hkdfguard.h`) with six functions.
+The library exposes a small, stable C ABI (`include/hkdfguard.h`) with seven functions.
 No Windows handle, CNG/NCrypt type, or COM interface crosses that boundary, and no C++
 exception ever escapes it - every call returns an integer status code.
 
 ```c
-int32_t hkdfguard_kek_exists(
+int hkdfguard_kek_exists(
     const char* service,
-    int32_t* out_exists);
+    int* out_exists);
 
-int32_t hkdfguard_create_kek(
+int hkdfguard_create_kek(
     const char* service);
 
-int32_t hkdfguard_wrap_dek(
+int hkdfguard_wrap_dek(
     const char* service,
-    const uint8_t* dek, int32_t dek_len,
-    uint8_t* out, int32_t* out_len);
+    const uint8_t* dek, int dek_len,
+    uint8_t* out, int* out_len);
 
-int32_t hkdfguard_unwrap_dek(
+int hkdfguard_unwrap_dek(
     const char* service,
-    const uint8_t* wrapped, int32_t wrapped_len,
-    uint8_t* out, int32_t* out_len);
+    const uint8_t* wrapped, int wrapped_len,
+    uint8_t* out, int* out_len);
 
-int32_t hkdfguard_generate_and_wrap_dek(
+int hkdfguard_generate_and_wrap_dek(
     const char* service,
-    uint8_t* out, int32_t* out_len);
+    uint8_t* out, int* out_len);
 
-int32_t hkdfguard_open_file(
+int hkdfguard_open_file(
     const char* path,
-    uint8_t* out, int32_t* out_len);
+    uint8_t* out, int* out_len);
+
+int hkdfguard_harden_process(void);
+int hkdfguard_harden_process_with_flags(unsigned int flags);
 ```
 
 `service` is a null-terminated UTF-8 string (non-empty, at most 128 bytes, ASCII letters/
-digits/`.` only) identifying which persistent KEK to use - e.g. an application or tenant
+digits/`.` only, not starting with `.`, no `..`) identifying which persistent KEK to use - e.g. an application or tenant
 name. It's case-insensitive (normalized to lowercase internally, so `"MyApp"` and
 `"myapp"` are the same service everywhere). Different service names get independent,
 non-interoperable KEKs; the same service name must be passed to both wrap and unwrap a
@@ -103,10 +106,24 @@ an older payload for the same service. Protect the file itself, which is what th
 `--group` ACL is for. If your application must refuse older DEKs, it has to check that
 after unwrapping.
 
-`dek_len` must be exactly 32 (`HKDFGUARD_DEK_LEN`). A wrapped payload is always exactly
-164 bytes (`HKDFGUARD_WRAPPED_LEN`) - a fixed size regardless of which KEK provider
-produced it - so callers can allocate output buffers without a size-query round trip.
-See `include/hkdfguard.h` for the full set of `HKDFGUARD_ERR_*` status codes.
+`dek_len` must be exactly 32 (`HKDFGUARD_DEK_LEN`). On Windows a wrapped payload is always
+exactly 132 bytes (`HKDFGUARD_WRAPPED_MAX_LEN`), whichever KEK provider produced it, so a
+buffer of that size never needs a retry. The constant has the same name on Linux and
+macOS, where its value differs: a payload is only ever unwrapped on the host that wrapped
+it. The buffer rules match those builds too. `out` may be NULL only with `*out_len` 0, a
+size probe that returns `HKDFGUARD_ERR_BUFFER_TOO_SMALL` with the size to allocate, before
+any provider is reached or file opened. A negative capacity or `wrapped_len` is
+`HKDFGUARD_ERR_INVALID_ARGUMENT`. An invalid service name is reported before a too-small
+buffer. `*out_len` is left unchanged on every failure except `BUFFER_TOO_SMALL`. Lengths
+and status codes are plain `int` in every platform's header (32 bits on all of them).
+See `include/hkdfguard.h` for the full set of `HKDFGUARD_ERR_*` status codes. The table
+is shared number for number with the Linux and macOS builds of this ABI: general codes
+(-1..-7), service name and policy (-8, -9), wrapped payload (-10..-12), KEK and process
+(-16..-20) and key file (-32..-39), then platform bands (Windows -64..-79, Linux -80..-95,
+macOS -96..-111). Every platform-band code refines a common one and can be treated as it;
+the only Windows-specific code is `HKDFGUARD_ERR_WIN_GROUP_INVALID` (-64), a refinement of
+`HKDFGUARD_ERR_POLICY_INVALID`. A NULL, empty, over-long or badly formed `service` fails
+with `HKDFGUARD_ERR_INVALID_SERVICE_NAME` on every call.
 
 `hkdfguard_generate_and_wrap_dek` generates its own cryptographically random 32-byte DEK
 (via `BCryptGenRandom`) and wraps it in one call, for callers minting a brand new
@@ -115,45 +132,119 @@ it's zeroed internally the moment it's wrapped. Recover it later via
 `hkdfguard_unwrap_dek` on the resulting payload, with the same `service`.
 
 `hkdfguard_open_file` reads a wrapped-key file, such as one written by the CLI's `wrap`,
-and returns its 164 bytes **still wrapped**, ready for a later, separate
+and returns its 132 bytes **still wrapped**, ready for a later, separate
 `hkdfguard_unwrap_dek` call. It never unwraps, opens no KEK, and needs only read access to
 the file. `path` is UTF-8, absolute or relative to the current directory, and follows the
 same rules as the CLI's `--key-file-path`: it must be a real file on a local drive, reached
 through real directories. A symbolic link, junction or other reparse point at the path or
 anywhere above it is refused, never followed, and so are 8.3 short names (`PROGRA~1`),
 UNC paths, mapped and SUBST drives and device paths - all with
-`HKDFGUARD_ERR_FILE_PATH_REJECTED`, and the network and device cases before anything
+`HKDFGUARD_ERR_FILE_UNTRUSTED`, and the network and device cases before anything
 is opened, so the process never connects to a server named in a path. Configure key-file
 paths as full long paths, and don't build them from `%TEMP%` or other environment variables
 without first expanding them with `GetLongPathNameW`: Windows can set those variables with
 short names (for example `C:\Users\RUNNER~1\AppData\Local\Temp` on GitHub-hosted runners),
-and a path containing one is refused. It checks the file's size before reading anything, and
-fails
-with `HKDFGUARD_ERR_FILE_PLAINTEXT_KEY` for a file of exactly 32 bytes (the size of an
+and a path containing one is refused.
+
+The file and every folder above it must also be owned by SYSTEM, Administrators,
+TrustedInstaller or the account the process runs as, and must not let any other account
+write, delete, rename or re-permission them (creating new files in a folder is fine, so
+`C:\ProgramData\<app>\` works). Otherwise it fails with `HKDFGUARD_ERR_FILE_UNTRUSTED`:
+reading a wrapped DEK gains nothing, but anyone who could replace it, and could also wrap
+under the service's KEK, could plant a DEK they know. Read access for other accounts is
+never refused. A folder made directly under `C:\` inherits `Authenticated Users: Modify` and
+is refused until its permissions are narrowed.
+
+It checks the file's size before reading anything, and fails with
+`HKDFGUARD_ERR_FILE_PLAINTEXT_KEY` for a file of exactly 32 bytes (the size of an
 *unwrapped* DEK, so probably a plaintext key written to disk - treat it as exposed; its
-contents are never read), `HKDFGUARD_ERR_FILE_TOO_SHORT` for any other size under 164, and
-`HKDFGUARD_ERR_FILE_TOO_LONG` for anything over. A 164-byte file must also pass the same
-structural and P-256 point checks unwrap applies, or it fails with
-`HKDFGUARD_ERR_MALFORMED`. `HKDFGUARD_ERR_FILE_NOT_FOUND`,
+contents are never read). It also fails with `HKDFGUARD_ERR_FILE_PLAINTEXT_KEY` for a DEK
+written as text: 64 hex digits, or base64 (standard or URL-safe, padded or not), with any
+surrounding whitespace. A file of 96 bytes or fewer is read into a wiped buffer to tell, and
+none of it is returned. Any other size under 132 is `HKDFGUARD_ERR_FILE_TOO_SHORT`, and
+anything over is `HKDFGUARD_ERR_FILE_TOO_LONG`. A 132-byte file must also pass the same
+structural checks unwrap applies before it touches a KEK, or it fails with
+`HKDFGUARD_ERR_FILE_MALFORMED` (an unrecognized version included). `HKDFGUARD_ERR_FILE_NOT_FOUND`,
 `HKDFGUARD_ERR_FILE_ACCESS_DENIED` and `HKDFGUARD_ERR_FILE_IO` cover a file that can't be
 opened or read; directories, pipes and devices are refused, and so is a file another
 process has open for writing. On any failure the output buffer is zeroed; `*out_len` is
 left unchanged except on `HKDFGUARD_ERR_BUFFER_TOO_SMALL`, as with wrap and unwrap.
 
+`hkdfguard_harden_process` is opt-in, process-wide hardening against memory disclosure,
+the Windows counterpart of the Linux build's call of the same name. The library never
+calls it itself. It does three things:
+
+- It tells Windows Error Reporting to leave the heap out of crash reports
+  (`WerSetFlags(WER_FAULT_REPORTING_FLAG_NOHEAP)`).
+- It replaces the process object's DACL. Only SYSTEM may then read or write the process's
+  memory, inject threads or duplicate its handles. The account it runs as keeps query,
+  synchronize and terminate access. An OWNER RIGHTS ACE removes the owner's implicit right
+  to put the old DACL back.
+- It applies the same restriction to every thread that exists at the time of the call.
+
+After the call, a dump from the same account fails, whether it comes from Task Manager,
+procdump or `MiniDumpWriteDump`, and so does attaching a debugger.
+
+This is a same-user barrier only. Administrators holding `SeDebugPrivilege`, SYSTEM and
+the kernel bypass it. Threads started after the call keep the default thread DACL, so call
+it again once worker threads are running, or use the strict flag below. Handles that were
+opened before the call keep their access. A GUI process can still be injected into
+through window hooks (`SetWindowsHookEx`) by a same-user process on the same desktop, so
+host key handling in a service or console process. The page file, hibernation and
+machine-wide dump settings (WER `LocalDumps`) are outside its reach. The call is
+idempotent. It returns `HKDFGUARD_OK` or `HKDFGUARD_ERR_PROCESS_HARDENING_FAILED`, and
+steps applied before a failure stay applied.
+
+`hkdfguard_harden_process_with_flags(flags)` is the same call with options, as on Linux
+and macOS; `hkdfguard_harden_process()` is `..._with_flags(0)`. Unknown flag bits return
+`HKDFGUARD_ERR_INVALID_ARGUMENT` before anything is changed. The one flag,
+`HKDFGUARD_HARDEN_REQUIRE_PROTECTED_SIGNATURE` (`0x1`), requires that no other process of
+the same user can debug or inject code into this one. On macOS that depends on the code
+signature, and on Linux it's already true. On Windows it adds two steps, applied first:
+
+- It replaces the process token's **default DACL**, which every unnamed object the process
+  creates from then on receives. SYSTEM keeps every right; the account keeps only
+  `SYNCHRONIZE` and `READ_CONTROL`. Threads started later are then closed like the
+  existing ones.
+- It replaces the **token's own DACL**, so the account can only query and duplicate it.
+  Without this, a same-user process could open the token and put the old default DACL
+  back. Duplicate is kept because the TPM key store duplicates its own process token on
+  every key open.
+
+The cost is why it's a flag. Everything the process creates afterwards without an explicit
+security descriptor is closed to its own account too: child processes (Task Manager can't
+stop them; the creator's own handle still can), and named pipes, events and other named
+objects. A same-user client can't connect to a pipe created with a NULL security
+descriptor. Pass it in a service or console process that doesn't share objects by name
+with other processes. Window hooks into a GUI process stay outside it.
+
 ## Command-line tool
 
-`tools/hkdfguard-v1-initialize.cpp` builds `hkdfguard-v1-initialize.exe`, a thin
-wrapper around the ABI above with two subcommands:
+`tools/hkdfguard_cli.cpp` builds `hkdfguard.exe`, a thin
+wrapper around the ABI above with two subcommands.
+
+It hardens itself before reading anything, as the Linux CLI does. It calls
+`hkdfguard_harden_process_with_flags(HKDFGUARD_HARDEN_REQUIRE_PROTECTED_SIGNATURE)`, so
+crash reports leave out the heap, and no same-user process can dump, debug or inject into
+it, including through threads the key storage provider starts later. If hardening
+fails, the CLI refuses to run. Every copy of the DEK the CLI makes, both the base64 text
+and the decoded bytes, lives in one buffer. That buffer is locked into RAM with
+`VirtualLock`, so it is never written to the page file, and it is wiped before it is
+freed. Stdin is read with `ReadFile`, not through the C runtime's buffered stream, which
+would keep a copy that can't be wiped. If the lock fails, the CLI warns and continues,
+as on Linux. Windows has no counterpart to Linux's `mlockall`, so the library's own
+transient copies while it wraps are not locked. Hardening still keeps them out of crash
+reports and away from other processes.
 
 - **`provision`** - always calls `hkdfguard_create_kek`, which creates the KEK if it
   is missing and otherwise re-verifies the existing key's properties and ACL (failing
-  with `HKDFGUARD_ERR_KEK_ACL_INVALID` on a pre-planted or widened key). Never wraps a
+  with `HKDFGUARD_ERR_KEK_INVALID` on a pre-planted or widened key). Never wraps a
   DEK, never touches a file. This is the *only* subcommand that can create a KEK. Run
   it elevated: creating a KEK requires elevation (see "Deployment model" above), and
   verifying an existing one reads its ACL, which a key-use-only account cannot do.
 
   ```
-  hkdfguard-v1-initialize.exe provision --service-name|-sn <name>
+  hkdfguard.exe provision --service-name|-sn <name>
   ```
 
 - **`wrap`** - calls `hkdfguard_wrap_dek` only, against an *already-provisioned* KEK;
@@ -162,13 +253,31 @@ wrapper around the ABI above with two subcommands:
   **stdin** rather than a command-line argument, specifically so it never appears in
   this process's `argv`, where another process on the same host could otherwise read
   it via a command-line/process listing (e.g. a WMI query) for the life of the run.
+  The input rules are the Linux tool's, exactly: strict standard base64 (`+/`, padded,
+  as `[Convert]::ToBase64String` writes it), at most 64 bytes, with one trailing newline
+  (LF or CRLF) allowed and no other whitespace. A leading UTF-8 byte-order mark is
+  skipped, and UTF-16 input is refused with a message saying so.
+  `--dek-file <path>` reads the same text from a file instead, by the Linux tool's rules
+  in ACL form. The file must be on a local drive, a regular file with no link, junction or
+  8.3 name at or above it, and owned by SYSTEM, Administrators or you. Its DACL must grant
+  nothing to anyone else, not even read, since it holds the plaintext DEK. All of this is
+  checked on the open handle; a refusal says how to fix the ACL with `icacls`. Decoding is constant
+  time with respect to the DEK text (no branch or table lookup depends on it, as with
+  RustCrypto's `base64ct` on Linux), and any malformed input gets one fixed message that
+  names no character or offset, so a mistyped DEK never ends up in a log. `--dek-stdin`
+  refuses an interactive console: pipe the DEK in rather than typing or pasting it, so
+  it isn't echoed or kept in the scrollback.
 
   ```
-  hkdfguard-v1-initialize.exe wrap --key-file-path|-kf <path> --service-name|-sn <name> --dek-stdin --group|-g <name> [--force|-f]
+  hkdfguard.exe wrap --key-file-path|-kf <path> --service-name|-sn <name> (--dek-stdin | --dek-file <path>)
+                     [--group|-g <name>] [--force|-f]
   ```
 
-  `--group|-g` sets the wrapped **file's** Windows ACL (owner read/write, that group
-  read-only, no one else) - it has nothing to do with the KEK's own ACL, which is
+  The wrapped **file's** Windows ACL is protected (nothing inherited) and grants the
+  owner read/write and no one else. The owner is the token owner, so Administrators when
+  `wrap` runs elevated. That matches the Linux tool's `0600`. The optional `--group|-g`
+  adds that group, read-only, matching the Linux tool's `--group` and `0640`. This has
+  nothing to do with the KEK's own ACL, which is
   governed entirely by machine policy (see "Deployment model" above), not by anything
   passed on this command line. Name a dedicated group for the service that will read
   the file, for example a local group `App_1234` whose only member is that service's
@@ -196,7 +305,7 @@ freshly-generated DEK under it on every later release:
 
 ```powershell
 # One-time, elevated: create the KEK for this service if it doesn't already exist.
-.\hkdfguard-v1-initialize.exe provision --service-name myapp
+.\hkdfguard.exe provision --service-name myapp
 
 # One-time: a dedicated local group for the account that will read the wrapped file.
 net localgroup App_1234 /add
@@ -207,8 +316,8 @@ net localgroup App_1234 "NT SERVICE\MyAppService" /add
 $dekBytes = New-Object byte[] 32
 [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($dekBytes)
 $dekBase64 = [Convert]::ToBase64String($dekBytes)
-$dekBase64 | .\hkdfguard-v1-initialize.exe wrap `
-    --key-file-path C:\secrets\myapp.v1.key --service-name myapp `
+$dekBase64 | .\hkdfguard.exe wrap `
+    --key-file-path C:\ProgramData\myapp\myapp.v1.key --service-name myapp `
     --dek-stdin --group App_1234 --force
 ```
 
@@ -273,8 +382,8 @@ creates a machine-wide KEK (`NCRYPT_MACHINE_KEY_FLAG`) the first time a given se
 name is used, and that creation step fails outright without elevation - see "Deployment
 model" above.
 
-This produces `build/HkdfGuardV1.dll` (+ its `.lib` import library) and
-`build/tools/hkdfguard-v1-initialize.exe`, and registers two tests with `ctest`:
+This produces `build/HkdfGuard.dll` (+ its `.lib` import library) and
+`build/tools/hkdfguard.exe`, and registers two tests with `ctest`:
 
 - **`roundtrip`** (`tests/test_roundtrip.cpp`, built to `build/tests/test_roundtrip.exe`)
   exercises the public ABI end to end, by linking directly against the built DLL: KEK
@@ -295,7 +404,7 @@ This produces `build/HkdfGuardV1.dll` (+ its `.lib` import library) and
   build\tests\test_roundtrip.exe
   ```
 
-- **`cli`** (`tests/test_cli.ps1`) exercises `hkdfguard-v1-initialize.exe`'s own
+- **`cli`** (`tests/test_cli.ps1`) exercises `hkdfguard.exe`'s own
   subcommand dispatch, argument parsing, validation, and file-handling by spawning the
   real built `.exe` as a subprocess - including, when elevated, a full
   provision-then-wrap-then-`--force`-overwrite run through it, and (unconditionally,
@@ -304,7 +413,7 @@ This produces `build/HkdfGuardV1.dll` (+ its `.lib` import library) and
   as a required parameter, so it can also be pointed at any build of the tool:
 
   ```powershell
-  powershell -ExecutionPolicy Bypass -File tests\test_cli.ps1 -CliExePath build\tools\hkdfguard-v1-initialize.exe
+  powershell -ExecutionPolicy Bypass -File tests\test_cli.ps1 -CliExePath build\tools\hkdfguard.exe
   ```
 
 Both tests delete any KEKs they create once they finish, so repeated runs don't
@@ -363,12 +472,13 @@ including the impersonated client when a service acts on someone's behalf.
 | 1001 | Warning | A KEK was created on the software provider because `PreferTpm`'s TPM attempt failed, so it isn't hardware-protected. |
 | 1002 | Information | A DEK was wrapped (`hkdfguard_wrap_dek` or `hkdfguard_generate_and_wrap_dek`). |
 | 1003 | Information | A DEK was unwrapped. |
-| 2000 | Warning | `ACCESS_DENIED` on any call: use of a KEK by an unauthorized account, or provisioning without elevation. |
-| 2002 | Error | `KEK_ACL_INVALID`: an existing KEK under the service name has an ACL this library would never create. Investigate it. |
-| 2003 | Warning | `AUTH_FAILED`, `KEK_MISMATCH` or `MALFORMED` on unwrap: a tampered, corrupted, or misdirected payload. |
-| 2004 | Error | `INVALID_POLICY` or `GROUP_INVALID`: the registry policy is misconfigured, so calls fail closed. |
-| 2005 | Error | `PROVIDER`, `CRYPTO` or `INTERNAL`: the key storage provider or crypto layer failed. |
-| 2006 | Error | `hkdfguard_open_file` refused a file of exactly 32 bytes - the size of an unwrapped DEK, so possibly a plaintext key on disk. Names the file; its contents were not read. Investigate it. |
+| 2000 | Warning | `KEK_ACCESS_DENIED` on any call: use of a KEK by an unauthorized account, or provisioning without elevation. |
+| 2002 | Error | `KEK_INVALID`: an existing KEK under the service name has an ACL this library would never create. Investigate it. |
+| 2003 | Warning | `PAYLOAD_AUTH_FAILED`, `KEK_FINGERPRINT_MISMATCH`, `PAYLOAD_MALFORMED` or `PAYLOAD_UNSUPPORTED` on unwrap: a tampered, corrupted, misdirected or unknown-version payload. |
+| 2004 | Error | `POLICY_INVALID` or `WIN_GROUP_INVALID`: the registry policy is misconfigured, so calls fail closed. |
+| 2005 | Error | `PROVIDER_UNAVAILABLE`, `PROVIDER_ERROR`, `CRYPTO_ERROR` or `INTERNAL_ERROR`: the key storage provider or crypto layer failed. |
+| 2006 | Error | `hkdfguard_open_file` refused a file that looks like an unwrapped DEK (32 raw bytes, or its hex or base64), so possibly a plaintext key on disk. Names the file; none of its contents are logged or returned. Investigate it. |
+| 2007 | Warning | A process made more than 10 `hkdfguard_create_kek` / `hkdfguard_kek_exists` calls. They are meant to run once at startup, so a caller is probably looping on them. Logged once per process. |
 
 The wrap and unwrap events also record the KEK's fingerprint and a SHA-256 of the
 wrapped payload. Both are public values that reveal nothing about the DEK. Because the
@@ -378,8 +488,8 @@ older payload visible, which matters because the format deliberately allows roll
 (see the note on what a payload is bound to). To compute a wrapped file's hash for
 comparison: `(Get-FileHash <file> -Algorithm SHA256).Hash.ToLower()`.
 
-Deliberately not logged: caller mistakes (`INVALID_ARG`, `BUFFER_TOO_SMALL`,
-`SERVICE_NAME_INVALID`) and `KEK_NOT_FOUND`. `hkdfguard_open_file` writes only event 2006;
+Deliberately not logged: caller mistakes (`INVALID_ARGUMENT`, `BUFFER_TOO_SMALL`,
+`INVALID_SERVICE_NAME`) and `KEK_NOT_FOUND`. `hkdfguard_open_file` writes only event 2006;
 its other failures (a missing, unreadable, wrong-sized or malformed file, or a rejected
 path) involve no KEK and are reported to the caller alone. No key material is ever logged. Every
 successful wrap and unwrap writes one event, which suits deployment-time wrapping and
@@ -410,33 +520,69 @@ Get-WinEvent -LogName Application -FilterXPath "*[System[Provider[@Name='hkdfgua
     Format-Table TimeCreated, Id, LevelDisplayName, UserId, Message -Wrap
 ```
 
+
+## Setup calls are deliberately slow
+
+`hkdfguard_create_kek` and `hkdfguard_kek_exists` are meant to run once per application
+startup, so each takes **at least one second** of wall-clock time whatever its outcome
+(found, not found, or error), and they run one at a time across threads. This bounds how
+fast a buggy or hot-looping caller can drive the TPM: every call opens a fresh key storage
+provider handle. Argument errors (null pointer, invalid service name) still return
+immediately, since they never reach a provider. After more than 10 setup calls in one
+process, event 2007 is logged once. The same rule as the Linux build.
+
+The floor is about load, not secrecy. `hkdfguard_wrap_dek` is the hot path and is not
+slowed, and it answers `KEK_NOT_FOUND` (`-17`) at once for a service with no KEK. Treat
+service names as public identifiers, never as secrets.
+
+An administrator can tune the floor per host with a REG_DWORD value, in milliseconds (up
+to 60000; `0` disables it):
+
+```
+reg add HKLM\Software\Policies\HkdfGuard /v SetupMinDelayMs /t REG_DWORD /d 1000 /f
+```
+
+A missing value means 1000. A value above 60000, or of the wrong type, also keeps the
+1000 ms default: a typo can neither remove the floor nor turn startup into a long hang.
+It is read on every setup call.
+
 ## Design
 
-- **Crypto**: ephemeral ECDH (P-256) + HKDF-SHA512 + AES-256-GCM, matching the macOS
-  Secure Enclave implementation's pattern. See `src/ecdh_hkdf.cpp` for the derivation
-  design note - wrap-side and unwrap-side both extract the *raw* ECDH shared secret
-  (`BCRYPT_KDF_RAW_SECRET`, works identically via `BCryptDeriveKey` and
-  `NCryptDeriveKey`) and then run one shared, self-contained HKDF-SHA512
-  implementation, rather than relying on two separately-implemented KDF code paths
-  inside BCrypt and NCrypt. The AES-256-GCM step authenticates the normalized `service`
-  name followed by a SHA-256 fingerprint of the KEK's public key as additional
-  authenticated data (`src/aes_gcm.cpp`'s `AesGcmEncrypt`/`AesGcmDecrypt`, called from
-  `src/hkdfguard.cpp`) - binding a wrapped payload to both the exact service and the
-  specific KEK it was wrapped under. The fingerprint also travels in the payload and is
+- **Crypto**: ECDH (P-256) between the KEK's private key and a point hashed from a
+  random per-payload salt, then HKDF-SHA512 and AES-256-GCM - the construction this
+  project's Linux implementation uses. Each wrap draws a 32-byte salt and hashes it to a
+  P-256 point `H(salt)` (`src/hash_to_curve.cpp`: SHA-256 try-and-increment, identical to
+  the Linux `payload_ecdh_point`, pinned by test vectors from the Linux crate). The shared
+  secret `Z = ECDH(KEK private key, H(salt))` is computed by `NCryptSecretAgreement` on the
+  KEK's own provider - inside the TPM for a Platform Crypto Provider KEK - for wrap and
+  unwrap alike, taken out raw (`BCRYPT_KDF_RAW_SECRET`) and reversed to big-endian, then
+  fed to one self-contained HKDF-SHA512 implementation: salt = the payload salt, info =
+  `"hkdfguard-wrap-v1:"` || `u16le(len(service))` || normalized service || the payload's
+  header (bytes 0..39) || KEK fingerprint - the Linux build's derivation byte for byte,
+  confirmed by running the Linux crate's own `derive_wrapping_key` on the golden test's
+  inputs. Nobody knows the discrete log of
+  `H(salt)`, so **only an account authorized to use the KEK can create a payload**:
+  knowing the KEK's public key is not enough to forge one. Every wrap is therefore a use
+  of the KEK's private key - a TPM operation of about 10 ms for a TPM-backed KEK. See
+  `src/ecdh_hkdf.cpp` for the derivation design note. The AES-256-GCM step authenticates
+  the same header || fingerprint bytes as additional authenticated data
+  (`src/aes_gcm.cpp`'s `AesGcmEncrypt`/`AesGcmDecrypt`, called from `src/hkdfguard.cpp`).
+  So the service, the version, the routing fields and the specific KEK are bound into
+  the wrapping key itself, and every header byte is also checked by the tag - as on
+  Linux. The fingerprint also travels in the payload and is
   checked against the opened KEK before any ECDH or decryption, so "wrong KEK"
-  (`HKDFGUARD_ERR_KEK_MISMATCH`) is distinguishable from tampering
-  (`HKDFGUARD_ERR_AUTH_FAILED`). Matches the construction this project's macOS and
-  Linux implementations use.
-- **Wire format**: `src/wire_format.h` documents the exact 164-byte `WrappedDekV1`
-  layout (version, provider type, key id, ephemeral public key, AES-GCM nonce/
-  ciphertext/tag, KEK fingerprint), serialized field-by-field rather than via a packed
+  (`HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH`) is distinguishable from tampering
+  (`HKDFGUARD_ERR_PAYLOAD_AUTH_FAILED`).
+- **Wire format**: `src/wire_format.h` documents the exact 132-byte `WrappedDekV1`
+  layout (version, provider type, key id, salt, AES-GCM nonce/ciphertext/tag, KEK
+  fingerprint), serialized field-by-field rather than via a packed
   C struct so the format has no dependency on compiler struct-packing rules.
 - **KEK lifecycle**: `src/kek_store.cpp` creates the KEK (Platform Crypto Provider first,
   falling back to Software KSP under `PreferTpm`) only via `hkdfguard_create_kek`, which
   also applies the `KeyUseGroups`-driven ACL and is idempotent - safe to call again for
   an already-provisioned service, which just re-verifies it - including that the existing
   key's ACL is a real DACL with SYSTEM and Administrators on it and grants nothing to an
-  over-broad principal such as Everyone (`HKDFGUARD_ERR_KEK_ACL_INVALID` otherwise; the
+  over-broad principal such as Everyone (`HKDFGUARD_ERR_KEK_INVALID` otherwise; the
   key is left untouched). `hkdfguard_wrap_dek` and `hkdfguard_unwrap_dek` only ever *open*
   an existing KEK, never create one; unwrap opens the exact provider/key recorded in the
   payload. Every create/open/delete call passes `NCRYPT_MACHINE_KEY_FLAG` (and
@@ -519,7 +665,7 @@ msiexec /i hkdfguard-native-windows-0.9.0-win-x64.msi /qn /l*v install.log
 
 The MSI does four things:
 
-- **Installs both files** to `C:\Program Files\HkdfGuard\v1\`. That folder
+- **Installs both files** to `C:\Program Files\HkdfGuard\`. That folder
   inherits the Program Files ACL, where only Administrators, SYSTEM and TrustedInstaller
   can write. This is what stops a less-privileged user from planting a fake DLL next to
   the CLI and getting code execution the next time an administrator runs the elevated
@@ -539,7 +685,7 @@ The MSI does four things:
 Then, once per service, elevated:
 
 ```
-"C:\Program Files\HkdfGuard\v1\hkdfguard-v1-initialize.exe" provision --service-name myapp
+"C:\Program Files\HkdfGuard\hkdfguard.exe" provision --service-name myapp
 ```
 
 **Upgrades** remove the previous version before installing the new one. A service with
@@ -562,10 +708,10 @@ already manages machine policy (Group Policy, Intune, SCCM).
 
 This repository only implements the native Windows library and its C ABI. To call it
 from C#, Python, Java, Go, or Node, install the MSI above and bind to the installed
-`HkdfGuardV1.dll` with the platform's standard FFI mechanism.
+`HkdfGuard.dll` with the platform's standard FFI mechanism.
 
 **Load it by its full, known path - never by a bare filename.** Every binding below that
-accepts just a name (`"HkdfGuardV1.dll"`, `Native.load("HkdfGuardV1", ...)`, a bare-name
+accepts just a name (`"HkdfGuard.dll"`, `Native.load("HkdfGuard", ...)`, a bare-name
 `[DllImport]`, ...) resolves it through the operating system's standard DLL search order,
 which - depending on the host process's configuration - can include the current working
 directory or other locations a lower-privileged or otherwise unexpected file could
@@ -593,21 +739,22 @@ loading it.
   using var key = hklm.OpenSubKey(@"Software\hkdfguard-native-windows")
       ?? throw new InvalidOperationException("hkdfguard-native-windows is not installed");
   string dir = (string)key.GetValue("InstallPath")!;
-  IntPtr lib = NativeLibrary.Load(Path.Combine(dir, "HkdfGuardV1.dll"));
+  IntPtr lib = NativeLibrary.Load(Path.Combine(dir, "HkdfGuard.dll"));
   ```
-- **Python**: `ctypes.WinDLL(r"<absolute-path>\HkdfGuardV1.dll")`
+- **Python**: `ctypes.WinDLL(r"<absolute-path>\HkdfGuard.dll")`
 - **Java**: JNA's `NativeLibrary.getInstance("<absolute-path>")`, or a thin JNI shim that
   calls `LoadLibraryW` with an absolute path
-- **Go**: `cgo` linking against `HkdfGuardV1.lib` (resolved at link time, not
+- **Go**: `cgo` linking against `HkdfGuard.lib` (resolved at link time, not
   a runtime search - the safest option of all here), or, for dynamic loading,
   `golang.org/x/sys/windows.LoadLibraryEx(absPath, 0,
   LOAD_LIBRARY_SEARCH_APPLICATION_DIR)`
 - **Node**: `ffi-napi`/`koffi` given an absolute path, or a native addon (N-API) linking
-  `HkdfGuardV1.lib`
+  `HkdfGuard.lib`
 
-All five bindings map directly onto the six exported functions
+All five bindings map directly onto the seven exported functions
 (`hkdfguard_kek_exists`, `hkdfguard_create_kek`, `hkdfguard_wrap_dek`,
-`hkdfguard_unwrap_dek`, `hkdfguard_generate_and_wrap_dek`, `hkdfguard_open_file`) and the status codes in
+`hkdfguard_unwrap_dek`, `hkdfguard_generate_and_wrap_dek`, `hkdfguard_open_file`,
+`hkdfguard_harden_process`) and the status codes in
 `include/hkdfguard.h`; none of them need to know anything about TPMs, CNG, or NCrypt.
 
 ## License

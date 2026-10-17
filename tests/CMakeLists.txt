@@ -1,4 +1,4 @@
-# test_roundtrip exercises the public DLL ABI (HkdfGuardV1.dll) for wrap/unwrap,
+# test_roundtrip exercises the public DLL ABI (HkdfGuard.dll) for wrap/unwrap,
 # and additionally compiles kek_store.cpp/wire_format.cpp directly so it can
 # call the internal DeleteKek() helper to remove any KEKs it creates once the
 # test finishes - those helpers are not part of the public C ABI.
@@ -6,7 +6,7 @@
 # Compiling kek_store.cpp/wire_format.cpp a second time here (they're also
 # compiled once already as part of the hkdfguard DLL target in the parent
 # CMakeLists.txt) is intentional and harmless: each ends up in a separate
-# binary (HkdfGuardV1.dll vs. test_roundtrip.exe), so there's no linker
+# binary (HkdfGuard.dll vs. test_roundtrip.exe), so there's no linker
 # conflict from the same function existing in both.
 add_executable(test_roundtrip
     test_roundtrip.cpp
@@ -14,16 +14,17 @@ add_executable(test_roundtrip
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/wire_format.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/policy.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/key_acl.cpp
-    # ecdh_hkdf.cpp: so the test can call ValidateEphemeralPublicKey (the
-    # unwrap-side point-validation gate) directly, with hand-built valid and
-    # invalid points, without needing a provisioned KEK or elevation.
+    # ecdh_hkdf.cpp + hash_to_curve.cpp: so the test can call
+    # IsValidP256Point and PayloadEcdhPoint directly (hand-built points, and
+    # the Linux implementation's hash-to-curve vectors) without a KEK, and
+    # DeriveWrappingKey with the test-only provider fault enabled.
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/ecdh_hkdf.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/hash_to_curve.cpp
     # event_log.cpp: kek_store.cpp's CreateKek logs KEK creation, so this
     # test's own compiled copy of kek_store.cpp needs it too.
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/event_log.cpp
     # key_file.cpp: so the test can call ReadWrappedKeyFile (hkdfguard_open_file's
-    # implementation) directly with ecdh_hkdf.cpp's test-only provider fault
-    # enabled - a failure the shipped DLL can't be made to produce on cue.
+    # implementation) directly.
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/key_file.cpp
 )
 # Links against hkdfguard (the DLL's import library, for the public ABI
@@ -46,10 +47,10 @@ target_compile_definitions(test_roundtrip PRIVATE HKDFGUARD_ENABLE_TEST_POLICY_O
 # `ctest` (see README.md) actually runs.
 add_test(NAME roundtrip COMMAND test_roundtrip)
 # Windows only searches a fixed set of locations for a DLL an .exe depends
-# on, and the directory containing HkdfGuardV1.dll (the build output directory
+# on, and the directory containing HkdfGuard.dll (the build output directory
 # for that target) isn't necessarily one of them when ctest launches
 # test_roundtrip.exe directly. This prepends that directory onto PATH for
-# just this one test's process, so the OS loader can find HkdfGuardV1.dll at
+# just this one test's process, so the OS loader can find HkdfGuard.dll at
 # startup. $<TARGET_FILE_DIR:hkdfguard> is a CMake "generator expression" -
 # evaluated at build-configuration time to the real output path, whatever it
 # ends up being for the chosen build type/generator.
@@ -65,22 +66,37 @@ set_tests_properties(roundtrip PROPERTIES
     ENVIRONMENT "PATH=$<TARGET_FILE_DIR:hkdfguard>\\;${HKDFGUARD_TEST_PATH}"
 )
 
-# test_cli.ps1 exercises hkdfguard-v1-initialize.exe's own argument parsing,
+# test_cli.ps1 exercises hkdfguard.exe's own argument parsing,
 # validation, and file-handling behavior - none of which test_roundtrip
-# covers, since that only calls into HkdfGuardV1.dll directly and never spawns
+# covers, since that only calls into HkdfGuard.dll directly and never spawns
 # the CLI. Registered as an ordinary ctest test whose "command" happens to be
 # powershell.exe running a script, the same way any other test executable
-# would be; $<TARGET_FILE:hkdfguard-v1-initialize> resolves to the CLI's real
+# would be; $<TARGET_FILE:hkdfguard-cli> resolves to the CLI's real
 # built path (whatever it ends up being for the chosen generator/config),
-# passed as that script's -CliExePath argument. hkdfguard-v1-initialize.exe
-# needs HkdfGuardV1.dll to be findable too (same reason as roundtrip/
+# passed as that script's -CliExePath argument. hkdfguard.exe
+# needs HkdfGuard.dll to be findable too (same reason as roundtrip/
 # direct_aead above), so this test gets the identical PATH treatment.
 add_test(
     NAME cli
     COMMAND powershell.exe -NoProfile -ExecutionPolicy Bypass
             -File "${CMAKE_CURRENT_SOURCE_DIR}/test_cli.ps1"
-            -CliExePath "$<TARGET_FILE:hkdfguard-v1-initialize>"
+            -CliExePath "$<TARGET_FILE:hkdfguard-cli>"
 )
 set_tests_properties(cli PROPERTIES
     ENVIRONMENT "PATH=$<TARGET_FILE_DIR:hkdfguard>\\;${HKDFGUARD_TEST_PATH}"
+)
+
+# test_harden_process checks hkdfguard_harden_process from outside the
+# hardened process - the only vantage point where a process DACL is visible
+# - by starting a copy of itself as a child and probing it (see the comment
+# at the top of the .cpp). Public ABI only, so no src/ files are compiled
+# in. dbghelp.lib: MiniDumpWriteDump; wer.lib: WerGetFlags. Exit code 77
+# means it ran as SYSTEM, which the hardened DACL deliberately lets through,
+# so there is nothing to test.
+add_executable(test_harden_process test_harden_process.cpp)
+target_link_libraries(test_harden_process PRIVATE hkdfguard dbghelp.lib wer.lib)
+add_test(NAME harden_process COMMAND test_harden_process)
+set_tests_properties(harden_process PROPERTIES
+    ENVIRONMENT "PATH=$<TARGET_FILE_DIR:hkdfguard>\\;${HKDFGUARD_TEST_PATH}"
+    SKIP_RETURN_CODE 77
 )

@@ -1,7 +1,7 @@
 @echo off
 rem Runs Build-Dist.ps1 next to this file: clean-builds the Release
-rem configuration and stages HkdfGuardV1.dll and
-rem hkdfguard-v1-initialize.exe into dist\win-x64. Unlike
+rem configuration and stages HkdfGuard.dll and
+rem hkdfguard.exe into dist\win-x64. Unlike
 rem run-build-test-verify.bat, this does not need to run elevated - building
 rem Release doesn't touch the machine-wide KEK, only actually wrapping a DEK
 rem does. Pass -Sign to Authenticode-sign the staged binaries through Azure

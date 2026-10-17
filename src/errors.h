@@ -35,7 +35,7 @@ namespace hkdfguard {
         // ScopedHandle's constructor) stops the compiler from implicitly
         // converting a bare `int` into an HkdfGuardError in places that don't
         // obviously call for one. `code` defaults to nothing (it's required),
-        // but `what` has a default value, so `HkdfGuardError(HKDFGUARD_ERR_CRYPTO)`
+        // but `what` has a default value, so `HkdfGuardError(HKDFGUARD_ERR_CRYPTO_ERROR)`
         // alone is a valid call.
         //
         // The constructor's initializer list, `: std::runtime_error(what),

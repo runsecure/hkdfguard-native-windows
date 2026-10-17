@@ -20,7 +20,7 @@
        silently keep old settings baked into an incrementally-reused build
        directory. Each architecture gets its own build directory so
        building both doesn't clobber the other's cached CMake config.
-    3. Copies HkdfGuardV1.dll and hkdfguard-v1-initialize.exe
+    3. Copies HkdfGuard.dll and hkdfguard.exe
        (which needs that DLL sitting next to it - Windows won't find it
        across directories) into dist\win-<arch>\, ready to hand to a C#
        wrapper or copy to another machine.
@@ -173,8 +173,8 @@ cmake --build $BuildDirName --config Release
 if ($LASTEXITCODE -ne 0) { throw "build failed (exit $LASTEXITCODE)" }
 Write-Ok "build succeeded"
 
-$dllPath = Join-Path $RepoRoot "$BuildDirName\HkdfGuardV1.dll"
-$cliPath = Join-Path $RepoRoot "$BuildDirName\tools\hkdfguard-v1-initialize.exe"
+$dllPath = Join-Path $RepoRoot "$BuildDirName\HkdfGuard.dll"
+$cliPath = Join-Path $RepoRoot "$BuildDirName\tools\hkdfguard.exe"
 foreach ($p in $dllPath, $cliPath) {
     if (-not (Test-Path $p)) { throw "expected Release build output missing: $p" }
 }

@@ -51,7 +51,7 @@ namespace hkdfguard {
                 // Throwing here means `alg` (already own a valid provider handle or
                 // not) gets cleaned up correctly by its own destructor as this
                 // exception unwinds - no manual cleanup needed on this error path.
-                throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO, "BCryptOpenAlgorithmProvider(AES) failed");
+                throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO_ERROR, "BCryptOpenAlgorithmProvider(AES) failed");
             }
 
             // AES defaults to ECB mode in CNG unless told otherwise; this call
@@ -72,7 +72,7 @@ namespace hkdfguard {
                 reinterpret_cast<PUCHAR>(const_cast<wchar_t *>(BCRYPT_CHAIN_MODE_GCM)),
                 sizeof(BCRYPT_CHAIN_MODE_GCM), 0);
             if (!BCRYPT_SUCCESS(status)) {
-                throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO, "BCryptSetProperty(GCM) failed");
+                throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO_ERROR, "BCryptSetProperty(GCM) failed");
             }
 
             // Turns the raw 32 key bytes into an actual CNG key object CNG can
@@ -88,7 +88,7 @@ namespace hkdfguard {
                 alg.get(), aes_key.put(), nullptr, 0,
                 const_cast<PUCHAR>(key), 32, 0);
             if (!BCRYPT_SUCCESS(status)) {
-                throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO, "BCryptGenerateSymmetricKey failed");
+                throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO_ERROR, "BCryptGenerateSymmetricKey failed");
             }
             // Returned by value; see handle_traits.h's note on ScopedHandle's move
             // constructor for why this doesn't copy the underlying handle.
@@ -120,7 +120,7 @@ namespace hkdfguard {
         NTSTATUS status = BCryptGenRandom(
             nullptr, nonce_out, static_cast<ULONG>(kNonceLen), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
         if (!BCRYPT_SUCCESS(status)) {
-            throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO, "BCryptGenRandom(nonce) failed");
+            throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO_ERROR, "BCryptGenRandom(nonce) failed");
         }
 
         // BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO is the struct CNG uses to pass
@@ -160,7 +160,7 @@ namespace hkdfguard {
             // specifically expects to receive it.
             nullptr, 0, ciphertext_out, plaintext_len, &result_len, 0);
         if (!BCRYPT_SUCCESS(status) || result_len != plaintext_len) {
-            throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO, "BCryptEncrypt failed");
+            throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO_ERROR, "BCryptEncrypt failed");
         }
         // Nothing further to clean up by hand here: `aes_key` and `alg` both
         // wipe/close themselves automatically via their destructors as this
@@ -213,14 +213,14 @@ namespace hkdfguard {
         // the ABI layer zeroes the caller's output buffer on any failure.
         if (status == STATUS_AUTH_TAG_MISMATCH) {
             // A tag mismatch is reported as its own distinct, more specific
-            // error code (HKDFGUARD_ERR_AUTH_FAILED) rather than the generic
-            // HKDFGUARD_ERR_CRYPTO below, so a caller can tell "this was
+            // error code (HKDFGUARD_ERR_PAYLOAD_AUTH_FAILED) rather than the generic
+            // HKDFGUARD_ERR_CRYPTO_ERROR below, so a caller can tell "this was
             // tampered with / the wrong key was used" apart from "something
             // about the crypto machinery itself broke."
-            throw HkdfGuardError(HKDFGUARD_ERR_AUTH_FAILED, "AES-GCM authentication failed");
+            throw HkdfGuardError(HKDFGUARD_ERR_PAYLOAD_AUTH_FAILED, "AES-GCM authentication failed");
         }
         if (!BCRYPT_SUCCESS(status) || result_len != ciphertext_len) {
-            throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO, "BCryptDecrypt failed");
+            throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO_ERROR, "BCryptDecrypt failed");
         }
         // On success, the plaintext DEK now lives in `plaintext_out`, which -
         // all the way back up the call chain - is the caller-owned buffer
