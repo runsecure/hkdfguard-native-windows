@@ -158,7 +158,21 @@ if ($LASTEXITCODE -eq 0) {
 # ---- CLI provision + wrap + independent DLL unwrap verification ----------
 Write-Section "CLI provision + wrap + DLL unwrap round-trip verification"
 
-$verifyDir = Join-Path $RepoRoot "build\verify"
+# The key file goes in a scratch folder under %TEMP%, not under the repo:
+# hkdfguard_open_file refuses a file when any folder above it lets another
+# account delete or replace entries, and a checkout outside a user profile
+# often does - GitHub's hosted runners use C:\a\..., which inherits
+# Authenticated Users: Modify from C:\. %TEMP% may be spelled with an 8.3
+# short name (C:\Users\RUNNER~1\... on those runners), which open_file also
+# refuses, so it's expanded to its long form first - as tests/test_cli.ps1 does.
+Add-Type -Namespace HkdfGuardVerify -Name Path -MemberDefinition @"
+[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+public static extern uint GetLongPathNameW(string shortPath, System.Text.StringBuilder longPath, uint size);
+"@
+$tempLong = New-Object System.Text.StringBuilder 32768
+$tempLen = [HkdfGuardVerify.Path]::GetLongPathNameW($env:TEMP, $tempLong, 32768)
+$tempDir = if ($tempLen -gt 0 -and $tempLen -lt 32768) { $tempLong.ToString() } else { $env:TEMP }
+$verifyDir = Join-Path $tempDir ("hkdfguard-verify-" + [Guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Force -Path $verifyDir | Out-Null
 $keyFile = Join-Path $verifyDir "verify.key"
 # Alphanumeric only - hkdfguard.exe's ValidateServiceCharset
@@ -331,6 +345,9 @@ if (-not $NoCleanup) {
     if (Test-Path $keyFile) {
         Remove-Item -Force $keyFile
         Write-Host "removed $keyFile"
+    }
+    if (Test-Path $verifyDir) {
+        Remove-Item -Recurse -Force $verifyDir
     }
     if ($providerName) {
         # Matches kek_store.cpp's KeyName(): every piece of the persisted
