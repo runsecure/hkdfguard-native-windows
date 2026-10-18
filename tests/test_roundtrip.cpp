@@ -2476,6 +2476,17 @@ int main() {
         Check(!plain(b64 + "="), "detector: an extra '=' is not a DEK");
         Check(!plain("\v" + b64), "detector: vertical tab is not trimmed (as Rust's trim_ascii)");
         Check(plain(std::string(HKDFGUARD_DEK_LEN, '\0')), "detector: any 32 raw bytes");
+        // The constant-time rewrite: the same answers as the Linux build's
+        // edge-case test (the_detector_s_edge_cases_match_the_windows_build).
+        Check(plain("\f" + b64 + "\f"), "detector: form feed is trimmed");
+        Check(!plain(""), "detector: empty is not a DEK");
+        Check(!plain(std::string(50, ' ')), "detector: only whitespace is not a DEK");
+        Check(plain(Base64Of(zeros, true, false)), "detector: URL-safe base64 without padding is a DEK");
+        Check(plain(std::string(64, 'F')), "detector: 64 uppercase hex digits are a DEK");
+        Check(plain("  " + std::string(64, 'a') + "\r\n"), "detector: 64 hex digits with surrounding whitespace are a DEK");
+        Check(!plain(std::string(63, 'a') + "g"), "detector: 64 characters with one not hex are not a DEK");
+        Check(!plain(std::string(32, 'a') + "\n" + std::string(32, 'a')), "detector: whitespace inside the text is not trimmed");
+        Check(!plain(b64.substr(0, 20) + "=" + b64.substr(21)), "detector: '=' anywhere but the end is not a DEK");
     }
 
     // ---- 25. KeyStoragePolicy is honored for all three values, forced via ----

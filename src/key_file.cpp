@@ -428,49 +428,68 @@ namespace hkdfguard {
         static_assert(kMaxPlaintextTextLen < kTotalLen && HKDFGUARD_DEK_LEN < kTotalLen,
                       "plaintext detection must never be able to refuse a real payload");
 
-        // The characters Rust's trim_ascii removes, so both builds trim the
-        // same: space, tab, LF, form feed, CR.
-        bool IsAsciiWhitespace(uint8_t c) {
-            return c == ' ' || c == '\t' || c == '\n' || c == '\f' || c == '\r';
+        // Branch-free byte classification for LooksLikePlaintextDek. Every
+        // helper returns 0 or 1 and is straight-line arithmetic on uint32_t,
+        // with no data-dependent branch or table lookup. The Linux build's
+        // `ct` module, step for step.
+
+        // 1 if a == b, else 0 (inputs below 2^31).
+        uint32_t CtEq(uint32_t a, uint32_t b) {
+            return ((a ^ b) - 1u) >> 31;
         }
 
-        // The 6-bit value of a base64 character in the standard (+/) or
-        // URL-safe (-_) alphabet, or -1.
-        int Base64Value(uint8_t c, bool url_safe) {
-            if (c >= 'A' && c <= 'Z') return c - 'A';
-            if (c >= 'a' && c <= 'z') return c - 'a' + 26;
-            if (c >= '0' && c <= '9') return c - '0' + 52;
-            if (c == (url_safe ? '-' : '+')) return 62;
-            if (c == (url_safe ? '_' : '/')) return 63;
-            return -1;
+        // 1 if lo <= c <= hi, else 0 (inputs below 2^31): both differences
+        // wrap negative exactly when c is inside.
+        uint32_t CtInRange(uint32_t c, uint32_t lo, uint32_t hi) {
+            return (((lo - 1u) - c) & (c - (hi + 1u))) >> 31 & 1u;
         }
 
-        // Whether `data` (`len` characters, padding already removed) is
-        // exactly 32 bytes of base64 in one alphabet: 43 characters whose
-        // last carries 2 unused bits, which must be zero - what the Rust
-        // base64 crate's decoders the Linux build uses require. Decides
-        // without decoding, so the possible key is never reassembled.
-        bool IsBase64OfDek(const uint8_t *data, size_t len, bool url_safe) {
-            if (len != 43) {
-                return false;
-            }
-            int last = 0;
-            for (size_t i = 0; i < len; ++i) {
-                last = Base64Value(data[i], url_safe);
-                if (last < 0) {
-                    return false;
-                }
-            }
-            return (last & 0x3) == 0;
+        // a if cond is 1, b if it is 0.
+        uint32_t CtSelect(uint32_t cond, uint32_t a, uint32_t b) {
+            return b ^ ((a ^ b) & (0u - cond));
+        }
+
+        // What Rust's trim_ascii removes: space, tab, LF, form feed, CR.
+        uint32_t CtIsWhitespace(uint32_t c) {
+            return CtEq(c, ' ') | CtEq(c, '\t') | CtEq(c, '\n') | CtEq(c, '\f') | CtEq(c, '\r');
+        }
+
+        uint32_t CtIsHex(uint32_t c) {
+            return CtInRange(c, '0', '9') | CtInRange(c, 'a', 'f') | CtInRange(c, 'A', 'F');
+        }
+
+        // Membership of c in the base64 alphabet whose 62nd and 63rd
+        // characters are c62 and c63; its 6-bit value goes to `value`.
+        uint32_t CtBase64(uint32_t c, uint32_t c62, uint32_t c63, uint32_t &value) {
+            uint32_t upper = CtInRange(c, 'A', 'Z');
+            uint32_t lower = CtInRange(c, 'a', 'z');
+            uint32_t digit = CtInRange(c, '0', '9');
+            uint32_t s62 = CtEq(c, c62);
+            uint32_t s63 = CtEq(c, c63);
+            value = ((c - 'A') & (0u - upper)) | ((c - ('a' - 26u)) & (0u - lower)) |
+                    ((c + (52u - '0')) & (0u - digit)) | (62u & (0u - s62)) | (63u & (0u - s63));
+            return upper | lower | digit | s62 | s63;
         }
 
         // 32 raw bytes, or 32 bytes written as text: hex (either case, 64
         // digits) or base64 (standard or URL-safe, with or without its one
         // '=' of padding - the CLI's own DEK input is standard, padded),
         // with any leading or trailing whitespace an editor or `echo` adds.
-        // The same forms the Linux build recognises. Every one of these is
-        // too short to be a payload anyway; recognising them is what turns
-        // "wrong file" into "this key is exposed".
+        // Every one of these is too short to be a payload anyway;
+        // recognising them is what turns "wrong file" into "this key is
+        // exposed".
+        //
+        // Constant-time in the contents, as on Linux and macOS: the only
+        // branches are on the length, which the file's size already gives
+        // away. Every byte is visited twice (once to find the text between
+        // the surrounding whitespace, once to test it against all three
+        // alphabets at once) and every decision is mask arithmetic, so how
+        // long this takes says nothing about where in a would-be key the
+        // first non-matching byte sits. Nothing is decoded, so the key is
+        // never reassembled. Base64 is 43 characters, or 44 ending in '=',
+        // all in one alphabet, whose last character's 2 unused bits are
+        // zero - what the Rust base64 crate's decoders the Linux build is
+        // tested against accept as 32 bytes.
         bool LooksLikePlaintextDek(const uint8_t *bytes, size_t len) {
             if (len == HKDFGUARD_DEK_LEN) {
                 return true;
@@ -478,23 +497,48 @@ namespace hkdfguard {
             if (len > kMaxPlaintextTextLen) {
                 return false;
             }
-            const uint8_t *begin = bytes;
-            const uint8_t *end = bytes + len;
-            while (begin < end && IsAsciiWhitespace(*begin)) ++begin;
-            while (end > begin && IsAsciiWhitespace(end[-1])) --end;
-            size_t text_len = static_cast<size_t>(end - begin);
-            if (text_len == 2 * HKDFGUARD_DEK_LEN) {
-                for (const uint8_t *p = begin; p < end; ++p) {
-                    if (!((*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'f') || (*p >= 'A' && *p <= 'F'))) {
-                        return false;
-                    }
-                }
-                return true;
+            const uint32_t n = static_cast<uint32_t>(len);
+
+            // Pass 1: the first and last non-whitespace positions.
+            uint32_t seen = 0, start = 0, end = 0;
+            for (uint32_t i = 0; i < n; ++i) {
+                uint32_t text = CtIsWhitespace(bytes[i]) ^ 1u;
+                start = CtSelect(text & (seen ^ 1u), i, start);
+                end = CtSelect(text, i, end);
+                seen |= text;
             }
-            if (text_len == 44 && end[-1] == '=') {
-                --text_len; // its one '=' of padding
+            const uint32_t text_len = (end - start + 1u) & (0u - seen);
+
+            // Pass 2: every byte between them against every alphabet, plus
+            // the values of the last two (the last may be the '=' of padding).
+            uint32_t hex_ok = 1, std_ok = 1, url_ok = 1, padded = 0;
+            uint32_t std_last = 0, std_prev = 0, url_last = 0, url_prev = 0;
+            for (uint32_t i = 0; i < n; ++i) {
+                const uint32_t c = bytes[i];
+                const uint32_t outside = (CtInRange(i, start, end) & seen) ^ 1u;
+                const uint32_t is_end = CtEq(i, end);
+                const uint32_t is_prev = CtEq(i + 1u, end);
+                const uint32_t pad = is_end & CtEq(c, '=');
+                uint32_t std_value = 0, url_value = 0;
+                const uint32_t std_member = CtBase64(c, '+', '/', std_value);
+                const uint32_t url_member = CtBase64(c, '-', '_', url_value);
+                hex_ok &= CtIsHex(c) | outside;
+                std_ok &= std_member | pad | outside;
+                url_ok &= url_member | pad | outside;
+                padded |= pad;
+                std_last = CtSelect(is_end, std_value, std_last);
+                std_prev = CtSelect(is_prev, std_value, std_prev);
+                url_last = CtSelect(is_end, url_value, url_last);
+                url_prev = CtSelect(is_prev, url_value, url_prev);
             }
-            return IsBase64OfDek(begin, text_len, false) || IsBase64OfDek(begin, text_len, true);
+
+            // 43 data characters carry 258 bits: the last one's low 2 must be 0.
+            const uint32_t shape = (CtEq(text_len, 43) & (padded ^ 1u)) | (CtEq(text_len, 44) & padded);
+            const uint32_t std_canonical = CtEq(CtSelect(padded, std_prev, std_last) & 3u, 0);
+            const uint32_t url_canonical = CtEq(CtSelect(padded, url_prev, url_last) & 3u, 0);
+            const uint32_t hex = hex_ok & CtEq(text_len, 2 * HKDFGUARD_DEK_LEN);
+            const uint32_t base64 = shape & ((std_ok & std_canonical) | (url_ok & url_canonical));
+            return (seen & (hex | base64)) == 1u;
         }
 
         // Reads a file already known to be no longer than
