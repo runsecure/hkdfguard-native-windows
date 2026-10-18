@@ -142,7 +142,19 @@ Write-Section "CLI wrap -> hkdfguard_open_file -> hkdfguard_unwrap_dek (installe
 $cli = Join-Path $InstallDir "hkdfguard.exe"
 $dll = Join-Path $InstallDir "HkdfGuard.dll"
 $chainService = "hkdfguardcontainerchain"
-$keyFile = Join-Path $work "chain.key"
+# The key files live in their own folder under C:\ProgramData, not in $work.
+# hkdfguard_open_file refuses a file if any folder above it lets another
+# account delete or rename it, and $work fails that by design: on the hosted
+# runners it is under D:\a, and in the containers it is C:\work, and a new
+# folder at a drive root inherits "Authenticated Users: Modify", which
+# includes DELETE. C:\ProgramData only lets Users create entries, so a plain
+# folder under it passes, which is also where docs/admin-guide.md tells
+# deployments to keep key files. test_roundtrip's own open_file checks pass
+# because they use %TEMP%, inside the user profile.
+$keyDir = Join-Path $env:ProgramData "hkdfguard-container-chain"
+Remove-Item -Recurse -Force $keyDir -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Path $keyDir | Out-Null
+$keyFile = Join-Path $keyDir "chain.key"
 & $cli provision --service-name $chainService *> "$Out\chain-provision.log"
 Check ($LASTEXITCODE -eq 0) "installed CLI provisions a KEK"
 $dek = New-Object byte[] 32
@@ -152,7 +164,7 @@ $dek = New-Object byte[] 32
 Check ($LASTEXITCODE -eq 0) "installed CLI wraps a DEK to a file"
 
 # A 32-byte file - the size of a plaintext DEK - must be flagged, not read.
-$plainFile = Join-Path $work "plain.key"
+$plainFile = Join-Path $keyDir "plain.key"
 [IO.File]::WriteAllBytes($plainFile, (New-Object byte[] 32))
 
 # The P/Invoke calls run in a CHILD PowerShell process, never in this one:
@@ -225,7 +237,7 @@ if ($probeExit -ne 0 -or $results.Count -ne 4) {
 }
 Remove-Item -Force $probe -ErrorAction SilentlyContinue
 
-Remove-Item -Force $keyFile, $plainFile -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force $keyDir -ErrorAction SilentlyContinue
 
 # ---- 4. Audit events render through the registered source -------------------------
 Write-Section "Event log"
