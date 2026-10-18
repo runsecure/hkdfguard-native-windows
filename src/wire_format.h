@@ -2,9 +2,10 @@
 
 #include <cstddef> // size_t
 #include <cstdint> // uint8_t, uint32_t
+#include <vector> // std::vector (BuildWrappedDekAuthenticated's result)
 
 namespace hkdfguard {
-    // WrappedDekV1 layout (all integers little-endian; total 164 bytes,
+    // WrappedDekV1 layout (all integers little-endian; total 132 bytes,
     // identical regardless of which KEK provider produced it):
     //
     //   offset  size  field
@@ -12,18 +13,49 @@ namespace hkdfguard {
     //   1       1     ProviderType       (1 = Platform Crypto Provider, 2 = Software KSP)
     //   2       2     Reserved           (must be 0; rejected otherwise)
     //   4       4     KeyId              (little-endian; = 1 for this format version)
-    //   8       64    EphemeralPublicKey (raw P-256 point, X || Y)
-    //   72      12    Nonce              (AES-GCM IV)
-    //   84      32    Ciphertext         (AES-256-GCM ciphertext of the 32-byte DEK)
-    //   116     16    Tag                (AES-GCM authentication tag)
-    //   132     32    KekFingerprint     (SHA-256 of the KEK's public key, raw X || Y)
+    //   8       32    Salt               (random per payload; see below)
+    //   40      12    Nonce              (AES-GCM IV)
+    //   52      32    Ciphertext         (AES-256-GCM ciphertext of the 32-byte DEK)
+    //   84      16    Tag                (AES-GCM authentication tag)
+    //   100     32    KekFingerprint     (SHA-256 of the KEK's public key, raw X || Y)
+    //
+    // The wrapping key is Z = ECDH(KEK private key, H(Salt)), where H hashes
+    // the salt to a P-256 point (hash_to_curve.h) - the same construction as
+    // this project's Linux implementation. Nobody knows the discrete log of
+    // H(Salt), so computing Z needs the KEK's *private* key: only an account
+    // authorized to use the KEK can create a payload, and knowing the KEK's
+    // public key is not enough to forge one. (The format carried an
+    // ephemeral public key here before the library's first release; that
+    // ECIES construction let anyone holding the public key forge payloads.)
+    // The salt is also HKDF's salt, and is otherwise unstructured - any 32
+    // bytes are a well-formed salt.
+    //
+    // The payload's *authenticated bytes* are header || KekFingerprint (see
+    // BuildWrappedDekAuthenticated) - every byte except the Nonce,
+    // Ciphertext and Tag - and they are used twice, as on Linux (whose
+    // Payload::authenticated_bytes is the same idea over its own layout):
+    // as the AES-GCM AAD, and inside HKDF's info, after the normalized
+    // service name (see ecdh_hkdf.h). So every field is bound into the
+    // wrapping key itself, not only checked by the tag. The header is bytes
+    // 0..39 - Version, ProviderType, Reserved, KeyId and Salt - so every
+    // field a parser reads or routes on is authenticated: a payload whose
+    // version, provider type or KeyId was rewritten fails even when the
+    // rewritten value would itself parse, which is what keeps a future
+    // second format version from being able to relabel a payload as the
+    // first. The service name is bound through the key (HKDF info), not the
+    // AAD: unwrapped under the wrong service, the key is wrong and the tag
+    // fails. The Nonce is not authenticated bytes: AesGcmEncrypt generates
+    // it, so it does not exist yet when they are fixed, and GCM
+    // authenticates it inherently (a different nonce changes both the
+    // keystream and the tag). The Ciphertext and Tag are what everything
+    // else is authenticated *with*.
     //
     // KekFingerprint identifies which KEK produced the payload. It is both
-    // (a) authenticated - it is part of the AES-GCM AAD, alongside the
-    // service name - and (b) checked explicitly on unwrap, before any ECDH
+    // (a) authenticated - it is part of the authenticated bytes, alongside
+    // the header - and (b) checked explicitly on unwrap, before any ECDH
     // or decryption: the KEK selected by (service, ProviderType, KeyId) is
     // opened, its public key fingerprinted the same way, and a mismatch is
-    // rejected as HKDFGUARD_ERR_KEK_MISMATCH. That turns "wrong key" into a
+    // rejected as HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH. That turns "wrong key" into a
     // precise, cheap failure (no TPM operation spent on it) instead of an
     // authentication failure indistinguishable from tampering. It is a
     // check, never a lookup: key selection is always by the routing fields,
@@ -70,13 +102,16 @@ namespace hkdfguard {
     constexpr uint8_t kProviderTypeTpm = 1; // Microsoft Platform Crypto Provider
     constexpr uint8_t kProviderTypeSoftware = 2; // Microsoft Software Key Storage Provider
 
-    constexpr size_t kEphemeralPubLen = 64;
+    constexpr size_t kSaltLen = 32;
+    // A raw P-256 public point, X || Y - the KEK's public key and H(Salt).
+    // Not part of the payload.
+    constexpr size_t kPublicPointLen = 64;
     constexpr size_t kNonceLen = 12;
     constexpr size_t kCiphertextLen = 32; // == HKDFGUARD_DEK_LEN
     constexpr size_t kTagLen = 16;
     constexpr size_t kFingerprintLen = 32; // SHA-256 output
 
-    // Byte offsets of each field within the 164-byte payload. Each one is
+    // Byte offsets of each field within the 132-byte payload. Each one is
     // defined in terms of the previous field's offset and length, so if a field
     // length above ever changed, every later offset would automatically recompute
     // correctly at compile time rather than needing to be hand-edited.
@@ -84,17 +119,26 @@ namespace hkdfguard {
     constexpr size_t kProviderTypeOffset = 1;
     constexpr size_t kReservedOffset = 2;
     constexpr size_t kKeyIdOffset = 4;
-    constexpr size_t kEphemeralPubOffset = 8;
-    constexpr size_t kNonceOffset = kEphemeralPubOffset + kEphemeralPubLen; // 72
-    constexpr size_t kCiphertextOffset = kNonceOffset + kNonceLen; // 84
-    constexpr size_t kTagOffset = kCiphertextOffset + kCiphertextLen; // 116
-    constexpr size_t kFingerprintOffset = kTagOffset + kTagLen; // 132
-    constexpr size_t kTotalLen = kFingerprintOffset + kFingerprintLen; // 164
+    constexpr size_t kSaltOffset = 8;
+    constexpr size_t kNonceOffset = kSaltOffset + kSaltLen; // 40
+    constexpr size_t kCiphertextOffset = kNonceOffset + kNonceLen; // 52
+    constexpr size_t kTagOffset = kCiphertextOffset + kCiphertextLen; // 84
+    constexpr size_t kFingerprintOffset = kTagOffset + kTagLen; // 100
+    constexpr size_t kTotalLen = kFingerprintOffset + kFingerprintLen; // 132
+
+    // The authenticated header: every byte before the Nonce (Version through
+    // Salt). It is a prefix of the payload, so on unwrap the AAD is built
+    // from the received bytes themselves, never from a re-serialization of
+    // what was parsed out of them.
+    constexpr size_t kHeaderLen = kNonceOffset; // 40
+
+    // header || KekFingerprint: the AES-GCM AAD, and the tail of HKDF's info.
+    constexpr size_t kAuthenticatedLen = kHeaderLen + kFingerprintLen; // 72
 
     // A plain C++ `struct` (equivalent to a `class` whose members default to
     // `public`) used purely to bundle the parsed-out pieces of a wrapped
     // payload for easy return from ParseWrappedDek below. None of these fields
-    // are secret (they're either public metadata, a public ephemeral key, or
+    // are secret (they're either public metadata, the public salt, or
     // AES-GCM ciphertext/tag bytes that are meant to be stored/transmitted), so
     // unlike SecureBuffer there's no zero-on-destruction behavior needed here.
     //
@@ -108,7 +152,8 @@ namespace hkdfguard {
     struct ParsedWrappedDek {
         uint8_t provider_type;
         uint32_t key_id;
-        const uint8_t *ephemeral_pub; // kEphemeralPubLen bytes
+        const uint8_t *header; // kHeaderLen bytes, as received - the AAD's first part
+        const uint8_t *salt; // kSaltLen bytes
         const uint8_t *nonce; // kNonceLen bytes
         const uint8_t *ciphertext; // kCiphertextLen bytes
         const uint8_t *tag; // kTagLen bytes
@@ -123,26 +168,46 @@ namespace hkdfguard {
     // the two together afterward.
     //
     // Writes a kTotalLen-byte WrappedDekV1 payload into out. The parameter
-    // types like `const uint8_t ephemeral_pub[kEphemeralPubLen]` are a bit of
+    // types like `const uint8_t salt[kSaltLen]` are a bit of
     // C/C++ notation worth knowing: as a *function parameter*, an array type
     // always silently decays to a plain pointer (`const uint8_t*`) - the
-    // `[kEphemeralPubLen]` here is purely documentation for a human reader of
+    // `[kSaltLen]` here is purely documentation for a human reader of
     // exactly how many bytes the function expects to find at that pointer; the
     // compiler does not actually check the caller passed an array of that
     // length.
     void SerializeWrappedDek(
         uint8_t provider_type,
         uint32_t key_id,
-        const uint8_t ephemeral_pub[kEphemeralPubLen],
+        const uint8_t salt[kSaltLen],
         const uint8_t nonce[kNonceLen],
         const uint8_t ciphertext[kCiphertextLen],
         const uint8_t tag[kTagLen],
         const uint8_t fingerprint[kFingerprintLen],
         uint8_t out[kTotalLen]);
 
+    // Writes just the kHeaderLen-byte header (Version through Salt) into
+    // out - exactly the first kHeaderLen bytes SerializeWrappedDek writes,
+    // since that function writes its header through this one. Wrap needs the
+    // header before the payload exists, to build the AAD it encrypts under.
+    void SerializeWrappedDekHeader(
+        uint8_t provider_type,
+        uint32_t key_id,
+        const uint8_t salt[kSaltLen],
+        uint8_t out[kHeaderLen]);
+
+    // The payload's authenticated bytes: header || fingerprint
+    // (kAuthenticatedLen bytes; see the layout comment above). Used as the
+    // AES-GCM AAD and passed to DeriveWrappingKey for HKDF's info. Wrap
+    // passes the header it is about to serialize; unwrap passes
+    // ParsedWrappedDek::header, the received bytes. None of it is secret.
+    std::vector<uint8_t> BuildWrappedDekAuthenticated(
+        const uint8_t header[kHeaderLen],
+        const uint8_t fingerprint[kFingerprintLen]);
+
     // Validates and parses a wrapped payload. Throws HkdfGuardError with
-    // HKDFGUARD_ERR_MALFORMED if wrapped_len != kTotalLen, the version is not
-    // recognized, the reserved bytes are not zero, the provider type is not
+    // HKDFGUARD_ERR_PAYLOAD_UNSUPPORTED if the version is not recognized,
+    // and with HKDFGUARD_ERR_PAYLOAD_MALFORMED if wrapped_len != kTotalLen,
+    // the reserved bytes are not zero, the provider type is not
     // recognized, or KeyId is not kCurrentKeyId - see that constant's
     // comment for why a payload naming any other KeyId is rejected outright
     // rather than passed through to look up a key that, by design, could

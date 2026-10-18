@@ -39,28 +39,34 @@ defended against:
   roll back to a previous release and still recover that release's DEK.
   The consequence is accepted: anyone who can replace the wrapped-key file
   can substitute an older payload for the same service, and unwrap will
-  return that older DEK. The defense is the wrapped file's ACL (owner
+  return that older DEK. The defense is the wrapped file's ACL, which `hkdfguard_open_file` enforces (section 15) (owner
   read/write, one group read-only - see the CLI's `--group`), not the
   payload format. An application that needs to refuse old DEKs must check
   that itself, after unwrapping.
-- **Anyone who can unwrap can also forge.** Wrapping needs only the KEK's
-  *public* key, which any key-use principal can export. So every principal
-  granted key use (`KeyUseGroups`, `HkdfGuardUsers`) can mint a brand-new,
-  fully valid payload for the service around a DEK of its own choosing, and
-  unwrap will accept it exactly like a genuine one. The payload is
-  authenticated as "made for this service under this KEK", never as "made
-  by the deployment step". Consequences: a key-use principal that can also
-  write the wrapped-key file can make the service run with a DEK it picked,
-  not just an older genuine one. The audit trail only partly helps: a
-  forger who calls `hkdfguard_wrap_dek` leaves a wrap event (1002) under its
-  own account, but one who builds the payload itself, from the public key,
-  leaves none - and an unwrap event (1003) whose payload SHA-256 matches no
-  wrap event by the deployment account is the sign of that.
-  The defenses are the same as for rollback: keep key-use groups narrow, and
-  keep the wrapped file writable only by the deployment account. An
-  application that must know a DEK came from its own deployment needs a
-  separate signature over the payload, made with a key the service can only
-  verify.
+- **Only the KEK's authorized users can create payloads - and all of them
+  can.** The wrapping key comes from `Z = ECDH(KEK private key, H(salt))`
+  (section 13), so making a payload needs a live use of the KEK's private
+  key, governed by its ACL. Knowing the KEK's *public* key is not enough:
+  a payload built from it is rejected (verified, test section 24b). This
+  replaced, before the first release, an ECIES construction in which the
+  public key alone sufficed - so anyone who had ever obtained it (a former
+  key-use principal, a copy taken off the host) could forge payloads
+  offline, indefinitely, without touching the KEK. Now removing an account
+  from the key-use groups really ends its ability to create payloads.
+  What remains is accepted: every principal currently granted key use
+  (`KeyUseGroups`, `HkdfGuardUsers`) can wrap, and so can mint a valid
+  payload around a DEK of its own choosing. The payload is authenticated as
+  "made for this service by a holder of this KEK", never as "made by the
+  deployment step". A key-use principal that can also write the
+  wrapped-key file can make the service run with a DEK it picked. The audit
+  trail only partly helps: a wrap through `hkdfguard_wrap_dek` leaves an
+  event (1002) under the caller's account, but one that calls
+  `NCryptSecretAgreement` itself leaves none - an unwrap event (1003) whose
+  payload SHA-256 matches no wrap event by the deployment account is the
+  sign of that. The defenses: keep key-use groups narrow, and keep the
+  wrapped file writable only by the deployment account. An application that
+  must know a DEK came from its own deployment needs a separate signature
+  over the payload.
 - **Local Administrators and SYSTEM are fully trusted.** They always hold
   full control of every KEK, can change the registry policy, and can alter a
   key's ACL. Nothing here defends the KEK against a host administrator.
@@ -70,66 +76,64 @@ defended against:
 
 ## 2. Public-key point validation (verified)
 
-**Claim.** An attacker-supplied P-256 point that is not on the curve is
-rejected before it is ever combined with the long-term KEK private key.
+**Claim.** No point that is not on P-256 is ever combined with the KEK's
+private key.
 
-**Why it matters.** The ephemeral public key in a wrapped payload is the one
-input an attacker controls outright, and `NCryptSecretAgreement` combines it
-with the KEK's private key - the classic invalid-curve / small-subgroup
-setup. P-256 has cofactor 1, so an on-curve check is sufficient.
+**Why it matters.** `NCryptSecretAgreement` multiplies the KEK's private key
+by whatever point it is given - the classic invalid-curve / small-subgroup
+setup if that point were off the curve. P-256 has cofactor 1, so an
+on-curve check is sufficient.
+
+**How it holds now.** The point is no longer taken from the payload at all:
+it is `H(salt)`, computed by `src/hash_to_curve.cpp` from the salt, and
+lies on the curve by construction - the payload's only input to it is 32
+bytes of salt, which have no invalid value. As defense in depth, every
+`H(salt)` still goes through `IsValidP256Point` (`src/ecdh_hkdf.cpp`)
+before any KSP sees it, so an arithmetic bug in the hash-to-curve could
+only fail closed (`HKDFGUARD_ERR_CRYPTO_ERROR`). The salt is copied out of
+the caller's buffer exactly once, so the point and HKDF's salt are always
+derived from the same bytes, whatever a hostile thread does to the buffer.
 
 **Verified how.** `BCryptImportKeyPair(BCRYPT_ECCPUBLIC_BLOB)` was fuzzed
 with valid keys, all-zero and all-0xFF coordinates, random coordinates,
 single-bit mutations of valid keys, and 100 fuzzed valid keys: every valid
-point imported, every malformed point was rejected, no mutated point
-imported. `tests/test_roundtrip.cpp` re-checks the gate on every run with
-valid, all-zero, all-0xFF and single-bit-mutated (X and Y) points.
+point imported, every malformed point was rejected. `tests/test_roundtrip.cpp`
+re-checks the gate on every run (valid, all-zero, all-0xFF, single-bit
+mutations of X and Y) and checks 32 random salts all hash to valid,
+distinct points. Underneath, the providers refuse bad points themselves
+(section 13): the Software KSP and the Platform Crypto Provider both reject
+off-curve, (0,0), out-of-range and all-0xFF points at `NCryptImportKey`,
+and the PCP does so in software before the TPM.
 
-**Where it is applied.** `ValidateEphemeralPublicKey` (`src/ecdh_hkdf.cpp`)
-runs on the unwrap path *before* `NCryptImportKey`, for every provider. The
-fuzzing covered only the software provider's import; the Platform Crypto
-Provider's own import validation was never tested and is no longer relied
-upon. The point is copied out of the caller's payload buffer exactly once
-and both the validation and the later import read that copy, so a hostile
-thread in the host process cannot swap the bytes between check and use.
+**Residual risk.** None known.
+## 3. Raw ECDH secret byte order (verified)
 
-**Residual risk.** None known for this input. The wrap side imports the
-KEK's *own* public key (not attacker-controlled) through the same fuzzed
-path.
+**Claim.** The shared secret fed to HKDF is the shared point's X coordinate,
+**big-endian** - the same bytes the Linux implementation (RustCrypto's
+`raw_secret_bytes`) feeds HKDF.
 
-## 3. Raw ECDH secret byte order agrees across providers (verified, pre-fingerprint)
+**Why it matters.** `BCRYPT_KDF_RAW_SECRET` returns the secret
+**little-endian** (byte-reversed X). Feeding it as-is would derive a
+different key from the Linux construction for the same inputs.
 
-**Claim.** `BCryptDeriveKey(BCRYPT_KDF_RAW_SECRET)` on the software
-ephemeral key (wrap side) and `NCryptDeriveKey(BCRYPT_KDF_RAW_SECRET)` on a
-TPM-resident KEK via the Platform Crypto Provider (unwrap side) return the
-shared secret in the same byte order, so both sides feed identical bytes to
-HKDF.
+**Verified how.** The proof of concept behind section 13 compared
+`NCryptDeriveKey(BCRYPT_KDF_RAW_SECRET)` against an independent
+`BigInteger` computation of `d·H(salt)` on the Software KSP, and against
+`x(KEK public)` / `x(2·KEK public)` for the generator and its double on the
+Platform Crypto Provider (AMD fTPM): RAW_SECRET is little-endian on both.
+`DeriveWrappingKey` reverses it. Wrap and unwrap now run the same code on
+the same provider, so the earlier concern - BCrypt on wrap and NCrypt on
+unwrap agreeing on byte order - no longer arises.
 
-**Why it matters.** Microsoft documents `BCRYPT_KDF_RAW_SECRET` as returning
-the secret little-endian for BCrypt, and says nothing about whether every
-KSP's `NCryptDeriveKey` does the same. If they disagreed, every TPM-backed
-unwrap would fail authentication.
+**The construction is pinned.** Section 29 of `tests/test_roundtrip.cpp`
+rebuilds a frozen golden payload from the documented construction,
+independently of `src/` - with `H(salt)` taken from the Linux crate's own
+output, not this project's hash-to-curve - and checks the shipped DLL
+unwraps it to a known DEK. Any change to the hash-to-curve, the IKM byte
+order, the HKDF salt, hash or info string, the AAD, or the wire layout fails
+that test while ordinary round trips still pass.
 
-**Verified how.** A full wrap (BCrypt) / unwrap (NCrypt, provider_type = 1,
-AMD fTPM) round-trip succeeded in the elevated test suite, most recently on
-2026-10-06 after the curve-pinning change to `src/ecdh_hkdf.cpp`. Re-run the
-elevated suite after any change to that file to keep this claim current.
-
-**The byte order itself is pinned.** The library uses the raw secret exactly
-as `BCRYPT_KDF_RAW_SECRET` returns it - little-endian, i.e. the shared
-point's X coordinate byte-reversed - as the HKDF input. Section 29 of
-`tests/test_roundtrip.cpp` rebuilds a frozen golden payload from the
-documented construction, independently of `src/`, and checks the shipped DLL
-unwraps it to a known DEK. Any change to the IKM byte order, the HKDF salt,
-hash or info string, the AAD, or the wire layout fails that test while
-ordinary round trips still pass (verified by deliberately changing the HKDF
-context string). Note for cross-platform work: an implementation that feeds
-HKDF the conventional big-endian X coordinate derives a different key, so
-claims of matching another platform's construction hold only if that
-platform reverses the bytes too.
-
-**Residual risk.** Verified on one TPM vendor/firmware only.
-
+**Residual risk.** The PCP path was verified on one TPM vendor/firmware only.
 ## 4. Platform Crypto Provider quirks on an AMD fTPM (verified)
 
 All observed on `Microsoft Platform Crypto Provider` over an AMD fTPM
@@ -163,8 +167,8 @@ succeed regardless of elevation.
 
 **Verified how.** Standalone repro, non-elevated, Software KSP.
 
-**Consequence.** That failure is reported as `HKDFGUARD_ERR_ACCESS_DENIED`
-(not the generic `HKDFGUARD_ERR_PROVIDER`), and the CLI's "requires an
+**Consequence.** That failure is reported as `HKDFGUARD_ERR_KEK_ACCESS_DENIED`
+(not the generic `HKDFGUARD_ERR_PROVIDER_ERROR`), and the CLI's "requires an
 elevated process" hint keys on that code. Opening and using an existing
 key does not require elevation - only the key's ACL governs it.
 
@@ -194,7 +198,7 @@ administrator.
 - A missing `KeyStoragePolicy` value means "never configured" and yields the
   default (`PreferTpm`). A value that is present but unrecognized yields
   `KeyStoragePolicy::Invalid`, and every reader fails closed with
-  `HKDFGUARD_ERR_INVALID_POLICY`. **Verified** by test
+  `HKDFGUARD_ERR_POLICY_INVALID`. **Verified** by test
   (`test_roundtrip.cpp` section 25b) via the test-only override.
 - `KeyUseGroups` read failures of any kind yield an empty list (no
   additional principals), never an exception. Entries are trimmed; a bad
@@ -206,6 +210,23 @@ administrator.
   test (`test_roundtrip.cpp` section -2); the switch's effect on a real
   unwrap is not exercised, since that would mean changing this machine's
   HKLM policy during a test run.
+- `SetupMinDelayMs` is the floor on `hkdfguard_create_kek` /
+  `hkdfguard_kek_exists`: 1000 ms when absent, a REG_DWORD of 0..60000 used
+  as is (0 disables it), and anything else, including above 60000, also
+  1000 ms. This is the Linux build's `setup_min_delay_ms`, with the same
+  numbers. Setup calls are serialized by a process-wide mutex. The floor is
+  waited out by a scope guard, so a throwing call pays it too. Argument
+  errors return before the gate. **Verified** by test section 0c2:
+  - the value-to-setting rule;
+  - both calls take at least the floor, with and without a KEK and on a
+    failing `create_kek`;
+  - argument errors and `hkdfguard_wrap_dek` return in under half the floor;
+  - two concurrent calls take at least twice it.
+
+  This is a **design decision** about load, not secrecy:
+  `hkdfguard_wrap_dek` still answers `KEK_NOT_FOUND` at once. The floor
+  bounds the rate per process, not per machine: separate processes each
+  have their own gate.
 - The default `PreferTpm` fallback to software is a **design decision**:
   the policy is the administrator's to set. It falls back only when the TPM
   is provably unusable for the service: the TPM provider cannot be opened,
@@ -213,19 +234,19 @@ administrator.
   or the TPM key was confirmed absent (`NTE_BAD_KEYSET`) and creating it
   failed, with the partly-created key successfully deleted. Internally these
   are the only failures thrown as `TpmUnusableError`; the public code is
-  still `HKDFGUARD_ERR_PROVIDER`. Everything else propagates, including an
+  still `HKDFGUARD_ERR_PROVIDER_ERROR`. Everything else propagates, including an
   *existing* TPM KEK that fails property verification, any other error while
   probing for the TPM key (a busy, locked-out or not-ready TPM), a
-  concurrent creation (`NTE_EXISTS`), `ACCESS_DENIED` and `KEK_ACL_INVALID`.
+  concurrent creation (`NTE_EXISTS`), `KEK_ACCESS_DENIED` and `KEK_INVALID`.
   Each of those may sit in front of a TPM KEK that is in use, and creating a
   second, software KEK beside it would split the service and permanently
   route new wraps to the weaker key. `OpenKekForWrap` (which also falls back
   on `KEK_NOT_FOUND`) and `KekExists` follow the same rule, so an
-  unauthorized caller is told `ACCESS_DENIED`, never `KEK_NOT_FOUND`.
+  unauthorized caller is told `KEK_ACCESS_DENIED`, never `KEK_NOT_FOUND`.
   **Assumed / not verified**: that a host with no TPM fails at
   `NCryptOpenStorageProvider` or reports one of the two "no device" codes.
   If some host instead reports a different code when probing for the key,
-  `PreferTpm` there now fails with `HKDFGUARD_ERR_PROVIDER` rather than
+  `PreferTpm` there now fails with `HKDFGUARD_ERR_PROVIDER_ERROR` rather than
   falling back. Exercise the default policy on a VM without a vTPM before
   relying on it. The test suite simulates the provider-open failure (section
   25c) and, through a test-only fault-injection seam, a TPM probe error, a
@@ -250,18 +271,29 @@ over-broad well-known principal (Everyone, Authenticated Users, Anonymous,
 NULL, INTERACTIVE/NETWORK/BATCH/SERVICE/REMOTE INTERACTIVE LOGON,
 BUILTIN\Users, BUILTIN\Guests, Local account (S-1-5-113), This Organization
 (S-1-5-15), NT SERVICE\ALL SERVICES (S-1-5-80-0), LOCAL (S-1-2-0), CONSOLE
-LOGON (S-1-2-1)). Local account, This Organization, ALL SERVICES and REMOTE
-INTERACTIVE LOGON resolve as `SidTypeWellKnownGroup` in an accepted domain
-(`NT AUTHORITY` or `NT SERVICE`), so the denylist alone excludes them.
-Policy validation and the existing-key ACL check share one implementation
-(`IsOverBroadSid` in `src/key_acl.cpp`).
+LOGON (S-1-2-1), TERMINAL SERVER USER (S-1-5-13), and the
+authentication-package groups NTLM/SChannel/Digest Authentication
+(S-1-5-64-10/14/21)), nor the "Domain Users" group of any domain
+(S-1-5-21-...-513, which the local SAM names `None`). Local account, This
+Organization, ALL SERVICES, REMOTE INTERACTIVE LOGON, TERMINAL SERVER USER
+and the authentication-package groups resolve as `SidTypeWellKnownGroup` in
+an accepted domain (`NT AUTHORITY` or `NT SERVICE`), so the denylist alone
+excludes them. `None` is worse placed still: it is a real `SidTypeGroup` in
+this machine's own domain, the primary group of every local account, and
+it has no fixed SID, so it is refused by shape (NT authority, five
+sub-authorities starting with 21, RID 513 - `IsDomainUsersRid`) rather than
+from a list. Policy validation and the existing-key ACL check share one
+implementation (`IsOverBroadSid` in `src/key_acl.cpp`).
 
 **Verified how.** Tests (section 0d) cover Everyone by name and as
-`S-1-1-0`, Authenticated Users, BUILTIN\Users, the six broad groups added
-above by SID string (Local account and ALL SERVICES by name too), a user
-account, an
+`S-1-1-0`, Authenticated Users, BUILTIN\Users, the ten broad groups added
+above by SID string (Local account and ALL SERVICES by name too), `None` by
+name and as its resolved SID string (skipped where the name doesn't resolve
+to a local group, i.e. on a domain controller), a user account, an
 unresolvable name, a foreign-domain-qualified name, and every branch of
-`IsHostLocalAccountDomain`. Facts established while building it, all by
+`IsHostLocalAccountDomain`. Section 28 checks that an existing KEK granting
+NTLM Authentication or an unresolvable RID-513 SID is refused as
+`HKDFGUARD_ERR_KEK_INVALID`. Facts established while building it, all by
 repro on this host: well-known SIDs such as Everyone report an *empty*
 domain (treated as non-local); default local groups live in `BUILTIN` and
 `COMPUTERNAME\<builtin alias>` does not resolve at all; SAM accounts are
@@ -281,7 +313,7 @@ use) are still granted by *name*, now restricted to local groups.
 
 - The KEK's ACL is applied once, at creation, and never re-verified on open:
   the OS enforces the DACL on every use, so an unauthorized caller gets
-  `NTE_PERM` (surfaced as `HKDFGUARD_ERR_ACCESS_DENIED`). **Design
+  `NTE_PERM` (surfaced as `HKDFGUARD_ERR_KEK_ACCESS_DENIED`). **Design
   decision.** A fresh key's ACL is checked for the presence of every
   principal it was granted. An *existing* key found by
   `hkdfguard_create_kek` is checked against policy-independent invariants
@@ -290,7 +322,7 @@ use) are still granted by *name*, now restricted to local groups.
   or a conditional (callback) allow ACE. An object or compound allow ACE,
   which this library never writes, or an unreadable ACE fails the check
   outright rather than being skipped. Failing that returns
-  `HKDFGUARD_ERR_KEK_ACL_INVALID` and leaves the key untouched. This
+  `HKDFGUARD_ERR_KEK_INVALID` and leaves the key untouched. This
   catches a pre-planted key or one later widened to e.g. Everyone. It does
   not catch a widening to some other specific account, and it does not run
   on wrap or unwrap, which never re-verify the ACL. **Verified** by test
@@ -307,27 +339,58 @@ use) are still granted by *name*, now restricted to local groups.
   the CLI and unwrapped it via a direct call into the DLL, with no
   elevation, on the strength of that `GENERIC_READ` grant alone. The same
   account's attempt to *provision* a brand-new KEK failed as expected
-  (`HKDFGUARD_ERR_ACCESS_DENIED`, elevation required), confirming creation
+  (`HKDFGUARD_ERR_KEK_ACCESS_DENIED`, elevation required), confirming creation
   and use are genuinely governed by separate mechanisms (elevation vs.
   ACL). Both the KEK and the test account/group were removed afterward.
 
 ## 10. Payload integrity and the KEK fingerprint (verified where noted)
 
-- AES-256-GCM authenticates `normalized service name || SHA-256(KEK public
-  key, raw X||Y)`. The fingerprint also travels in the payload and is
+- The payload's *authenticated bytes* are `header || SHA-256(KEK public
+  key, raw X||Y)`, where the header is payload bytes 0..39 (`Version`,
+  `ProviderType`, `Reserved`, `KeyId`, `Salt`). They are the AES-256-GCM
+  AAD, **and** they end HKDF's info: `"hkdfguard-wrap-v1:" ||
+  u16le(len(service)) || normalized service || authenticated bytes`. This
+  is the Linux build's construction (`derive_wrapping_key`,
+  `Payload::authenticated_bytes`), adopted so both builds have one spec.
+  Every field a parser reads or routes on, the KEK, and the service are
+  therefore bound into the wrapping key itself, not only checked by the
+  tag. AES-GCM doesn't commit to its key, but here a payload's context
+  selects its own key: no context can be swapped and still find a key the
+  tag accepts. The service is bound through the key alone, so a wrong
+  service fails at the tag. Unwrap builds the authenticated bytes once,
+  from the header exactly as received, and DeriveWrappingKey reads the salt
+  from that same copy. The `Nonce` is not authenticated bytes - it is
+  generated inside the encrypt call, after they are fixed - and needs no
+  coverage: GCM authenticates it inherently. **Verified** in three ways:
+  - The golden-payload test (section 29 of `tests/test_roundtrip.cpp`)
+    reproduces the frozen payload from an implementation of the spec written
+    in the test, independent of `src/`.
+  - The frozen value was computed separately with .NET's `HKDF` and `AesGcm`.
+  - Its wrapping key (`4de2f10c...`) is what the Linux crate's own
+    `derive_wrapping_key` returns for the same Z, salt, service and
+    authenticated bytes.
+
+  The library's `DeriveWrappingKey` is checked against that key without
+  elevation, on the golden KEK imported as an in-memory Software KSP key.
+  Elevated (2026-10-16), the shipped DLL also unwraps the frozen payload to
+  the known DEK, with the golden KEK imported as a Software KSP machine
+  key.
+  The fingerprint also travels in the payload and is
   compared, before any ECDH, against the fingerprint of the KEK the
-  payload's routing fields select; mismatch is `HKDFGUARD_ERR_KEK_MISMATCH`.
+  payload's routing fields select; mismatch is `HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH`.
   It is a check on the selected key, never a lookup - searching for a key
   matching an attacker-supplied fingerprint would let the payload steer
   key selection. **Verified** by tests for the mismatch path (elevated).
 - The comparison is a plain `memcmp`, deliberately: both operands are
   hashes of *public* keys, so timing reveals nothing secret.
-- `Version` and `Reserved` are not in the AAD. `Reserved` is required to be
-  zero and `Version` to be `1`, so neither can currently be varied at all;
-  if a second version is ever introduced, `Version` should be added to the
-  AAD at that point.
-- Each wrap uses a fresh ephemeral ECDH key and therefore a fresh AES key,
-  so the random 96-bit nonce can never repeat under a key.
+- `Reserved` is required to be zero, `Version` to be `1` and `KeyId` to be
+  `1`, so none can currently be varied in a payload that still parses. They
+  are authenticated anyway, so that introducing a second version later can
+  never let an existing payload be relabelled as it.
+- Each wrap draws a fresh random 32-byte salt, which yields a fresh `Z` and
+  is HKDF's salt, and therefore a fresh AES key; the random 96-bit nonce
+  would have to repeat under the *same* salt to matter (probability of a
+  salt collision: about 2^-128 per pair of wraps).
 - Concurrent mutation of nonce/ciphertext/tag by a hostile in-process thread
   is not a check-then-use problem: `BCryptDecrypt` reads them in one call
   and GCM authenticates whatever it reads.
@@ -343,7 +406,8 @@ use) are still granted by *name*, now restricted to local groups.
   `hkdfguard_create_kek` race cannot clobber an existing key - the second
   finalize is expected to fail with `NTE_EXISTS` and the caller to retry.
   **Assumed / not verified**: the race itself has not been exercised.
-- Service names are restricted to ASCII letters, digits and `.`, lowercased,
+- Service names are restricted to ASCII letters, digits and `.` (no leading
+  `.`, no `..`), lowercased,
   and used inside a fixed prefix/suffix to form the persisted key name. The
   Software KSP and PCP store keys under a hash of the container name, so
   `.` cannot form a path. **Assumed / not verified** beyond standard
@@ -382,3 +446,309 @@ use) are still granted by *name*, now restricted to local groups.
   attestation for the zip, DLL and CLI (`gh attestation verify`), which
   needs a public repository or GitHub Enterprise Cloud. Workflow actions
   are pinned to commit SHAs.
+
+## 13. ECDH with a computed point on the Windows providers (verified)
+
+**Claim.** Both KSPs can compute `Z = ECDH(KEK private key, H(salt))` for a
+point the library constructs, deterministically, with the private key
+staying inside the TPM for a Platform Crypto Provider KEK, and with the
+same authorization as any other use of the KEK.
+
+**Verified how.** A standalone proof of concept (not part of the
+repository), run on 2026-10-14 on the Microsoft Platform Crypto Provider
+over an AMD fTPM (firmware 6.24.0.6) and on the Software KSP, with per-user
+keys and, elevated, machine keys:
+
+- `NCryptImportKey` of a constructed `BCRYPT_ECCPUBLIC_BLOB` and
+  `NCryptSecretAgreement` succeed on both. On the PCP, ECDH with the
+  generator G and with 2G returned exactly `x(KEK public)` and
+  `x(2·KEK public)` - computed from the public key alone - so the TPM
+  performs genuine scalar multiplication on a supplied point. No key flags
+  beyond today's: the PCP refuses `NCRYPT_ALLOW_KEY_AGREEMENT_FLAG` and
+  keeps usage `DECRYPT` (section 4), yet the agreement works.
+- `NCryptDeriveKey` KDFs: `BCRYPT_KDF_RAW_SECRET`, `HASH`, `HMAC` and
+  `SP800_56A_CONCAT` work on both providers; `TLS_PRF` and `HKDF` return
+  `NTE_INVALID_PARAMETER`. Passing `NCRYPT_SILENT_FLAG` to `NCryptDeriveKey`
+  makes every KDF fail with `NTE_INVALID_PARAMETER`; the library passes 0.
+- Deterministic: the same KEK and salt twice give identical output;
+  different salts or different KEKs give different output (all four KDFs,
+  both providers).
+- Independent maths (Software KSP, exportable test key): `d·H(salt)`
+  computed with `System.Numerics.BigInteger` matched the provider for two
+  salts and three KDFs. The hash-to-curve re-implementation matched the
+  Linux implementation's `payload_ecdh_point` on the RustCrypto p256 0.14
+  crate for three salts.
+- The private key stays in the TPM: exporting the PCP key's private blob is
+  refused (`0x8009000A`), as is changing its export policy; the provider
+  reports `NCRYPT_IMPL_HARDWARE_FLAG`; one agreement takes ~8.9 ms on the
+  PCP against ~0.09 ms in software. A `TPM` ETW trace recorded no command
+  events, and Microsoft does not document which TPM command the PCP issues,
+  so `TPM2_ECDH_ZGen` is inferred from this evidence, not observed.
+- Bad points are refused at import: off-curve, (0,0), X = p and all-0xFF
+  points by `BCryptImportKeyPair` (`STATUS_INVALID_PARAMETER`), the Software
+  KSP (`NTE_INVALID_PARAMETER`) and the PCP (`TPM_E_PCP_INTERNAL_ERROR`,
+  `0x80290407`) - the PCP in 0.07 ms, as fast as a successful import, i.e.
+  in software before the TPM.
+- Authorization: with a machine KEK whose DACL admits only SYSTEM and
+  Administrators, a non-elevated account fails at `NCryptOpenKey`
+  (`NTE_PERM` on the PCP, `NTE_BAD_KEYSET` on the Software KSP) and cannot
+  read the key file directly, so it can neither run the agreement nor read
+  the public key; the elevated administrator can do both. 52 denied
+  attempts left the TPM's `LockoutCount` at 0 of 32: the refusal happens at
+  the key's ACL, and these keys have no TPM authorization value to fail.
+- Cost: import + agreement + raw derive averaged 9.8 ms on the PCP
+  (median 9.5, p95 11.0, 100 runs) and 0.17 ms on the Software KSP. Every
+  wrap is now one such operation.
+
+**Residual risk.** One TPM vendor/firmware only; a Hyper-V vTPM was not
+tested (no Windows guest was available). Note for diagnostics: on the
+Software KSP an unauthorized caller gets `NTE_BAD_KEYSET`, the same status
+as a missing key.
+
+## 14. Process hardening keeps same-user processes out (verified)
+
+**Claim.** After `hkdfguard_harden_process`, another process running as the
+same account cannot read or write the caller's memory, dump it, inject a
+thread or duplicate its handles. It also cannot read or change the context
+of any thread that existed at the time of the call, and it cannot undo any
+of this by rewriting the DACLs. Windows Error Reporting leaves the heap out
+of the crash reports it collects. This is the counterpart of the Linux
+build's `RLIMIT_CORE = 0` plus `PR_SET_DUMPABLE = 0`. It is opt-in, because
+it changes process-wide state that belongs to the host.
+
+**How.** `src/process_hardening.cpp`:
+
+- It calls `WerSetFlags(WER_FAULT_REPORTING_FLAG_NOHEAP)`.
+- It sets a protected DACL on the process and on every thread in a Toolhelp
+  snapshot. SYSTEM is granted the object type's all-access mask. The
+  account's SID and OWNER RIGHTS (`S-1-3-4`) are both granted query,
+  synchronize and, for the process, terminate. The threads also keep
+  `READ_CONTROL`.
+- The OWNER RIGHTS ACE replaces the owner's implicit `READ_CONTROL | WRITE_DAC`.
+  Without it, a same-user process could simply restore the old DACL.
+- The masks are explicit rather than generic `GA`, because the kernel stores
+  `GA` mapped to specific rights.
+- A repeat call cannot reopen an already-hardened thread for `WRITE_DAC`.
+  It reads that thread's DACL back and accepts it only if it is protected
+  and matches ACE for ACE, which is what makes the call idempotent.
+
+**Verified how.** `tests/test_harden_process.cpp` starts a copy of itself as a
+child process. The child starts a worker thread, calls the function twice
+(both calls must return `HKDFGUARD_OK`) and confirms `WerGetFlags` reports
+NOHEAP. It then confirms it still works from the inside: it starts another
+thread and runs `hkdfguard_kek_exists` against the key storage provider. The
+parent, with `SeDebugPrivilege` explicitly disabled, then probes the child:
+
+- These process rights are refused with `ERROR_ACCESS_DENIED`:
+  - `PROCESS_VM_READ`;
+  - `PROCESS_VM_WRITE | PROCESS_VM_OPERATION`;
+  - `PROCESS_CREATE_THREAD`, `PROCESS_DUP_HANDLE`, `PROCESS_SET_INFORMATION` and `PROCESS_SUSPEND_RESUME`;
+  - `READ_CONTROL`, `WRITE_DAC` and `WRITE_OWNER`;
+  - `PROCESS_ALL_ACCESS`.
+- These process rights still succeed: query (plain and limited),
+  `SYNCHRONIZE` and `PROCESS_TERMINATE`.
+- A full-memory `MiniDumpWriteDump` fails.
+- On both pre-existing threads, `THREAD_GET_CONTEXT`, `THREAD_SET_CONTEXT`,
+  suspend/resume, terminate, `WRITE_DAC` and `WRITE_OWNER` are refused.
+  Limited query and `SYNCHRONIZE` still succeed.
+
+The test passed non-elevated at Medium integrity on the development machine
+on 2026-10-15, and elevated (High integrity, `SeDebugPrivilege` disabled as
+above) on 2026-10-16. The first run caught the `GA` mapping above, which had made
+the second call fail. The test exits with ctest's skip code when run as
+SYSTEM.
+
+**Residual risk.** This is a same-user barrier. Under section 1,
+administrators and SYSTEM are trusted anyway. Specifically:
+
+- **Bypasses:** an administrator with `SeDebugPrivilege` enabled, SYSTEM and
+  kernel code all get past it.
+- **Later threads:** a thread created after the call gets the token's
+  default DACL, so its registers are readable by the same account; the
+  process memory is not. The test pins this. The token default DACL is
+  deliberately left alone, because it applies to every unnamed object the
+  host creates. Hosts should call the function again after starting worker
+  threads.
+- **Existing handles:** handles opened before the call keep their granted
+  access.
+- **Outside its reach:** memory paged out or written to `hiberfil.sys`, and
+  machine-wide dump configuration (WER `LocalDumps`, kernel and live kernel
+  dumps).
+- **Not yet run:** in the Server 2022/2025 containers and on ARM64.
+- **Window hooks:** a GUI process can be injected into by a same-user
+  process on the same desktop through `SetWindowsHookEx`. No process or
+  thread DACL covers that, with or without the strict flag below.
+
+**Strict mode: `hkdfguard_harden_process_with_flags(HKDFGUARD_HARDEN_REQUIRE_PROTECTED_SIGNATURE)`
+(verified).**
+
+**Claim.** With this flag, the "later threads" gap above is closed too. A same-user
+process can't read or redirect any thread of the process, including ones started
+after the call, and can't undo that through the process token. It is the same
+cross-platform flag the Linux and macOS builds take (bit `0x1`, unknown bits
+refused with `INVALID_ARGUMENT` before anything changes). On Linux
+`PR_SET_DUMPABLE` already guarantees it; on Windows it takes two more steps.
+
+**How** (`HardenToken` in `src/process_hardening.cpp`, run before the steps
+above):
+
+- **Default DACL.** The token's default DACL becomes `SY: 0x1FFFFF`,
+  `OW: 0x120000`, user `0x120000`: SYSTEM all rights, and the account and OWNER
+  RIGHTS only `SYNCHRONIZE | READ_CONTROL`. The account gets only standard
+  rights, because a specific bit means something different per object type.
+- **Token DACL.** The token's own DACL becomes protected: SYSTEM gets
+  `TOKEN_ALL_ACCESS`, and the account and OWNER RIGHTS get `TOKEN_QUERY |
+  TOKEN_QUERY_SOURCE | TOKEN_DUPLICATE | READ_CONTROL`.
+- **Why `TOKEN_DUPLICATE` stays.** The Platform Crypto Provider duplicates its
+  own process token on every key open and returns `NTE_PERM` without it. This
+  was found by a probe on the development machine, granting rights one at a
+  time. The Software KSP needs nothing.
+- **Idempotency.** A repeat call can't open the token to change it any more.
+  It verifies both DACLs instead. The thread sweep accepts a thread created
+  under the strict default DACL, which also denies it `WRITE_DAC`, as already
+  hardened. So strict and non-strict calls can follow each other in any order.
+
+**Verified how.** `tests/test_harden_process.cpp` runs the child twice, in
+default and in strict mode. Both children first confirm that unknown flag bits
+return `INVALID_ARGUMENT` and leave WER's NOHEAP off. The strict child then:
+
+- hardens itself;
+- starts a thread;
+- hardens again, strict and then non-strict, with all calls returning OK;
+- starts another thread;
+- runs `hkdfguard_kek_exists` against the real providers.
+
+The parent then checks both later threads, and the token:
+
+- **Later threads:** `GET_CONTEXT`, `SET_CONTEXT`, suspend, terminate,
+  `WRITE_DAC`, `WRITE_OWNER` and even `QUERY_LIMITED` are denied;
+  `SYNCHRONIZE` is allowed.
+- **Token:** `TOKEN_ADJUST_DEFAULT`, `WRITE_DAC`, `WRITE_OWNER` and
+  `TOKEN_ADJUST_PRIVILEGES` are denied; `TOKEN_QUERY` and `TOKEN_DUPLICATE`
+  are allowed.
+
+In default mode it pins the documented gaps: a later thread allows
+`GET_CONTEXT`, and the token allows `TOKEN_ADJUST_DEFAULT`. This passed
+non-elevated on the development machine on 2026-10-15, and elevated, with a
+TPM, on 2026-10-16: the strict child's `hkdfguard_kek_exists` reached the
+Platform Crypto Provider with the token locked.
+
+**The CLI uses it.** `hkdfguard.exe` calls the strict form first thing in
+`main`, before parsing arguments, and exits with "refusing to handle key
+material" if it fails, matching the Linux CLI. Every copy of the DEK the CLI makes lives in
+one `VirtualAlloc` buffer (`DekScratch`): the stdin text, read with
+`ReadFile` rather than the CRT's buffered `fread`, and the decoded bytes,
+decoded straight into it. The buffer is locked with `VirtualLock` and wiped
+before it is freed. If the lock fails, the CLI prints a warning, as on Linux.
+`tests/test_cli.ps1` passes with this in place: non-elevated, through to
+the `hkdfguard_wrap_dek` call; and elevated, on 2026-10-16 with a TPM,
+including `provision` creating a TPM KEK and a full `wrap` against it, all
+under strict hardening. **Verified.**
+
+**Residual risk (strict).** These are the cost of the flag, documented in the
+header:
+
+- **Same-user access is lost:** everything the process creates afterwards
+  without an explicit security descriptor is closed to its own account. That
+  includes child processes, named pipes and other named objects.
+- **Process-scoped:** an impersonating thread's objects follow the
+  impersonation token's default DACL, not this one.
+- **Not yet run:** in containers, and with hosts (.NET, JVM) that open
+  their own threads or processes by ID.
+
+## 15. `hkdfguard_open_file`: who could have written the key file (design decision + verified)
+
+**Claim.** `hkdfguard_open_file` refuses a key file with
+`HKDFGUARD_ERR_FILE_UNTRUSTED` (-39) unless the file and every folder above it,
+up to the drive root, are owned by SYSTEM, BUILTIN\Administrators,
+TrustedInstaller or the process's own account, and no other account holds a
+right that would let it change what the path names. This is the Linux build's
+owner and mode check (`key_file.rs`: owned by root or this user, not group- or
+other-writable, sticky folders allowed), in ACL form. It also refuses a DEK
+saved as text, in the same forms the Linux build does, with
+`HKDFGUARD_ERR_FILE_PLAINTEXT_KEY` (-37).
+
+**Why.** A wrapped DEK is ciphertext, so reading it gains nothing, and read
+access for other accounts is never refused. *Replacing* it does gain
+something. Any key-use principal can wrap (section 1). One that can also put a
+file at the key's path can make the service run with a DEK it chose.
+
+**How.** `src/key_file.cpp`. These checks run on the open handle, after the
+link, short-name and local-drive checks, so the file that is judged is the
+file that is read:
+
+- **Owner.** It must be SYSTEM, Administrators, TrustedInstaller (which owns
+  `C:\`) or the process token's user. Administrators is included because an
+  elevated administrator's files are owned by the group. That is how the CLI's
+  `wrap` writes them when run elevated (TokenOwner).
+- **File rights.** No ACE for another principal may grant write data, append,
+  write EA or attributes, `DELETE`, `WRITE_DAC`, `WRITE_OWNER`,
+  `GENERIC_WRITE` or `GENERIC_ALL`.
+- **Folder rights.** No ACE for another principal may grant
+  `FILE_DELETE_CHILD`, `DELETE`, `WRITE_DAC`, `WRITE_OWNER` or `GENERIC_ALL`.
+  Creating entries is allowed. A new entry can't displace an existing one: that
+  takes `DELETE` on the entry, or `FILE_DELETE_CHILD` on its folder. This is the
+  Windows counterpart of the sticky-folder allowance, and it is why
+  `C:\ProgramData` (Users: `WD,AD,WEA,WA`) and `C:\` (Authenticated Users: `AD`)
+  pass.
+- **Ignored ACEs.** Deny ACEs and inherit-only ACEs are skipped. A conditional
+  (callback) allow ACE is judged as if its condition held. Any other
+  allow-ACE type is refused, as one this code can't read.
+- **Special principals.** OWNER RIGHTS counts as the (already checked)
+  owner. CREATOR OWNER and CREATOR GROUP match nobody outside an inherit-only
+  ACE.
+- **Missing DACL.** A missing or NULL DACL is refused, since it means
+  unrestricted access.
+- **Folder walk.** Each folder is opened without following reparse points and
+  must still be a plain folder. Any folder whose security can't be read is
+  refused (the file itself being unreadable is still -33).
+- **Text keys.** A file of 96 bytes or fewer, other than 32, is read into a
+  `SecureBuffer` that is wiped when it goes out of scope. After trimming
+  whitespace the way Rust's `trim_ascii` does, it is a plaintext key if it is
+  64 hex digits, or 43 characters of standard or URL-safe base64 (not mixed,
+  with zero trailing bits, optionally followed by one `=`). That matches what
+  the Rust base64 decoders the Linux build uses accept. It is decided without
+  decoding, so the key is never rebuilt. None of it reaches the caller. A
+  32-byte file is still refused unread.
+
+**Verified how.** Test sections 24c and 24d:
+
+- **Real files and folders.** A file Everyone may write is refused, while one
+  Everyone may only read opens. A folder granting Everyone
+  `FILE_DELETE_CHILD`, or `DELETE` on itself, is refused, while one granting
+  only create rights (`0x116`) opens.
+- **Synthetic descriptors** (`CheckKeyFileSecurity` on SDDL):
+  - **Owners:** Users, Everyone and LocalService are refused; SYSTEM,
+    Administrators, TrustedInstaller and this account pass.
+  - **DACLs:** a missing or NULL DACL is refused.
+  - **Rights:** each forbidden right is refused one at a time, on files and
+    on folders.
+  - **ACE kinds:** deny, inherit-only and conditional ACEs are handled as
+    described above.
+  - **Shipped ACLs:** the system drive root's ACL passes, and the
+    `Authenticated Users: Modify` that a new folder under `C:\` inherits is
+    refused.
+- **Plaintext detector.** All six text forms (base64 padded or not, URL-safe
+  padded or not, hex in either case) are refused, each with five whitespace
+  variants. These near misses are refused as merely too short: 31 or 33 bytes
+  as base64, 63 hex digits, a non-hex character, a newline inside the hex,
+  mixed alphabets, set trailing bits, `==`, more than 96 bytes, and a
+  vertical tab, which Rust doesn't trim either.
+
+These passed non-elevated on the development machine on 2026-10-15, and
+elevated, with a TPM, on 2026-10-16. The positive cases use the golden
+payload, so they don't depend on a KEK.
+
+**Residual risk.**
+
+- **What isn't checked.** Folders that intermediate links point into are not
+  walked: links anywhere in the path are refused outright. Neither are
+  hard-link siblings: they share the file's own ACL, which is checked.
+- **Window between check and read.** A folder's ACL could in principle be
+  widened between the check and the read, but only by someone who already
+  holds `WRITE_DAC` on it, which is what was just checked for.
+- **Configurations now refused.** Anything already in place that grants other
+  accounts delete rights is refused, by design, including a folder created
+  directly under `C:\`. `docs/admin-guide.md` shows how to narrow it.
+- **Not yet run:** in the Server 2022/2025 containers, where
+  ContainerAdministrator's ownership of `C:\` needs to be confirmed.

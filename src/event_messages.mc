@@ -1,6 +1,6 @@
 ; // Message table for the "hkdfguard-native-windows" Application event log
 ; // source. Compiled by mc.exe into a resource linked into
-; // HkdfGuardV1.dll (see CMakeLists.txt); the MSI registers
+; // HkdfGuard.dll (see CMakeLists.txt); the MSI registers
 ; // that DLL as the source's EventMessageFile so Event Viewer can render
 ; // these. Every message is just "%1": event_log.cpp builds the full text,
 ; // and the event *type* passed to ReportEventW sets the level.
@@ -68,6 +68,12 @@ Language=English
 
 MessageId=2006
 SymbolicName=HKDFGUARD_EVT_PLAINTEXT_KEY_FILE
+Language=English
+%1
+.
+
+MessageId=2007
+SymbolicName=HKDFGUARD_EVT_SETUP_CALLS_EXCEEDED
 Language=English
 %1
 .

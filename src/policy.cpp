@@ -32,6 +32,10 @@ namespace hkdfguard {
         constexpr wchar_t kAuditUnwrapSuccessValue[] =
             L"AuditUnwrapSuccess";
 
+        // REG_DWORD under the same key: see LoadSetupMinDelayMs in policy.h.
+        constexpr wchar_t kSetupMinDelayMsValue[] =
+            L"SetupMinDelayMs";
+
         // Security-focused default.
         //
         // Existing behavior today is:
@@ -130,7 +134,7 @@ namespace hkdfguard {
 
         // KEY_WOW64_64KEY: makes this read the "real" 64-bit view of HKLM
         // regardless of whether this process itself is 32- or 64-bit, so a
-        // 32-bit and a 64-bit HkdfGuardV1.dll on the same machine are
+        // 32-bit and a 64-bit HkdfGuard.dll on the same machine are
         // guaranteed to see the identical policy rather than one of them
         // silently reading a WOW64-redirected Software\WOW6432Node copy.
         // (Software\Policies specifically is documented by Microsoft as
@@ -241,6 +245,59 @@ namespace hkdfguard {
         }
 
         return ParseAuditUnwrapSuccess(true, type, value);
+    }
+
+    unsigned long ParseSetupMinDelayMs(bool found, unsigned long type, unsigned long value) noexcept
+    {
+        // Only a REG_DWORD within range is honored. Anything else keeps the
+        // default, as a Linux policy file that is present but invalid
+        // does: a typo must neither remove the floor nor turn application
+        // startup into a long hang.
+        if (found && type == REG_DWORD && value <= kMaxSetupMinDelayMs)
+        {
+            return value;
+        }
+        return kDefaultSetupMinDelayMs;
+    }
+
+    unsigned long LoadSetupMinDelayMs() noexcept
+    {
+        HKEY key = nullptr;
+
+        // KEY_WOW64_64KEY - see LoadKeyUseGroupsPolicy's comment on the
+        // identical flag on its own RegOpenKeyExW call.
+        if (RegOpenKeyExW(
+                HKEY_LOCAL_MACHINE,
+                kPolicyKey,
+                0,
+                KEY_QUERY_VALUE | KEY_WOW64_64KEY,
+                &key) != ERROR_SUCCESS)
+        {
+            return ParseSetupMinDelayMs(false, 0, 0);
+        }
+
+        DWORD value = 0;
+        DWORD type = 0;
+        DWORD size = sizeof(value);
+
+        LONG status = RegQueryValueExW(
+            key,
+            kSetupMinDelayMsValue,
+            nullptr,
+            &type,
+            reinterpret_cast<LPBYTE>(&value),
+            &size);
+
+        RegCloseKey(key);
+
+        // A value too large for a DWORD (ERROR_MORE_DATA) or any other read
+        // failure is "not found" here, i.e. the default floor.
+        if (status != ERROR_SUCCESS || size != sizeof(value))
+        {
+            return ParseSetupMinDelayMs(false, 0, 0);
+        }
+
+        return ParseSetupMinDelayMs(true, type, value);
     }
 
 #if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
