@@ -31,8 +31,8 @@ You install two files:
 
 | File | Used by | Purpose |
 |---|---|---|
-| `HkdfGuardV1.dll` | Applications | Wraps and unwraps DEKs. Applications load it at runtime. |
-| `hkdfguard-v1-initialize.exe` | Administrators | Creates a service's KEK (`provision`) and wraps a DEK to a file (`wrap`). |
+| `HkdfGuard.dll` | Applications | Wraps and unwraps DEKs. Applications load it at runtime. |
+| `hkdfguard.exe` | Administrators | Creates a service's KEK (`provision`) and wraps a DEK to a file (`wrap`). |
 
 The usual flow is:
 
@@ -108,7 +108,7 @@ with a restart required. For anything else, see `install.log`.
 
 | Change | Detail |
 |---|---|
-| Files | `C:\Program Files\HkdfGuard\v1\HkdfGuardV1.dll` and `hkdfguard-v1-initialize.exe`. The folder inherits the Program Files ACL, so only Administrators, SYSTEM and TrustedInstaller can write to it. The location can't be changed. |
+| Files | `C:\Program Files\HkdfGuard\HkdfGuard.dll` and `hkdfguard.exe`. The folder inherits the Program Files ACL, so only Administrators, SYSTEM and TrustedInstaller can write to it. The location can't be changed. |
 | Registry | `HKLM\Software\hkdfguard-native-windows`, value `InstallPath` (`REG_SZ`). Applications read it to find the DLL. |
 | Event log | Registers the Application log source `hkdfguard-native-windows`. |
 | Local group | Creates `HkdfGuardUsers` if it doesn't already exist. |
@@ -120,15 +120,16 @@ machine policy, such as Group Policy, Intune or SCCM.
 
 ```powershell
 Get-ItemProperty HKLM:\Software\hkdfguard-native-windows | Select-Object InstallPath
-Get-ChildItem "C:\Program Files\HkdfGuard\v1"
+Get-ChildItem "C:\Program Files\HkdfGuard"
 net localgroup HkdfGuardUsers
-& "C:\Program Files\HkdfGuard\v1\hkdfguard-v1-initialize.exe" --help
+& "C:\Program Files\HkdfGuard\hkdfguard.exe" --help
 ```
 
 ## Set up a service
 
 A **service name** identifies one KEK, for example `myapp` or `contoso.billing`. Service
-names may contain only ASCII letters, digits and `.`, are 1 to 128 characters long, and are
+names may contain only ASCII letters, digits and `.`, may not start with `.` or contain `..`, are 1 to 128
+characters long, and are
 case-insensitive. The same name must be used to wrap and to unwrap.
 
 ### 1. Decide who can use the key
@@ -153,13 +154,27 @@ Because the KEK's access list names the group, you can change who has access lat
 changing the group's membership. You don't need a new KEK. A running service only picks up
 a new group membership after it restarts.
 
+`HkdfGuardAdmins` is optional and for delegating key administration: its members get full
+control of every KEK created while the group exists, including the ability to delete those
+KEKs, without being local administrators. Most deployments don't need it, since
+Administrators and SYSTEM already have full control. If you do, create it **before**
+provisioning any service, because a KEK's access list is fixed when it's created:
+
+```powershell
+net localgroup HkdfGuardAdmins /add
+net localgroup HkdfGuardAdmins "CONTOSO\KeyAdmin" /add
+```
+
+Both groups must be local groups on this machine. The installer never creates
+`HkdfGuardAdmins`.
+
 > Don't delete and recreate `HkdfGuardUsers` or `HkdfGuardAdmins`. A recreated group gets a
 > new SID, so its members would silently lose access to every KEK created earlier.
 
 ### 2. Provision the KEK (elevated, once per service)
 
 ```powershell
-& "C:\Program Files\HkdfGuard\v1\hkdfguard-v1-initialize.exe" provision --service-name myapp
+& "C:\Program Files\HkdfGuard\hkdfguard.exe" provision --service-name myapp
 ```
 
 `provision` creates the KEK if it's missing. If the KEK already exists, `provision` checks
@@ -173,12 +188,16 @@ needed.** Deleting it makes every DEK wrapped under it unrecoverable.
 ### 3. Wrap a DEK into a key file (every release)
 
 `wrap` uses an existing KEK and never creates one. It reads the DEK as base64 from
-**stdin**, so the key never appears on a command line. `--group` sets the key file's ACL:
-the owner can read and write, the named group can only read, and no one else has access.
-Use a dedicated group whose members are only the service's account.
+**stdin**, so the key never appears on a command line. The key file's ACL lets the owner
+read and write and no one else (the owner is Administrators when `wrap` runs elevated).
+The optional `--group` adds one group that can only read it. Use it when the application
+runs as a different account, and use a dedicated group whose members are only the
+service's account. The group must be on this host, as for `KeyUseGroups`; a domain
+group is refused. Without `--group`, only the owner can read the file, so an
+application running as another account can't open it.
 
 ```powershell
-$exe = "C:\Program Files\HkdfGuard\v1\hkdfguard-v1-initialize.exe"
+$exe = "C:\Program Files\HkdfGuard\hkdfguard.exe"
 
 # One-time: a group for the account that reads the key file.
 net localgroup App_1234 /add
@@ -188,27 +207,63 @@ net localgroup App_1234 "NT SERVICE\MyAppService" /add
 $dek = New-Object byte[] 32
 [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($dek)
 [Convert]::ToBase64String($dek) | & $exe wrap `
-    --key-file-path C:\secrets\myapp.key --service-name myapp `
+    --key-file-path C:\ProgramData\myapp\myapp.key --service-name myapp `
     --dek-stdin --group App_1234 --force
 ```
 
-`--force` overwrites an existing key file. The wrapped file is always 164 bytes. The key
+`--force` overwrites an existing key file. The wrapped file is always 132 bytes. The key
 file must be on a real local path. Symbolic links, junctions, SUBST drives, mapped network
-drives and hard-linked files are refused.
+drives and hard-linked files are refused, and so are 8.3 short names such as `PROGRA~1`:
+spell every folder with its full name. Don't build the path from `%TEMP%` or another
+environment variable without expanding it first: Windows can set those variables with short
+names (for example `C:\Users\RUNNER~1\AppData\Local\Temp` on GitHub-hosted runners), and a
+path containing one is refused.
+
+**Where to keep the key file.** Applications read it back through the library with the
+same rules, so the path must be a plain local NTFS folder, for example
+`C:\ProgramData\<app>\`. In addition to links and network paths, the
+library refuses files on volumes with **Data Deduplication** enabled and **cloud
+placeholder files** (OneDrive, Dropbox and similar), because Windows stores both as
+reparse points. An application that hits this reports `HKDFGUARD_ERR_FILE_UNTRUSTED`
+(-39). Move the file to a plain local folder and wrap it again there.
+
+Configure applications with the key file's **full long path**, the same one you passed to
+`wrap`. If an application builds the path from `%TEMP%`, `%USERPROFILE%` or another
+environment variable, it must expand it to its long form first with the Windows
+`GetLongPathNameW` function, or the library refuses it with -39. Don't assume a framework's
+path helpers do this: some keep short names (PowerShell's `Resolve-Path`, for one).
+
+**Who may own and change the folder.** The library also refuses the file with -39 unless
+the file and every folder above it, up to the drive root, are owned by SYSTEM,
+Administrators, TrustedInstaller or the account the application runs as, and no other
+account may write the file or delete, rename, re-permission or take ownership of it or of
+any of those folders. Read access for other accounts is fine, and so is a folder that lets
+others create new files but not delete existing ones. A folder you create under
+`C:\ProgramData` as an administrator passes. A folder created directly under `C:\` (such as
+`C:\secrets`) does not: it inherits `Authenticated Users: Modify`, which lets any signed-in
+user rename the folder away and put their own in its place. Narrow it first:
+
+```powershell
+icacls C:\secrets /inheritance:r /grant:r "SYSTEM:(OI)(CI)F" "Administrators:(OI)(CI)F" "App_1234:(OI)(CI)RX"
+```
+
+If the key file was written by `wrap` run without elevation, it is owned by that user, and
+an application running as a different account refuses it. Run `wrap` elevated, or as the
+application's own account.
 
 Protect the key file. An older key file for the same service still unwraps, so anyone who
 can replace the file can roll it back to an earlier DEK.
 
 ### 4. Unwrap at runtime
 
-Applications unwrap the key file by calling `hkdfguard_unwrap_dek` in `HkdfGuardV1.dll`.
+Applications unwrap the key file by calling `hkdfguard_unwrap_dek` in `HkdfGuard.dll`.
 The command-line tool has no unwrap command. Applications must load the DLL by the full
 path built from the `InstallPath` registry value, never by bare file name. See
 [Consuming from other languages](../README.md#consuming-from-other-languages) in the README.
 
 ## Machine policy settings
 
-All three settings are values under `HKLM\Software\Policies\HkdfGuard`. Set them with Group
+All four settings are values under `HKLM\Software\Policies\HkdfGuard`. Set them with Group
 Policy, Intune or SCCM, or with `reg add` for testing. They're read on every call, so a
 change takes effect without a restart.
 
@@ -244,7 +299,10 @@ setting doesn't affect KEKs that already exist. Each entry must be a group name 
   `NT SERVICE`. Domain groups are refused, even on a domain-joined machine;
 - isn't over-broad. `Everyone`, `Authenticated Users`, `BUILTIN\Users`, `BUILTIN\Guests`,
   `NT AUTHORITY\Local account`, `NT SERVICE\ALL SERVICES`, `This Organization`, the
-  logon-type groups, and the anonymous and NULL principals are all refused.
+  logon-type groups (including `TERMINAL SERVER USER`), the authentication-package
+  groups (`NTLM Authentication`, `SChannel Authentication`, `Digest Authentication`),
+  the local SAM's `None` group (every local account's primary group; `Domain Users` on
+  a domain), and the anonymous and NULL principals are all refused.
 
 One invalid entry makes provisioning fail, and no KEK is created.
 
@@ -260,6 +318,25 @@ always logged.
 
 ```powershell
 reg add HKLM\Software\Policies\HkdfGuard /v AuditUnwrapSuccess /t REG_DWORD /d 0 /f
+```
+
+### SetupMinDelayMs
+
+`REG_DWORD`, in milliseconds. The minimum time each setup call (`hkdfguard_create_kek`,
+`hkdfguard_kek_exists`) takes, whatever its outcome. Setup calls also run one at a time.
+This limits how hard a misbehaving application can drive the TPM. Wrapping and unwrapping
+are never slowed.
+
+| Value | Behavior |
+|---|---|
+| absent | 1000 ms. |
+| `0` to `60000` | That many milliseconds. `0` turns the delay off. |
+| anything else (above `60000`, or the wrong type) | 1000 ms, the same as absent. |
+
+Provisioning with the CLI makes two setup calls, so it takes about two seconds.
+
+```powershell
+reg add HKLM\Software\Policies\HkdfGuard /v SetupMinDelayMs /t REG_DWORD /d 1000 /f
 ```
 
 ## Monitoring and auditing
@@ -279,10 +356,12 @@ User field is the calling account.
 | 2003 | Warning | Unwrap rejected a tampered, corrupted or misdirected payload. |
 | 2004 | Error | Policy is misconfigured (`KeyStoragePolicy` or `KeyUseGroups`), so calls fail. |
 | 2005 | Error | The key store or cryptography layer failed. |
+| 2006 | Error | An application asked the library to read a key file that looks like an *unwrapped* key (32 raw bytes, or its hex or base64), so it may be a plaintext key on disk. The event names the file; none of its contents are logged. **Investigate**, remove the file and re-mint that DEK. |
+| 2007 | Warning | An application made more than 10 setup calls (`create_kek` / `kek_exists`) in one process. These should run once at startup; it is probably calling them per request. Logged once per process. |
 
 Wrap and unwrap events include a SHA-256 of the wrapped payload, so each unwrap can be
 traced to the wrap that produced it. To compare against a key file:
-`(Get-FileHash C:\secrets\myapp.key -Algorithm SHA256).Hash.ToLower()`.
+`(Get-FileHash C:\ProgramData\myapp\myapp.key -Algorithm SHA256).Hash.ToLower()`.
 
 ```powershell
 Get-WinEvent -LogName Application -FilterXPath "*[System[Provider[@Name='hkdfguard-native-windows']]]" -MaxEvents 50 |
@@ -291,7 +370,7 @@ Get-WinEvent -LogName Application -FilterXPath "*[System[Provider[@Name='hkdfgua
 
 Any local user can write to the Application log, so treat these events as an operational
 aid, not tamper-proof evidence. Forward them to your SIEM for retention and alerting. Events
-2002, 2003 and 1001 are good candidates for alerts.
+2002, 2006, 2003 and 1001 are good candidates for alerts.
 
 ## Upgrade
 
@@ -330,11 +409,22 @@ was attempted) and `1` for an operational failure. On failure it prints an `erro
 | `KEK provider/key open or create failed` | Under `RequireTpm`: no usable TPM. Otherwise, the key store failed. | Check the TPM (`Get-Tpm`) and event 2005 for details. |
 | `a KEK already exists under this service name, but its ACL is ...` | The existing KEK's access list was changed, or a key was planted under that name. It was left untouched. | Investigate it as a security event. To move on, provision a new versioned service name. |
 | `wrapped payload was not produced under this service's current KEK` | The key file belongs to a different service or a different KEK. | Check the service name, and that the file was wrapped on this machine. |
-| `service name is malformed` | The name uses characters other than ASCII letters, digits and `.`, or is longer than 128. | Use a valid name. |
+| `service name is missing or malformed` | The name uses characters other than ASCII letters, digits and `.`, starts with `.`, contains `..`, or is longer than 128. | Use a valid name. |
 
 An application that can't load the DLL usually has an architecture mismatch (see
 [Requirements](#requirements)) or is loading by bare file name instead of the
 `InstallPath` location.
+
+Applications that read the key file through the library may report these codes, which the
+command-line tool itself never produces:
+
+| Code | Meaning | What to do |
+|---|---|---|
+| -39 `FILE_UNTRUSTED` | The key file's path is a link, passes through a junction or SUBST drive, uses an 8.3 short name (`PROGRA~1`), is on a network or deduplicated volume, or is a cloud placeholder. Or the file or a folder above it is owned by, or can be changed, deleted or renamed by, an account other than SYSTEM, Administrators, TrustedInstaller or the application's own. | Configure the application with the full long path (if it comes from `%TEMP%` or another environment variable, expand it first), or move the file to a plain local folder. For an ownership or permissions refusal, narrow the folder's permissions or re-run `wrap` elevated. See [Where to keep the key file](#3-wrap-a-dek-into-a-key-file-every-release). |
+| -38 `FILE_MALFORMED` | The file is 132 bytes but does not hold a valid wrapped key (corrupted, edited, or not a key file at all). | Re-run `wrap` to rewrite the file. |
+| -37 `FILE_PLAINTEXT_KEY` | The file is 32 raw bytes, or 32 bytes as hex or base64: probably an unwrapped key on disk. Event 2006 names it. | Treat the key as exposed. Find out how the file was written, remove it, and re-mint the DEK. |
+| -35 / -36 `FILE_TOO_SHORT` / `FILE_TOO_LONG` | The file isn't 132 bytes, so it isn't a wrapped key. | Check the application is pointed at the right file; re-run `wrap`. |
+| -32 / -33 / -34 `FILE_NOT_FOUND` / `FILE_ACCESS_DENIED` / `FILE_IO` | The file is missing, the service account can't read it, or another process has it open for writing. | Check the path and the file's `--group` ACL, and that nothing is rewriting the file while the service starts. |
 
 For security assumptions and known TPM vendor behavior, see
 [SecurityAssumptions.md](../SecurityAssumptions.md).

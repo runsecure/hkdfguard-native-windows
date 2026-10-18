@@ -31,7 +31,7 @@ namespace hkdfguard {
 
     // A wrap (op Wrap or GenerateAndWrap) or unwrap (op Unwrap) succeeded.
     // Records which KEK was used (its public-key fingerprint) and which
-    // payload (SHA-256 of the 164 wrapped bytes) - both public values that
+    // payload (SHA-256 of the 132 wrapped bytes) - both public values that
     // reveal nothing about the DEK - so an unwrap can be matched back to the
     // wrap that produced it, and a substituted older payload is visible.
     // `payload` is the wrapped output (wrap) or input (unwrap); it is only
@@ -49,5 +49,20 @@ namespace hkdfguard {
     // small, malformed service name) and "not provisioned yet" do not.
     // `service` is the normalized service name, or empty if it was invalid.
     void LogOperationFailure(AuditOp op, const std::string &service, int32_t code) noexcept;
+
+    // hkdfguard_open_file refused `path` because it holds what looks like an
+    // unwrapped DEK - 32 raw bytes, or its hex or base64
+    // (HKDFGUARD_ERR_FILE_PLAINTEXT_KEY): possibly a plaintext key on disk.
+    // The only event that call writes - its other failures concern no KEK
+    // and are reported to the caller alone. The path is logged so an
+    // administrator can find the file; none of its contents are logged.
+    void LogPlaintextKeyFile(const std::wstring &path) noexcept;
+
+    // This process has just made its (`calls` + 1)th setup call
+    // (hkdfguard_create_kek / hkdfguard_kek_exists), each held to at least
+    // `floor_ms`: the signature of a caller looping on them. Logged once
+    // per process, a warning - the counterpart of the Linux build's
+    // log::warn at the same point.
+    void LogSetupCallsExceeded(unsigned long calls, unsigned long floor_ms) noexcept;
 
 } // namespace hkdfguard

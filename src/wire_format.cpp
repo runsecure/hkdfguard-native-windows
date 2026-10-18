@@ -6,19 +6,15 @@
 #include <cstring>
 
 namespace hkdfguard {
-    // Builds the 164-byte wire payload by writing each field at its known
-    // offset. Every field here is public information (metadata, a public
-    // ephemeral key, ciphertext, and an auth tag) - nothing in this function
-    // handles a secret, so there's no zeroing concern in this file.
-    void SerializeWrappedDek(
+    // Writes the authenticated header - Version through Salt - by writing
+    // each field at its known offset. Every field here is public information
+    // (metadata and the salt) - nothing in this file handles a secret, so
+    // there's no zeroing concern here.
+    void SerializeWrappedDekHeader(
         uint8_t provider_type,
         uint32_t key_id,
-        const uint8_t ephemeral_pub[kEphemeralPubLen],
-        const uint8_t nonce[kNonceLen],
-        const uint8_t ciphertext[kCiphertextLen],
-        const uint8_t tag[kTagLen],
-        const uint8_t fingerprint[kFingerprintLen],
-        uint8_t out[kTotalLen]) {
+        const uint8_t salt[kSaltLen],
+        uint8_t out[kHeaderLen]) {
         // Single-byte fields: just assign directly at their offset.
         out[kVersionOffset] = kFormatVersion1;
         out[kProviderTypeOffset] = provider_type;
@@ -43,15 +39,43 @@ namespace hkdfguard {
         out[kKeyIdOffset + 2] = static_cast<uint8_t>((key_id >> 16) & 0xFF);
         out[kKeyIdOffset + 3] = static_cast<uint8_t>((key_id >> 24) & 0xFF);
 
-        // The remaining fields are already raw byte arrays of the right length,
-        // so they're just block-copied into place: destination pointer
-        // (`out + <offset>`, i.e. pointer arithmetic - "the address `offset`
-        // bytes past the start of `out`"), source pointer, and byte count.
-        memcpy(out + kEphemeralPubOffset, ephemeral_pub, kEphemeralPubLen);
+        // The salt is already a raw byte array of the right length, so it's
+        // just block-copied into place: destination pointer (`out + <offset>`,
+        // i.e. pointer arithmetic - "the address `offset` bytes past the start
+        // of `out`"), source pointer, and byte count.
+        memcpy(out + kSaltOffset, salt, kSaltLen);
+    }
+
+    // Builds the 132-byte wire payload: the header first, through the same
+    // function wrap used to build its AAD, so the bytes authenticated and the
+    // bytes stored cannot drift apart; then the remaining fields at their
+    // offsets.
+    void SerializeWrappedDek(
+        uint8_t provider_type,
+        uint32_t key_id,
+        const uint8_t salt[kSaltLen],
+        const uint8_t nonce[kNonceLen],
+        const uint8_t ciphertext[kCiphertextLen],
+        const uint8_t tag[kTagLen],
+        const uint8_t fingerprint[kFingerprintLen],
+        uint8_t out[kTotalLen]) {
+        SerializeWrappedDekHeader(provider_type, key_id, salt, out);
         memcpy(out + kNonceOffset, nonce, kNonceLen);
         memcpy(out + kCiphertextOffset, ciphertext, kCiphertextLen);
         memcpy(out + kTagOffset, tag, kTagLen);
         memcpy(out + kFingerprintOffset, fingerprint, kFingerprintLen);
+    }
+
+    // header || fingerprint: both fixed-length, so the encoding is
+    // unambiguous as it stands.
+    std::vector<uint8_t> BuildWrappedDekAuthenticated(
+        const uint8_t header[kHeaderLen],
+        const uint8_t fingerprint[kFingerprintLen]) {
+        std::vector<uint8_t> authenticated;
+        authenticated.reserve(kAuthenticatedLen);
+        authenticated.insert(authenticated.end(), header, header + kHeaderLen);
+        authenticated.insert(authenticated.end(), fingerprint, fingerprint + kFingerprintLen);
+        return authenticated;
     }
 
     // Validates a caller-supplied buffer really is a well-formed WrappedDekV1
@@ -73,12 +97,16 @@ namespace hkdfguard {
             // catches it - here, that's the `try`/`catch` in hkdfguard.cpp's
             // hkdfguard_unwrap_dek. See errors.h for the full explanation of
             // why this codebase uses exceptions internally.
-            throw HkdfGuardError(HKDFGUARD_ERR_MALFORMED, "wrapped payload has wrong length");
+            throw HkdfGuardError(HKDFGUARD_ERR_PAYLOAD_MALFORMED, "wrapped payload has wrong length");
         }
 
         // Reject anything other than the one version this build understands.
+        // A different version byte is not necessarily *broken* - it may be a
+        // newer format this build simply predates - so it gets its own code,
+        // HKDFGUARD_ERR_PAYLOAD_UNSUPPORTED, distinct from the structural
+        // HKDFGUARD_ERR_PAYLOAD_MALFORMED failures around it.
         if (wrapped[kVersionOffset] != kFormatVersion1) {
-            throw HkdfGuardError(HKDFGUARD_ERR_MALFORMED, "unrecognized wrapped payload version");
+            throw HkdfGuardError(HKDFGUARD_ERR_PAYLOAD_UNSUPPORTED, "unrecognized wrapped payload version");
         }
 
         // The reserved bytes must be exactly what SerializeWrappedDek wrote.
@@ -87,12 +115,12 @@ namespace hkdfguard {
         // an existing payload - so they're pinned to zero now, while nothing
         // depends on them.
         if (wrapped[kReservedOffset] != 0 || wrapped[kReservedOffset + 1] != 0) {
-            throw HkdfGuardError(HKDFGUARD_ERR_MALFORMED, "reserved bytes must be zero");
+            throw HkdfGuardError(HKDFGUARD_ERR_PAYLOAD_MALFORMED, "reserved bytes must be zero");
         }
 
         uint8_t provider_type = wrapped[kProviderTypeOffset];
         if (provider_type != kProviderTypeTpm && provider_type != kProviderTypeSoftware) {
-            throw HkdfGuardError(HKDFGUARD_ERR_MALFORMED, "unrecognized provider type");
+            throw HkdfGuardError(HKDFGUARD_ERR_PAYLOAD_MALFORMED, "unrecognized provider type");
         }
 
         // Reassemble the little-endian KeyId bytes back into a uint32_t - the
@@ -115,22 +143,23 @@ namespace hkdfguard {
         // kek_store.cpp's KeyName, which would just build a persisted-key
         // name for a key that, by design, was never created - turns a
         // payload with a tampered or simply wrong KeyId into an immediate,
-        // precise HKDFGUARD_ERR_MALFORMED instead of a less specific
+        // precise HKDFGUARD_ERR_PAYLOAD_MALFORMED instead of a less specific
         // "provider/key open failed" further down the call chain.
         if (key_id != kCurrentKeyId) {
-            throw HkdfGuardError(HKDFGUARD_ERR_MALFORMED, "unrecognized key id");
+            throw HkdfGuardError(HKDFGUARD_ERR_PAYLOAD_MALFORMED, "unrecognized key id");
         }
 
         // `ParsedWrappedDek parsed{};` default-constructs the struct with every
         // member zero-initialized (the `{}` is "empty brace-init"), then each
-        // field is filled in explicitly below. The four pointer fields are set
+        // field is filled in explicitly below. The six pointer fields are set
         // to `wrapped + <offset>` - pointer arithmetic again, computing the
         // address of each field *inside* the caller's original buffer, rather
         // than copying those bytes anywhere new.
         ParsedWrappedDek parsed{};
         parsed.provider_type = provider_type;
         parsed.key_id = key_id;
-        parsed.ephemeral_pub = wrapped + kEphemeralPubOffset;
+        parsed.header = wrapped; // the header is the payload's first kHeaderLen bytes
+        parsed.salt = wrapped + kSaltOffset;
         parsed.nonce = wrapped + kNonceOffset;
         parsed.ciphertext = wrapped + kCiphertextOffset;
         parsed.tag = wrapped + kTagOffset;

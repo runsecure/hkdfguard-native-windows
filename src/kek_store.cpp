@@ -19,7 +19,7 @@ namespace hkdfguard {
 #endif
 
         // The NCrypt provider name used for everything "TPM" in this file.
-        // Always MS_PLATFORM_CRYPTO_PROVIDER in HkdfGuardV1.dll; a test build
+        // Always MS_PLATFORM_CRYPTO_PROVIDER in HkdfGuard.dll; a test build
         // may point it at a nonexistent provider to exercise the "no TPM on
         // this machine" paths deterministically on hardware that has one.
         LPCWSTR TpmProviderName()
@@ -34,7 +34,7 @@ namespace hkdfguard {
         }
 
         // Test seam hooks (see TestTpmFaults in kek_store.h). In
-        // HkdfGuardV1.dll these compile to "return the real status" and
+        // HkdfGuard.dll these compile to "return the real status" and
         // "never fail", so the shipped library behaves exactly as without
         // them.
         SECURITY_STATUS ApplyTestTpmOpenStatus(LPCWSTR providerName, SECURITY_STATUS actual)
@@ -106,7 +106,7 @@ namespace hkdfguard {
 
                 default:
                     throw HkdfGuardError(
-                        HKDFGUARD_ERR_PROVIDER,
+                        HKDFGUARD_ERR_PROVIDER_ERROR,
                         "invalid provider type");
             }
         }
@@ -127,8 +127,8 @@ namespace hkdfguard {
         // concurrent creation - is a plain HkdfGuardError and propagates.
         // Falling back on those would put a second, software KEK beside a
         // TPM KEK that may be in use, permanently downgrading the service.
-        // The public status code is unchanged (HKDFGUARD_ERR_PROVIDER or
-        // HKDFGUARD_ERR_CRYPTO); only PreferTpm's fallback logic looks at
+        // The public status code is unchanged (HKDFGUARD_ERR_PROVIDER_ERROR or
+        // HKDFGUARD_ERR_CRYPTO_ERROR); only PreferTpm's fallback logic looks at
         // the type.
         class TpmUnusableError : public HkdfGuardError {
         public:
@@ -150,12 +150,12 @@ namespace hkdfguard {
         [[noreturn]] void ThrowProviderOpenFailure()
         {
             throw TpmUnusableError(
-                HKDFGUARD_ERR_PROVIDER,
+                HKDFGUARD_ERR_PROVIDER_ERROR,
                 "NCryptOpenStorageProvider failed");
         }
 
         // Throws the most specific HkdfGuardError an NCrypt failure
-        // warrants, rather than the generic HKDFGUARD_ERR_PROVIDER every
+        // warrants, rather than the generic HKDFGUARD_ERR_PROVIDER_ERROR every
         // such failure used to collapse into. Used at every NCryptOpenKey
         // call site (open-for-wrap, open-for-unwrap, the exists check, and
         // create's "does it already exist" probe) and at
@@ -173,13 +173,13 @@ namespace hkdfguard {
         //     call sites; NCryptFinalizeKey never returns it.
         //   - NTE_PERM (Microsoft's own documented meaning is literally
         //     "Access is denied"), or the Win32 ERROR_ACCESS_DENIED some
-        //     providers surface instead -> HKDFGUARD_ERR_ACCESS_DENIED: the
+        //     providers surface instead -> HKDFGUARD_ERR_KEK_ACCESS_DENIED: the
         //     key exists (or, at NCryptFinalizeKey, is about to) but this
         //     caller's token isn't authorized for the operation - which
         //     includes "not elevated enough to finalize a machine-scoped
         //     key," the single most common real-world cause of this whole
         //     function throwing.
-        //   - anything else -> HKDFGUARD_ERR_PROVIDER (`genericMessage`): a
+        //   - anything else -> HKDFGUARD_ERR_PROVIDER_ERROR (`genericMessage`): a
         //     genuine provider malfunction, unrelated to who's asking.
         //
         // Distinguishing these lets both a program (which can retry/report
@@ -202,7 +202,7 @@ namespace hkdfguard {
                 status == static_cast<SECURITY_STATUS>(ERROR_ACCESS_DENIED))
             {
                 throw HkdfGuardError(
-                    HKDFGUARD_ERR_ACCESS_DENIED,
+                    HKDFGUARD_ERR_KEK_ACCESS_DENIED,
                     "access to the KEK was denied");
             }
 
@@ -213,12 +213,12 @@ namespace hkdfguard {
             if (status == TBS_E_TPM_NOT_FOUND || status == NTE_DEVICE_NOT_FOUND)
             {
                 throw TpmUnusableError(
-                    HKDFGUARD_ERR_PROVIDER,
+                    HKDFGUARD_ERR_PROVIDER_ERROR,
                     "no TPM device is present");
             }
 
             throw HkdfGuardError(
-                HKDFGUARD_ERR_PROVIDER,
+                HKDFGUARD_ERR_PROVIDER_ERROR,
                 genericMessage);
         }
 
@@ -256,7 +256,7 @@ namespace hkdfguard {
             if (status != ERROR_SUCCESS)
             {
                 throw HkdfGuardError(
-                    HKDFGUARD_ERR_PROVIDER,
+                    HKDFGUARD_ERR_PROVIDER_ERROR,
                     "cannot query key algorithm group");
             }
 
@@ -265,7 +265,7 @@ namespace hkdfguard {
                     NCRYPT_ECDH_ALGORITHM_GROUP) != 0)
             {
                 throw HkdfGuardError(
-                    HKDFGUARD_ERR_PROVIDER,
+                    HKDFGUARD_ERR_PROVIDER_ERROR,
                     "unexpected key algorithm");
             }
         }
@@ -289,14 +289,14 @@ namespace hkdfguard {
             if (status != ERROR_SUCCESS)
             {
                 throw HkdfGuardError(
-                    HKDFGUARD_ERR_PROVIDER,
+                    HKDFGUARD_ERR_PROVIDER_ERROR,
                     "cannot query key length");
             }
 
             if (length != 256)
             {
                 throw HkdfGuardError(
-                    HKDFGUARD_ERR_PROVIDER,
+                    HKDFGUARD_ERR_PROVIDER_ERROR,
                     "unexpected key length");
             }
         }
@@ -331,7 +331,7 @@ namespace hkdfguard {
             if (status != ERROR_SUCCESS || cb < sizeof(BCRYPT_ECCKEY_BLOB))
             {
                 throw HkdfGuardError(
-                    HKDFGUARD_ERR_PROVIDER,
+                    HKDFGUARD_ERR_PROVIDER_ERROR,
                     "cannot export key public blob");
             }
 
@@ -342,7 +342,7 @@ namespace hkdfguard {
             if (status != ERROR_SUCCESS || cb < sizeof(BCRYPT_ECCKEY_BLOB))
             {
                 throw HkdfGuardError(
-                    HKDFGUARD_ERR_PROVIDER,
+                    HKDFGUARD_ERR_PROVIDER_ERROR,
                     "cannot export key public blob");
             }
 
@@ -351,7 +351,7 @@ namespace hkdfguard {
             if (header->dwMagic != BCRYPT_ECDH_PUBLIC_P256_MAGIC || header->cbKey != 32)
             {
                 throw HkdfGuardError(
-                    HKDFGUARD_ERR_PROVIDER,
+                    HKDFGUARD_ERR_PROVIDER_ERROR,
                     "key is not on the NIST P-256 curve");
             }
 
@@ -372,14 +372,14 @@ namespace hkdfguard {
                 if (wcscmp(curveName, BCRYPT_ECC_CURVE_NISTP256) != 0)
                 {
                     throw HkdfGuardError(
-                        HKDFGUARD_ERR_PROVIDER,
+                        HKDFGUARD_ERR_PROVIDER_ERROR,
                         "key is not on the NIST P-256 curve");
                 }
             }
             else if (status != NTE_NOT_FOUND && status != NTE_NOT_SUPPORTED)
             {
                 throw HkdfGuardError(
-                    HKDFGUARD_ERR_PROVIDER,
+                    HKDFGUARD_ERR_PROVIDER_ERROR,
                     "cannot query key curve name");
             }
         }
@@ -397,9 +397,9 @@ namespace hkdfguard {
         // returns NTE_NOT_SUPPORTED - see CreateKekOnProvider's comment on
         // that same call). Verified empirically that this is a labeling
         // quirk, not an actual capability restriction: a genuine
-        // NCryptSecretAgreement call against such a key, using a real
-        // ephemeral peer public key, succeeds and produces a correct shared
-        // secret. An ECDH key has no meaningful "decrypt" operation of its
+        // NCryptSecretAgreement call against such a key, using a supplied
+        // peer point (as DeriveWrappingKey does with H(salt)), succeeds and
+        // produces a correct shared secret. An ECDH key has no meaningful "decrypt" operation of its
         // own on Windows CNG (NCryptDecrypt is for RSA-family keys) - by the
         // time this function runs, VerifyAlgorithm has already confirmed
         // the key's algorithm group genuinely is ECDH, so accepting the
@@ -424,7 +424,7 @@ namespace hkdfguard {
             if (status != ERROR_SUCCESS)
             {
                 throw HkdfGuardError(
-                    HKDFGUARD_ERR_PROVIDER,
+                    HKDFGUARD_ERR_PROVIDER_ERROR,
                     "cannot query key usage");
             }
 
@@ -432,7 +432,7 @@ namespace hkdfguard {
                  (NCRYPT_ALLOW_KEY_AGREEMENT_FLAG | NCRYPT_ALLOW_DECRYPT_FLAG)) == 0)
             {
                 throw HkdfGuardError(
-                    HKDFGUARD_ERR_PROVIDER,
+                    HKDFGUARD_ERR_PROVIDER_ERROR,
                     "key agreement usage missing");
             }
         }
@@ -456,7 +456,7 @@ namespace hkdfguard {
             if (status != ERROR_SUCCESS)
             {
                 throw HkdfGuardError(
-                    HKDFGUARD_ERR_PROVIDER,
+                    HKDFGUARD_ERR_PROVIDER_ERROR,
                     "cannot query export policy");
             }
 
@@ -465,7 +465,7 @@ namespace hkdfguard {
                  NCRYPT_ALLOW_PLAINTEXT_EXPORT_FLAG))
             {
                 throw HkdfGuardError(
-                    HKDFGUARD_ERR_PROVIDER,
+                    HKDFGUARD_ERR_PROVIDER_ERROR,
                     "key unexpectedly exportable");
             }
         }
@@ -516,14 +516,14 @@ namespace hkdfguard {
             if (status != ERROR_SUCCESS)
             {
                 throw HkdfGuardError(
-                    HKDFGUARD_ERR_PROVIDER,
+                    HKDFGUARD_ERR_PROVIDER_ERROR,
                     "cannot query implementation type");
             }
 
             if ((implType & NCRYPT_IMPL_HARDWARE_FLAG) == 0)
             {
                 throw HkdfGuardError(
-                    HKDFGUARD_ERR_PROVIDER,
+                    HKDFGUARD_ERR_PROVIDER_ERROR,
                     "key is not hardware backed");
             }
         }
@@ -537,7 +537,7 @@ namespace hkdfguard {
             if (TestTpmVerificationFails(provider_type))
             {
                 throw HkdfGuardError(
-                    HKDFGUARD_ERR_PROVIDER,
+                    HKDFGUARD_ERR_PROVIDER_ERROR,
                     "injected test fault: TPM key failed verification");
             }
 
@@ -659,7 +659,7 @@ namespace hkdfguard {
             }
 
             // Notably: NTE_PERM here means this caller can't even confirm
-            // whether the key exists (reported as HKDFGUARD_ERR_ACCESS_DENIED,
+            // whether the key exists (reported as HKDFGUARD_ERR_KEK_ACCESS_DENIED,
             // not as `false`) - a permissions problem must never be
             // misreported as "no KEK provisioned."
             ThrowForNCryptFailure(status, "NCryptOpenKey failed");
@@ -754,7 +754,7 @@ namespace hkdfguard {
             // PreferTpm fallback (TpmUnusableError) - except a concurrent
             // creation (NTE_EXISTS: another provisioner just made it, so a
             // KEK now exists here and falling back would split the service)
-            // and ACCESS_DENIED, which would fail on the software provider
+            // and KEK_ACCESS_DENIED, which would fail on the software provider
             // just the same.
             //
 
@@ -774,14 +774,14 @@ namespace hkdfguard {
             if (status == NTE_EXISTS)
             {
                 throw HkdfGuardError(
-                    HKDFGUARD_ERR_PROVIDER,
+                    HKDFGUARD_ERR_PROVIDER_ERROR,
                     "the KEK was created concurrently by another caller; retry");
             }
 
             if (status != ERROR_SUCCESS)
             {
                 throw TpmUnusableError(
-                    HKDFGUARD_ERR_PROVIDER,
+                    HKDFGUARD_ERR_PROVIDER_ERROR,
                     "NCryptCreatePersistedKey failed");
             }
 
@@ -798,7 +798,7 @@ namespace hkdfguard {
             if (status != ERROR_SUCCESS)
             {
                 throw TpmUnusableError(
-                    HKDFGUARD_ERR_PROVIDER,
+                    HKDFGUARD_ERR_PROVIDER_ERROR,
                     "setting export policy failed");
             }
 
@@ -851,7 +851,7 @@ namespace hkdfguard {
                 // provider-capability failure; anything else (a key-use
                 // group that stopped resolving, say) would fail on the
                 // software provider just the same.
-                if (e.code() == HKDFGUARD_ERR_PROVIDER)
+                if (e.code() == HKDFGUARD_ERR_PROVIDER_ERROR)
                 {
                     throw TpmUnusableError(e.code(), e.what());
                 }
@@ -871,8 +871,8 @@ namespace hkdfguard {
                 // Empirically confirmed (see ThrowForNCryptFailure's
                 // comment): this is the call that actually enforces
                 // elevation for a machine-scoped key, and it reports that
-                // as NTE_PERM - mapped below to HKDFGUARD_ERR_ACCESS_DENIED,
-                // not the generic HKDFGUARD_ERR_PROVIDER a caller could
+                // as NTE_PERM - mapped below to HKDFGUARD_ERR_KEK_ACCESS_DENIED,
+                // not the generic HKDFGUARD_ERR_PROVIDER_ERROR a caller could
                 // otherwise mistake for "the TPM/KSP itself is broken."
                 if (status == NTE_PERM ||
                     status == static_cast<SECURITY_STATUS>(ERROR_ACCESS_DENIED))
@@ -883,14 +883,14 @@ namespace hkdfguard {
                 if (status == NTE_EXISTS)
                 {
                     throw HkdfGuardError(
-                        HKDFGUARD_ERR_PROVIDER,
+                        HKDFGUARD_ERR_PROVIDER_ERROR,
                         "the KEK was created concurrently by another caller; retry");
                 }
 
                 // Anything else: this provider could not create the key
                 // (for example a TPM that cannot hold an ECDH P-256 key).
                 throw TpmUnusableError(
-                    HKDFGUARD_ERR_PROVIDER,
+                    HKDFGUARD_ERR_PROVIDER_ERROR,
                     "NCryptFinalizeKey failed");
             }
 
@@ -961,9 +961,9 @@ namespace hkdfguard {
 
                 // The key this call created is gone, so the provider simply
                 // could not produce a verifiable KEK: fallback-eligible.
-                // ACCESS_DENIED and the like stay as they are.
-                if (e.code() == HKDFGUARD_ERR_PROVIDER ||
-                    e.code() == HKDFGUARD_ERR_CRYPTO)
+                // KEK_ACCESS_DENIED and the like stay as they are.
+                if (e.code() == HKDFGUARD_ERR_PROVIDER_ERROR ||
+                    e.code() == HKDFGUARD_ERR_CRYPTO_ERROR)
                 {
                     throw TpmUnusableError(e.code(), e.what());
                 }
@@ -1015,7 +1015,7 @@ namespace hkdfguard {
                     // fail outright on exactly the TPM-less hosts PreferTpm's
                     // fallback exists for.
                     //
-                    // Anything else propagates as-is: ACCESS_DENIED means a TPM
+                    // Anything else propagates as-is: KEK_ACCESS_DENIED means a TPM
                     // key *does* exist and this caller may not open it, and an
                     // unexpected probe error means one might. Answering from
                     // the software provider in either case could report "no
@@ -1033,7 +1033,7 @@ namespace hkdfguard {
         }
 
         throw HkdfGuardError(
-            HKDFGUARD_ERR_INVALID_POLICY,
+            HKDFGUARD_ERR_POLICY_INVALID,
             "invalid key storage policy");
     }
 
@@ -1137,10 +1137,10 @@ namespace hkdfguard {
                     // destroying every DEK wrapped under it. Nothing here
                     // deletes anything now.
                     //
-                    // Everything else propagates: ACCESS_DENIED (not elevated
+                    // Everything else propagates: KEK_ACCESS_DENIED (not elevated
                     // - the software attempt would fail the same way - or a
                     // TPM KEK exists that this caller may not open) and
-                    // KEK_ACL_INVALID (a TPM KEK exists with an unacceptable
+                    // KEK_INVALID (a TPM KEK exists with an unacceptable
                     // ACL). In both "exists" cases, quietly creating a second,
                     // software KEK beside it would split the service across
                     // two keys.
@@ -1168,7 +1168,7 @@ namespace hkdfguard {
         }
 
         throw HkdfGuardError(
-            HKDFGUARD_ERR_INVALID_POLICY,
+            HKDFGUARD_ERR_POLICY_INVALID,
             "invalid key storage policy");
     }
 
@@ -1217,12 +1217,12 @@ namespace hkdfguard {
                     // exists) instead of surfacing that the service's TPM KEK
                     // has a problem.
                     //
-                    // ACCESS_DENIED - and anything else - propagates as-is: it
+                    // KEK_ACCESS_DENIED - and anything else - propagates as-is: it
                     // means a TPM KEK exists and this caller may not use it.
                     // Swallowing it would make the software probe below answer
                     // instead, so an unauthorized caller would be told
                     // KEK_NOT_FOUND ("nothing provisioned") rather than
-                    // ACCESS_DENIED - the same misreport KekExists is careful
+                    // KEK_ACCESS_DENIED - the same misreport KekExists is careful
                     // to avoid. A caller in that position also never has a
                     // software KEK legitimately waiting for it: PreferTpm only
                     // creates one when the TPM attempt failed outright.
@@ -1242,7 +1242,7 @@ namespace hkdfguard {
         }
 
         throw HkdfGuardError(
-            HKDFGUARD_ERR_INVALID_POLICY,
+            HKDFGUARD_ERR_POLICY_INVALID,
             "invalid key storage policy");
     }
 
@@ -1253,7 +1253,7 @@ namespace hkdfguard {
 
         SECURITY_STATUS status = NCryptOpenStorageProvider(result.provider.put(), ProviderName(provider_type), 0);
         if (status != ERROR_SUCCESS) {
-            throw HkdfGuardError(HKDFGUARD_ERR_PROVIDER, "NCryptOpenStorageProvider failed");
+            throw HkdfGuardError(HKDFGUARD_ERR_PROVIDER_ERROR, "NCryptOpenStorageProvider failed");
         }
 
         // Unlike CreateKekOnProvider, this function only ever *opens* -
@@ -1288,7 +1288,7 @@ namespace hkdfguard {
         // performs just below - that would let a misconfigured registry
         // value quietly weaken verification on every unwrap.
         if (policy == KeyStoragePolicy::Invalid) {
-            throw HkdfGuardError(HKDFGUARD_ERR_INVALID_POLICY, "invalid key storage policy");
+            throw HkdfGuardError(HKDFGUARD_ERR_POLICY_INVALID, "invalid key storage policy");
         }
 
         VerifyKeyProperties(
@@ -1304,7 +1304,7 @@ namespace hkdfguard {
         ScopedNCryptProv provider;
         SECURITY_STATUS status = NCryptOpenStorageProvider(provider.put(), ProviderName(provider_type), 0);
         if (status != ERROR_SUCCESS) {
-            throw HkdfGuardError(HKDFGUARD_ERR_PROVIDER, "NCryptOpenStorageProvider failed");
+            throw HkdfGuardError(HKDFGUARD_ERR_PROVIDER_ERROR, "NCryptOpenStorageProvider failed");
         }
 
         std::wstring name = KeyName(service, key_id);
@@ -1319,7 +1319,7 @@ namespace hkdfguard {
             provider.get(), key.put(), name.c_str(), 0,
             NCRYPT_MACHINE_KEY_FLAG | NCRYPT_SILENT_FLAG);
         if (status != ERROR_SUCCESS) {
-            throw HkdfGuardError(HKDFGUARD_ERR_PROVIDER, "NCryptOpenKey failed");
+            throw HkdfGuardError(HKDFGUARD_ERR_PROVIDER_ERROR, "NCryptOpenKey failed");
         }
 
         // NCryptDeleteKey both removes the persisted key from storage *and*
@@ -1336,7 +1336,7 @@ namespace hkdfguard {
         // exactly for this situation.
         key.release(); // NCryptDeleteKey invalidates the handle even on failure; do not also free it
         if (status != ERROR_SUCCESS) {
-            throw HkdfGuardError(HKDFGUARD_ERR_PROVIDER, "NCryptDeleteKey failed");
+            throw HkdfGuardError(HKDFGUARD_ERR_PROVIDER_ERROR, "NCryptDeleteKey failed");
         }
     }
 } // namespace hkdfguard

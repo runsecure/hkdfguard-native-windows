@@ -3,8 +3,8 @@
   Built by scripts/Build-Msi.ps1 - see that script for the parameters below.
 
   What it does:
-    - Installs HkdfGuardV1.dll and hkdfguard-v1-initialize.exe
-      side by side into  %ProgramFiles%\HkdfGuard\v1\ .
+    - Installs HkdfGuard.dll and hkdfguard.exe
+      side by side into  %ProgramFiles%\HkdfGuard\ .
     - Writes that folder to
         HKLM\Software\hkdfguard-native-windows  InstallPath  (REG_SZ)
       so consumers (e.g. a C# wrapper) can load the DLL by absolute path via
@@ -17,7 +17,7 @@
     - The install folder lives under Program Files and inherits its ACL:
       only Administrators, SYSTEM and TrustedInstaller can write there. That
       is what stops a less-privileged user planting a fake
-      HkdfGuardV1.dll next to the CLI and getting code
+      HkdfGuard.dll next to the CLI and getting code
       execution the next time an administrator runs the elevated
       `provision` step. Nothing in this file loosens that ACL - do not add
       Permission/PermissionEx elements to these directories.
@@ -63,17 +63,15 @@
     <MediaTemplate EmbedCab="yes" />
 
     <StandardDirectory Id="ProgramFiles64Folder">
-      <Directory Id="HkdfGuardRootDir" Name="HkdfGuard">
-        <Directory Id="HkdfGuardInstallDir" Name="v1" />
-      </Directory>
+      <Directory Id="HkdfGuardInstallDir" Name="HkdfGuard" />
     </StandardDirectory>
 
     <ComponentGroup Id="HkdfGuardComponents" Directory="HkdfGuardInstallDir">
       <Component Id="HkdfGuardDll">
-        <File Id="HkdfGuardDllFile" Source="$(SourceDir)\HkdfGuardV1.dll" KeyPath="yes" />
+        <File Id="HkdfGuardDllFile" Source="$(SourceDir)\HkdfGuard.dll" KeyPath="yes" />
       </Component>
       <Component Id="HkdfGuardCli">
-        <File Id="HkdfGuardCliFile" Source="$(SourceDir)\hkdfguard-v1-initialize.exe" KeyPath="yes" />
+        <File Id="HkdfGuardCliFile" Source="$(SourceDir)\hkdfguard.exe" KeyPath="yes" />
       </Component>
       <Component Id="HkdfGuardInstallPathValue">
         <RegistryValue

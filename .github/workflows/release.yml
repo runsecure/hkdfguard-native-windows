@@ -18,6 +18,9 @@
 #            MSIs, zips, and attests provenance of the signed files.
 #   publish  creates the GitHub Release from the sign job's output.
 #
+# Before tagging: run the suite on a machine with a TPM (see README.md,
+# "TPM tests are the developer's and maintainer's responsibility") - this
+# workflow's runners have none, so it cannot cover the TPM-only checks.
 # To cut a release: git tag v0.9.0; git push origin v0.9.0
 # Any v0.x.y tag is published as a GitHub pre-release (pre-release testing);
 # v1.0.0 and later as normal releases. The version must increase with every
@@ -154,10 +157,10 @@ jobs:
           . .\scripts\ArtifactSigning.ps1
           $config = Initialize-ArtifactSigning
           Invoke-ArtifactSigning -Config $config -Files @(
-            "dist\win-x64\HkdfGuardV1.dll",
-            "dist\win-x64\hkdfguard-v1-initialize.exe",
-            "dist\win-arm64\HkdfGuardV1.dll",
-            "dist\win-arm64\hkdfguard-v1-initialize.exe")
+            "dist\win-x64\HkdfGuard.dll",
+            "dist\win-x64\hkdfguard.exe",
+            "dist\win-arm64\HkdfGuard.dll",
+            "dist\win-arm64\hkdfguard.exe")
 
       # Packages the signed binaries (already signed, so not re-signed), then
       # signs each MSI and checks its contents.
@@ -201,10 +204,10 @@ jobs:
           subject-path: |
             release-assets/*.zip
             release-assets/*.msi
-            dist/win-x64/HkdfGuardV1.dll
-            dist/win-x64/hkdfguard-v1-initialize.exe
-            dist/win-arm64/HkdfGuardV1.dll
-            dist/win-arm64/hkdfguard-v1-initialize.exe
+            dist/win-x64/HkdfGuard.dll
+            dist/win-x64/hkdfguard.exe
+            dist/win-arm64/HkdfGuard.dll
+            dist/win-arm64/hkdfguard.exe
 
       - name: Upload the signed release assets
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

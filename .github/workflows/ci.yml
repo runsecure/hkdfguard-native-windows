@@ -1,8 +1,11 @@
 # Continuous integration: every push to main, every pull request, and on
-# demand. Runs the same build.yml that release.yml runs - so a green CI
+# demand. First lints the workflows and parses every PowerShell script
+# (lint), then runs the same build.yml that release.yml runs - so a green CI
 # commit is one a tag will build and test identically - then builds both
 # MSIs unsigned so a packaging mistake (WiX, the .wxs, Build-Msi.ps1's
 # content checks) shows up here rather than in the middle of a release.
+# Finally installs the x64 MSI on clean windows-2022 and windows-2025
+# runners and tests the installed files (install-test).
 #
 # No signing, no secrets, no "release" environment: pull requests from forks
 # run this too, and must not be able to reach the signing account.
@@ -23,7 +26,52 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Seconds, not minutes: checks the workflows themselves and every
+  # PowerShell script before the long Windows jobs depend on them, so a
+  # broken workflow or a script syntax error fails here - not twenty minutes
+  # into a build, and never for the first time on a release tag (release.yml
+  # can't run until a tag is pushed, so this lint is its only pre-tag check).
+  lint:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      # Syntax, expressions, job dependencies and runner labels for every
+      # file in .github/workflows (configured by .github/actionlint.yaml).
+      # Pinned by image digest, like the actions are by commit SHA.
+      - name: Lint the workflow files (actionlint)
+        uses: docker://rhysd/actionlint@sha256:887a259a5a534f3c4f36cb02dca341673c6089431057242cdc931e9f133147e9 # 1.7.7
+        with:
+          args: -no-color
+
+      # Parse (not run) every script with PowerShell's own parser. The
+      # scripts target Windows PowerShell 5.1, whose grammar PowerShell 7
+      # accepts, so a parse error here is one there too.
+      - name: Parse every PowerShell script
+        shell: pwsh
+        run: |
+          $failed = 0
+          $scripts = Get-ChildItem -Path . -Recurse -Include *.ps1 -File |
+            Where-Object { $_.FullName -notmatch '[\\/]\.git[\\/]' }
+          foreach ($script in $scripts) {
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($script.FullName, [ref]$null, [ref]$errors)
+            $relative = [System.IO.Path]::GetRelativePath($PWD, $script.FullName)
+            foreach ($e in $errors) {
+              Write-Host "::error file=$relative,line=$($e.Extent.StartLineNumber),col=$($e.Extent.StartColumnNumber)::$($e.Message)"
+              $failed++
+            }
+          }
+          Write-Host "Parsed $($scripts.Count) script(s), $failed error(s)."
+          if ($failed -gt 0) { exit 1 }
+
   build:
+    needs: lint
     uses: ./.github/workflows/build.yml
     permissions:
       contents: read
@@ -68,4 +116,78 @@ jobs:
           name: unsigned-msi
           path: dist/*.msi
           if-no-files-found: error
+          retention-days: 7
+
+  # Installs the x64 MSI on clean Windows Server 2022 and 2025 runners and
+  # runs both test suites against the INSTALLED files, then uninstalls - the
+  # same tests/container/Test-InContainer.ps1 that scripts/Test-Containers.ps1
+  # runs locally in Server Core containers, here on full hosted images.
+  # Hosted runners are disposable and run elevated, which the install and
+  # the machine-wide KEK tests need. They have no TPM, so the two TPM-only
+  # checks print [SKIP]; see README.md for who runs those.
+  install-test:
+    needs: package
+    strategy:
+      fail-fast: false # one Server version failing shouldn't hide the other's result
+      matrix:
+        runner: [windows-2022, windows-2025]
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Download the unsigned MSIs
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: unsigned-msi
+          path: dist
+
+      - name: Download the roundtrip test executable
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: tests-win-x64
+          path: tests-bin
+
+      # Test-InContainer.ps1 expects exactly one MSI in its payload folder.
+      - name: Stage the test payload
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $payload = Join-Path $env:RUNNER_TEMP "payload"
+          New-Item -ItemType Directory -Force -Path $payload | Out-Null
+          $msi = @(Get-ChildItem dist -Filter "hkdfguard-native-windows-*-win-x64.msi")
+          if ($msi.Count -ne 1) { throw "expected one x64 MSI in dist, found $($msi.Count)" }
+          Copy-Item $msi[0].FullName, tests-bin\test_roundtrip.exe, tests\test_cli.ps1, tests\container\Test-InContainer.ps1 $payload
+          Get-ChildItem $payload | ForEach-Object { Write-Host "  $($_.Name)" }
+
+      - name: Install, test and uninstall on ${{ matrix.runner }}
+        shell: powershell
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP "out"
+          $work = Join-Path $env:RUNNER_TEMP "work"
+          & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $env:RUNNER_TEMP "payload\Test-InContainer.ps1") `
+              -Payload (Join-Path $env:RUNNER_TEMP "payload") -Out $out -Work $work
+          $code = $LASTEXITCODE
+          # Each failed check as an annotation on the run's summary page.
+          foreach ($log in "test_roundtrip.log", "test_cli.log") {
+            $path = Join-Path $out $log
+            if (Test-Path $path) {
+              Select-String -Path $path -Pattern '\[FAIL\] (.*)$' | ForEach-Object {
+                Write-Host "::error title=${{ matrix.runner }} ($log)::$($_.Matches[0].Groups[1].Value.Trim())"
+              }
+            }
+          }
+          exit $code
+
+      - name: Upload the install and test logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: install-test-logs-${{ matrix.runner }}
+          path: ${{ runner.temp }}/out/
+          if-no-files-found: warn
           retention-days: 7

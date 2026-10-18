@@ -20,7 +20,7 @@ namespace hkdfguard {
         // trailing "invalid policy" throw after the switch (KekExists,
         // CreateKek, OpenKekForWrap), or checks for this sentinel directly
         // (OpenKekForUnwrap) - both fail closed with
-        // HKDFGUARD_ERR_INVALID_POLICY the moment this value appears.
+        // HKDFGUARD_ERR_POLICY_INVALID the moment this value appears.
         Invalid = 0xFFFFFFFFu,
     };
 
@@ -41,7 +41,7 @@ namespace hkdfguard {
     // - and silently substituting PreferTpm would mean a typo can quietly
     // weaken protection instead of being surfaced as the configuration
     // error it is. Every caller of this function turns
-    // KeyStoragePolicy::Invalid into HKDFGUARD_ERR_INVALID_POLICY.
+    // KeyStoragePolicy::Invalid into HKDFGUARD_ERR_POLICY_INVALID.
     //
     // Reads the real registry value (see policy.cpp). When this translation
     // unit is built with HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE defined, a
@@ -58,7 +58,7 @@ namespace hkdfguard {
 //
 // Compiled in only when HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE is defined -
 // tests/CMakeLists.txt defines it for test_roundtrip's own copy of this
-// file only. HkdfGuardV1.dll's own build (the top-level CMakeLists.txt) never
+// file only. HkdfGuard.dll's own build (the top-level CMakeLists.txt) never
 // defines it, so this function - and the override state it would control -
 // does not exist at all in the shipped DLL; there is no runtime flag or
 // code path in release code that could ever activate it. Not thread-safe,
@@ -98,9 +98,31 @@ namespace hkdfguard {
     // key or value doesn't exist (or can't be read).
     bool ParseAuditUnwrapSuccess(bool found, unsigned long type, unsigned long value) noexcept;
 
+    // The floor on every hkdfguard_create_kek / hkdfguard_kek_exists call's
+    // wall-clock time when policy doesn't set one, and the most it may set -
+    // the same numbers as the Linux build's DEFAULT_SETUP_MIN_DELAY_MS and
+    // MAX_SETUP_MIN_DELAY_MS.
+    inline constexpr unsigned long kDefaultSetupMinDelayMs = 1000;
+    inline constexpr unsigned long kMaxSetupMinDelayMs = 60000;
+
+    // The setup-call floor in milliseconds, from the REG_DWORD value
+    // HKLM\Software\Policies\HkdfGuard\SetupMinDelayMs - the counterpart of
+    // the Linux policy file's startup_behavior.setup_min_delay_ms. Read on
+    // every setup call. Never throws.
+    //
+    // Missing: kDefaultSetupMinDelayMs. A REG_DWORD from 0 to
+    // kMaxSetupMinDelayMs is used as is (0 disables the floor). Anything
+    // else - the wrong type, or above the maximum - also means
+    // kDefaultSetupMinDelayMs.
+    unsigned long LoadSetupMinDelayMs() noexcept;
+
+    // The value-to-setting rule LoadSetupMinDelayMs applies, with no
+    // registry I/O, so it can be tested directly.
+    unsigned long ParseSetupMinDelayMs(bool found, unsigned long type, unsigned long value) noexcept;
+
     // Test-only seam for LoadKeyUseGroupsPolicy(), with exactly the same
     // scope and caveats as SetTestPolicyOverride above: compiled in only
-    // for test binaries, absent from HkdfGuardV1.dll. std::nullopt clears it.
+    // for test binaries, absent from HkdfGuard.dll. std::nullopt clears it.
 #if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
     void SetTestKeyUseGroupsOverride(std::optional<std::vector<std::wstring>> groups);
 #endif
