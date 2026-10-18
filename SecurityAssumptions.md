@@ -271,18 +271,29 @@ over-broad well-known principal (Everyone, Authenticated Users, Anonymous,
 NULL, INTERACTIVE/NETWORK/BATCH/SERVICE/REMOTE INTERACTIVE LOGON,
 BUILTIN\Users, BUILTIN\Guests, Local account (S-1-5-113), This Organization
 (S-1-5-15), NT SERVICE\ALL SERVICES (S-1-5-80-0), LOCAL (S-1-2-0), CONSOLE
-LOGON (S-1-2-1)). Local account, This Organization, ALL SERVICES and REMOTE
-INTERACTIVE LOGON resolve as `SidTypeWellKnownGroup` in an accepted domain
-(`NT AUTHORITY` or `NT SERVICE`), so the denylist alone excludes them.
-Policy validation and the existing-key ACL check share one implementation
-(`IsOverBroadSid` in `src/key_acl.cpp`).
+LOGON (S-1-2-1), TERMINAL SERVER USER (S-1-5-13), and the
+authentication-package groups NTLM/SChannel/Digest Authentication
+(S-1-5-64-10/14/21)), nor the "Domain Users" group of any domain
+(S-1-5-21-...-513, which the local SAM names `None`). Local account, This
+Organization, ALL SERVICES, REMOTE INTERACTIVE LOGON, TERMINAL SERVER USER
+and the authentication-package groups resolve as `SidTypeWellKnownGroup` in
+an accepted domain (`NT AUTHORITY` or `NT SERVICE`), so the denylist alone
+excludes them. `None` is worse placed still: it is a real `SidTypeGroup` in
+this machine's own domain, the primary group of every local account, and
+it has no fixed SID, so it is refused by shape (NT authority, five
+sub-authorities starting with 21, RID 513 - `IsDomainUsersRid`) rather than
+from a list. Policy validation and the existing-key ACL check share one
+implementation (`IsOverBroadSid` in `src/key_acl.cpp`).
 
 **Verified how.** Tests (section 0d) cover Everyone by name and as
-`S-1-1-0`, Authenticated Users, BUILTIN\Users, the six broad groups added
-above by SID string (Local account and ALL SERVICES by name too), a user
-account, an
+`S-1-1-0`, Authenticated Users, BUILTIN\Users, the ten broad groups added
+above by SID string (Local account and ALL SERVICES by name too), `None` by
+name and as its resolved SID string (skipped where the name doesn't resolve
+to a local group, i.e. on a domain controller), a user account, an
 unresolvable name, a foreign-domain-qualified name, and every branch of
-`IsHostLocalAccountDomain`. Facts established while building it, all by
+`IsHostLocalAccountDomain`. Section 28 checks that an existing KEK granting
+NTLM Authentication or an unresolvable RID-513 SID is refused as
+`HKDFGUARD_ERR_KEK_INVALID`. Facts established while building it, all by
 repro on this host: well-known SIDs such as Everyone report an *empty*
 domain (treated as non-local); default local groups live in `BUILTIN` and
 `COMPUTERNAME\<builtin alias>` does not resolve at all; SAM accounts are

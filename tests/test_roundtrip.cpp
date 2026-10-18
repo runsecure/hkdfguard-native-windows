@@ -1036,10 +1036,55 @@ int main() {
             {L"S-1-5-14", "create_kek rejects NT AUTHORITY\\REMOTE INTERACTIVE LOGON (S-1-5-14)"},
             {L"S-1-2-0", "create_kek rejects LOCAL (S-1-2-0)"},
             {L"S-1-2-1", "create_kek rejects CONSOLE LOGON (S-1-2-1)"},
+            {L"S-1-5-13", "create_kek rejects NT AUTHORITY\\TERMINAL SERVER USER (S-1-5-13)"},
+            {L"S-1-5-64-10", "create_kek rejects NT AUTHORITY\\NTLM Authentication (S-1-5-64-10)"},
+            {L"S-1-5-64-14", "create_kek rejects NT AUTHORITY\\SChannel Authentication (S-1-5-64-14)"},
+            {L"S-1-5-64-21", "create_kek rejects NT AUTHORITY\\Digest Authentication (S-1-5-64-21)"},
         };
         for (const BroadPrincipal &p: broad) {
             hkdfguard::SetTestKeyUseGroupsOverride(std::vector<std::wstring>{p.sid});
             Check(InternalCreateKekResult(kServiceUseGroupsWide) == HKDFGUARD_ERR_WIN_GROUP_INVALID, p.label);
+        }
+    }
+
+    // The local SAM's "None" group (S-1-5-21-<machine>-513, "Domain Users"
+    // on a domain): the primary group of every local account, so every local
+    // user. It has no fixed SID and resolves as a real SidTypeGroup in this
+    // machine's own domain, so neither the type check nor the host-local
+    // check stops it - only the RID-513 shape check can. Named "None", it is
+    // also the entry most likely to be typed in by mistake. The test first
+    // confirms the name resolves to a group here (it won't on a domain
+    // controller, whose SAM is the domain), so the rejection below is known
+    // to come from the over-broad check and not from an unresolvable name.
+    {
+        DWORD sidSize = 0, domainSize = 0;
+        SID_NAME_USE sidType = SidTypeUnknown;
+        LookupAccountNameW(nullptr, L"None", nullptr, &sidSize, nullptr, &domainSize, &sidType);
+        std::vector<BYTE> noneSid(sidSize);
+        std::wstring noneDomain(domainSize, L'\0');
+        const bool noneResolves =
+                sidSize != 0 &&
+                LookupAccountNameW(nullptr, L"None", noneSid.data(), &sidSize, noneDomain.data(), &domainSize,
+                                   &sidType) &&
+                sidType == SidTypeGroup;
+        if (!noneResolves) {
+            Skip("\"None\" does not resolve to a local group on this machine (domain controller?)");
+        } else {
+            hkdfguard::SetTestKeyUseGroupsOverride(std::vector<std::wstring>{L"None"});
+            Check(
+                InternalCreateKekResult(kServiceUseGroupsWide) == HKDFGUARD_ERR_WIN_GROUP_INVALID,
+                "create_kek rejects the local SAM's \"None\" group (RID 513) by name");
+
+            // And as a SID string, so the check is known to be on the SID's
+            // shape and not on the spelling.
+            LPWSTR noneSidText = nullptr;
+            if (ConvertSidToStringSidW(noneSid.data(), &noneSidText)) {
+                hkdfguard::SetTestKeyUseGroupsOverride(std::vector<std::wstring>{noneSidText});
+                Check(
+                    InternalCreateKekResult(kServiceUseGroupsWide) == HKDFGUARD_ERR_WIN_GROUP_INVALID,
+                    "create_kek rejects the local SAM's \"None\" group (RID 513) given as a SID string");
+                LocalFree(noneSidText);
+            }
         }
     }
 
@@ -2858,6 +2903,11 @@ int main() {
              "a conditional allow ACE for Everyone"},
             {L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GR;;;S-1-5-80-0)", "a grant to NT SERVICE\\ALL SERVICES"},
             {L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GR;;;S-1-5-113)", "a grant to NT AUTHORITY\\Local account"},
+            {L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GR;;;S-1-5-64-10)", "a grant to NT AUTHORITY\\NTLM Authentication"},
+            // S-1-5-21-1-2-3-513 is nobody's real "None" group, which is the
+            // point: the existing-key check must recognize RID 513 by shape,
+            // without resolving the SID.
+            {L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GR;;;S-1-5-21-1-2-3-513)", "a grant to a Domain Users/None group (RID 513)"},
         };
         if (!elevated) {
             Skip("existing-KEK ACL checks for conditional and newly denied grants (needs elevation)");

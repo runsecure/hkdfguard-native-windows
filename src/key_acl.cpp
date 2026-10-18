@@ -5,6 +5,7 @@
 #include <aclapi.h>
 #include <sddl.h> // ConvertStringSidToSidW
 
+#include <cstring> // memcmp - IsDomainUsersRid compares SID identifier authorities
 #include <cwchar> // _wcsicmp
 #include <optional>
 #include <string>
@@ -80,10 +81,18 @@ namespace hkdfguard {
             WinRemoteLogonIdSid,    // S-1-5-14 "REMOTE INTERACTIVE LOGON": every RDP user
             WinLocalSid,            // S-1-2-0 "LOCAL": every locally logged-on user
             WinConsoleLogonSid,     // S-1-2-1 "CONSOLE LOGON": every console user
+            WinTerminalServerSid,   // S-1-5-13 "TERMINAL SERVER USER": every RDP session (older sibling of S-1-5-14)
+            // The authentication-package groups: a token carries one for
+            // whichever package authenticated it, so each is every account
+            // that logged on that way. NTLM is every local-account logon.
+            WinNTLMAuthenticationSid,     // S-1-5-64-10 "NTLM Authentication"
+            WinSChannelAuthenticationSid, // S-1-5-64-14 "SChannel Authentication"
+            WinDigestAuthenticationSid,   // S-1-5-64-21 "Digest Authentication"
         };
 
-        // tools/hkdfguard_cli.cpp keeps a copy of both lists for its
-        // --group check (it depends only on the public ABI); keep them in sync.
+        // tools/hkdfguard_cli.cpp keeps a copy of both lists and of
+        // IsDomainUsersRid for its --group check (it depends only on the
+        // public ABI); keep them in sync.
         //
         // Over-broad principals with no WELL_KNOWN_SID_TYPE constant of their
         // own, given as SID strings instead.
@@ -91,11 +100,42 @@ namespace hkdfguard {
             L"S-1-5-80-0", // NT SERVICE\ALL SERVICES: every service process
         };
 
-        // Whether `sid` is any principal on the two lists above. The single
-        // implementation behind both policy validation (ResolveKeyUseGroupSid)
-        // and the existing-key ACL check (VerifyExistingKeyAcl), so the two
-        // can never disagree about what counts as over-broad.
+        // Whether `sid` is S-1-5-21-<domain>-513: "Domain Users", which the
+        // local SAM calls "None". It is the primary group of every account in
+        // its domain and is in every such account's token, so on this host
+        // it is every local user - the same population as Local account
+        // (S-1-5-113). It has no fixed SID (the domain part is per machine),
+        // so it is recognized by shape: an NT-authority SID of five
+        // sub-authorities starting with 21 and ending in RID 513. Domain
+        // groups are refused anyway by IsHostLocalAccountDomain; this check
+        // closes the local one, which that test accepts.
+        bool IsDomainUsersRid(PSID sid) {
+            static const SID_IDENTIFIER_AUTHORITY nt = SECURITY_NT_AUTHORITY;
+            if (!IsValidSid(sid)) {
+                return false;
+            }
+            const PSID_IDENTIFIER_AUTHORITY authority = GetSidIdentifierAuthority(sid);
+            if (memcmp(authority->Value, nt.Value, sizeof(nt.Value)) != 0) {
+                return false;
+            }
+            const PUCHAR count = GetSidSubAuthorityCount(sid);
+            if (*count != 5) {
+                return false;
+            }
+            return *GetSidSubAuthority(sid, 0) == SECURITY_NT_NON_UNIQUE &&
+                   *GetSidSubAuthority(sid, 4) == DOMAIN_GROUP_RID_USERS;
+        }
+
+        // Whether `sid` is any principal on the two lists above, or a
+        // domain's "Domain Users"/"None" group. The single implementation
+        // behind both policy validation (ResolveKeyUseGroupSid) and the
+        // existing-key ACL check (VerifyExistingKeyAcl), so the two can never
+        // disagree about what counts as over-broad.
         bool IsOverBroadSid(PSID sid) {
+            if (IsDomainUsersRid(sid)) {
+                return true;
+            }
+
             for (WELL_KNOWN_SID_TYPE overBroad: kOverBroadSids) {
                 SidBuffer known = CreateWellKnownSidBuffer(overBroad);
                 if (EqualSid(sid, known.data())) {

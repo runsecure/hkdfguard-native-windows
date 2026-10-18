@@ -207,9 +207,13 @@ try {
     #          never acceptable. Checked on the resolved SID, so a
     #          BUILTIN-qualified spelling is caught the same way. (English
     #          account names; a localized Windows names these differently.)
+    #          "None" is the local SAM's RID-513 group (every local account's
+    #          primary group); "NTLM Authentication" is in the token of every
+    #          NTLM-authenticated logon, which is every local-account logon.
     $broadGroups = @(
         "Users", "BUILTIN\Users", "Everyone", "Authenticated Users",
-        "NT AUTHORITY\Local account", "NT SERVICE\ALL SERVICES", "Guests")
+        "NT AUTHORITY\Local account", "NT SERVICE\ALL SERVICES", "Guests",
+        "None", "NT AUTHORITY\NTLM Authentication")
     foreach ($broad in $broadGroups) {
         $broadKeyFile = Join-Path $workDir ("broad-" + ($broad -replace '[\\ ]', '_') + ".key")
         $r = Invoke-Cli @(

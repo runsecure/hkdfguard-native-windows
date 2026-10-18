@@ -285,8 +285,10 @@ reports and away from other processes.
   who can read the file can copy it, and the payload format deliberately allows an
   older payload to be swapped in (see above). Refused groups are `Everyone`,
   `Authenticated Users`, `BUILTIN\Users`, `BUILTIN\Guests`, `NT AUTHORITY\Local account`,
-  `NT SERVICE\ALL SERVICES`, `This Organization`, the logon-type groups and the
-  anonymous and NULL principals - the same set refused as a KEK key-use group. As for a
+  `NT SERVICE\ALL SERVICES`, `This Organization`, the logon-type groups, the
+  authentication-package groups (`NTLM Authentication` and its siblings), the local
+  SAM's `None` group and the anonymous and NULL principals - the same set refused as a
+  KEK key-use group. As for a
   key-use group, the group must be on this host (a local group, `BUILTIN`, `NT AUTHORITY`
   or `NT SERVICE`): a domain group is refused, since its members could never be granted
   the KEK to unwrap the file. Repeating any flag (`-kf`, `-sn`, `-g`, `-f`, the DEK source)

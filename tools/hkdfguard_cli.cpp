@@ -824,13 +824,35 @@ namespace {
         WinRemoteLogonIdSid,    // S-1-5-14 "REMOTE INTERACTIVE LOGON"
         WinLocalSid,            // S-1-2-0 "LOCAL"
         WinConsoleLogonSid,     // S-1-2-1 "CONSOLE LOGON"
+        WinTerminalServerSid,   // S-1-5-13 "TERMINAL SERVER USER"
+        WinNTLMAuthenticationSid,     // S-1-5-64-10 "NTLM Authentication"
+        WinSChannelAuthenticationSid, // S-1-5-64-14 "SChannel Authentication"
+        WinDigestAuthenticationSid,   // S-1-5-64-21 "Digest Authentication"
     };
 
     constexpr const char *kOverBroadGroupSidStrings[] = {
         "S-1-5-80-0", // NT SERVICE\ALL SERVICES
     };
 
+    // S-1-5-21-<domain>-513: "Domain Users", called "None" in the local SAM -
+    // the primary group of every account in its domain, so on this host every
+    // local user. No fixed SID, so recognized by shape (the DLL's
+    // IsDomainUsersRid does the same).
+    bool IsDomainUsersRid(PSID sid) {
+        static const SID_IDENTIFIER_AUTHORITY nt = SECURITY_NT_AUTHORITY;
+        if (!IsValidSid(sid) ||
+            memcmp(GetSidIdentifierAuthority(sid)->Value, nt.Value, sizeof(nt.Value)) != 0 ||
+            *GetSidSubAuthorityCount(sid) != 5) {
+            return false;
+        }
+        return *GetSidSubAuthority(sid, 0) == SECURITY_NT_NON_UNIQUE &&
+               *GetSidSubAuthority(sid, 4) == DOMAIN_GROUP_RID_USERS;
+    }
+
     bool IsOverBroadGroupSid(PSID sid) {
+        if (IsDomainUsersRid(sid)) {
+            return true;
+        }
         for (WELL_KNOWN_SID_TYPE type: kOverBroadGroupSids) {
             BYTE known[SECURITY_MAX_SID_SIZE];
             DWORD knownSize = sizeof(known);
