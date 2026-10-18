@@ -192,7 +192,8 @@ needed.** Deleting it makes every DEK wrapped under it unrecoverable.
 read and write and no one else (the owner is Administrators when `wrap` runs elevated).
 The optional `--group` adds one group that can only read it. Use it when the application
 runs as a different account, and use a dedicated group whose members are only the
-service's account. Without `--group`, only the owner can read the file, so an
+service's account. The group must be on this host, as for `KeyUseGroups`; a domain
+group is refused. Without `--group`, only the owner can read the file, so an
 application running as another account can't open it.
 
 ```powershell

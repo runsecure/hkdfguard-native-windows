@@ -232,6 +232,18 @@ namespace {
             kProgramName, kProgramName, kProgramName, kProgramName, kProgramName);
     }
 
+    // Stores a flag's value, refusing a second one rather than letting the
+    // last win: `-kf a.key ... -kf b.key` is ambiguous about which file the
+    // operator meant, and silently picking one is how the wrong key file gets
+    // written or the wrong service's KEK gets used. `flag` is the flag's long
+    // name. The Linux tool's set_once.
+    void SetOnce(std::optional<std::string> &slot, const char *flag, const std::string &value) {
+        if (slot) {
+            throw CliError(std::string("give ") + flag + " at most once");
+        }
+        slot = value;
+    }
+
     // Throws CliError on any parse failure; returns ParseOutcome::Help if
     // --help/-h was seen (in which case `out` is left unpopulated - the caller
     // must check the return value before using `out`). Starts at argv[2] -
@@ -252,7 +264,7 @@ namespace {
                 if (value.empty()) {
                     throw CliError("--service-name must not be empty");
                 }
-                serviceName = value;
+                SetOnce(serviceName, "--service-name", value);
             } else if (arg == "--key-file-path" || arg == "-kf" || arg == "--dek-stdin" || arg == "--dek-file" ||
                        arg == "--force" || arg == "-f" || arg == "--group" || arg == "-g") {
                 throw CliError(arg + " is not valid for `provision`; it belongs to `wrap`");
@@ -289,6 +301,9 @@ namespace {
             if (arg == "--help" || arg == "-h") {
                 return ParseOutcome::Help;
             } else if (arg == "--force" || arg == "-f") {
+                if (force) {
+                    throw CliError("give --force at most once");
+                }
                 force = true;
             } else if (arg == "--dek-stdin") {
                 oneSource();
@@ -311,7 +326,7 @@ namespace {
                 if (value.empty()) {
                     throw CliError("--key-file-path must not be empty");
                 }
-                keyFilePath = value;
+                SetOnce(keyFilePath, "--key-file-path", value);
             } else if (arg == "--service-name" || arg == "-sn") {
                 if (i + 1 >= argc) {
                     throw CliError(arg + " requires a value");
@@ -320,7 +335,7 @@ namespace {
                 if (value.empty()) {
                     throw CliError("--service-name must not be empty");
                 }
-                serviceName = value;
+                SetOnce(serviceName, "--service-name", value);
             } else if (arg == "--group" || arg == "-g") {
                 if (i + 1 >= argc) {
                     throw CliError(arg + " requires a value");
@@ -329,10 +344,7 @@ namespace {
                 if (value.empty()) {
                     throw CliError("--group must not be empty");
                 }
-                if (groupName) {
-                    throw CliError("give --group at most once");
-                }
-                groupName = value;
+                SetOnce(groupName, "--group", value);
             } else {
                 throw CliError("unrecognized argument for `wrap`: " + arg);
             }
@@ -620,6 +632,7 @@ namespace {
             case HKDFGUARD_OK: return "success";
             case HKDFGUARD_ERR_INVALID_ARGUMENT: return "invalid argument (null pointer or wrong DEK length)";
             case HKDFGUARD_ERR_BUFFER_TOO_SMALL: return "output buffer too small";
+            case HKDFGUARD_ERR_PROVIDER_UNAVAILABLE: return "no KEK provider is available on this host";
             case HKDFGUARD_ERR_PROVIDER_ERROR: return "KEK provider/key open or create failed";
             case HKDFGUARD_ERR_CRYPTO_ERROR: return "a cryptographic operation failed";
             case HKDFGUARD_ERR_PAYLOAD_AUTH_FAILED: return "AES-GCM authentication failed";
@@ -732,6 +745,12 @@ namespace {
     // matching this project's macOS/Linux tools. The library enforces the
     // same rules; checking here first gives the operator a specific message.
     void ValidateServiceCharset(const std::string &service) {
+        constexpr size_t kMaxServiceLen = 128; // the ABI's limit
+        if (service.size() > kMaxServiceLen) {
+            throw CliError(
+                "--service-name must be at most " + std::to_string(kMaxServiceLen) + " bytes, got " +
+                std::to_string(service.size()));
+        }
         for (wchar_t c: service) {
             bool isAsciiAlnum = (c >= L'0' && c <= L'9') || (c >= L'A' && c <= L'Z') || (c >= L'a' && c <= L'z');
             if (!isAsciiAlnum && c != L'.') {
@@ -836,13 +855,32 @@ namespace {
         return false;
     }
 
-    // Resolves `groupName` (a local or domain group name, e.g. "App_1234"
-    // or "MYDOMAIN\SomeGroup") to its SID, rejecting anything that isn't
-    // actually a group account (a plain user name, for instance) so a typo
-    // doesn't silently grant read access to the wrong kind of principal, and
-    // rejecting an over-broad group (Everyone, Users, Authenticated Users,
-    // ... - see kOverBroadGroupSids above). The over-broad check is on the
-    // resolved SID, so it can't be dodged by spelling (e.g. "BUILTIN\Users").
+    // Whether `domain` - a ReferencedDomainName from LookupAccountName - is
+    // this host: its own computer name, BUILTIN, NT AUTHORITY or NT SERVICE
+    // (case-insensitive). The library's IsHostLocalAccountDomain, which the
+    // CLI can't call (it isn't exported).
+    bool IsHostLocalDomain(const std::string &domain) {
+        if (domain.empty()) {
+            return false;
+        }
+        for (const char *fixed: {"BUILTIN", "NT AUTHORITY", "NT SERVICE"}) {
+            if (_stricmp(domain.c_str(), fixed) == 0) {
+                return true;
+            }
+        }
+        char computer[MAX_COMPUTERNAME_LENGTH + 1] = {};
+        DWORD size = MAX_COMPUTERNAME_LENGTH + 1;
+        return GetComputerNameA(computer, &size) && _stricmp(domain.c_str(), computer) == 0;
+    }
+
+    // Resolves `groupName` (a group on this host, e.g. "App_1234" or
+    // "BUILTIN\Performance Log Users") to its SID, rejecting anything that
+    // isn't actually a group account (a plain user name, for instance) so a
+    // typo doesn't silently grant read access to the wrong kind of
+    // principal, rejecting an over-broad group (Everyone, Users,
+    // Authenticated Users, ... - see kOverBroadGroupSids above), and
+    // rejecting a domain group. The checks are on the resolved SID and
+    // domain, so they can't be dodged by spelling (e.g. "BUILTIN\Users").
     std::vector<BYTE> ResolveGroupSid(const std::string &groupName) {
         DWORD sidSize = 0;
         DWORD domainSize = 0;
@@ -855,11 +893,12 @@ namespace {
             throw CliError("--group \"" + groupName + "\" could not be resolved: " + FormatWin32Error(GetLastError()));
         }
         std::vector<BYTE> sid(sidSize);
-        std::string domain(domainSize, L'\0');
+        std::string domain(domainSize, '\0');
         if (!LookupAccountName(
             nullptr, groupName.c_str(), sid.data(), &sidSize, domain.data(), &domainSize, &sidType)) {
             throw CliError("--group \"" + groupName + "\" could not be resolved: " + FormatWin32Error(GetLastError()));
         }
+        domain.resize(domainSize); // on success, the length without the NUL
         if (sidType != SidTypeGroup && sidType != SidTypeAlias && sidType != SidTypeWellKnownGroup) {
             throw CliError("--group \"" + groupName + "\" does not name a group account");
         }
@@ -868,6 +907,18 @@ namespace {
                 "--group \"" + groupName + "\" is an over-broad group (it covers essentially every account or "
                 "process on this host); name a dedicated group for the service that unwraps this key, such as "
                 "a local group created for it");
+        }
+        // Host-local only, as the library requires of KeyUseGroups: a
+        // --group reader must also be granted the KEK, and the library
+        // refuses a domain group there, so a domain group here would be a
+        // file ACE for readers who can never unwrap it. Judged on the domain
+        // the name resolved to, not on how it was spelled, so an unqualified
+        // name that falls through to a domain group is caught too.
+        if (!IsHostLocalDomain(domain)) {
+            throw CliError(
+                "--group \"" + groupName + "\" resolves to a group in domain \"" + domain + "\"; only groups on "
+                "this host (local groups, BUILTIN, NT AUTHORITY or NT SERVICE) are accepted, as for the "
+                "KeyUseGroups policy");
         }
         return sid;
     }
@@ -1165,6 +1216,30 @@ namespace {
         }
     }
 
+    // Refuses `path` unless it names a file on a local drive: never a UNC
+    // path (\\server\share\..., \\?\UNC\...), a device or \\?\ path, or a
+    // mapped network drive. Decided from the path text alone (GetFullPathName
+    // does no I/O; GetDriveType asks only the local mount manager) and before
+    // anything touches the path, so this process never connects or
+    // authenticates to a server named in it - which would hand that server
+    // the caller's NTLM credentials. A SUBST drive passes here and is caught
+    // later, where the opened handle's real path must match the spelled one.
+    // `what` names the path in the message.
+    void RequireLocalDrivePath(const std::string &path, const std::string &what) {
+        char fullBuf[MAX_PATH * 4];
+        DWORD fullLen = GetFullPathNameA(path.c_str(), static_cast<DWORD>(sizeof(fullBuf)), fullBuf, nullptr);
+        if (fullLen == 0 || fullLen >= sizeof(fullBuf)) {
+            throw CliError("failed to resolve " + what + ": " + FormatWin32Error(GetLastError()));
+        }
+        const std::string full(fullBuf, fullLen);
+        const bool driveLetter = full.size() >= 3 && std::isalpha(static_cast<unsigned char>(full[0])) &&
+                                 full[1] == ':' && full[2] == '\\';
+        if (!driveLetter || GetDriveTypeA(full.substr(0, 3).c_str()) == DRIVE_REMOTE) {
+            throw CliError(
+                what + " is not on a local drive (UNC paths, mapped network drives and devices are refused)");
+        }
+    }
+
     // Fail-fast version of the checks above, run before any KEK or DEK work
     // so a bad output path is rejected without touching the key store or
     // reading the DEK at all: the parent directory must be a real directory
@@ -1405,14 +1480,33 @@ namespace {
             throw CliError("failed to protect the ACL of " + path + ": " + FormatWin32Error(protectError));
         }
 
+        // Write the payload and flush it to storage, so a reported success
+        // survives a crash. On any failure the file is deleted through its
+        // own handle (it goes when ScopedFileHandle closes it): a failed wrap
+        // never leaves an empty or truncated key file behind, for the next
+        // `wrap` to call "already exists" or a service to read as malformed -
+        // the same rule as the Linux tool's finish_key_file.
+        auto discard = [&file](const std::string &message) {
+            FILE_DISPOSITION_INFO disposition{};
+            disposition.DeleteFile = TRUE;
+            SetFileInformationByHandle(file.get(), FileDispositionInfo, &disposition, sizeof(disposition));
+            throw CliError(message);
+        };
         DWORD totalWritten = 0;
         const DWORD bytesSize = static_cast<DWORD>(bytes.size());
         while (totalWritten < bytesSize) {
             DWORD written = 0;
             if (!WriteFile(file.get(), bytes.data() + totalWritten, bytesSize - totalWritten, &written, nullptr)) {
-                throw CliError("failed to write " + path + ": " + FormatWin32Error(GetLastError()));
+                discard("failed to write " + path + ": " + FormatWin32Error(GetLastError()));
+            }
+            if (written == 0) {
+                // A successful write of nothing would otherwise loop forever.
+                discard("failed to write " + path + ": the write made no progress");
             }
             totalWritten += written;
+        }
+        if (!FlushFileBuffers(file.get())) {
+            discard("failed to flush " + path + " to storage: " + FormatWin32Error(GetLastError()));
         }
     }
 
@@ -1547,19 +1641,7 @@ namespace {
     // Unlike the key file, a hard link isn't refused: nothing here writes
     // through it, and the Linux tool doesn't refuse one either.
     void ReadDekFile(const std::string &path, DekScratch &scratch) {
-        char fullBuf[MAX_PATH * 4];
-        DWORD fullLen = GetFullPathNameA(path.c_str(), static_cast<DWORD>(sizeof(fullBuf)), fullBuf, nullptr);
-        if (fullLen == 0 || fullLen >= sizeof(fullBuf)) {
-            throw CliError("failed to resolve --dek-file " + path + ": " + FormatWin32Error(GetLastError()));
-        }
-        const std::string full(fullBuf, fullLen);
-        const bool driveLetter = full.size() >= 3 && std::isalpha(static_cast<unsigned char>(full[0])) &&
-                                 full[1] == ':' && full[2] == '\\';
-        if (!driveLetter || GetDriveTypeA(full.substr(0, 3).c_str()) == DRIVE_REMOTE) {
-            throw CliError(
-                "--dek-file " + path + " is not on a local drive (UNC paths, mapped network drives and devices "
-                "are refused)");
-        }
+        RequireLocalDrivePath(path, "--dek-file " + path);
         const std::string expected = FullLongPath(path); // refuses 8.3 short names
 
         ScopedFileHandle file(CreateFile(
@@ -1603,6 +1685,14 @@ namespace {
     // MARK: - Run: wrap
 
     void RunWrap(WrapArgs &args) {
+        // First, before anything - even the exists pre-check below - touches
+        // a path: a UNC or mapped-drive path would make this process connect
+        // to the server it names. The same rule as hkdfguard_open_file.
+        RequireLocalDrivePath(args.keyFilePath, args.keyFilePath);
+        if (args.dekFile) {
+            RequireLocalDrivePath(*args.dekFile, "--dek-file " + *args.dekFile);
+        }
+
         // Fast, friendly pre-check: fail before ever touching the TPM/Software
         // Key Storage Provider if the output path obviously already exists and
         // --force wasn't passed. WriteWrappedKeyFile's CREATE_NEW is the actual

@@ -164,6 +164,21 @@ try {
     $r = Invoke-Cli @("provision", "--service-name", "svc", "--force")
     Check (($r.ExitCode -eq 2) -and ($r.StdErr -match 'is not valid for `provision`; it belongs to `wrap`')) "provision refuses wrap-only flags, as on Linux"
 
+    # #12: every repeated flag is a usage error, not "the last one wins".
+    foreach ($case in @(
+            @(@("wrap", "-kf", "a.key", "-kf", "b.key", "-sn", "svc", "--dek-stdin"), "--key-file-path"),
+            @(@("wrap", "-kf", "a.key", "-sn", "a", "--service-name", "b", "--dek-stdin"), "--service-name"),
+            @(@("wrap", "-kf", "a.key", "-sn", "svc", "--dek-stdin", "-f", "--force"), "--force"),
+            @(@("wrap", "-kf", "a.key", "-sn", "svc", "--dek-stdin", "-g", "x", "--group", "x"), "--group"),
+            @(@("provision", "-sn", "a", "-sn", "a"), "--service-name"))) {
+        $r = Invoke-Cli $case[0]
+        Check (($r.ExitCode -eq 2) -and ($r.StdErr -match "give $($case[1]) at most once")) "a repeated $($case[1]) is a usage error ($($case[0] -join ' '))"
+    }
+
+    # #16: an over-long service name gets the Linux tool's message, before the library sees it.
+    $r = Invoke-Cli @("provision", "-sn", ("a" * 129))
+    Check (($r.ExitCode -eq 1) -and ($r.StdErr -match "--service-name must be at most 128 bytes, got 129")) "an over-long service name gets the Linux tool's message"
+
     # ---- 4. wrap: missing a required flag (--dek-stdin). ----
     $keyFile = Join-Path $workDir "missing-dek.key"
     $r = Invoke-Cli @("wrap", "--key-file-path", $keyFile, "--service-name", "svc", "--group", $narrowGroup)
@@ -203,6 +218,17 @@ try {
         Check (($r.ExitCode -eq 1) -and ($r.StdErr -match "over-broad")) "wrap refuses the over-broad --group `"$broad`""
         Check (-not (Test-Path $broadKeyFile)) "wrap with over-broad --group `"$broad`" does not create the key file"
     }
+
+    # ---- 7c. wrap: a --group outside this host is refused, as for the ----
+    #          KeyUseGroups policy. A domain group needs a domain; CREATOR
+    #          OWNER (S-1-3-0, a well-known group with no domain at all) is
+    #          the case every machine has.
+    $creatorOwner = (New-Object System.Security.Principal.SecurityIdentifier("S-1-3-0")).Translate([System.Security.Principal.NTAccount]).Value
+    $r = Invoke-Cli @(
+        "wrap", "--key-file-path", (Join-Path $workDir "creator-owner.key"), "--service-name", "svc", "--dek-stdin",
+        "--group", $creatorOwner) -StdIn $validB64
+    Check (($r.ExitCode -eq 1) -and ($r.StdErr -match "only groups on this host")) "wrap refuses a --group that isn't on this host ($creatorOwner)"
+    if ($r.StdErr -notmatch "only groups on this host") { Write-Host "    stderr: $($r.StdErr)" }
 
     # ---- 8. wrap: invalid base64 on stdin. ----
     $badB64KeyFile = Join-Path $workDir "bad-b64.key"
@@ -493,6 +519,14 @@ try {
 
     $r = Invoke-Cli @("wrap", "--key-file-path", $dekFileKey, "--service-name", $neverProvisionedService, "--dek-file", "\\localhost\C$\hkdfguard-no-such\dek.b64")
     Check (($r.ExitCode -eq 1) -and ($r.StdErr -match "not on a local drive")) "--dek-file: a UNC path is refused before anything is opened"
+
+    # The output path follows the same rule, checked before even the
+    # "already exists" probe would touch it - in every UNC spelling.
+    foreach ($uncKey in @("\\localhost\C$\hkdfguard-no-such\out.key", "\\?\UNC\localhost\C$\hkdfguard-no-such\out.key", "//localhost/C$/hkdfguard-no-such/out.key")) {
+        $r = Invoke-Cli @("wrap", "--key-file-path", $uncKey, "--service-name", $neverProvisionedService, "--dek-stdin") -StdIn $validB64
+        Check (($r.ExitCode -eq 1) -and ($r.StdErr -match "is not on a local drive")) "--key-file-path: a UNC path ($uncKey) is refused before anything is opened"
+        if ($r.StdErr -notmatch "is not on a local drive") { Write-Host "    stderr: $($r.StdErr)" }
+    }
 
     # ---- 12c. UTF-16 input is refused with a message that says so, rather ----
     #           than a generic "not valid base64".

@@ -286,7 +286,11 @@ reports and away from other processes.
   older payload to be swapped in (see above). Refused groups are `Everyone`,
   `Authenticated Users`, `BUILTIN\Users`, `BUILTIN\Guests`, `NT AUTHORITY\Local account`,
   `NT SERVICE\ALL SERVICES`, `This Organization`, the logon-type groups and the
-  anonymous and NULL principals - the same set refused as a KEK key-use group.
+  anonymous and NULL principals - the same set refused as a KEK key-use group. As for a
+  key-use group, the group must be on this host (a local group, `BUILTIN`, `NT AUTHORITY`
+  or `NT SERVICE`): a domain group is refused, since its members could never be granted
+  the KEK to unwrap the file. Repeating any flag (`-kf`, `-sn`, `-g`, `-f`, the DEK source)
+  is a usage error rather than the last value winning, as on Linux.
 
   `--key-file-path` must be a real local file reached through real directories. A
   symbolic link, junction, or other reparse point at the path or anywhere above it
