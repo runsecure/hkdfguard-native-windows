@@ -16,6 +16,7 @@ namespace hkdfguard {
 
     enum class AuditOp {
         KekExists,
+        KekFingerprint,
         CreateKek,
         Wrap,
         GenerateAndWrap,

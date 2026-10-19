@@ -6,10 +6,12 @@ covered by test_roundtrip.exe (which only calls into HkdfGuard.dll directly,
 never spawns the CLI). Registered as ctest's "cli" test; see
 tests/CMakeLists.txt.
 
-The CLI has two subcommands: "provision" (calls hkdfguard_kek_exists /
-hkdfguard_create_kek only) and "wrap" (calls hkdfguard_wrap_dek only, against
-an already-provisioned KEK; the DEK is fed to it as base64 text on stdin via
---dek-stdin, never as a command-line argument).
+The CLI has four subcommands: "provision" (hkdfguard_kek_exists /
+hkdfguard_create_kek, then prints hkdfguard_kek_fingerprint), "wrap"
+(hkdfguard_wrap_dek only, against an already-provisioned KEK; the DEK is fed
+to it as base64 text on stdin via --dek-stdin, never as a command-line
+argument), "status" (read-only) and "retire" (deletes a KEK by fingerprint;
+elevated only - it also serves as the elevated scenarios' cleanup).
 
 Most scenarios below are reachable without ever creating a machine-wide KEK
 (each one fails - by design - before RunWrap()/RunProvision() in
@@ -157,9 +159,9 @@ try {
     # ---- 3. An unrecognized top-level command. ----
     $r = Invoke-Cli @("frobnicate")
     Check ($r.ExitCode -eq 2) "unrecognized command exits 2"
-    Check ($r.StdErr -match 'unknown subcommand "frobnicate": expected `provision` or `wrap`') "an unknown subcommand gets the Linux tool's message"
+    Check ($r.StdErr -match 'unknown subcommand "frobnicate": expected `provision`, `wrap`, `retire` or `status`') "an unknown subcommand gets the macOS tool's message"
     $r = Invoke-Cli @()
-    Check ($r.StdErr -match 'missing subcommand: expected `provision` or `wrap`') "a missing subcommand gets the Linux tool's message"
+    Check ($r.StdErr -match 'missing subcommand: expected `provision`, `wrap`, `retire` or `status`') "a missing subcommand gets the macOS tool's message"
     Check ($r.StdErr -match "--dek-stdin \| --dek-file <path>") "the usage text shows both DEK sources"
     $r = Invoke-Cli @("provision", "--service-name", "svc", "--force")
     Check (($r.ExitCode -eq 2) -and ($r.StdErr -match 'is not valid for `provision`; it belongs to `wrap`')) "provision refuses wrap-only flags, as on Linux"
@@ -178,6 +180,57 @@ try {
     # #16: an over-long service name gets the Linux tool's message, before the library sees it.
     $r = Invoke-Cli @("provision", "-sn", ("a" * 129))
     Check (($r.ExitCode -eq 1) -and ($r.StdErr -match "--service-name must be at most 128 bytes, got 129")) "an over-long service name gets the Linux tool's message"
+
+    # ---- 3b. retire and status argument parsing - usage errors (exit 2), ----
+    #          all before any key is looked at. The macOS tool's messages.
+    $zeroFp = "0" * 64
+    foreach ($case in @(
+            @(@("retire", "-sn", "svc"), "missing required --fingerprint\|-fp"),
+            @(@("retire", "-fp", $zeroFp), "retire: missing required --service-name"),
+            @(@("retire", "-sn", "svc", "-fp", $zeroFp, "--corrupt"), "--fingerprint and --corrupt are mutually exclusive"),
+            @(@("retire", "-sn", "svc", "-fp", "abc"), "--fingerprint must be exactly 64 hex characters, got 3"),
+            @(@("retire", "-sn", "svc", "-fp", ("g" * 64)), "--fingerprint must contain only hex characters"),
+            @(@("retire", "-sn", "svc", "-fp", $zeroFp, "-fp", $zeroFp), "give --fingerprint at most once"),
+            @(@("retire", "-sn", "svc", "--corrupt", "--provider", "disk"), "--provider must be ``tpm`` or ``software``"),
+            @(@("retire", "-sn", "svc", "--corrupt", "--force"), "unrecognized argument for ``retire``"),
+            @(@("status"), "status: missing required --service-name"),
+            @(@("status", "-sn", "svc", "--corrupt"), "unrecognized argument for ``status``"),
+            @(@("retire", "-sn", "svc", "--corrupt", "--corrupt"), "give --corrupt at most once"),
+            @(@("retire", "-sn", "svc", "--corrupt", "--provider", "tpm", "--provider", "tpm"), "give --provider at most once"),
+            @(@("retire", "-sn", "a", "-sn", "a", "--corrupt"), "give --service-name at most once"),
+            @(@("status", "-sn", "a", "--service-name", "a"), "give --service-name at most once"),
+            @(@("retire", "--corrupt", "-fp"), "-fp requires a value"),
+            @(@("retire", "--corrupt", "--provider"), "--provider requires a value"),
+            @(@("status", "-sn"), "-sn requires a value"),
+            @(@("retire", "-sn", "svc", "--fingerprint", ""), "--fingerprint must not be empty"),
+            @(@("status", "--service-name", ""), "--service-name must not be empty"))) {
+        $r = Invoke-Cli $case[0]
+        Check (($r.ExitCode -eq 2) -and ($r.StdErr -match $case[1])) "usage error: $($case[0] -join ' ')"
+        if (-not (($r.ExitCode -eq 2) -and ($r.StdErr -match $case[1]))) { Write-Host "    exit $($r.ExitCode); stderr: $($r.StdErr)" }
+    }
+
+    # --help after either new subcommand prints the usage and exits 0.
+    foreach ($sub in "retire", "status") {
+        $r = Invoke-Cli @($sub, "--help")
+        Check (($r.ExitCode -eq 0) -and ($r.StdErr -match "hkdfguard retire --service-name")) "$sub --help prints the usage (exit 0)"
+    }
+
+    # A malformed service name is an operational error (exit 1) with the
+    # same message provision and wrap give - for retire before the
+    # elevation check, so it is the same elevated or not.
+    foreach ($sub in "retire", "status") {
+        $extra = if ($sub -eq "retire") { @("--corrupt") } else { @() }
+        $r = Invoke-Cli (@($sub, "-sn", "bad-name") + $extra)
+        Check (($r.ExitCode -eq 1) -and ($r.StdErr -match "must contain only alphanumeric characters or '.'")) "$sub refuses a service name with a hyphen"
+        $r = Invoke-Cli (@($sub, "-sn", ".svc") + $extra)
+        Check (($r.ExitCode -eq 1) -and ($r.StdErr -match "may not start with '.' or contain")) "$sub refuses a service name starting with '.'"
+    }
+
+    # ---- 3c. status for a never-provisioned service: a definite "absent", ----
+    #          exit 0, so scripts can tell "no key" from "can't tell".
+    $absentService = "hkdfguardabsent" + [Guid]::NewGuid().ToString("N")
+    $r = Invoke-Cli @("status", "-sn", $absentService)
+    Check (($r.ExitCode -eq 0) -and ($r.StdOut -match "kek: absent")) "status reports a never-provisioned service as absent (exit 0)"
 
     # ---- 4. wrap: missing a required flag (--dek-stdin). ----
     $keyFile = Join-Path $workDir "missing-dek.key"
@@ -604,6 +657,14 @@ try {
             Check ($pr2.StdOut -match "already provisioned .*; verified") "re-provisioning an existing KEK reports that it verified the key"
         }
 
+        # provision prints the KEK's fingerprint, and status repeats it.
+        $kekFingerprint = $null
+        if ($pr.StdOut -match "fingerprint: ([0-9a-f]{64}) -- ") { $kekFingerprint = $Matches[1] }
+        Check ($null -ne $kekFingerprint) "provision prints the KEK's 64-hex-character fingerprint"
+        $st = Invoke-Cli @("status", "-sn", $serviceName)
+        Check (($st.ExitCode -eq 0) -and ($st.StdOut -match "kek: present") -and ($st.StdOut -match "provider: Microsoft ")) "status reports the provisioned KEK as present, with its provider"
+        Check ($kekFingerprint -and $st.StdOut -match "fingerprint: $kekFingerprint") "status reports the same fingerprint provision printed"
+
         $dekBytes = New-Object byte[] 32
         [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($dekBytes)
         $dekB64 = [Convert]::ToBase64String($dekBytes)
@@ -672,6 +733,8 @@ try {
         if ($r.ExitCode -eq 0) {
             $bytes = [System.IO.File]::ReadAllBytes($happyKeyFile)
             Check ($bytes.Length -eq 132) "CLI-produced wrapped file is 132 bytes"
+            $embedded = -join ($bytes[100..131] | ForEach-Object { $_.ToString("x2") })
+            Check ($embedded -eq $kekFingerprint) "the fingerprint provision printed is the one embedded in the payload (bytes 100..131)"
 
             # The wrap is audited (event 1002) with a SHA-256 of the exact
             # payload written - the value an unwrap event will later repeat.
@@ -699,13 +762,183 @@ try {
             }
         }
 
-        # Clean up the KEK this test created, mirroring test_roundtrip.exe's
-        # own cleanup, so repeated runs don't accumulate persisted keys. Full
-        # path, not just "certutil" - this test's PATH is whatever ctest
-        # baked into its ENVIRONMENT property at configure time (see
-        # tests/CMakeLists.txt), which isn't guaranteed to still resolve
-        # ordinary system tools.
-        if ($providerName) {
+        # ---- 14. retire: refuses anything but the exact KEK, then deletes it. ----
+        #          Doubles as this test's cleanup, so repeated runs don't
+        #          accumulate persisted keys.
+        $retired = $false
+        if ($kekFingerprint) {
+            $wrongFp = if ($kekFingerprint.StartsWith("0")) { "1" + $kekFingerprint.Substring(1) } else { "0" + $kekFingerprint.Substring(1) }
+            $r = Invoke-Cli @("retire", "-sn", $serviceName, "-fp", $wrongFp)
+            Check (($r.ExitCode -eq 1) -and ($r.StdErr -match "fingerprint mismatch") -and ($r.StdErr -match "nothing was deleted")) "retire refuses a wrong fingerprint"
+            $r = Invoke-Cli @("retire", "-sn", $serviceName, "--corrupt")
+            Check (($r.ExitCode -eq 1) -and ($r.StdErr -match "not corrupt; nothing was deleted")) "retire --corrupt refuses a valid KEK"
+            if ($providerName) {
+                $other = if ($providerName -eq "Microsoft Platform Crypto Provider") { "software" } else { "tpm" }
+                $r = Invoke-Cli @("retire", "-sn", $serviceName, "-fp", $kekFingerprint, "--provider", $other)
+                Check (($r.ExitCode -eq 1) -and ($r.StdErr -match "no KEK exists .* on the .*; nothing to retire")) "retire --provider looks only on that provider, and finds nothing there"
+            }
+            $st = Invoke-Cli @("status", "-sn", $serviceName)
+            Check ($st.StdOut -match "kek: present") "the refused retires left the KEK in place"
+
+            $retireStart = (Get-Date).AddSeconds(-2)
+            $r = Invoke-Cli @("retire", "-sn", $serviceName.ToUpperInvariant(), "-fp", $kekFingerprint.ToUpperInvariant())
+            Check (($r.ExitCode -eq 0) -and ($r.StdOut -match "retired KEK for service `"$serviceName`" \(fingerprint $kekFingerprint")) "retire deletes the KEK given its fingerprint (any case, service name normalized)"
+            if ($r.ExitCode -ne 0) { Write-Host "    stderr: $($r.StdErr)" }
+            $retired = $r.ExitCode -eq 0
+            $st = Invoke-Cli @("status", "-sn", $serviceName)
+            Check (($st.ExitCode -eq 0) -and ($st.StdOut -match "kek: absent")) "after retire, status reports the KEK absent"
+            $evt = Find-HkdfEvent -Since $retireStart -Id 1004 -Needle "'$serviceName'"
+            Check ($evt.Count -ge 1) "the retirement is recorded in the Application event log (event 1004)"
+            if ($evt.Count -ge 1) {
+                Check ([string]$evt[0].Properties[0].Value -match $kekFingerprint) "the retirement event names the KEK's fingerprint"
+                Check ($evt[0].UserId.Value -eq $identity.User.Value) "the retirement event records the calling user"
+            }
+            $r = Invoke-Cli @("retire", "-sn", $serviceName, "-fp", $kekFingerprint)
+            Check (($r.ExitCode -eq 1) -and ($r.StdErr -match "nothing to retire")) "retiring an already-retired KEK reports there is nothing to retire"
+        }
+
+        # ---- 15. status and retire against keys this library would never ----
+        #          create: planted directly in the software key store under
+        #          a service's KEK name with .NET's CngKey (machine scope, as
+        #          the library's own keys). They stand in for a corrupt or
+        #          tampered KEK. Each scenario removes its own key.
+        $cng = "System.Security.Cryptography"
+        function Get-KekName([string]$service) { "hkdfguardwin_${service}_v1" }
+        function Remove-PlantedKey([string]$service) {
+            try {
+                $k = [System.Security.Cryptography.CngKey]::Open(
+                    (Get-KekName $service), [System.Security.Cryptography.CngProvider]::MicrosoftSoftwareKeyStorageProvider,
+                    [System.Security.Cryptography.CngKeyOpenOptions]::MachineKey)
+                $k.Delete()
+            } catch { }
+        }
+        function New-PlantedKey([string]$service, [System.Security.Cryptography.CngAlgorithm]$algorithm, [bool]$exportable) {
+            Remove-PlantedKey $service
+            $p = New-Object "$cng.CngKeyCreationParameters"
+            $p.Provider = [System.Security.Cryptography.CngProvider]::MicrosoftSoftwareKeyStorageProvider
+            $p.KeyCreationOptions = [System.Security.Cryptography.CngKeyCreationOptions]::MachineKey
+            $p.ExportPolicy = if ($exportable) { [System.Security.Cryptography.CngExportPolicies]::AllowExport } else { [System.Security.Cryptography.CngExportPolicies]::None }
+            [System.Security.Cryptography.CngKey]::Create($algorithm, (Get-KekName $service), $p).Dispose()
+        }
+        # Under RequireTpm the library never looks at the software key store,
+        # so what status reports for a planted software key depends on the
+        # machine's KeyStoragePolicy. retire looks at both stores directly,
+        # whatever the policy.
+        $storagePolicy = $null
+        try { $storagePolicy = (Get-ItemProperty -Path "HKLM:\Software\Policies\HkdfGuard" -Name KeyStoragePolicy -ErrorAction Stop).KeyStoragePolicy } catch { }
+        $libraryReadsSoftware = ($null -eq $storagePolicy) -or ($storagePolicy -eq 0) -or ($storagePolicy -eq 2)
+
+        # 15a. An RSA key under the name: corrupt. retire --fingerprint
+        #      refuses it (no fingerprint to confirm); retire --corrupt deletes
+        #      it and says the name can be provisioned again.
+        $rsaService = "hkdfguardclitestrsa"
+        try {
+            New-PlantedKey $rsaService ([System.Security.Cryptography.CngAlgorithm]::Rsa) $false
+            $st = Invoke-Cli @("status", "-sn", $rsaService)
+            if ($libraryReadsSoftware) {
+                Check (($st.ExitCode -eq 0) -and ($st.StdOut -match "kek: corrupt \(not a P-256 ECDH key; see retire --corrupt\)")) "status reports an RSA key under the KEK name as corrupt (exit 0)"
+                Check ($st.StdOut -match "key under this name: software: a key of algorithm group RSA") "status says what the corrupt key is"
+            } else {
+                Check (($st.ExitCode -eq 0) -and ($st.StdOut -match "kek: absent") -and ($st.StdOut -match "other key under this name .*software: a key of algorithm group RSA")) "under RequireTpm, status lists the software key as unselected"
+            }
+            $r = Invoke-Cli @("retire", "-sn", $rsaService, "-fp", ("0" * 64))
+            Check (($r.ExitCode -eq 1) -and ($r.StdErr -match "not a P-256 ECDH key, so it has no fingerprint to confirm; if it is genuinely corrupt, retire it with --corrupt")) "retire --fingerprint refuses a key that has no fingerprint, pointing at --corrupt"
+            $corruptStart = (Get-Date).AddSeconds(-2)
+            $r = Invoke-Cli @("retire", "-sn", $rsaService, "--corrupt")
+            Check (($r.ExitCode -eq 0) -and ($r.StdOut -match "retired KEK for service `"$rsaService`" \(corrupt: a key of algorithm group RSA") -and ($r.StdOut -match "can now be provisioned again")) "retire --corrupt deletes a non-P-256 key and says the name can be provisioned again"
+            if ($r.ExitCode -ne 0) { Write-Host "    stderr: $($r.StdErr)" }
+            $st = Invoke-Cli @("status", "-sn", $rsaService)
+            Check (($st.ExitCode -eq 0) -and ($st.StdOut -match "kek: absent") -and ($st.StdOut -notmatch "key under this name")) "after retire --corrupt, nothing remains under the name"
+            $evt = Find-HkdfEvent -Since $corruptStart -Id 1004 -Needle "'$rsaService'"
+            Check (($evt.Count -ge 1) -and ([string]$evt[0].Properties[0].Value -match "corrupt: a key of algorithm group RSA")) "a corrupt-key retirement is recorded as event 1004, saying why the key was corrupt"
+        } catch {
+            Check $false "15a setup: plant an RSA machine key ($($_.Exception.Message))"
+        } finally {
+            Remove-PlantedKey $rsaService
+        }
+
+        # 15b. A P-384 ECDH key: the right algorithm, the wrong size - corrupt too.
+        $p384Service = "hkdfguardclitestp384"
+        try {
+            New-PlantedKey $p384Service ([System.Security.Cryptography.CngAlgorithm]::ECDiffieHellmanP384) $false
+            if ($libraryReadsSoftware) {
+                $st = Invoke-Cli @("status", "-sn", $p384Service)
+                Check (($st.ExitCode -eq 0) -and ($st.StdOut -match "kek: corrupt") -and ($st.StdOut -match "software: a 384-bit ECDH key")) "status reports a P-384 ECDH key under the KEK name as corrupt"
+            }
+            $r = Invoke-Cli @("retire", "-sn", $p384Service, "--corrupt")
+            Check (($r.ExitCode -eq 0) -and ($r.StdOut -match "corrupt: a 384-bit ECDH key")) "retire --corrupt deletes a P-384 ECDH key"
+        } catch {
+            Check $false "15b setup: plant a P-384 machine key ($($_.Exception.Message))"
+        } finally {
+            Remove-PlantedKey $p384Service
+        }
+
+        # 15c. An exportable P-256 ECDH key: has a fingerprint, but the library
+        #      refuses to use it - "unusable". --corrupt refuses it (it is a
+        #      valid P-256 key); --fingerprint retires it.
+        $exportService = "hkdfguardclitestexport"
+        try {
+            New-PlantedKey $exportService ([System.Security.Cryptography.CngAlgorithm]::ECDiffieHellmanP256) $true
+            $st = Invoke-Cli @("status", "-sn", $exportService)
+            $plantedFp = $null
+            if ($st.StdOut -match "software: fingerprint ([0-9a-f]{64})") { $plantedFp = $Matches[1] }
+            Check ($null -ne $plantedFp) "status prints the fingerprint of a P-256 key it finds under the name"
+            if ($libraryReadsSoftware) {
+                Check (($st.ExitCode -eq 0) -and ($st.StdOut -match "kek: unusable \(")) "status reports an exportable P-256 key as unusable (exit 0)"
+            }
+            $r = Invoke-Cli @("retire", "-sn", $exportService, "--corrupt")
+            Check (($r.ExitCode -eq 1) -and ($r.StdErr -match "is a valid P-256 ECDH key \(fingerprint $plantedFp\), not corrupt; nothing was deleted")) "retire --corrupt refuses an unusable but valid P-256 key"
+            if ($plantedFp) {
+                $r = Invoke-Cli @("retire", "-sn", $exportService, "-fp", $plantedFp)
+                Check (($r.ExitCode -eq 0) -and ($r.StdOut -match "retired KEK for service `"$exportService`" \(fingerprint $plantedFp")) "retire --fingerprint deletes an unusable P-256 key"
+            }
+        } catch {
+            Check $false "15c setup: plant an exportable P-256 machine key ($($_.Exception.Message))"
+        } finally {
+            Remove-PlantedKey $exportService
+        }
+
+        # 15d. A key on both providers: a TPM KEK (provisioned normally) plus
+        #      a P-256 key planted in the software store under the same name.
+        #      Only possible where provision lands on the TPM.
+        $bothService = "hkdfguardclitestboth"
+        $tpmFp = $null
+        try {
+            $pb = Invoke-Cli @("provision", "-sn", $bothService)
+            if ($pb.StdOut -match "fingerprint: ([0-9a-f]{64}) -- ") { $tpmFp = $Matches[1] }
+            $st = Invoke-Cli @("status", "-sn", $bothService)
+            if ($tpmFp -and $st.StdOut -match "provider: Microsoft Platform Crypto Provider") {
+                New-PlantedKey $bothService ([System.Security.Cryptography.CngAlgorithm]::ECDiffieHellmanP256) $false
+                $st = Invoke-Cli @("status", "-sn", $bothService)
+                $swFp = $null
+                if ($st.StdOut -match "other key under this name \(not selected by the KeyStoragePolicy\): software: fingerprint ([0-9a-f]{64})") { $swFp = $Matches[1] }
+                Check (($st.ExitCode -eq 0) -and ($st.StdOut -match "fingerprint: $tpmFp") -and $swFp) "status reports the selected TPM KEK and lists the unselected software key"
+
+                $r = Invoke-Cli @("retire", "-sn", $bothService, "-fp", $tpmFp)
+                Check (($r.ExitCode -eq 1) -and ($r.StdErr -match "on both providers .*refusing to choose which one to delete -- nothing was deleted") -and ($r.StdErr -match "--provider tpm or --provider software")) "retire refuses to choose between keys on both providers"
+                $r = Invoke-Cli @("retire", "-sn", $bothService, "-fp", $tpmFp, "--provider", "software")
+                Check (($r.ExitCode -eq 1) -and ($r.StdErr -match "fingerprint mismatch")) "retire --provider software checks the software key's own fingerprint"
+                if ($swFp) {
+                    $r = Invoke-Cli @("retire", "-sn", $bothService, "-fp", $swFp, "--provider", "software")
+                    Check (($r.ExitCode -eq 0) -and ($r.StdOut -match "note: service `"$bothService`" still has a key on the other provider \(tpm: fingerprint $tpmFp\)")) "retiring one provider's key leaves the other, and says so"
+                }
+                $r = Invoke-Cli @("retire", "-sn", $bothService, "-fp", $tpmFp, "--provider", "tpm")
+                Check (($r.ExitCode -eq 0) -and ($r.StdOut -notmatch "still has a key")) "retire --provider tpm then deletes the TPM KEK"
+            } else {
+                Write-Host "[SKIP] both-providers retire scenario: provision did not create a TPM KEK on this machine"
+            }
+        } catch {
+            Check $false "15d setup ($($_.Exception.Message))"
+        } finally {
+            Remove-PlantedKey $bothService
+            if ($tpmFp) { Invoke-Cli @("retire", "-sn", $bothService, "-fp", $tpmFp) | Out-Null }
+        }
+
+        # Fallback cleanup, if retire couldn't run. Full path, not just
+        # "certutil" - this test's PATH is whatever ctest baked into its
+        # ENVIRONMENT property at configure time (see tests/CMakeLists.txt),
+        # which isn't guaranteed to still resolve ordinary system tools.
+        if ($providerName -and -not $retired) {
             # Matches kek_store.cpp's KeyName(): every piece is lowercase, and
             # $serviceName is already lowercase.
             $keyName = "hkdfguardwin_${serviceName}_v1"
@@ -713,7 +946,11 @@ try {
             & $certutilPath -csp $providerName -delkey $keyName | Out-Null
         }
     } else {
-        Write-Host "[INFO] skipping provision/full-wrap/--force scenarios: not elevated (machine-wide KEK creation requires Administrator)"
+        Write-Host "[INFO] skipping provision/full-wrap/--force/retire scenarios: not elevated (machine-wide KEK creation requires Administrator)"
+
+        # retire refuses up front without elevation, before looking at any key.
+        $r = Invoke-Cli @("retire", "-sn", "hkdfguardclitest", "-fp", ("0" * 64))
+        Check (($r.ExitCode -eq 1) -and ($r.StdErr -match "retire must run from an elevated prompt")) "retire without elevation is refused"
 
         # ---- 13b. Not elevated: a provision attempt is refused, and the ----
         #           refusal is recorded in the Application event log (event

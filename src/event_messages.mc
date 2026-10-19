@@ -36,6 +36,14 @@ Language=English
 %1
 .
 
+; // Written by hkdfguard.exe retire (tools/hkdfguard_cli.cpp), which is the
+; // only code that deletes a KEK; the library itself never writes it.
+MessageId=1004
+SymbolicName=HKDFGUARD_EVT_KEK_RETIRED
+Language=English
+%1
+.
+
 MessageId=2000
 SymbolicName=HKDFGUARD_EVT_ACCESS_DENIED
 Language=English

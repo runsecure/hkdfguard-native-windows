@@ -1,14 +1,33 @@
-// CLI tool: provisions a service's machine-wide KEK, and separately wraps a
+// CLI tool: provisions a service's machine-wide KEK, separately wraps a
 // caller-supplied Data Encryption Key (DEK) under an already-provisioned
-// KEK, writing the wrapped payload to a file.
+// KEK, writing the wrapped payload to a file, and retires (deletes) a KEK
+// once nothing needs it.
 //
-// Two subcommands, strictly separated:
+// Four subcommands, strictly separated:
 //
 //   provision --service-name|-sn <name>
 //       Calls hkdfguard_create_kek, which creates the KEK if it is missing
-//       or re-verifies an existing one (properties and ACL). Never wraps a
-//       DEK, never touches a file.
+//       or re-verifies an existing one (properties and ACL), then prints
+//       its fingerprint (hkdfguard_kek_fingerprint) for the operator to
+//       record. Never wraps a DEK, never touches a file.
 //       This is the *only* subcommand that may create a KEK.
+//
+//   retire --service-name|-sn <name> (--fingerprint|-fp <hex> | --corrupt)
+//          [--provider tpm|software]
+//       Deletes the service's KEK, after the operator proves which KEK they
+//       mean by supplying its fingerprint - or, with --corrupt, only if the
+//       key under the service's name is not a P-256 ECDH key at all, so has
+//       no fingerprint. The *only* subcommand that deletes keys, and
+//       deliberately implemented here rather than in the library: the DLL's
+//       C ABI offers no delete, so no application that loads it gets a
+//       one-call wipe. Requires an elevated process. Every payload wrapped
+//       under a retired KEK is permanently unrecoverable. Logged as event
+//       1004. The macOS tool's retire, with --provider added because a
+//       Windows service can have a KEK on each of two providers.
+//
+//   status --service-name|-sn <name>
+//       Reports whether the service has a KEK, which provider holds it, and
+//       its fingerprint. Read-only: never creates or deletes a key.
 //
 //   wrap --key-file-path|-kf <path> --service-name|-sn <name> \
 //        (--dek-stdin | --dek-file <path>) [--group|-g <name>] [--force|-f]
@@ -23,9 +42,12 @@
 //       of this process, unlike a plain --dek=<value> argument would be.
 //
 // Calls into HkdfGuard.dll through its stable C ABI - hkdfguard_kek_exists,
-// hkdfguard_create_kek, and hkdfguard_wrap_dek - the same interface any
-// other-language caller uses; this tool links only against
-// include/hkdfguard.h and the hkdfguard import library, nothing from src/.
+// hkdfguard_create_kek, hkdfguard_kek_fingerprint and hkdfguard_wrap_dek -
+// the same interface any other-language caller uses; this tool links only
+// against include/hkdfguard.h and the hkdfguard import library, nothing from
+// src/. The one exception is retire/status's direct NCrypt access to the
+// KEK's persisted key (see "KEK inspection and retirement" below): the ABI
+// deliberately has no way to delete a key or address one provider's copy.
 //
 // The KEK's `service` identity is exactly --service-name's value, passed
 // straight through to the hkdfguard_* calls as `service`, and shared
@@ -75,9 +97,11 @@
 #include <windows.h>
 #include <aclapi.h> // SetSecurityInfo - protecting the key file's DACL on its handle
 #include <bcrypt.h>
+#include <ncrypt.h> // retire/status: opening, inspecting and deleting the persisted KEK
 #include <sddl.h> // ConvertStringSidToSidA - over-broad --group check
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -89,6 +113,7 @@
 #include <vector>
 
 #pragma comment(lib, "bcrypt.lib")
+#pragma comment(lib, "ncrypt.lib")
 #pragma comment(lib, "advapi32.lib")
 
 namespace {
@@ -201,6 +226,23 @@ namespace {
         std::optional<std::string> dekFile; // --dek-file: read the DEK from this file instead of stdin
     };
 
+    constexpr size_t kFingerprintLen = HKDFGUARD_KEK_FINGERPRINT_LEN;
+    using Fingerprint = std::array<uint8_t, kFingerprintLen>;
+
+    // The two key storage providers a service's KEK can live on.
+    enum class KekProvider { Tpm, Software };
+
+    struct RetireArgs {
+        std::string serviceName;
+        std::optional<Fingerprint> fingerprint; // --fingerprint: a valid KEK, by its fingerprint
+        bool corrupt = false;                   // --corrupt: a key under the name that isn't a P-256 ECDH key
+        std::optional<KekProvider> provider;    // --provider: which provider's key, when both have one
+    };
+
+    struct StatusArgs {
+        std::string serviceName;
+    };
+
     enum class ParseOutcome { Run, Help };
 
     // The one usage text, printed for every help request and after every
@@ -213,13 +255,24 @@ namespace {
             L"  %ls provision --service-name|-sn <name>\n"
             L"  %ls wrap --key-file-path|-kf <path> --service-name|-sn <name> (--dek-stdin | --dek-file <path>)\n"
             L"       [--group|-g <name>] [--force|-f]\n"
+            L"  %ls retire --service-name|-sn <name> (--fingerprint|-fp <hex> | --corrupt)\n"
+            L"       [--provider tpm|software]\n"
+            L"  %ls status --service-name|-sn <name>\n"
             L"\n"
             L"provision  ensures a KEK exists for the service. Run once, at deployment time, from an\n"
-            L"           elevated prompt; this is the only command that makes the (deliberately slow)\n"
-            L"           setup calls.\n"
+            L"           elevated prompt; this is the only command that creates keys. Prints the\n"
+            L"           KEK's fingerprint -- record it.\n"
             L"wrap       wraps a DEK under the service's existing KEK and writes the payload to\n"
             L"           --key-file-path, readable by its owner only, or also by --group's\n"
             L"           members (read-only). Fails if the KEK has not been provisioned.\n"
+            L"retire     deletes the service's KEK, only if its fingerprint matches <hex> (64 hex\n"
+            L"           characters, as printed by provision). The only command that deletes keys;\n"
+            L"           needs an elevated prompt. Everything wrapped under that KEK becomes\n"
+            L"           permanently unrecoverable: migrate to a new service name first. With\n"
+            L"           --corrupt instead, deletes the key only if it is not a P-256 ECDH key at\n"
+            L"           all. --provider picks the key when both providers hold one.\n"
+            L"status     reports whether the service has a KEK, which provider holds it, and its\n"
+            L"           fingerprint. Read-only: never creates or deletes anything.\n"
             L"\n"
             L"The DEK is base64 of exactly 32 bytes, read from stdin or a file -- never\n"
             L"from a command-line argument or an environment variable, both of which are\n"
@@ -228,9 +281,16 @@ namespace {
             L"Examples:\n"
             L"  %ls provision -sn svc\n"
             L"  $dekBase64 | %ls wrap -kf C:\\ProgramData\\app\\key.bin -sn svc --dek-stdin\n"
-            L"  %ls wrap -kf C:\\ProgramData\\app\\key.bin -sn svc --dek-file C:\\ProgramData\\app\\dek.b64\n",
-            kProgramName, kProgramName, kProgramName, kProgramName, kProgramName);
+            L"  %ls wrap -kf C:\\ProgramData\\app\\key.bin -sn svc --dek-file C:\\ProgramData\\app\\dek.b64\n"
+            L"  %ls status -sn svc\n"
+            L"  %ls retire -sn svc -fp <fingerprint printed by provision>\n",
+            kProgramName, kProgramName, kProgramName, kProgramName, kProgramName, kProgramName, kProgramName,
+            kProgramName, kProgramName);
     }
+
+    // The subcommand list every "missing/unknown subcommand" error names -
+    // the macOS tool's wording.
+    constexpr char kSubcommandList[] = "`provision`, `wrap`, `retire` or `status`";
 
     // Stores a flag's value, refusing a second one rather than letting the
     // last win: `-kf a.key ... -kf b.key` is ambiguous about which file the
@@ -360,6 +420,120 @@ namespace {
         out.force = force;
         out.dekStdin = dekStdin;
         out.dekFile = dekFile;
+        return ParseOutcome::Run;
+    }
+
+    // Exactly 64 hex digits, either case. No separators or prefixes: the
+    // value is meant to be pasted from provision's output, and a strict
+    // format keeps a truncated paste from ever looking valid. The macOS
+    // tool's parseFingerprintHex.
+    Fingerprint ParseFingerprintHex(const std::string &text) {
+        if (text.size() != kFingerprintLen * 2) {
+            throw CliError(
+                "--fingerprint must be exactly " + std::to_string(kFingerprintLen * 2) + " hex characters, got " +
+                std::to_string(text.size()));
+        }
+        auto nibble = [](char c) -> int {
+            if (c >= '0' && c <= '9') return c - '0';
+            if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+            if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+            return -1;
+        };
+        Fingerprint bytes{};
+        for (size_t i = 0; i < kFingerprintLen; ++i) {
+            int hi = nibble(text[2 * i]);
+            int lo = nibble(text[2 * i + 1]);
+            if (hi < 0 || lo < 0) {
+                throw CliError("--fingerprint must contain only hex characters (0-9, a-f)");
+            }
+            bytes[i] = static_cast<uint8_t>((hi << 4) | lo);
+        }
+        return bytes;
+    }
+
+    // Reads a flag's value (argv[i + 1]), refusing a missing or empty one.
+    std::string FlagValue(int argc, char *argv[], int &i, const std::string &flag, const char *longName) {
+        if (i + 1 >= argc) {
+            throw CliError(flag + " requires a value");
+        }
+        std::string value = argv[++i];
+        if (value.empty()) {
+            throw CliError(std::string(longName) + " must not be empty");
+        }
+        return value;
+    }
+
+    // Same argv[2]-onward convention as ParseProvisionArgs above.
+    ParseOutcome ParseRetireArgs(int argc, char *argv[], RetireArgs &out) {
+        std::optional<std::string> serviceName;
+        std::optional<std::string> fingerprintText;
+        std::optional<std::string> providerText;
+        bool corrupt = false;
+
+        for (int i = 2; i < argc; ++i) {
+            std::string arg = argv[i];
+            if (arg == "--help" || arg == "-h") {
+                return ParseOutcome::Help;
+            } else if (arg == "--service-name" || arg == "-sn") {
+                SetOnce(serviceName, "--service-name", FlagValue(argc, argv, i, arg, "--service-name"));
+            } else if (arg == "--fingerprint" || arg == "-fp") {
+                SetOnce(fingerprintText, "--fingerprint", FlagValue(argc, argv, i, arg, "--fingerprint"));
+            } else if (arg == "--provider") {
+                SetOnce(providerText, "--provider", FlagValue(argc, argv, i, arg, "--provider"));
+            } else if (arg == "--corrupt") {
+                if (corrupt) {
+                    throw CliError("give --corrupt at most once");
+                }
+                corrupt = true;
+            } else {
+                throw CliError("unrecognized argument for `retire`: " + arg);
+            }
+        }
+
+        if (!serviceName) throw CliError("retire: missing required --service-name|-sn");
+        if (fingerprintText && corrupt) {
+            throw CliError(
+                "retire: --fingerprint and --corrupt are mutually exclusive: a KEK with a readable fingerprint is "
+                "not corrupt");
+        }
+        if (!fingerprintText && !corrupt) {
+            throw CliError(
+                "retire: missing required --fingerprint|-fp (the 64-hex-character value printed by provision), or "
+                "--corrupt for a key that is not a P-256 ECDH key");
+        }
+
+        out.serviceName = *serviceName;
+        out.corrupt = corrupt;
+        if (fingerprintText) {
+            out.fingerprint = ParseFingerprintHex(*fingerprintText);
+        }
+        if (providerText) {
+            if (*providerText == "tpm") {
+                out.provider = KekProvider::Tpm;
+            } else if (*providerText == "software") {
+                out.provider = KekProvider::Software;
+            } else {
+                throw CliError("--provider must be `tpm` or `software`, got \"" + *providerText + "\"");
+            }
+        }
+        return ParseOutcome::Run;
+    }
+
+    // Same argv[2]-onward convention as ParseProvisionArgs above.
+    ParseOutcome ParseStatusArgs(int argc, char *argv[], StatusArgs &out) {
+        std::optional<std::string> serviceName;
+        for (int i = 2; i < argc; ++i) {
+            std::string arg = argv[i];
+            if (arg == "--help" || arg == "-h") {
+                return ParseOutcome::Help;
+            } else if (arg == "--service-name" || arg == "-sn") {
+                SetOnce(serviceName, "--service-name", FlagValue(argc, argv, i, arg, "--service-name"));
+            } else {
+                throw CliError("unrecognized argument for `status`: " + arg);
+            }
+        }
+        if (!serviceName) throw CliError("status: missing required --service-name|-sn");
+        out.serviceName = *serviceName;
         return ParseOutcome::Run;
     }
 
@@ -708,7 +882,8 @@ namespace {
     // over-broad principal). Skipping it whenever hkdfguard_kek_exists said
     // "yes" would let a pre-planted or later-widened KEK pass provisioning
     // unchecked. hkdfguard_kek_exists only chooses the message printed.
-    void EnsureKekProvisioned(const std::string &service) {
+    // Returns true if this call created the KEK.
+    bool EnsureKekProvisioned(const std::string &service) {
         int32_t exists = 0;
         int32_t rc = hkdfguard_kek_exists(service.c_str(), &exists);
         if (rc != HKDFGUARD_OK) {
@@ -737,6 +912,34 @@ namespace {
         } else {
             fprintf(stdout, "KEK provisioned for service \"%s\"\n", service.c_str());
         }
+        return exists == 0;
+    }
+
+    std::string HexString(const uint8_t *bytes, size_t len) {
+        static const char kDigits[] = "0123456789abcdef";
+        std::string out;
+        out.reserve(len * 2);
+        for (size_t i = 0; i < len; ++i) {
+            out.push_back(kDigits[bytes[i] >> 4]);
+            out.push_back(kDigits[bytes[i] & 0x0F]);
+        }
+        return out;
+    }
+
+    std::string HexString(const Fingerprint &fp) {
+        return HexString(fp.data(), fp.size());
+    }
+
+    // The library's answer for the KEK `service` resolves to - the one a
+    // wrap would use (hkdfguard_kek_fingerprint). Returns the status code;
+    // `out` is filled only on HKDFGUARD_OK.
+    int32_t ReadKekFingerprint(const std::string &service, Fingerprint &out) {
+        int32_t len = static_cast<int32_t>(out.size());
+        int32_t rc = hkdfguard_kek_fingerprint(service.c_str(), out.data(), &len);
+        if (rc == HKDFGUARD_OK && len != static_cast<int32_t>(out.size())) {
+            return HKDFGUARD_ERR_INTERNAL_ERROR;
+        }
+        return rc;
     }
 
     // Enforces that --service-name - the exact value passed to
@@ -1695,13 +1898,486 @@ namespace {
         ReadBoundedInto(file.get(), "--dek-file", scratch);
     }
 
+    // MARK: - KEK inspection and retirement (retire and status only)
+    //
+    // The library's ABI answers for "the KEK this service resolves to under
+    // the KeyStoragePolicy", and deliberately cannot delete anything. Retire
+    // needs more than that: the exact persisted key on one specific
+    // provider, opened once, checked, and deleted through that same handle.
+    // So this section opens the key directly with NCrypt, exactly as
+    // kek_store.cpp does (machine scope, silent), and nothing here ever
+    // creates or modifies a key.
+
+    // RAII for an NCrypt provider or key handle - this tool's own copy of
+    // src/handle_traits.h's, for the same reason as ScopedFileHandle above.
+    class ScopedNCryptHandle {
+    public:
+        ScopedNCryptHandle() = default;
+        ~ScopedNCryptHandle() { reset(); }
+        ScopedNCryptHandle(const ScopedNCryptHandle &) = delete;
+        ScopedNCryptHandle &operator=(const ScopedNCryptHandle &) = delete;
+        ScopedNCryptHandle(ScopedNCryptHandle &&other) noexcept : handle_(other.release()) {
+        }
+        ScopedNCryptHandle &operator=(ScopedNCryptHandle &&other) noexcept {
+            if (this != &other) {
+                reset();
+                handle_ = other.release();
+            }
+            return *this;
+        }
+
+        void reset() {
+            if (handle_ != 0) {
+                NCryptFreeObject(handle_);
+                handle_ = 0;
+            }
+        }
+        // Forgets the handle without freeing it - for NCryptDeleteKey, which
+        // frees the handle itself, even when it fails.
+        NCRYPT_HANDLE release() {
+            NCRYPT_HANDLE h = handle_;
+            handle_ = 0;
+            return h;
+        }
+        NCRYPT_HANDLE get() const { return handle_; }
+        NCRYPT_HANDLE *put() {
+            reset();
+            return &handle_;
+        }
+
+    private:
+        NCRYPT_HANDLE handle_ = 0;
+    };
+
+    LPCWSTR NCryptProviderName(KekProvider p) {
+        return p == KekProvider::Tpm ? MS_PLATFORM_CRYPTO_PROVIDER : MS_KEY_STORAGE_PROVIDER;
+    }
+
+    const char *ProviderLabel(KekProvider p) {
+        return p == KekProvider::Tpm ? "Microsoft Platform Crypto Provider (TPM)"
+                                     : "Microsoft Software Key Storage Provider";
+    }
+
+    const char *ProviderFlag(KekProvider p) {
+        return p == KekProvider::Tpm ? "tpm" : "software";
+    }
+
+    // The persisted name of `service`'s KEK. Must equal kek_store.cpp's
+    // KeyName(service, kCurrentKeyId) - a FROZEN format there. `service` is
+    // already validated and lowercased, so the widen is exact.
+    std::wstring KekKeyName(const std::string &service) {
+        return L"hkdfguardwin_" + std::wstring(service.begin(), service.end()) + L"_v1";
+    }
+
+    std::string NCryptErrorText(SECURITY_STATUS status) {
+        char code[16];
+        snprintf(code, sizeof(code), "0x%08lX", static_cast<unsigned long>(status));
+        return FormatWin32Error(static_cast<DWORD>(status)) + " (" + code + ")";
+    }
+
+#ifndef TBS_E_TPM_NOT_FOUND
+#define TBS_E_TPM_NOT_FOUND ((SECURITY_STATUS)0x8028400FL)
+#endif
+
+    struct OpenedKek {
+        KekProvider provider;
+        ScopedNCryptHandle storage; // kept open for as long as the key handle
+        ScopedNCryptHandle key;
+    };
+
+    // Opens `service`'s KEK on `provider`, or returns nullopt when that
+    // provider definitely holds none: the key name doesn't exist there
+    // (NTE_BAD_KEYSET), or - TPM only - this machine has no usable TPM
+    // provider at all, so nothing can be stored on it. Anything else
+    // (access denied, a TPM that is busy or errors) throws: a key may well
+    // be there, and "can't tell" must never be reported as "absent".
+    std::optional<OpenedKek> OpenKekDirect(const std::string &service, KekProvider provider) {
+        OpenedKek result{provider, {}, {}};
+        SECURITY_STATUS status = NCryptOpenStorageProvider(
+            reinterpret_cast<NCRYPT_PROV_HANDLE *>(result.storage.put()), NCryptProviderName(provider), 0);
+        if (status != ERROR_SUCCESS) {
+            if (provider == KekProvider::Tpm) {
+                return std::nullopt;
+            }
+            throw CliError(
+                std::string("cannot open the ") + ProviderLabel(provider) + ": " + NCryptErrorText(status));
+        }
+
+        std::wstring name = KekKeyName(service);
+        status = NCryptOpenKey(
+            static_cast<NCRYPT_PROV_HANDLE>(result.storage.get()),
+            reinterpret_cast<NCRYPT_KEY_HANDLE *>(result.key.put()), name.c_str(), 0,
+            NCRYPT_MACHINE_KEY_FLAG | NCRYPT_SILENT_FLAG);
+        if (status == ERROR_SUCCESS) {
+            return std::optional<OpenedKek>(std::move(result));
+        }
+        if (status == NTE_BAD_KEYSET) {
+            return std::nullopt;
+        }
+        if (provider == KekProvider::Tpm && (status == TBS_E_TPM_NOT_FOUND || status == NTE_DEVICE_NOT_FOUND)) {
+            return std::nullopt;
+        }
+        if (status == NTE_PERM || status == static_cast<SECURITY_STATUS>(ERROR_ACCESS_DENIED)) {
+            throw CliError(
+                "a KEK for service \"" + service + "\" exists on the " + ProviderLabel(provider) +
+                ", but this account may not open it (run from an elevated prompt)");
+        }
+        throw CliError(
+            "cannot inspect the KEK for service \"" + service + "\" on the " + ProviderLabel(provider) + ": " +
+            NCryptErrorText(status));
+    }
+
+    // What a persisted key under a service's name turned out to be.
+    struct KeyInspection {
+        bool isP256Ecdh = false;
+        Fingerprint fingerprint{}; // valid only when isP256Ecdh
+        std::string description;   // what it is instead, when not
+    };
+
+    // Reads `key`'s algorithm group, length and public key. A P-256 ECDH key
+    // gets its fingerprint, computed exactly as the library's
+    // ComputeKekFingerprint does: SHA-256 of the raw X || Y coordinates.
+    // Anything else is reported as such - but only on a *definite* answer
+    // (the properties read fine and describe another kind of key). A query
+    // that fails throws instead, so a key that merely couldn't be read right
+    // now is never classified as corrupt and deleted for it.
+    KeyInspection InspectKey(NCRYPT_KEY_HANDLE key, const std::string &where) {
+        KeyInspection result;
+
+        wchar_t group[64] = {};
+        DWORD cb = 0;
+        SECURITY_STATUS status = NCryptGetProperty(
+            key, NCRYPT_ALGORITHM_GROUP_PROPERTY, reinterpret_cast<PBYTE>(group),
+            sizeof(group) - sizeof(wchar_t), &cb, 0);
+        if (status != ERROR_SUCCESS) {
+            throw CliError("cannot read the algorithm of " + where + ": " + NCryptErrorText(status));
+        }
+        if (wcscmp(group, NCRYPT_ECDH_ALGORITHM_GROUP) != 0) {
+            std::string narrow;
+            for (const wchar_t *c = group; *c != L'\0'; ++c) {
+                narrow.push_back(*c >= 0x20 && *c < 0x7F ? static_cast<char>(*c) : '?');
+            }
+            result.description = "a key of algorithm group " + (narrow.empty() ? std::string("(unnamed)") : narrow);
+            return result;
+        }
+
+        DWORD length = 0;
+        status = NCryptGetProperty(key, NCRYPT_LENGTH_PROPERTY, reinterpret_cast<PBYTE>(&length), sizeof(length), &cb, 0);
+        if (status != ERROR_SUCCESS) {
+            throw CliError("cannot read the key length of " + where + ": " + NCryptErrorText(status));
+        }
+        if (length != 256) {
+            result.description = "a " + std::to_string(length) + "-bit ECDH key";
+            return result;
+        }
+
+        cb = 0;
+        status = NCryptExportKey(key, 0, BCRYPT_ECCPUBLIC_BLOB, nullptr, nullptr, 0, &cb, 0);
+        std::vector<BYTE> blob;
+        if (status == ERROR_SUCCESS && cb >= sizeof(BCRYPT_ECCKEY_BLOB)) {
+            blob.resize(cb);
+            status = NCryptExportKey(key, 0, BCRYPT_ECCPUBLIC_BLOB, nullptr, blob.data(), cb, &cb, 0);
+        }
+        if (status != ERROR_SUCCESS || cb < sizeof(BCRYPT_ECCKEY_BLOB)) {
+            throw CliError(
+                "cannot export the public key of " + where + ": " +
+                (status != ERROR_SUCCESS ? NCryptErrorText(status) : std::string("short blob")));
+        }
+        const auto *header = reinterpret_cast<const BCRYPT_ECCKEY_BLOB *>(blob.data());
+        constexpr size_t kPointLen = 64;
+        if (header->dwMagic != BCRYPT_ECDH_PUBLIC_P256_MAGIC || header->cbKey != 32 ||
+            cb < sizeof(BCRYPT_ECCKEY_BLOB) + kPointLen) {
+            result.description = "a 256-bit ECDH key on a curve other than P-256";
+            return result;
+        }
+
+        NTSTATUS hs = BCryptHash(
+            BCRYPT_SHA256_ALG_HANDLE, nullptr, 0, blob.data() + sizeof(BCRYPT_ECCKEY_BLOB),
+            static_cast<ULONG>(kPointLen), result.fingerprint.data(), static_cast<ULONG>(result.fingerprint.size()));
+        if (!BCRYPT_SUCCESS(hs)) {
+            throw CliError("cannot hash the public key of " + where + ": " + FormatWin32Error(static_cast<DWORD>(hs)));
+        }
+        result.isP256Ecdh = true;
+        return result;
+    }
+
+    // Every persisted key under `service`'s name, on both providers, in that
+    // order, each opened and inspected. `only` restricts it to one.
+    struct FoundKek {
+        OpenedKek opened;
+        KeyInspection inspection;
+    };
+
+    std::vector<FoundKek> FindKeks(const std::string &service, std::optional<KekProvider> only = std::nullopt) {
+        std::vector<FoundKek> found;
+        for (KekProvider p : {KekProvider::Tpm, KekProvider::Software}) {
+            if (only && *only != p) {
+                continue;
+            }
+            std::optional<OpenedKek> opened = OpenKekDirect(service, p);
+            if (!opened) {
+                continue;
+            }
+            std::string where = std::string("the KEK for service \"") + service + "\" on the " + ProviderLabel(p);
+            KeyInspection inspection = InspectKey(static_cast<NCRYPT_KEY_HANDLE>(opened->key.get()), where);
+            found.push_back(FoundKek{std::move(*opened), std::move(inspection)});
+        }
+        return found;
+    }
+
+    std::string DescribeFound(const FoundKek &k) {
+        return std::string(ProviderFlag(k.opened.provider)) + ": " +
+               (k.inspection.isP256Ecdh ? "fingerprint " + HexString(k.inspection.fingerprint)
+                                        : k.inspection.description);
+    }
+
+    bool ProcessIsElevated() {
+        HANDLE token = nullptr;
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+            return false;
+        }
+        TOKEN_ELEVATION elevation{};
+        DWORD size = 0;
+        bool elevated = GetTokenInformation(token, TokenElevation, &elevation, sizeof(elevation), &size) &&
+                        elevation.TokenIsElevated != 0;
+        CloseHandle(token);
+        return elevated;
+    }
+
+    // Records the retirement as event 1004 (warning) under the library's
+    // event source, with this account as the event's user - the same shape
+    // as the library's own events (src/event_log.cpp). Returns false if the
+    // event could not be written; the caller says so, since a deletion
+    // nobody can later find in the log is worth an operator's attention.
+    bool LogKekRetired(const std::string &text) {
+        constexpr DWORD kEvtKekRetired = 1004; // src/event_messages.mc
+        HANDLE source = RegisterEventSourceW(nullptr, L"hkdfguard-native-windows");
+        if (source == nullptr) {
+            return false;
+        }
+        std::wstring full(text.begin(), text.end());
+        wchar_t exe[MAX_PATH] = {};
+        DWORD n = GetModuleFileNameW(nullptr, exe, MAX_PATH);
+        full += L" Process: " + std::wstring(n > 0 && n < MAX_PATH ? exe : L"(unknown)") + L" (PID " +
+                std::to_wstring(GetCurrentProcessId()) + L").";
+        LPCWSTR strings[1] = {full.c_str()};
+        std::vector<BYTE> sid;
+        try {
+            sid = GetProcessUserSid();
+        } catch (const CliError &) {
+            sid.clear();
+        }
+        BOOL ok = ReportEventW(
+            source, EVENTLOG_WARNING_TYPE, 0, kEvtKekRetired, sid.empty() ? nullptr : sid.data(), 1, 0, strings,
+            nullptr);
+        DeregisterEventSource(source);
+        return ok != FALSE;
+    }
+
+    // Lowercases an already-ValidateServiceCharset-checked name: the exact
+    // form the library stores and names its keys by.
+    std::string LowercaseService(const std::string &service) {
+        std::string out = service;
+        for (char &c : out) {
+            if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+        }
+        return out;
+    }
+
+    // MARK: - Run: status
+
+    // Read-only. Exits 0 whenever there was a definite answer (present,
+    // absent, corrupt or unusable) and 1 when there wasn't (access denied, a
+    // provider error), so scripts can tell "no key" from "can't tell" - the
+    // macOS tool's rule.
+    void RunStatus(const StatusArgs &args) {
+        ValidateServiceCharset(args.serviceName);
+        const std::string service = LowercaseService(args.serviceName);
+        fprintf(stdout, "service: %s\n", service.c_str());
+
+        int32_t exists = 0;
+        int32_t rc = hkdfguard_kek_exists(service.c_str(), &exists);
+        if (rc != HKDFGUARD_OK) {
+            throw CliError("could not determine the KEK state for service \"" + service + "\": " + DescribeStatus(rc));
+        }
+        std::vector<FoundKek> found = FindKeks(service);
+
+        if (exists == 0) {
+            fprintf(stdout, "kek: absent\n");
+        } else {
+            Fingerprint fp{};
+            rc = ReadKekFingerprint(service, fp);
+            if (rc == HKDFGUARD_ERR_PROVIDER_ERROR && !found.empty()) {
+                // A key exists under the name but fails the library's
+                // property checks, so the library won't say which one it
+                // selected. List what is there instead of guessing.
+                bool anyP256 = false;
+                for (const FoundKek &k : found) {
+                    anyP256 = anyP256 || k.inspection.isP256Ecdh;
+                }
+                if (anyP256) {
+                    fprintf(stdout, "kek: unusable (%s)\n", DescribeStatus(rc).c_str());
+                } else {
+                    fprintf(stdout, "kek: corrupt (not a P-256 ECDH key; see retire --corrupt)\n");
+                }
+                for (const FoundKek &k : found) {
+                    fprintf(stdout, "key under this name: %s\n", DescribeFound(k).c_str());
+                }
+                return;
+            }
+            if (rc != HKDFGUARD_OK) {
+                throw CliError(
+                    "a KEK exists for service \"" + service + "\" but its fingerprint could not be read: " +
+                    DescribeStatus(rc));
+            }
+
+            fprintf(stdout, "kek: present\n");
+            for (auto it = found.begin(); it != found.end(); ++it) {
+                if (it->inspection.isP256Ecdh && it->inspection.fingerprint == fp) {
+                    fprintf(stdout, "provider: %s\n", ProviderLabel(it->opened.provider));
+                    found.erase(it);
+                    break;
+                }
+            }
+            fprintf(stdout, "fingerprint: %s\n", HexString(fp).c_str());
+        }
+
+        // A key on a provider the KeyStoragePolicy doesn't select is unused
+        // today but would be picked up if the policy changed - worth seeing.
+        for (const FoundKek &k : found) {
+            fprintf(stdout, "other key under this name (not selected by the KeyStoragePolicy): %s\n",
+                    DescribeFound(k).c_str());
+        }
+    }
+
+    // MARK: - Run: retire
+
+    // Deletes `service`'s KEK on one provider, only after confirming it is
+    // the key the operator means: by fingerprint, or (--corrupt) by its not
+    // being a P-256 ECDH key at all. The key is opened once and checked, and
+    // the delete goes through that same handle, so what is deleted is
+    // exactly what was checked. (Replacing a machine key between the check
+    // and the delete takes administrator rights, which retire's caller has
+    // anyway.) Afterwards the name is re-opened on that provider to confirm
+    // the key is gone.
+    void RunRetire(const RetireArgs &args) {
+        ValidateServiceCharset(args.serviceName);
+        const std::string service = LowercaseService(args.serviceName);
+
+        // Deleting a machine-wide key needs Administrators (or
+        // HkdfGuardAdmins) rights, and retire is a security administrator's
+        // act, so it refuses up front rather than failing part-way.
+        if (!ProcessIsElevated()) {
+            throw CliError("retire must run from an elevated prompt (Run as administrator); nothing was deleted");
+        }
+
+        std::vector<FoundKek> found = FindKeks(service, args.provider);
+        if (found.empty()) {
+            throw CliError(
+                "no KEK exists for service \"" + service + "\"" +
+                (args.provider ? std::string(" on the ") + ProviderLabel(*args.provider) : std::string()) +
+                "; nothing to retire");
+        }
+        if (found.size() > 1) {
+            throw CliError(
+                "found a key for service \"" + service + "\" on both providers (" + DescribeFound(found[0]) + "; " +
+                DescribeFound(found[1]) +
+                "); refusing to choose which one to delete -- nothing was deleted. Run `" + kProgramNameNarrow +
+                " status` to see which one the KeyStoragePolicy selects, then pass --provider tpm or --provider "
+                "software");
+        }
+        FoundKek &target = found.front();
+        const KekProvider provider = target.opened.provider;
+        const std::string where = std::string("the KEK for service \"") + service + "\" on the " + ProviderLabel(provider);
+
+        if (args.fingerprint) {
+            if (!target.inspection.isP256Ecdh) {
+                throw CliError(
+                    where + " is " + target.inspection.description +
+                    ", not a P-256 ECDH key, so it has no fingerprint to confirm; if it is genuinely corrupt, "
+                    "retire it with --corrupt");
+            }
+            if (target.inspection.fingerprint != *args.fingerprint) {
+                throw CliError(
+                    "fingerprint mismatch for service \"" + service + "\": " + where + " has fingerprint " +
+                    HexString(target.inspection.fingerprint) + ", not " + HexString(*args.fingerprint) +
+                    "; nothing was deleted");
+            }
+        } else if (target.inspection.isP256Ecdh) {
+            throw CliError(
+                where + " is a valid P-256 ECDH key (fingerprint " + HexString(target.inspection.fingerprint) +
+                "), not corrupt; nothing was deleted -- retire a valid KEK with --fingerprint");
+        }
+
+        // NCryptDeleteKey frees the key handle itself, even on failure.
+        SECURITY_STATUS status =
+            NCryptDeleteKey(static_cast<NCRYPT_KEY_HANDLE>(target.opened.key.release()), 0);
+        if (status != ERROR_SUCCESS) {
+            throw CliError(
+                "deleting " + where + " failed: " + NCryptErrorText(status) + "; run `" + kProgramNameNarrow +
+                " status` to see whether it remains");
+        }
+        if (OpenKekDirect(service, provider)) {
+            throw CliError(where + " was deleted, but a key under its name is still found; investigate before relying on it being gone");
+        }
+
+        const std::string identity =
+            args.fingerprint ? "fingerprint " + HexString(*args.fingerprint)
+                             : "corrupt: " + target.inspection.description + ", not a P-256 ECDH key";
+        const bool logged = LogKekRetired(
+            "KEK retired for service '" + service + "' on the " + ProviderLabel(provider) + " (" + identity +
+            ") by " + kProgramNameNarrow + " retire. Every DEK wrapped under it is permanently unrecoverable.");
+
+        fprintf(stdout, "retired KEK for service \"%s\" (%s, %s)\n", service.c_str(), identity.c_str(),
+                ProviderLabel(provider));
+        if (args.fingerprint) {
+            fprintf(stdout, "every payload wrapped under it is now permanently unrecoverable\n");
+        }
+        if (!logged) {
+            fprintf(stderr, "warning: the retirement could not be recorded in the Application event log (event 1004)\n");
+        }
+
+        // A key on the other provider, if any, is untouched - and may be the
+        // one the service now resolves to. The deletion has already
+        // succeeded, so a failure to look is only a note, never an error.
+        try {
+            std::vector<FoundKek> remaining = FindKeks(service);
+            if (!remaining.empty()) {
+                fprintf(stdout, "note: service \"%s\" still has a key on the other provider (%s); run `%s status`\n",
+                        service.c_str(), DescribeFound(remaining.front()).c_str(), kProgramNameNarrow);
+            } else if (!args.fingerprint) {
+                fprintf(stdout, "service \"%s\" can now be provisioned again\n", service.c_str());
+            }
+        } catch (const CliError &e) {
+            fprintf(stdout, "note: could not check the other provider for a key under this name: %s\n",
+                    e.message.c_str());
+        }
+    }
+
     // MARK: - Run: provision
 
     void RunProvision(const ProvisionArgs &args) {
         // `service` is not secret -- it's a logical identifier, not key
         // material.
         ValidateServiceCharset(args.serviceName);
-        EnsureKekProvisioned(args.serviceName);
+        const bool created = EnsureKekProvisioned(args.serviceName);
+
+        Fingerprint fp{};
+        int32_t rc = ReadKekFingerprint(args.serviceName, fp);
+        if (rc != HKDFGUARD_OK) {
+            throw CliError(
+                "the KEK for service \"" + args.serviceName + "\" exists but its fingerprint could not be read: " +
+                DescribeStatus(rc));
+        }
+        // The macOS tool's wording. A KEK this operator didn't create could
+        // have been planted by another administrator; the fingerprint is how
+        // to tell.
+        if (created) {
+            fprintf(stdout, "fingerprint: %s -- record this; retire requires it\n", HexString(fp).c_str());
+        } else {
+            fprintf(stdout, "fingerprint: %s -- confirm it matches the one recorded when this service was provisioned\n",
+                    HexString(fp).c_str());
+        }
     }
 
     // MARK: - Run: wrap
@@ -1798,6 +2474,34 @@ namespace {
             stdout, "wrapped key written to %s (%zu bytes, %s, service \"%s\")\n",
             args.keyFilePath.c_str(), wrapped.size(), access.c_str(), service.c_str());
     }
+
+    // Parses and runs one subcommand. Exit codes: 0 success, 1 operational
+    // failure, 2 usage error (followed by the usage text).
+    template <typename Args, typename Parse, typename Run>
+    int Dispatch(int argc, char *argv[], Parse parse, Run run) {
+        Args args;
+        try {
+            if (parse(argc, argv, args) == ParseOutcome::Help) {
+                PrintUsage();
+                return 0;
+            }
+        } catch (const CliError &e) {
+            fprintf(stderr, "error: %s\n", e.message.c_str());
+            PrintUsage();
+            return 2;
+        }
+
+        try {
+            run(args);
+            return 0;
+        } catch (const CliError &e) {
+            fprintf(stderr, "error: %s\n", e.message.c_str());
+            return 1;
+        } catch (const std::exception &e) {
+            fprintf(stderr, "error: %hs\n", e.what());
+            return 1;
+        }
+    }
 } // namespace
 
 int main(int argc, char *argv[]) {
@@ -1816,7 +2520,7 @@ int main(int argc, char *argv[]) {
     }
 
     if (argc < 2) {
-        fprintf(stderr, "error: missing subcommand: expected `provision` or `wrap`\n");
+        fprintf(stderr, "error: missing subcommand: expected %s\n", kSubcommandList);
         PrintUsage();
         return 2;
     }
@@ -1828,56 +2532,19 @@ int main(int argc, char *argv[]) {
     }
 
     if (command == "provision") {
-        ProvisionArgs args;
-        try {
-            if (ParseProvisionArgs(argc, argv, args) == ParseOutcome::Help) {
-                PrintUsage();
-                return 0;
-            }
-        } catch (const CliError &e) {
-            fprintf(stderr, "error: %s\n", e.message.c_str());
-            PrintUsage();
-            return 2;
-        }
-
-        try {
-            RunProvision(args);
-            return 0;
-        } catch (const CliError &e) {
-            fprintf(stderr, "error: %s\n", e.message.c_str());
-            return 1;
-        } catch (const std::exception &e) {
-            fprintf(stderr, "error: %hs\n", e.what());
-            return 1;
-        }
+        return Dispatch<ProvisionArgs>(argc, argv, ParseProvisionArgs, RunProvision);
     }
-
     if (command == "wrap") {
-        WrapArgs args;
-        try {
-            if (ParseWrapArgs(argc, argv, args) == ParseOutcome::Help) {
-                PrintUsage();
-                return 0;
-            }
-        } catch (const CliError &e) {
-            fprintf(stderr, "error: %s\n", e.message.c_str());
-            PrintUsage();
-            return 2;
-        }
-
-        try {
-            RunWrap(args);
-            return 0;
-        } catch (const CliError &e) {
-            fprintf(stderr, "error: %s\n", e.message.c_str());
-            return 1;
-        } catch (const std::exception &e) {
-            fprintf(stderr, "error: %hs\n", e.what());
-            return 1;
-        }
+        return Dispatch<WrapArgs>(argc, argv, ParseWrapArgs, RunWrap);
+    }
+    if (command == "retire") {
+        return Dispatch<RetireArgs>(argc, argv, ParseRetireArgs, RunRetire);
+    }
+    if (command == "status") {
+        return Dispatch<StatusArgs>(argc, argv, ParseStatusArgs, RunStatus);
     }
 
-    fprintf(stderr, "error: unknown subcommand \"%s\": expected `provision` or `wrap`\n", command.c_str());
+    fprintf(stderr, "error: unknown subcommand \"%s\": expected %s\n", command.c_str(), kSubcommandList);
     PrintUsage();
     return 2;
 }
