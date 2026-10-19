@@ -182,6 +182,45 @@ HKDFGUARD_API int hkdfguard_kek_exists(
     const char* service,
     int* out_exists);
 
+/* Length of a KEK fingerprint, as written by hkdfguard_kek_fingerprint. */
+#define HKDFGUARD_KEK_FINGERPRINT_LEN 32
+
+/*
+ * Writes the fingerprint of the KEK `service` currently resolves to under
+ * the KeyStoragePolicy - the KEK hkdfguard_wrap_dek would use - to `out`:
+ * SHA-256 of its public key's raw X || Y coordinates (64 bytes, no 0x04
+ * prefix), the same value embedded in every payload wrapped under it (bytes
+ * 100..131). Public-key material, not a secret. Lets an operator record which
+ * KEK a service uses after provisioning, and confirm it before retiring it
+ * (hkdfguard.exe retire). Never creates a KEK, and is not slowed by the setup
+ * floor: it opens the KEK exactly as hkdfguard_wrap_dek does.
+ *
+ * Shared with the macOS build (same name and signature; on Windows the
+ * buffer contract is the one every function here follows); not in the Linux
+ * build. Each platform hashes its own public-key encoding, so the values are
+ * only ever compared on the host that produced them.
+ *
+ * service - see hkdfguard_wrap_dek.
+ * out     - caller-owned output buffer. May be NULL only if *out_len is 0, to
+ *           probe the required size.
+ * out_len - in: capacity of out, in bytes (negative returns
+ *           HKDFGUARD_ERR_INVALID_ARGUMENT). out: on success
+ *           HKDFGUARD_KEK_FINGERPRINT_LEN. On HKDFGUARD_ERR_BUFFER_TOO_SMALL,
+ *           the required capacity (HKDFGUARD_KEK_FINGERPRINT_LEN), reported
+ *           after the service name is checked, without reaching a provider.
+ *           Left unchanged on every other failure.
+ *
+ * Returns HKDFGUARD_OK, or a negative HKDFGUARD_ERR_* code - notably
+ * HKDFGUARD_ERR_KEK_NOT_FOUND if no KEK is provisioned for the service,
+ * HKDFGUARD_ERR_KEK_ACCESS_DENIED if the calling account may not open it, and
+ * HKDFGUARD_ERR_PROVIDER_ERROR if a key exists under the service's name but
+ * fails the same property checks hkdfguard_wrap_dek applies (not a
+ * non-exportable P-256 ECDH key with the expected usage).
+ */
+HKDFGUARD_API int hkdfguard_kek_fingerprint(
+    const char* service,
+    uint8_t* out, int* out_len);
+
 /*
  * Creates the persistent KEK for `service` if it does not already exist, or
  * verifies its properties if it does. Safe to call more than once for the

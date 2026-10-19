@@ -6,10 +6,12 @@ covered by test_roundtrip.exe (which only calls into HkdfGuard.dll directly,
 never spawns the CLI). Registered as ctest's "cli" test; see
 tests/CMakeLists.txt.
 
-The CLI has two subcommands: "provision" (calls hkdfguard_kek_exists /
-hkdfguard_create_kek only) and "wrap" (calls hkdfguard_wrap_dek only, against
-an already-provisioned KEK; the DEK is fed to it as base64 text on stdin via
---dek-stdin, never as a command-line argument).
+The CLI has four subcommands: "provision" (hkdfguard_kek_exists /
+hkdfguard_create_kek, then prints hkdfguard_kek_fingerprint), "wrap"
+(hkdfguard_wrap_dek only, against an already-provisioned KEK; the DEK is fed
+to it as base64 text on stdin via --dek-stdin, never as a command-line
+argument), "status" (read-only) and "retire" (deletes a KEK by fingerprint;
+elevated only - it also serves as the elevated scenarios' cleanup).
 
 Most scenarios below are reachable without ever creating a machine-wide KEK
 (each one fails - by design - before RunWrap()/RunProvision() in
@@ -157,9 +159,9 @@ try {
     # ---- 3. An unrecognized top-level command. ----
     $r = Invoke-Cli @("frobnicate")
     Check ($r.ExitCode -eq 2) "unrecognized command exits 2"
-    Check ($r.StdErr -match 'unknown subcommand "frobnicate": expected `provision` or `wrap`') "an unknown subcommand gets the Linux tool's message"
+    Check ($r.StdErr -match 'unknown subcommand "frobnicate": expected `provision`, `wrap`, `retire` or `status`') "an unknown subcommand gets the macOS tool's message"
     $r = Invoke-Cli @()
-    Check ($r.StdErr -match 'missing subcommand: expected `provision` or `wrap`') "a missing subcommand gets the Linux tool's message"
+    Check ($r.StdErr -match 'missing subcommand: expected `provision`, `wrap`, `retire` or `status`') "a missing subcommand gets the macOS tool's message"
     Check ($r.StdErr -match "--dek-stdin \| --dek-file <path>") "the usage text shows both DEK sources"
     $r = Invoke-Cli @("provision", "--service-name", "svc", "--force")
     Check (($r.ExitCode -eq 2) -and ($r.StdErr -match 'is not valid for `provision`; it belongs to `wrap`')) "provision refuses wrap-only flags, as on Linux"
@@ -178,6 +180,31 @@ try {
     # #16: an over-long service name gets the Linux tool's message, before the library sees it.
     $r = Invoke-Cli @("provision", "-sn", ("a" * 129))
     Check (($r.ExitCode -eq 1) -and ($r.StdErr -match "--service-name must be at most 128 bytes, got 129")) "an over-long service name gets the Linux tool's message"
+
+    # ---- 3b. retire and status argument parsing - usage errors (exit 2), ----
+    #          all before any key is looked at. The macOS tool's messages.
+    $zeroFp = "0" * 64
+    foreach ($case in @(
+            @(@("retire", "-sn", "svc"), "missing required --fingerprint\|-fp"),
+            @(@("retire", "-fp", $zeroFp), "retire: missing required --service-name"),
+            @(@("retire", "-sn", "svc", "-fp", $zeroFp, "--corrupt"), "--fingerprint and --corrupt are mutually exclusive"),
+            @(@("retire", "-sn", "svc", "-fp", "abc"), "--fingerprint must be exactly 64 hex characters, got 3"),
+            @(@("retire", "-sn", "svc", "-fp", ("g" * 64)), "--fingerprint must contain only hex characters"),
+            @(@("retire", "-sn", "svc", "-fp", $zeroFp, "-fp", $zeroFp), "give --fingerprint at most once"),
+            @(@("retire", "-sn", "svc", "--corrupt", "--provider", "disk"), "--provider must be ``tpm`` or ``software``"),
+            @(@("retire", "-sn", "svc", "--corrupt", "--force"), "unrecognized argument for ``retire``"),
+            @(@("status"), "status: missing required --service-name"),
+            @(@("status", "-sn", "svc", "--corrupt"), "unrecognized argument for ``status``"))) {
+        $r = Invoke-Cli $case[0]
+        Check (($r.ExitCode -eq 2) -and ($r.StdErr -match $case[1])) "usage error: $($case[0] -join ' ')"
+        if (-not (($r.ExitCode -eq 2) -and ($r.StdErr -match $case[1]))) { Write-Host "    exit $($r.ExitCode); stderr: $($r.StdErr)" }
+    }
+
+    # ---- 3c. status for a never-provisioned service: a definite "absent", ----
+    #          exit 0, so scripts can tell "no key" from "can't tell".
+    $absentService = "hkdfguardabsent" + [Guid]::NewGuid().ToString("N")
+    $r = Invoke-Cli @("status", "-sn", $absentService)
+    Check (($r.ExitCode -eq 0) -and ($r.StdOut -match "kek: absent")) "status reports a never-provisioned service as absent (exit 0)"
 
     # ---- 4. wrap: missing a required flag (--dek-stdin). ----
     $keyFile = Join-Path $workDir "missing-dek.key"
@@ -604,6 +631,14 @@ try {
             Check ($pr2.StdOut -match "already provisioned .*; verified") "re-provisioning an existing KEK reports that it verified the key"
         }
 
+        # provision prints the KEK's fingerprint, and status repeats it.
+        $kekFingerprint = $null
+        if ($pr.StdOut -match "fingerprint: ([0-9a-f]{64}) -- ") { $kekFingerprint = $Matches[1] }
+        Check ($null -ne $kekFingerprint) "provision prints the KEK's 64-hex-character fingerprint"
+        $st = Invoke-Cli @("status", "-sn", $serviceName)
+        Check (($st.ExitCode -eq 0) -and ($st.StdOut -match "kek: present") -and ($st.StdOut -match "provider: Microsoft ")) "status reports the provisioned KEK as present, with its provider"
+        Check ($kekFingerprint -and $st.StdOut -match "fingerprint: $kekFingerprint") "status reports the same fingerprint provision printed"
+
         $dekBytes = New-Object byte[] 32
         [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($dekBytes)
         $dekB64 = [Convert]::ToBase64String($dekBytes)
@@ -672,6 +707,8 @@ try {
         if ($r.ExitCode -eq 0) {
             $bytes = [System.IO.File]::ReadAllBytes($happyKeyFile)
             Check ($bytes.Length -eq 132) "CLI-produced wrapped file is 132 bytes"
+            $embedded = -join ($bytes[100..131] | ForEach-Object { $_.ToString("x2") })
+            Check ($embedded -eq $kekFingerprint) "the fingerprint provision printed is the one embedded in the payload (bytes 100..131)"
 
             # The wrap is audited (event 1002) with a SHA-256 of the exact
             # payload written - the value an unwrap event will later repeat.
@@ -699,13 +736,46 @@ try {
             }
         }
 
-        # Clean up the KEK this test created, mirroring test_roundtrip.exe's
-        # own cleanup, so repeated runs don't accumulate persisted keys. Full
-        # path, not just "certutil" - this test's PATH is whatever ctest
-        # baked into its ENVIRONMENT property at configure time (see
-        # tests/CMakeLists.txt), which isn't guaranteed to still resolve
-        # ordinary system tools.
-        if ($providerName) {
+        # ---- 14. retire: refuses anything but the exact KEK, then deletes it. ----
+        #          Doubles as this test's cleanup, so repeated runs don't
+        #          accumulate persisted keys.
+        $retired = $false
+        if ($kekFingerprint) {
+            $wrongFp = if ($kekFingerprint.StartsWith("0")) { "1" + $kekFingerprint.Substring(1) } else { "0" + $kekFingerprint.Substring(1) }
+            $r = Invoke-Cli @("retire", "-sn", $serviceName, "-fp", $wrongFp)
+            Check (($r.ExitCode -eq 1) -and ($r.StdErr -match "fingerprint mismatch") -and ($r.StdErr -match "nothing was deleted")) "retire refuses a wrong fingerprint"
+            $r = Invoke-Cli @("retire", "-sn", $serviceName, "--corrupt")
+            Check (($r.ExitCode -eq 1) -and ($r.StdErr -match "not corrupt; nothing was deleted")) "retire --corrupt refuses a valid KEK"
+            if ($providerName) {
+                $other = if ($providerName -eq "Microsoft Platform Crypto Provider") { "software" } else { "tpm" }
+                $r = Invoke-Cli @("retire", "-sn", $serviceName, "-fp", $kekFingerprint, "--provider", $other)
+                Check (($r.ExitCode -eq 1) -and ($r.StdErr -match "no KEK exists .* on the .*; nothing to retire")) "retire --provider looks only on that provider, and finds nothing there"
+            }
+            $st = Invoke-Cli @("status", "-sn", $serviceName)
+            Check ($st.StdOut -match "kek: present") "the refused retires left the KEK in place"
+
+            $retireStart = (Get-Date).AddSeconds(-2)
+            $r = Invoke-Cli @("retire", "-sn", $serviceName.ToUpperInvariant(), "-fp", $kekFingerprint.ToUpperInvariant())
+            Check (($r.ExitCode -eq 0) -and ($r.StdOut -match "retired KEK for service `"$serviceName`" \(fingerprint $kekFingerprint")) "retire deletes the KEK given its fingerprint (any case, service name normalized)"
+            if ($r.ExitCode -ne 0) { Write-Host "    stderr: $($r.StdErr)" }
+            $retired = $r.ExitCode -eq 0
+            $st = Invoke-Cli @("status", "-sn", $serviceName)
+            Check (($st.ExitCode -eq 0) -and ($st.StdOut -match "kek: absent")) "after retire, status reports the KEK absent"
+            $evt = Find-HkdfEvent -Since $retireStart -Id 1004 -Needle "'$serviceName'"
+            Check ($evt.Count -ge 1) "the retirement is recorded in the Application event log (event 1004)"
+            if ($evt.Count -ge 1) {
+                Check ([string]$evt[0].Properties[0].Value -match $kekFingerprint) "the retirement event names the KEK's fingerprint"
+                Check ($evt[0].UserId.Value -eq $identity.User.Value) "the retirement event records the calling user"
+            }
+            $r = Invoke-Cli @("retire", "-sn", $serviceName, "-fp", $kekFingerprint)
+            Check (($r.ExitCode -eq 1) -and ($r.StdErr -match "nothing to retire")) "retiring an already-retired KEK reports there is nothing to retire"
+        }
+
+        # Fallback cleanup, if retire couldn't run. Full path, not just
+        # "certutil" - this test's PATH is whatever ctest baked into its
+        # ENVIRONMENT property at configure time (see tests/CMakeLists.txt),
+        # which isn't guaranteed to still resolve ordinary system tools.
+        if ($providerName -and -not $retired) {
             # Matches kek_store.cpp's KeyName(): every piece is lowercase, and
             # $serviceName is already lowercase.
             $keyName = "hkdfguardwin_${serviceName}_v1"
@@ -713,7 +783,11 @@ try {
             & $certutilPath -csp $providerName -delkey $keyName | Out-Null
         }
     } else {
-        Write-Host "[INFO] skipping provision/full-wrap/--force scenarios: not elevated (machine-wide KEK creation requires Administrator)"
+        Write-Host "[INFO] skipping provision/full-wrap/--force/retire scenarios: not elevated (machine-wide KEK creation requires Administrator)"
+
+        # retire refuses up front without elevation, before looking at any key.
+        $r = Invoke-Cli @("retire", "-sn", "hkdfguardclitest", "-fp", ("0" * 64))
+        Check (($r.ExitCode -eq 1) -and ($r.StdErr -match "retire must run from an elevated prompt")) "retire without elevation is refused"
 
         # ---- 13b. Not elevated: a provision attempt is refused, and the ----
         #           refusal is recorded in the Application event log (event

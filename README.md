@@ -56,7 +56,7 @@ If you need per-user isolation instead, that means leaving `NCRYPT_MACHINE_KEY_F
 unset (current-user scope) - not offered as a build option here, since this project
 targets the shared-service deployment model above.
 
-The library exposes a small, stable C ABI (`include/hkdfguard.h`) with seven functions.
+The library exposes a small, stable C ABI (`include/hkdfguard.h`) with nine functions.
 No Windows handle, CNG/NCrypt type, or COM interface crosses that boundary, and no C++
 exception ever escapes it - every call returns an integer status code.
 
@@ -64,6 +64,10 @@ exception ever escapes it - every call returns an integer status code.
 int hkdfguard_kek_exists(
     const char* service,
     int* out_exists);
+
+int hkdfguard_kek_fingerprint(
+    const char* service,
+    uint8_t* out, int* out_len);
 
 int hkdfguard_create_kek(
     const char* service);
@@ -221,7 +225,8 @@ with other processes. Window hooks into a GUI process stay outside it.
 ## Command-line tool
 
 `tools/hkdfguard_cli.cpp` builds `hkdfguard.exe`, a thin
-wrapper around the ABI above with two subcommands.
+wrapper around the ABI above with four subcommands: `provision`, `wrap`, `status` and
+`retire`.
 
 It hardens itself before reading anything, as the Linux CLI does. It calls
 `hkdfguard_harden_process_with_flags(HKDFGUARD_HARDEN_REQUIRE_PROTECTED_SIGNATURE)`, so
@@ -242,6 +247,9 @@ reports and away from other processes.
   DEK, never touches a file. This is the *only* subcommand that can create a KEK. Run
   it elevated: creating a KEK requires elevation (see "Deployment model" above), and
   verifying an existing one reads its ACL, which a key-use-only account cannot do.
+  Afterwards it prints the KEK's fingerprint (`hkdfguard_kek_fingerprint`). Record it:
+  `retire` requires it, and on a later run it lets you confirm that the KEK is still
+  the one you provisioned, not one another administrator planted under the same name.
 
   ```
   hkdfguard.exe provision --service-name|-sn <name>
@@ -306,6 +314,42 @@ reports and away from other processes.
   hard link is refused too, so `--force` cannot overwrite a file at some other path
   that shares its data.
 
+- **`status`** - read-only. Reports whether the service has a KEK, which provider holds
+  it and its fingerprint. It also lists any other key under the service's name on the
+  provider the `KeyStoragePolicy` doesn't select. Such a key is unused today, but a
+  policy change would pick it up. Exits `0` whenever it got a definite answer (present,
+  absent, corrupt or unusable) and `1` when it couldn't tell (for example, access
+  denied).
+
+  ```
+  hkdfguard.exe status --service-name|-sn <name>
+  ```
+
+- **`retire`** - deletes a service's KEK. **Every DEK wrapped under it becomes
+  permanently unrecoverable**, so retire a KEK only after the service has moved to a
+  new, versioned service name. It is the only command that deletes keys. It lives in
+  the CLI, not the library, so no application that loads `HkdfGuard.dll` can wipe a
+  KEK in one call. It must run elevated, and it deletes only after the operator proves
+  which key they mean:
+
+  - `--fingerprint|-fp <hex>`: the 64 hex characters `provision` printed. The key under
+    the service's name must be a P-256 ECDH key with exactly that fingerprint.
+  - `--corrupt`: for a key under the service's name that is not a P-256 ECDH key at all,
+    so has no fingerprint. Deleted only when its properties read cleanly and say so. A
+    key that merely couldn't be read is never treated as corrupt.
+
+  A service can have a key on both the TPM and the software provider. Then `retire`
+  refuses to choose, and `--provider tpm|software` picks one. The key is opened once,
+  checked, and deleted through that same handle, so what is deleted is exactly what
+  was checked. The name is then re-opened to confirm the key is gone. Each retirement
+  is logged as event 1004 with the fingerprint and the calling user. This matches the
+  macOS tool's `retire`, plus `--provider`.
+
+  ```
+  hkdfguard.exe retire --service-name|-sn <name> (--fingerprint|-fp <hex> | --corrupt)
+                       [--provider tpm|software]
+  ```
+
 Example, from an elevated PowerShell prompt - provisioning a KEK once, then wrapping a
 freshly-generated DEK under it on every later release:
 
@@ -327,8 +371,7 @@ $dekBase64 | .\hkdfguard.exe wrap `
     --dek-stdin --group App_1234 --force
 ```
 
-`--help`/`-h` at the top level, or after either subcommand, prints usage for that
-level. Exit code `0` is success, `2` is a usage/argument error (nothing was attempted),
+`--help`/`-h` at the top level, or after any subcommand, prints the usage text. Exit code `0` is success, `2` is a usage/argument error (nothing was attempted),
 and `1` is an operational failure (parsing succeeded but the operation itself failed -
 see the printed `error: ...` text and `include/hkdfguard.h`'s `HKDFGUARD_ERR_*` codes
 for what it means). There is no `unwrap` subcommand - unwrapping is DLL-only; see
@@ -478,6 +521,7 @@ including the impersonated client when a service acts on someone's behalf.
 | 1001 | Warning | A KEK was created on the software provider because `PreferTpm`'s TPM attempt failed, so it isn't hardware-protected. |
 | 1002 | Information | A DEK was wrapped (`hkdfguard_wrap_dek` or `hkdfguard_generate_and_wrap_dek`). |
 | 1003 | Information | A DEK was unwrapped. |
+| 1004 | Warning | A KEK was retired (deleted) by `hkdfguard.exe retire`. Names the service, the provider and the fingerprint, or why the key was corrupt. Written by the CLI; the library has no delete. |
 | 2000 | Warning | `KEK_ACCESS_DENIED` on any call: use of a KEK by an unauthorized account, or provisioning without elevation. |
 | 2002 | Error | `KEK_INVALID`: an existing KEK under the service name has an ACL this library would never create. Investigate it. |
 | 2003 | Warning | `PAYLOAD_AUTH_FAILED`, `KEK_FINGERPRINT_MISMATCH`, `PAYLOAD_MALFORMED` or `PAYLOAD_UNSUPPORTED` on unwrap: a tampered, corrupted, misdirected or unknown-version payload. |
@@ -596,11 +640,12 @@ It is read on every setup call.
   instead of prompting) - see the Deployment model note above. If a newly created key fails
   any post-finalize verification step, that same call deletes it before reporting the
   error, so a later wrap can't silently end up using a key that was never fully verified.
-  An *existing* KEK is never deleted or replaced by any library call.
+  An *existing* KEK is never deleted or replaced by any library call. Only the CLI's
+  `retire` deletes one, after the operator confirms its fingerprint.
 - **Memory security**: `src/secure_buffer.h` (RAII `SecureZeroMemory` wrapper) and
   `src/handle_traits.h` (RAII closers for every NCrypt/BCrypt handle type) ensure key
-  material and handles are wiped/closed on every exit path, including exceptions. All
-  six ABI entry points in `src/hkdfguard.cpp` catch every exception; `hkdfguard_unwrap_dek`
+  material and handles are wiped/closed on every exit path, including exceptions. Every
+  ABI entry point in `src/hkdfguard.cpp` catches every exception; `hkdfguard_unwrap_dek`
   additionally zeros the caller's output buffer on any failure (it calls into a CNG
   function - `BCryptDecrypt` - that can write unauthenticated plaintext before reporting
   a tag mismatch).
@@ -757,10 +802,11 @@ loading it.
 - **Node**: `ffi-napi`/`koffi` given an absolute path, or a native addon (N-API) linking
   `HkdfGuard.lib`
 
-All five bindings map directly onto the seven exported functions
-(`hkdfguard_kek_exists`, `hkdfguard_create_kek`, `hkdfguard_wrap_dek`,
-`hkdfguard_unwrap_dek`, `hkdfguard_generate_and_wrap_dek`, `hkdfguard_open_file`,
-`hkdfguard_harden_process`) and the status codes in
+All five bindings map directly onto the nine exported functions
+(`hkdfguard_kek_exists`, `hkdfguard_kek_fingerprint`, `hkdfguard_create_kek`,
+`hkdfguard_wrap_dek`, `hkdfguard_unwrap_dek`, `hkdfguard_generate_and_wrap_dek`,
+`hkdfguard_open_file`, `hkdfguard_harden_process`,
+`hkdfguard_harden_process_with_flags`) and the status codes in
 `include/hkdfguard.h`; none of them need to know anything about TPMs, CNG, or NCrypt.
 
 ## License

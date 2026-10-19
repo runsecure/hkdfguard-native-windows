@@ -25,6 +25,9 @@
 //                     wrap that produced it - which also makes a substituted
 //                     older payload visible, since deployment rollback is
 //                     deliberately allowed by the format itself.
+//   1004 Warning      A KEK was retired (deleted) by hkdfguard.exe retire.
+//                     Written by the CLI, not this file - the library has no
+//                     delete - but its message lives in this DLL's table.
 //   2000 Warning      KEK_ACCESS_DENIED on any call: someone tried to use (or
 //                     create) a KEK they aren't authorized for, or tried
 //                     to provision without elevation.
@@ -107,6 +110,7 @@ namespace hkdfguard {
         const wchar_t *OpName(AuditOp op) noexcept {
             switch (op) {
                 case AuditOp::KekExists: return L"hkdfguard_kek_exists";
+                case AuditOp::KekFingerprint: return L"hkdfguard_kek_fingerprint";
                 case AuditOp::CreateKek: return L"hkdfguard_create_kek";
                 case AuditOp::Wrap: return L"hkdfguard_wrap_dek";
                 case AuditOp::GenerateAndWrap: return L"hkdfguard_generate_and_wrap_dek";

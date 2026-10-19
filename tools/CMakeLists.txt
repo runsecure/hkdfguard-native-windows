@@ -10,7 +10,7 @@
 # brings along its PUBLIC include/ directory, so no separate
 # target_include_directories call is needed here for hkdfguard.h.
 add_executable(hkdfguard-cli hkdfguard_cli.cpp)
-target_link_libraries(hkdfguard-cli PRIVATE hkdfguard bcrypt.lib advapi32.lib)
+target_link_libraries(hkdfguard-cli PRIVATE hkdfguard bcrypt.lib ncrypt.lib advapi32.lib)
 
 # The executable is hkdfguard.exe. The CMake *target* can't share that name:
 # "hkdfguard" is already the DLL's target (output HkdfGuard.dll), so the
