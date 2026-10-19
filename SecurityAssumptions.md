@@ -699,9 +699,26 @@ file that is read:
   ACE.
 - **Missing DACL.** A missing or NULL DACL is refused, since it means
   unrestricted access.
-- **Folder walk.** Each folder is opened without following reparse points and
-  must still be a plain folder. Any folder whose security can't be read is
-  refused (the file itself being unreadable is still -33).
+- **Folder walk.** The path is never resolved by name past the drive letter
+  (`src/no_follow_open.h`, shared with the CLI's `--dek-file` and output
+  path). The drive must be a local volume: UNC, mapped network and SUBST
+  drives are refused from the drive letter alone (`GetDriveTypeW`,
+  `QueryDosDeviceW`), before anything is opened. Then the root is opened,
+  and each folder in turn is opened *relative to the handle of the one
+  above it* (`NtCreateFile` with a `RootDirectory` and
+  `FILE_OPEN_REPARSE_POINT`). Each must be a plain folder, not a reparse
+  point, before anything is opened through it. The file is then opened
+  relative to its folder the same way. The owner and rights checks run on
+  those same folder handles. Any folder whose security can't be read is
+  refused (the file itself being unreadable is still -33). Because of the
+  walk, no link anywhere in the path is ever followed, not even to find
+  out where it leads. That includes a directory symbolic link to
+  `\\server\share`, which Windows otherwise follows by default
+  (local-to-remote evaluation). Following one would make the process
+  connect and authenticate to that server, offering an NTLM
+  challenge-response it could relay, before any check on the result.
+  After the walk the only way the handle's canonical path can differ from
+  the spelled one is an 8.3 short name, which is refused.
 - **Text keys.** A file of 96 bytes or fewer, other than 32, is read into a
   `SecureBuffer` that is wiped when it goes out of scope. After trimming
   whitespace the way Rust's `trim_ascii` does, it is a plaintext key if it is
@@ -742,8 +759,18 @@ payload, so they don't depend on a KEK.
 **Residual risk.**
 
 - **What isn't checked.** Folders that intermediate links point into are not
-  walked: links anywhere in the path are refused outright. Neither are
-  hard-link siblings: they share the file's own ACL, which is checked.
+  walked: links anywhere in the path are refused outright, before anything
+  is opened through them. Neither are hard-link siblings: they share the
+  file's own ACL, which is checked.
+- **Links to shares, verified 2026-10-19.** On this machine an unprivileged
+  junction to `\??\UNC\...` or `\??\GLOBALROOT\Device\Mup\...` is stored by
+  NTFS but refused by Windows on every open (`ERROR_INVALID_REPARSE_DATA`).
+  A directory symbolic link to a share needs `SeCreateSymbolicLinkPrivilege`
+  (or Developer Mode) and *is* followed. Before the walk, `--dek-file`
+  through one opened the share's file before refusing it, and one to an
+  unroutable address spent 21 s trying to connect. With the walk both are
+  refused at the link in under 100 ms. The same holds for the output path and
+  `hkdfguard_open_file`, which tests 24c and the CLI's section 16 check.
 - **Window between check and read.** A folder's ACL could in principle be
   widened between the check and the read, but only by someone who already
   holds `WRITE_DAC` on it, which is what was just checked for.

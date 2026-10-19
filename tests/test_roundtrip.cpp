@@ -2416,6 +2416,48 @@ int main() {
                 }
             }
 
+            // A directory symbolic link to a *share* must be refused without
+            // being followed: following it would make this process connect
+            // and authenticate to that server (handing it an NTLM
+            // challenge-response) before any check on the result could
+            // refuse it. Two targets:
+            //   - \\localhost\C$\Windows, which really exists, so a refusal
+            //     can't be the share simply being unreachable;
+            //   - \\192.0.2.1\share (TEST-NET-1, RFC 5737: never routed), where
+            //     even trying to connect stalls for many seconds. Refused in
+            //     well under that is the evidence no connection was tried.
+            // Both need SeCreateSymbolicLinkPrivilege; Windows follows
+            // local-to-remote symbolic links by default.
+            {
+                struct ShareLink {
+                    const wchar_t *target;
+                    const wchar_t *file;
+                    const char *label;
+                };
+                const ShareLink links[] = {
+                    {L"\\\\localhost\\C$\\Windows", L"win.ini",
+                     "a file reached through a directory symbolic link to \\\\localhost\\C$ is refused"},
+                    {L"\\\\192.0.2.1\\share", L"good.key",
+                     "a file reached through a directory symbolic link to an unreachable share is refused"},
+                };
+                for (const ShareLink &link : links) {
+                    const std::wstring share_link = dir + L"\\sharelink";
+                    if (CreateSymbolicLinkW(share_link.c_str(), link.target, SYMBOLIC_LINK_FLAG_DIRECTORY)) {
+                        const auto start = std::chrono::steady_clock::now();
+                        expectFailure(ToUtf8(share_link + L"\\" + link.file), HKDFGUARD_ERR_FILE_UNTRUSTED, link.label);
+                        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - start).count();
+                        Check(ms < 2000, (std::string("open_file: ") + link.label + " - at once, without contacting the server").c_str());
+                        if (ms >= 2000) std::printf("    (took %lld ms)\n", static_cast<long long>(ms));
+                        RemoveDirectoryW(share_link.c_str());
+                    } else if (GetLastError() == ERROR_PRIVILEGE_NOT_HELD) {
+                        Skip((std::string(link.label) + " (needs SeCreateSymbolicLinkPrivilege)").c_str());
+                    } else {
+                        Check(false, "test setup: create a directory symbolic link to a share");
+                    }
+                }
+            }
+
             // The real file at the real path still opens after all that.
             r = open(good);
             Check(r.rc == HKDFGUARD_OK && r.out == wrapped, "open_file still reads the real file at its real path");

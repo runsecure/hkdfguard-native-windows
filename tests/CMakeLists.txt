@@ -31,7 +31,7 @@ add_executable(test_roundtrip
 # calls) plus the two raw Windows crypto libraries directly (needed because
 # this executable now also compiles kek_store.cpp itself, which calls
 # NCrypt*/BCrypt* functions of its own).
-target_link_libraries(test_roundtrip PRIVATE hkdfguard ncrypt.lib bcrypt.lib)
+target_link_libraries(test_roundtrip PRIVATE hkdfguard ncrypt.lib bcrypt.lib ntdll.lib)
 target_include_directories(test_roundtrip PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../include
     ${CMAKE_CURRENT_SOURCE_DIR}/../src

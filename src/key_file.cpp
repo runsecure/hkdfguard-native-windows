@@ -9,6 +9,7 @@
 #include "wire_format.h" // ParseWrappedDek, kTotalLen
 
 #include "secure_buffer.h" // SecureBuffer - holds a small file's bytes while they're inspected
+#include "no_follow_open.h" // OpenFolderChain / OpenRelative - the path walk that never follows a link
 
 #include <windows.h>
 #include <aclapi.h> // GetSecurityInfo
@@ -23,31 +24,6 @@ namespace hkdfguard {
         // UTF-8 bytes. Bounds the strnlen below the same way kMaxServiceLen does
         // for a service name.
         constexpr size_t kMaxPathBytes = 32767 * 3;
-
-        // Owns a Win32 file HANDLE. Not handle_traits.h's ScopedHandle: that
-        // treats 0 as "no handle", but CreateFileW reports failure as
-        // INVALID_HANDLE_VALUE.
-        class ScopedFile {
-        public:
-            explicit ScopedFile(HANDLE h) : handle_(h) {
-            }
-
-            ~ScopedFile() {
-                if (valid()) {
-                    CloseHandle(handle_);
-                }
-            }
-
-            ScopedFile(const ScopedFile &) = delete;
-
-            ScopedFile &operator=(const ScopedFile &) = delete;
-
-            bool valid() const { return handle_ != INVALID_HANDLE_VALUE && handle_ != nullptr; }
-            HANDLE get() const { return handle_; }
-
-        private:
-            HANDLE handle_;
-        };
 
         // UTF-8 path -> UTF-16 for CreateFileW. Unlike a service name, a path may
         // legitimately contain any Unicode character, so it is converted rather
@@ -100,64 +76,11 @@ namespace hkdfguard {
             return p;
         }
 
-        // The long-name form of `path` from GetLongPathName, which walks the path
-        // component by component through the directory listing - expanding any
-        // 8.3 short name ("PROGRA~1") to its real name, but reporting a link by
-        // its own name, never its target. Empty if any component doesn't exist.
-        std::wstring TryLongPathName(const std::wstring &path) {
-            DWORD needed = GetLongPathNameW(path.c_str(), nullptr, 0);
-            if (needed == 0) {
-                return {};
-            }
-            std::wstring long_form(needed, L'\0');
-            DWORD written = GetLongPathNameW(path.c_str(), long_form.data(), needed);
-            if (written == 0 || written >= needed) {
-                return {};
-            }
-            long_form.resize(written);
-            return long_form;
-        }
-
-        // 8.3 short names are refused outright rather than expanded. They are a
-        // second, auto-generated name for the same file, and their history -
-        // checks that matched one spelling but not the other, and a name that
-        // isn't chosen by whoever created the file - makes them a liability for
-        // a path that decides which key file a privileged process reads.
-        //
-        // The test is exact, not a guess from "~" characters: a path is refused
-        // only if the file system itself expands one of its components to a
-        // different name, so a genuine long name such as "report~1.key" is
-        // fine. Case differences don't count; the file system ignores case.
-        // If the file doesn't exist, its folder is checked instead, so
-        // "C:\PROGRA~1\missing.key" is refused too rather than reported as
-        // merely not found.
-        void RejectShortNames(const std::wstring &full) {
-            std::wstring checked = full;
-            std::wstring long_form = TryLongPathName(checked);
-            if (long_form.empty()) {
-                size_t sep = full.find_last_of(L'\\');
-                if (sep == std::wstring::npos || sep < 3) {
-                    return; // nothing above a drive root to check
-                }
-                checked = full.substr(0, sep);
-                long_form = TryLongPathName(checked);
-                if (long_form.empty()) {
-                    return; // the folder doesn't exist either: CreateFileW reports it
-                }
-            }
-            if (CompareStringOrdinal(
-                    StripExtendedPrefix(long_form).c_str(), -1, StripExtendedPrefix(checked).c_str(), -1, TRUE) !=
-                CSTR_EQUAL) {
-                throw HkdfGuardError(HKDFGUARD_ERR_FILE_UNTRUSTED, "path uses an 8.3 short name");
-            }
-        }
-
         // The fully-qualified path the caller actually spelled - relative paths
         // resolved against the current directory - with no link followed and
-        // nothing expanded (8.3 short names are refused, see RejectShortNames).
-        // This is what the opened handle's own path is compared against in
-        // ReadWrappedKeyFile: any difference means the open went somewhere other
-        // than where the caller pointed.
+        // nothing expanded. GetFullPathNameW works on the text alone. This is
+        // what the opened handle's own path is compared against in
+        // ReadWrappedKeyFile.
         std::wstring ExpectedFullPath(const std::wstring &path) {
             DWORD needed = GetFullPathNameW(path.c_str(), 0, nullptr, nullptr);
             if (needed == 0) {
@@ -172,24 +95,17 @@ namespace hkdfguard {
             return full;
         }
 
-        // Only "<letter>:\..." on a local drive is allowed, decided before
+        // Only "<letter>:\..." on a local volume is allowed, decided before
         // anything is opened. Refused: UNC paths (\\server\share, \\?\UNC\...),
         // the device namespace (\\.\pipe\..., \\.\PhysicalDrive0, and DOS device
         // names such as NUL or CON, which GetFullPathName turns into \\.\NUL),
-        // and mapped network drives. Opening a path on a server would make this
-        // process connect and authenticate to that server - a credential leak if
-        // the path is attacker-influenced - before any later check could refuse
-        // the result.
+        // mapped network drives and SUBST drives. Opening a path on a server
+        // would make this process connect and authenticate to that server - a
+        // credential leak if the path is attacker-influenced. Links further
+        // down the path are the walk's job (OpenFolderChain).
         void RequireLocalDrivePath(const std::wstring &full) {
-            const bool drive_path =
-                    full.size() >= 3 &&
-                    ((full[0] >= L'A' && full[0] <= L'Z') || (full[0] >= L'a' && full[0] <= L'z')) &&
-                    full[1] == L':' && full[2] == L'\\';
-            if (!drive_path) {
-                throw HkdfGuardError(HKDFGUARD_ERR_FILE_UNTRUSTED, "path is not a local drive path");
-            }
-            if (GetDriveTypeW(full.substr(0, 3).c_str()) == DRIVE_REMOTE) {
-                throw HkdfGuardError(HKDFGUARD_ERR_FILE_UNTRUSTED, "path is on a network drive");
+            if (!hkdfguard_nofollow::IsLocalDrivePath(full)) {
+                throw HkdfGuardError(HKDFGUARD_ERR_FILE_UNTRUSTED, "path is not on a local drive");
             }
         }
 
@@ -386,36 +302,13 @@ namespace hkdfguard {
         // drive root, must pass the same owner test and grant nobody else
         // kFolderReplaceRights - otherwise someone else could rename a file
         // of their choosing over the key, or the key's folder out of the way
-        // and one of their own into its place. `final_path` is the opened
-        // file's canonical path, already confirmed to contain no link, so
-        // every prefix of it is a real folder. Each is opened without
-        // following a reparse point and checked to still be a plain folder:
-        // replacing one would need exactly the rights being checked for.
-        // Any failure to open or read a folder means it can't be vouched for.
-        void CheckFolderChain(const std::wstring &final_path, const TrustedPrincipals &trusted) {
-            size_t sep = final_path.find_last_of(L'\\');
-            while (sep != std::wstring::npos && sep >= 2) {
-                // "C:\a\b" for every folder but the root, which needs its
-                // trailing backslash ("C:" alone is a drive's current folder).
-                std::wstring folder = final_path.substr(0, sep == 2 ? 3 : sep);
-                ScopedFile handle(CreateFileW(
-                    (L"\\\\?\\" + folder).c_str(), READ_CONTROL | FILE_READ_ATTRIBUTES,
-                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
-                    FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
-                if (!handle.valid()) {
-                    throw HkdfGuardError(HKDFGUARD_ERR_FILE_UNTRUSTED, "a folder in the path could not be opened to check its security");
-                }
-                BY_HANDLE_FILE_INFORMATION info{};
-                if (!GetFileInformationByHandle(handle.get(), &info) ||
-                    !(info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ||
-                    (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
-                    throw HkdfGuardError(HKDFGUARD_ERR_FILE_UNTRUSTED, "a folder in the path changed while it was checked");
-                }
-                CheckHandleSecurity(handle.get(), kFolderReplaceRights, trusted, "a folder in the path");
-                if (sep == 2) {
-                    break; // that was the root
-                }
-                sep = final_path.find_last_of(L'\\', sep - 1);
+        // and one of their own into its place. Checked on the handles the
+        // walk opened each folder through (already confirmed real folders,
+        // not reparse points), so it is the folders actually traversed that
+        // are judged - nothing is looked up by name again.
+        void CheckFolderChain(const hkdfguard_nofollow::FolderChain &chain, const TrustedPrincipals &trusted) {
+            for (const hkdfguard_nofollow::Handle &folder : chain.handles) {
+                CheckHandleSecurity(folder.get(), kFolderReplaceRights, trusted, "a folder in the path");
             }
         }
 
@@ -594,44 +487,72 @@ namespace hkdfguard {
         std::wstring wide_path = PathToWide(path);
         std::wstring expected = StripExtendedPrefix(ExpectedFullPath(wide_path));
         RequireLocalDrivePath(expected);
-        // After the local-drive check: GetLongPathName reads directory
-        // listings, which must never mean contacting a server.
-        RejectShortNames(expected);
 
-        // A directory can't be opened without FILE_FLAG_BACKUP_SEMANTICS, so
-        // CreateFileW would report one as ERROR_ACCESS_DENIED - checked first
-        // only so that case reads as "not a regular file" rather than as a
-        // permissions problem. The handle checks below are what's
-        // authoritative.
-        DWORD attributes = GetFileAttributesW(wide_path.c_str());
-        if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY)) {
-            throw HkdfGuardError(HKDFGUARD_ERR_FILE_IO, "path is a directory");
+        // Walk to the file's folder one component at a time, each opened
+        // relative to the one above it and refused if it is a reparse point
+        // - so no junction or directory symbolic link is ever followed, and
+        // in particular none pointing at \\server\share: nothing is opened
+        // on another machine, so no credentials are offered to one. See
+        // no_follow_open.h.
+        hkdfguard_nofollow::FolderChain chain;
+        hkdfguard_nofollow::Error walk;
+        if (!hkdfguard_nofollow::OpenFolderChain(expected, chain, walk)) {
+            switch (walk.failure) {
+                case hkdfguard_nofollow::Failure::ReparsePoint:
+                    throw HkdfGuardError(HKDFGUARD_ERR_FILE_UNTRUSTED,
+                                         "a folder in the path is a symbolic link, junction or other reparse point");
+                case hkdfguard_nofollow::Failure::NotADirectory:
+                    throw HkdfGuardError(HKDFGUARD_ERR_FILE_NOT_FOUND, "a component of the path is a file, not a folder");
+                case hkdfguard_nofollow::Failure::OpenFailed:
+                    // A folder that doesn't exist is "not found"; one that
+                    // can't be opened to read its security can't be vouched
+                    // for.
+                    if (FileOpenErrorCode(walk.win32) == HKDFGUARD_ERR_FILE_NOT_FOUND) {
+                        throw HkdfGuardError(HKDFGUARD_ERR_FILE_NOT_FOUND, "a folder in the path does not exist");
+                    }
+                    throw HkdfGuardError(HKDFGUARD_ERR_FILE_UNTRUSTED,
+                                         "a folder in the path could not be opened to check its security");
+                default:
+                    throw HkdfGuardError(HKDFGUARD_ERR_FILE_UNTRUSTED,
+                                         "the path names an alternate data stream or has an empty component");
+            }
         }
 
-        // FILE_SHARE_READ only: while this handle is open nobody can write
-        // the file, and if a writer already has it open this fails with a
-        // sharing violation instead of reading a half-written payload.
-        // FILE_FLAG_OPEN_REPARSE_POINT: a symbolic link at the path opens as
-        // the link itself, so the reparse check below sees it instead of
-        // the open silently following it. SECURITY_IDENTIFICATION: should a
-        // path ever reach a named pipe despite the checks above, its server
-        // could identify this process but not impersonate it.
-        ScopedFile file(CreateFileW(
-            wide_path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
-            nullptr));
-        if (!file.valid()) {
-            throw HkdfGuardError(FileOpenErrorCode(GetLastError()), "CreateFileW failed");
+        // Short names in the folders: the walk followed no link, so the
+        // deepest folder's canonical path differs from the spelled one only
+        // if some folder was spelled with its 8.3 short name ("PROGRA~1"),
+        // which GetFinalPathNameByHandle expands. Checked before the file is
+        // opened, so "C:\PROGRA~1\missing.key" is refused as a short name
+        // rather than reported as merely not found. Asked of a local handle,
+        // so nothing leaves the machine.
+        if (CompareStringOrdinal(FinalPathOfHandle(chain.parent()).c_str(), -1, chain.parentPath().c_str(), -1,
+                                 TRUE) != CSTR_EQUAL) {
+            throw HkdfGuardError(HKDFGUARD_ERR_FILE_UNTRUSTED, "path uses an 8.3 short name");
         }
+
+        // The file itself, relative to its folder. FILE_SHARE_READ only:
+        // while this handle is open nobody can write the file, and if a
+        // writer already has it open this fails with a sharing violation
+        // instead of reading a half-written payload. FILE_OPEN_REPARSE_POINT
+        // (always added by OpenRelative): a symbolic link here opens as the
+        // link itself, so the reparse check below sees it.
+        hkdfguard_nofollow::Handle file_handle;
+        DWORD open_error = 0;
+        if (!hkdfguard_nofollow::OpenRelative(
+                chain.parent(), chain.leaf, GENERIC_READ, FILE_SHARE_READ, FILE_OPEN, FILE_SEQUENTIAL_ONLY, nullptr,
+                file_handle, open_error)) {
+            throw HkdfGuardError(FileOpenErrorCode(open_error), "opening the file failed");
+        }
+        HANDLE file = file_handle.get();
 
         // Only a regular on-disk file. A pipe, console or other device is
         // refused before any ReadFile, since reading one could block
         // indefinitely or return arbitrary data.
-        if (GetFileType(file.get()) != FILE_TYPE_DISK) {
+        if (GetFileType(file) != FILE_TYPE_DISK) {
             throw HkdfGuardError(HKDFGUARD_ERR_FILE_IO, "path is not a regular file");
         }
         BY_HANDLE_FILE_INFORMATION info{};
-        if (!GetFileInformationByHandle(file.get(), &info)) {
+        if (!GetFileInformationByHandle(file, &info)) {
             throw HkdfGuardError(HKDFGUARD_ERR_FILE_IO, "GetFileInformationByHandle failed");
         }
         // The object at the path itself must not be a link (or any other
@@ -643,16 +564,13 @@ namespace hkdfguard {
         if (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
             throw HkdfGuardError(HKDFGUARD_ERR_FILE_IO, "path is a directory");
         }
-        // And nothing above it may be one either: FILE_FLAG_OPEN_REPARSE_POINT
-        // only covers the final component, so a junction or directory
-        // symbolic link in a parent folder is still followed by the open.
-        // The handle's canonical path reflects that; if it isn't the path
-        // the caller spelled, something redirected the open. (Also catches
-        // SUBST drives, whose canonical path is the directory they alias.)
-        // Case-insensitive, like the file system.
-        std::wstring actual = FinalPathOfHandle(file.get());
+        // And the file's own name. Short names are refused rather than
+        // accepted: they are a second, auto-generated name for the same file,
+        // with a history of checks that matched one spelling but not the
+        // other. Case-insensitive, like the file system.
+        std::wstring actual = FinalPathOfHandle(file);
         if (CompareStringOrdinal(actual.c_str(), -1, expected.c_str(), -1, TRUE) != CSTR_EQUAL) {
-            throw HkdfGuardError(HKDFGUARD_ERR_FILE_UNTRUSTED, "path resolves through a link, junction or SUBST drive");
+            throw HkdfGuardError(HKDFGUARD_ERR_FILE_UNTRUSTED, "path uses an 8.3 short name");
         }
 
         // Who could have written what is about to be read. A wrapped DEK is
@@ -669,8 +587,8 @@ namespace hkdfguard {
         // refusing the open itself was HKDFGUARD_ERR_FILE_ACCESS_DENIED,
         // above.)
         TrustedPrincipals trusted;
-        CheckHandleSecurity(file.get(), kFileWriteRights, trusted, "the file");
-        CheckFolderChain(actual, trusted);
+        CheckHandleSecurity(file, kFileWriteRights, trusted, "the file");
+        CheckFolderChain(chain, trusted);
 
         // Decided on the size first. A DEK-sized file is never read at all:
         // if it really is a plaintext key, it never enters this process's
@@ -678,7 +596,7 @@ namespace hkdfguard {
         // DEK written as text (hex or base64) is read into a wiped buffer to
         // tell which; its bytes are never copied to the caller.
         LARGE_INTEGER size{};
-        if (!GetFileSizeEx(file.get(), &size)) {
+        if (!GetFileSizeEx(file, &size)) {
             throw HkdfGuardError(HKDFGUARD_ERR_FILE_IO, "GetFileSizeEx failed");
         }
         if (size.QuadPart == HKDFGUARD_DEK_LEN) {
@@ -686,7 +604,7 @@ namespace hkdfguard {
         }
         if (size.QuadPart < static_cast<LONGLONG>(kTotalLen)) {
             if (size.QuadPart <= static_cast<LONGLONG>(kMaxPlaintextTextLen) &&
-                SmallFileLooksLikePlaintextDek(file.get())) {
+                SmallFileLooksLikePlaintextDek(file)) {
                 throw HkdfGuardError(HKDFGUARD_ERR_FILE_PLAINTEXT_KEY, "file holds a DEK written as hex or base64");
             }
             throw HkdfGuardError(HKDFGUARD_ERR_FILE_TOO_SHORT, "file is shorter than a wrapped payload");
@@ -700,7 +618,7 @@ namespace hkdfguard {
         DWORD total = 0;
         while (total < kTotalLen) {
             DWORD got = 0;
-            if (!ReadFile(file.get(), out + total, static_cast<DWORD>(kTotalLen - total), &got, nullptr)) {
+            if (!ReadFile(file, out + total, static_cast<DWORD>(kTotalLen - total), &got, nullptr)) {
                 throw HkdfGuardError(HKDFGUARD_ERR_FILE_IO, "ReadFile failed");
             }
             if (got == 0) {
@@ -714,7 +632,7 @@ namespace hkdfguard {
         // read, not just about what GetFileSizeEx reported.
         uint8_t extra = 0;
         DWORD got_extra = 0;
-        if (!ReadFile(file.get(), &extra, 1, &got_extra, nullptr)) {
+        if (!ReadFile(file, &extra, 1, &got_extra, nullptr)) {
             throw HkdfGuardError(HKDFGUARD_ERR_FILE_IO, "ReadFile failed");
         }
         if (got_extra != 0) {

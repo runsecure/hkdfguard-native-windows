@@ -93,6 +93,7 @@
 // enforced on open handles rather than on re-queried paths.
 
 #include "hkdfguard.h"
+#include "no_follow_open.h" // the path walk shared with hkdfguard_open_file - see tools/CMakeLists.txt
 
 #include <windows.h>
 #include <aclapi.h> // SetSecurityInfo - protecting the key file's DACL on its handle
@@ -181,35 +182,6 @@ namespace {
 
         return result;
     }
-
-    // Minimal RAII wrapper for a Win32 file HANDLE - this tool's own local
-    // copy of the same idea src/handle_traits.h uses for NCrypt/BCrypt handles
-    // elsewhere in this project, kept local since this tool intentionally
-    // depends only on the public hkdfguard.h header, nothing from src/.
-    class ScopedFileHandle {
-    public:
-        explicit ScopedFileHandle(HANDLE h = INVALID_HANDLE_VALUE) : handle_(h) {
-        }
-
-        ~ScopedFileHandle() { reset(); }
-
-        ScopedFileHandle(const ScopedFileHandle &) = delete;
-
-        ScopedFileHandle &operator=(const ScopedFileHandle &) = delete;
-
-        void reset(HANDLE h = INVALID_HANDLE_VALUE) {
-            if (handle_ != INVALID_HANDLE_VALUE && handle_ != nullptr) {
-                CloseHandle(handle_);
-            }
-            handle_ = h;
-        }
-
-        HANDLE get() const { return handle_; }
-        bool valid() const { return handle_ != INVALID_HANDLE_VALUE && handle_ != nullptr; }
-
-    private:
-        HANDLE handle_;
-    };
 
     // MARK: - Argument parsing
 
@@ -1247,64 +1219,36 @@ namespace {
     // to could redirect an (often elevated) `wrap --force` into overwriting
     // and deleting an arbitrary file, or a plain `wrap` into creating one
     // somewhere it never meant to (CREATE_NEW happily follows a *dangling*
-    // symlink and creates its target). So: refuse, don't tolerate. The
-    // helpers below enforce that four ways, all on handles already open
-    // (never by re-querying a path that could be swapped underneath):
+    // symlink and creates its target). And a directory symbolic link can
+    // point at \\server\share: following one would make this process connect
+    // and authenticate to that server before anything could refuse it. So:
+    // refuse, don't tolerate - and never follow a link even to find out.
     //
+    //   0. The path is walked, never resolved by name (no_follow_open.h):
+    //      the drive root, then each folder opened relative to the handle of
+    //      the one above it, each refused if it is a reparse point before
+    //      anything is opened through it, then the file relative to its
+    //      folder. Nothing reached through a link is ever opened.
     //   1. The object itself must not carry FILE_ATTRIBUTE_REPARSE_POINT -
-    //      every CreateFile in this section passes
-    //      FILE_FLAG_OPEN_REPARSE_POINT precisely so a symlink at the path
-    //      opens *as the link* and gets caught here, rather than being
-    //      silently followed.
+    //      it is opened with FILE_OPEN_REPARSE_POINT, so a link at the path
+    //      opens *as the link* and gets caught here.
     //   2. It must be a file, not a directory.
     //   3. The kernel's own resolved path for the handle
     //      (GetFinalPathNameByHandle) must equal the fully-qualified form of
-    //      what the caller typed - which is what catches a junction or
-    //      symlink in a *parent* component, where flag (1) on the leaf can't
-    //      see it. (A path using 8.3 short names is refused before this, in
-    //      FullLongPath.)
+    //      what the caller typed. After (0) the only way they can differ is
+    //      a component spelled with its 8.3 short name ("PROGRA~1"), which
+    //      is refused.
     //   4. The file must have exactly one name (no hard links), since
     //      neither (1) nor (3) can tell that a file is also reachable at
     //      another path, and overwriting it would change that file too.
     //
-    // A consequence of (3) worth knowing: a path through a SUBST drive or a
-    // mapped network drive resolves to a different canonical form and is
-    // refused too. A secrets file belongs on a real local path anyway.
+    // SUBST and mapped network drives are refused before (0), from the
+    // drive letter alone. A secrets file belongs on a real local path.
 
-    // GetLongPathName for a path that must exist; empty on failure, with
-    // GetLastError() left set for the caller.
-    std::string TryLongPathName(const std::string &path) {
-        DWORD needed = GetLongPathNameA(path.c_str(), nullptr, 0);
-        if (needed == 0) {
-            return {};
-        }
-        std::string longForm(needed, '\0');
-        DWORD written = GetLongPathNameA(path.c_str(), longForm.data(), needed);
-        if (written == 0 || written >= needed) {
-            return {};
-        }
-        longForm.resize(written);
-        return longForm;
-    }
-
-    // Fully-qualified form of `path`, as the caller spelled it - *not*
-    // resolved through any reparse point. This is the "expected" side of
-    // check (3) above.
-    //
-    // 8.3 short names ("PROGRA~1") are refused rather than expanded, here
-    // and in HkdfGuard.dll's hkdfguard_open_file alike: they are a second,
-    // auto-generated name for the same file, with a history of checks that
-    // matched one spelling but not the other. The test is exact, not a guess
-    // from "~" characters: GetLongPathName walks the path through the
-    // directory listing, and a path is refused only if that changes one of
-    // its components (ignoring case). A genuine long name such as
-    // "report~1.key" passes.
-    //
-    // GetLongPathName only works on paths that exist, and the wrapped-key
-    // file usually doesn't yet. So if the full path doesn't resolve, the
-    // parent directory (which must exist) is checked instead; the leaf of a
-    // file that doesn't exist yet has no short name to check.
-    std::string FullLongPath(const std::string &path) {
+    // Fully-qualified form of `path`, as the caller spelled it -
+    // GetFullPathName works on the text alone, so nothing is opened and no
+    // link is followed. This is the "expected" side of check (3) above.
+    std::string FullPath(const std::string &path) {
         DWORD needed = GetFullPathNameA(path.c_str(), 0, nullptr, nullptr);
         if (needed == 0) {
             throw CliError("GetFullPathName failed for " + path + ": " + FormatWin32Error(GetLastError()));
@@ -1315,45 +1259,70 @@ namespace {
             throw CliError("GetFullPathName failed for " + path + ": " + FormatWin32Error(GetLastError()));
         }
         full.resize(written);
-
-        auto refuseShortName = [&path]() {
-            throw CliError(
-                path + " uses an 8.3 short name (such as PROGRA~1); spell every folder and the file "
-                "with its full name");
-        };
-
-        std::string longForm = TryLongPathName(full);
-        if (!longForm.empty()) {
-            if (_stricmp(longForm.c_str(), full.c_str()) != 0) {
-                refuseShortName();
-            }
-            return full;
-        }
-        DWORD err = GetLastError();
-        if (err != ERROR_FILE_NOT_FOUND) {
-            throw CliError("GetLongPathName failed for " + full + ": " + FormatWin32Error(err));
-        }
-
-        size_t sep = full.find_last_of("\\/");
-        if (sep == std::string::npos || sep + 1 >= full.size()) {
-            throw CliError("cannot determine the file name in " + path);
-        }
-        std::string parent = (sep <= 2) ? full.substr(0, sep + 1) : full.substr(0, sep);
-        std::string parentLong = TryLongPathName(parent);
-        if (parentLong.empty()) {
-            throw CliError(
-                "the directory for " + path + " (" + parent + ") does not exist or cannot be resolved: " +
-                FormatWin32Error(GetLastError()));
-        }
-        if (_stricmp(parentLong.c_str(), parent.c_str()) != 0) {
-            refuseShortName();
-        }
         return full;
+    }
+
+    // This tool's paths are ANSI (argv, the A-suffixed Win32 calls); the
+    // walk is in UTF-16. Converted with the same code page CreateFileA would
+    // use, so the same names are meant.
+    std::wstring AnsiToWide(const std::string &s) {
+        if (s.empty()) return {};
+        int len = MultiByteToWideChar(CP_ACP, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
+        std::wstring wide(static_cast<size_t>(len > 0 ? len : 0), L'\0');
+        if (len > 0) MultiByteToWideChar(CP_ACP, 0, s.data(), static_cast<int>(s.size()), wide.data(), len);
+        return wide;
+    }
+
+    std::string WideToAnsi(const std::wstring &w) {
+        if (w.empty()) return {};
+        int len = WideCharToMultiByte(CP_ACP, 0, w.data(), static_cast<int>(w.size()), nullptr, 0, nullptr, nullptr);
+        std::string narrow(static_cast<size_t>(len > 0 ? len : 0), '\0');
+        if (len > 0) WideCharToMultiByte(CP_ACP, 0, w.data(), static_cast<int>(w.size()), narrow.data(), len, nullptr, nullptr);
+        return narrow;
+    }
+
+    std::string FinalPathOfHandle(HANDLE file, const std::string &path);
+    std::string TrimTrailingSeparators(std::string p);
+
+    // Check (0): opens every folder from the drive root down to the one
+    // holding `full`'s last component, never following a link (see
+    // no_follow_open.h), then refuses an 8.3 short name anywhere in those
+    // folders - check (3) on the deepest one, whose canonical path spells
+    // every folder above it. `what` names the path in messages. `full` must
+    // already have passed RequireLocalDrivePath.
+    hkdfguard_nofollow::FolderChain WalkToParent(const std::string &full, const std::string &what) {
+        hkdfguard_nofollow::FolderChain chain;
+        hkdfguard_nofollow::Error error;
+        if (!hkdfguard_nofollow::OpenFolderChain(AnsiToWide(full), chain, error)) {
+            const std::string at = WideToAnsi(error.at);
+            switch (error.failure) {
+                case hkdfguard_nofollow::Failure::ReparsePoint:
+                    throw CliError(
+                        what + " resolves through a symbolic link, junction or other reparse point at \"" + at +
+                        "\"; it must be a real local path with no links in it (nothing was opened through the link)");
+                case hkdfguard_nofollow::Failure::NotADirectory:
+                    throw CliError(what + ": \"" + at + "\" is a file, not a folder");
+                case hkdfguard_nofollow::Failure::OpenFailed:
+                    if (error.win32 == ERROR_FILE_NOT_FOUND || error.win32 == ERROR_PATH_NOT_FOUND) {
+                        throw CliError("the directory for " + what + " (" + at + ") does not exist");
+                    }
+                    throw CliError("cannot open the folder \"" + at + "\" in " + what + ": " + FormatWin32Error(error.win32));
+                default:
+                    throw CliError(what + " names an alternate data stream or has an empty folder name");
+            }
+        }
+        const std::string parent = WideToAnsi(chain.parentPath());
+        const std::string actual = TrimTrailingSeparators(FinalPathOfHandle(chain.parent(), what));
+        if (_stricmp(actual.c_str(), TrimTrailingSeparators(parent).c_str()) != 0) {
+            throw CliError(
+                what + " uses an 8.3 short name (such as PROGRA~1); spell every folder and the file with its full name");
+        }
+        return chain;
     }
 
     // The kernel's canonical DOS path for an open handle, with the "\\?\"
     // (or "\\?\UNC\") prefix GetFinalPathNameByHandle always adds stripped
-    // back off so it compares directly against FullLongPath's output. This is
+    // back off so it compares directly against FullPath's output. This is
     // the "actual" side of check (3) above - it reflects every reparse point
     // that was traversed to reach the object, which is the whole point.
     std::string FinalPathOfHandle(HANDLE file, const std::string &path) {
@@ -1400,7 +1369,7 @@ namespace {
     }
 
     // Checks (1)-(4) above against an already-open handle. `expected` is the
-    // FullLongPath form the handle is supposed to be sitting at;
+    // FullPath form the handle is supposed to be sitting at;
     // `allowDirectory` is set only for the parent-directory pre-check in
     // ValidateOutputPathIsReal, never for the wrapped-key file itself.
     void RequireRealObjectAtExpectedPath(
@@ -1432,24 +1401,26 @@ namespace {
                 "overwriting it cannot alter a file at some other path");
         }
 
+        // Reached only through the walk, so a difference here can only be an
+        // 8.3 short name in the last component.
         std::string actual = TrimTrailingSeparators(FinalPathOfHandle(file, path));
         std::string want = TrimTrailingSeparators(expected);
         if (_stricmp(actual.c_str(), want.c_str()) != 0) {
             throw CliError(
-                path + " resolves through a symbolic link, junction, SUBST or mapped drive to \"" + actual +
-                "\"; the wrapped-key path must be a real local path with no links in it");
+                path + " uses an 8.3 short name (such as PROGRA~1), resolving to \"" + actual +
+                "\"; spell every folder and the file with its full name");
         }
     }
 
     // Refuses `path` unless it names a file on a local drive: never a UNC
     // path (\\server\share\..., \\?\UNC\...), a device or \\?\ path, or a
-    // mapped network drive. Decided from the path text alone (GetFullPathName
-    // does no I/O; GetDriveType asks only the local mount manager) and before
-    // anything touches the path, so this process never connects or
-    // authenticates to a server named in it - which would hand that server
-    // the caller's NTLM credentials. A SUBST drive passes here and is caught
-    // later, where the opened handle's real path must match the spelled one.
-    // `what` names the path in the message.
+    // mapped network drive, nor a SUBST drive (whose target is another path,
+    // possibly a share). Decided from the path text and the drive letter
+    // alone (see hkdfguard_nofollow::IsLocalDrivePath - nothing is opened)
+    // and before anything touches the path, so this process never connects
+    // or authenticates to a server named in it - which would hand that
+    // server the caller's NTLM credentials. Links further down the path are
+    // the walk's job (WalkToParent). `what` names the path in the message.
     void RequireLocalDrivePath(const std::string &path, const std::string &what) {
         char fullBuf[MAX_PATH * 4];
         DWORD fullLen = GetFullPathNameA(path.c_str(), static_cast<DWORD>(sizeof(fullBuf)), fullBuf, nullptr);
@@ -1457,63 +1428,39 @@ namespace {
             throw CliError("failed to resolve " + what + ": " + FormatWin32Error(GetLastError()));
         }
         const std::string full(fullBuf, fullLen);
-        const bool driveLetter = full.size() >= 3 && std::isalpha(static_cast<unsigned char>(full[0])) &&
-                                 full[1] == ':' && full[2] == '\\';
-        if (!driveLetter || GetDriveTypeA(full.substr(0, 3).c_str()) == DRIVE_REMOTE) {
+        if (!hkdfguard_nofollow::IsLocalDrivePath(AnsiToWide(full))) {
             throw CliError(
-                what + " is not on a local drive (UNC paths, mapped network drives and devices are refused)");
+                what + " is not on a local drive (UNC paths, mapped network and SUBST drives, and devices are "
+                "refused)");
         }
     }
 
     // Fail-fast version of the checks above, run before any KEK or DEK work
     // so a bad output path is rejected without touching the key store or
-    // reading the DEK at all: the parent directory must be a real directory
-    // at its spelled location, and if something already exists at the leaf
-    // it must not be a reparse point. The authoritative checks are still the
-    // ones made on the actual write/overwrite handles later
-    // (SecureOverwriteAndRemoveIfExists / WriteWrappedKeyFile) - this is the
-    // friendly early exit, not the security boundary, since a path can
-    // always change between a pre-check and a later open.
-    void ValidateOutputPathIsReal(const std::string &path) {
-        std::string full = FullLongPath(path);
+    // reading the DEK at all: every folder down to the file's must be real
+    // (WalkToParent), and if something already exists at the leaf it must
+    // pass checks (1)-(4). Returns whether something exists there. The
+    // authoritative checks are still the ones made on the actual
+    // write/overwrite handles later (SecureOverwriteAndRemoveIfExists /
+    // WriteWrappedKeyFile) - this is the friendly early exit, not the
+    // security boundary, since a path can always change between a
+    // pre-check and a later open.
+    bool ValidateOutputPathIsReal(const std::string &path) {
+        const std::string full = FullPath(path);
+        hkdfguard_nofollow::FolderChain chain = WalkToParent(full, path);
 
-        size_t sep = full.find_last_of("\\/");
-        if (sep == std::string::npos) {
-            throw CliError("cannot determine the parent directory of " + path);
+        hkdfguard_nofollow::Handle leaf;
+        DWORD err = 0;
+        if (hkdfguard_nofollow::OpenRelative(
+                chain.parent(), chain.leaf, FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_OPEN, 0, nullptr, leaf, err)) {
+            RequireRealObjectAtExpectedPath(leaf.get(), full, path, /*allowDirectory=*/false);
+            return true;
         }
-        // Keep the separator for a drive root ("C:\"), drop it otherwise.
-        std::string parent = (sep <= 2) ? full.substr(0, sep + 1) : full.substr(0, sep);
-
-        {
-            // FILE_FLAG_BACKUP_SEMANTICS is what CreateFile requires to open a
-            // *directory* handle at all; FILE_FLAG_OPEN_REPARSE_POINT so a
-            // junction opens as itself (see the section comment above).
-            ScopedFileHandle dir(CreateFile(
-                parent.c_str(), FILE_READ_ATTRIBUTES,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
-                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
-            if (!dir.valid()) {
-                throw CliError(
-                    "cannot open the directory for " + path + " (" + parent + "): " +
-                    FormatWin32Error(GetLastError()));
-            }
-            RequireRealObjectAtExpectedPath(dir.get(), parent, parent, /*allowDirectory=*/true);
-        }
-
-        {
-            // FILE_FLAG_BACKUP_SEMANTICS here too, so that if the leaf turns
-            // out to be a directory or junction it still opens and is caught
-            // by the checks, rather than failing to open and being deferred.
-            ScopedFileHandle leaf(CreateFile(
-                path.c_str(), FILE_READ_ATTRIBUTES,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
-                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
-            if (leaf.valid()) {
-                RequireRealObjectAtExpectedPath(leaf.get(), full, path, /*allowDirectory=*/false);
-            }
-            // Not existing yet is fine (that's the normal first-run case);
-            // any other open failure is left for the real write to report.
-        }
+        // Not existing yet is the normal first-run case. Anything else
+        // (access denied, in use) means something is there; the real
+        // write reports what.
+        return err != ERROR_FILE_NOT_FOUND && err != ERROR_PATH_NOT_FOUND;
     }
 
     // Marks the file behind an open handle for deletion when its last handle
@@ -1538,7 +1485,8 @@ namespace {
     // --force, an existing file is never touched at all
     // (WriteWrappedKeyFile's CREATE_NEW fails outright instead).
     //
-    // The file is opened with FILE_FLAG_OPEN_REPARSE_POINT and vetted by
+    // The file is reached by the walk (WalkToParent), opened relative to its
+    // folder without following a reparse point, and vetted by
     // RequireRealObjectAtExpectedPath before a single byte is written, and is
     // deleted through that same handle (DeleteViaHandle) rather than by
     // path - see the section comment above for why. A symlink or junction
@@ -1562,29 +1510,30 @@ namespace {
     // best-effort measure against casual recovery, not a cryptographic
     // guarantee against a determined attacker with access to the raw storage.
     void SecureOverwriteAndRemoveIfExists(const std::string &path) {
-        ScopedFileHandle file(CreateFile(
-            path.c_str(), GENERIC_WRITE | DELETE, 0 /* exclusive access for the duration of the passes */, nullptr,
-            OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
-        if (!file.valid()) {
-            DWORD err = GetLastError();
+        const std::string full = FullPath(path);
+        hkdfguard_nofollow::FolderChain chain = WalkToParent(full, path);
+        hkdfguard_nofollow::Handle file;
+        DWORD err = 0;
+        if (!hkdfguard_nofollow::OpenRelative(
+                chain.parent(), chain.leaf, GENERIC_WRITE | DELETE, 0 /* exclusive access for the duration of the passes */,
+                FILE_OPEN, FILE_NON_DIRECTORY_FILE, nullptr, file, err)) {
             if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND) {
                 return; // nothing to overwrite or delete
             }
             if (err == ERROR_ACCESS_DENIED || err == ERROR_SHARING_VIOLATION) {
                 // Can't write to it - skip the overwrite passes and go
                 // straight to removing it, still through a vetted handle.
-                ScopedFileHandle del(CreateFile(
-                    path.c_str(), DELETE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-                    OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
-                if (!del.valid()) {
-                    DWORD delErr = GetLastError();
+                hkdfguard_nofollow::Handle del;
+                DWORD delErr = 0;
+                if (!hkdfguard_nofollow::OpenRelative(
+                        chain.parent(), chain.leaf, DELETE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                        FILE_OPEN, FILE_NON_DIRECTORY_FILE, nullptr, del, delErr)) {
                     if (delErr == ERROR_FILE_NOT_FOUND || delErr == ERROR_PATH_NOT_FOUND) {
                         return;
                     }
                     throw CliError("failed to remove " + path + ": " + FormatWin32Error(delErr));
                 }
-                RequireRealObjectAtExpectedPath(del.get(), FullLongPath(path), path, /*allowDirectory=*/false);
+                RequireRealObjectAtExpectedPath(del.get(), full, path, /*allowDirectory=*/false);
                 DeleteViaHandle(del.get(), path);
                 return;
             }
@@ -1592,7 +1541,7 @@ namespace {
         }
 
         // Vet the handle before writing anything through it.
-        RequireRealObjectAtExpectedPath(file.get(), FullLongPath(path), path, /*allowDirectory=*/false);
+        RequireRealObjectAtExpectedPath(file.get(), full, path, /*allowDirectory=*/false);
 
         LARGE_INTEGER fileSize{};
         if (!GetFileSizeEx(file.get(), &fileSize)) {
@@ -1640,7 +1589,7 @@ namespace {
         }
 
         // Delete through the very handle that was vetted and overwritten -
-        // the file disappears when ScopedFileHandle closes it on return.
+        // the file disappears when its handle closes on return.
         DeleteViaHandle(file.get(), path);
     }
 
@@ -1652,31 +1601,32 @@ namespace {
     // inherited-from-parent-directory) permissions before being locked down
     // after the fact.
     //
-    // FILE_FLAG_OPEN_REPARSE_POINT matters even here: without it, CREATE_NEW
-    // *follows* a symlink whose target doesn't exist yet and creates that
-    // target - so an attacker-planted dangling link would turn "create my
-    // key file here" into "create a file wherever the link points." With the
-    // flag, a link at the path is seen as an existing object and CREATE_NEW
-    // fails with ERROR_FILE_EXISTS instead. The resolved-path check right
-    // after creation then catches a junction in a parent directory; on a
-    // mismatch the just-created (still empty) file is deleted through its
-    // own handle before anything is written to it.
+    // Created relative to its folder's handle from the walk (WalkToParent),
+    // so no link above it is followed. A link *at* the path is an existing
+    // name, so FILE_CREATE fails with "already exists" rather than following
+    // a dangling symlink to create its target - which would turn "create my
+    // key file here" into "create a file wherever the link points". The
+    // resolved-path check right after creation catches an 8.3 short name;
+    // on a mismatch the just-created (still empty) file is deleted through
+    // its own handle before anything is written to it.
     void WriteWrappedKeyFile(
         const std::string &path, const std::vector<uint8_t> &bytes, const KeyFileSecurity &security) {
         SECURITY_ATTRIBUTES sa = security.attributes();
-        ScopedFileHandle file(CreateFile(
-            path.c_str(), GENERIC_WRITE | DELETE | WRITE_DAC, 0, &sa, CREATE_NEW,
-            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
-        if (!file.valid()) {
-            DWORD err = GetLastError();
-            if (err == ERROR_FILE_EXISTS) {
+        const std::string full = FullPath(path);
+        hkdfguard_nofollow::FolderChain chain = WalkToParent(full, path);
+        hkdfguard_nofollow::Handle file;
+        DWORD err = 0;
+        if (!hkdfguard_nofollow::OpenRelative(
+                chain.parent(), chain.leaf, GENERIC_WRITE | DELETE | WRITE_DAC, 0, FILE_CREATE,
+                FILE_NON_DIRECTORY_FILE, sa.lpSecurityDescriptor, file, err)) {
+            if (err == ERROR_FILE_EXISTS || err == ERROR_ALREADY_EXISTS) {
                 throw CliError(path + " already exists; pass --force|-f to overwrite");
             }
             throw CliError("failed to open " + path + " for writing: " + FormatWin32Error(err));
         }
 
         try {
-            RequireRealObjectAtExpectedPath(file.get(), FullLongPath(path), path, /*allowDirectory=*/false);
+            RequireRealObjectAtExpectedPath(file.get(), full, path, /*allowDirectory=*/false);
         } catch (const CliError &) {
             // Nothing has been written yet; don't leave an empty file behind
             // at wherever the path actually resolved to.
@@ -1707,7 +1657,7 @@ namespace {
 
         // Write the payload and flush it to storage, so a reported success
         // survives a crash. On any failure the file is deleted through its
-        // own handle (it goes when ScopedFileHandle closes it): a failed wrap
+        // own handle (it goes when that handle closes): a failed wrap
         // never leaves an empty or truncated key file behind, for the next
         // `wrap` to call "already exists" or a service to read as malformed -
         // the same rule as the Linux tool's finish_key_file.
@@ -1858,22 +1808,25 @@ namespace {
     //   - on a local drive: never UNC, a mapped network drive or a device,
     //     decided before anything is opened, so this process never connects
     //     or authenticates to a server named in the path;
+    //   - reached by the walk (WalkToParent): no symbolic link or junction
+    //     above it is ever followed, so nothing is opened on another machine;
+    //   - a regular file, opened without following a reparse point;
     //   - no 8.3 short name anywhere in it;
-    //   - a regular file, opened without following a reparse point, and at
-    //     the spelled path: no symbolic link or junction at it or above it;
     // then RequireTrustedDekFile, then at most kMaxDekStdinLen bytes. Opened
     // with read sharing only, so nobody can change it while it's read.
     // Unlike the key file, a hard link isn't refused: nothing here writes
     // through it, and the Linux tool doesn't refuse one either.
     void ReadDekFile(const std::string &path, DekScratch &scratch) {
-        RequireLocalDrivePath(path, "--dek-file " + path);
-        const std::string expected = FullLongPath(path); // refuses 8.3 short names
+        const std::string what = "--dek-file " + path;
+        RequireLocalDrivePath(path, what);
+        const std::string expected = FullPath(path);
+        hkdfguard_nofollow::FolderChain chain = WalkToParent(expected, what);
 
-        ScopedFileHandle file(CreateFile(
-            path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-            FILE_FLAG_OPEN_REPARSE_POINT | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION, nullptr));
-        if (!file.valid()) {
-            throw CliError("failed to open --dek-file " + path + ": " + FormatWin32Error(GetLastError()));
+        hkdfguard_nofollow::Handle file;
+        DWORD err = 0;
+        if (!hkdfguard_nofollow::OpenRelative(
+                chain.parent(), chain.leaf, GENERIC_READ, FILE_SHARE_READ, FILE_OPEN, 0, nullptr, file, err)) {
+            throw CliError("failed to open " + what + ": " + FormatWin32Error(err));
         }
         if (GetFileType(file.get()) != FILE_TYPE_DISK) {
             throw CliError("--dek-file " + path + " is not a regular file");
@@ -1891,8 +1844,8 @@ namespace {
         const std::string actual = TrimTrailingSeparators(FinalPathOfHandle(file.get(), path));
         if (_stricmp(actual.c_str(), TrimTrailingSeparators(expected).c_str()) != 0) {
             throw CliError(
-                "--dek-file " + path + " resolves through a symbolic link, junction, SUBST or mapped drive to \"" +
-                actual + "\"; give its real local path");
+                what + " uses an 8.3 short name (such as PROGRA~1), resolving to \"" + actual +
+                "\"; give its full local path");
         }
         RequireTrustedDekFile(file.get(), path);
         ReadBoundedInto(file.get(), "--dek-file", scratch);
@@ -1909,7 +1862,7 @@ namespace {
     // creates or modifies a key.
 
     // RAII for an NCrypt provider or key handle - this tool's own copy of
-    // src/handle_traits.h's, for the same reason as ScopedFileHandle above.
+    // src/handle_traits.h's: this tool compiles nothing from src/.
     class ScopedNCryptHandle {
     public:
         ScopedNCryptHandle() = default;
@@ -2391,23 +2344,21 @@ namespace {
             RequireLocalDrivePath(*args.dekFile, "--dek-file " + *args.dekFile);
         }
 
-        // Fast, friendly pre-check: fail before ever touching the TPM/Software
-        // Key Storage Provider if the output path obviously already exists and
-        // --force wasn't passed. WriteWrappedKeyFile's CREATE_NEW is the actual
-        // correctness guarantee against the exists-then-create race; this is
-        // purely a fail-fast convenience on top of it.
-        if (!args.force) {
-            DWORD attrs = GetFileAttributes(args.keyFilePath.c_str());
-            if (attrs != INVALID_FILE_ATTRIBUTES) {
-                throw CliError(args.keyFilePath + " already exists; pass --force|-f to overwrite");
-            }
-        }
-
         // The output path must be a real file at a real location - no
-        // symlink, junction, or other reparse point at or above it. Checked
-        // here, before any KEK or DEK work, so a bad path is rejected cheaply;
-        // the write/overwrite code re-checks on its own handles regardless.
-        ValidateOutputPathIsReal(args.keyFilePath);
+        // symlink, junction, or other reparse point at or above it, and none
+        // followed to find out (see WalkToParent). Checked here, before any
+        // KEK or DEK work, so a bad path is rejected cheaply; the
+        // write/overwrite code re-checks on its own handles regardless.
+        //
+        // Then a fast, friendly pre-check: fail before ever touching the
+        // TPM/Software Key Storage Provider if the output path already exists
+        // and --force wasn't passed. WriteWrappedKeyFile's FILE_CREATE is the
+        // actual correctness guarantee against the exists-then-create race;
+        // this is purely a fail-fast convenience on top of it.
+        const bool exists = ValidateOutputPathIsReal(args.keyFilePath);
+        if (exists && !args.force) {
+            throw CliError(args.keyFilePath + " already exists; pass --force|-f to overwrite");
+        }
 
         // Resolved before any TPM/Software Key Storage Provider work, so a bad
         // --group name fails fast rather than after an expensive (and, with

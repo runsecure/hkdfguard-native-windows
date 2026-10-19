@@ -934,6 +934,44 @@ try {
             if ($tpmFp) { Invoke-Cli @("retire", "-sn", $bothService, "-fp", $tpmFp) | Out-Null }
         }
 
+        # ---- 16. A directory symbolic link to a share, in the --dek-file ----
+        #          or output path, is refused without being followed:
+        #          following it would connect and authenticate to that server
+        #          (an NTLM challenge-response it could relay) before any
+        #          check on the result. Windows follows local-to-remote
+        #          symbolic links by default; creating one needs elevation.
+        #          Targets: \\localhost\C$\Windows (exists, so a refusal isn't
+        #          just "unreachable") and \\192.0.2.1\share (TEST-NET-1, never
+        #          routed: even trying to connect stalls for seconds, so a fast
+        #          refusal shows no connection was tried). The refusal must
+        #          name the link, never the resolved UNC path.
+        foreach ($share in @(@{ Target = '\\localhost\C$\Windows'; File = 'win.ini' }, @{ Target = '\\192.0.2.1\share'; File = 'dek.b64' })) {
+            $shareLink = Join-Path $workDir "sharelink"
+            cmd /c mklink /D "$shareLink" $share.Target 2>&1 | Out-Null
+            # The link's own attributes (GetFileAttributes doesn't follow the
+            # last component), so this never contacts the target either.
+            $linkMade = $false
+            try { $linkMade = ([IO.File]::GetAttributes($shareLink) -band [IO.FileAttributes]::ReparsePoint) -ne 0 } catch { }
+            if (-not $linkMade) {
+                Check $false "test setup: create a directory symbolic link to $($share.Target)"
+                continue
+            }
+            $sw = [Diagnostics.Stopwatch]::StartNew()
+            $r = Invoke-Cli @("wrap", "-kf", (Join-Path $workDir "share.key"), "-sn", $neverProvisionedService, "--dek-file", (Join-Path $shareLink $share.File))
+            $sw.Stop()
+            Check (($r.ExitCode -eq 1) -and ($r.StdErr -match "reparse point at `"[^`"]*sharelink`"") -and ($r.StdErr -notmatch [regex]::Escape($share.Target))) "--dek-file through a directory symbolic link to $($share.Target) is refused at the link, not followed"
+            if ($r.StdErr -match [regex]::Escape($share.Target)) { Write-Host "    stderr: $($r.StdErr)" }
+            Check ($sw.ElapsedMilliseconds -lt 2000) "--dek-file through a link to $($share.Target) is refused at once ($($sw.ElapsedMilliseconds) ms)"
+
+            $sw = [Diagnostics.Stopwatch]::StartNew()
+            $r = Invoke-Cli @("wrap", "-kf", (Join-Path $shareLink "hkdfguard-probe.key"), "-sn", $neverProvisionedService, "--dek-stdin") -StdIn $validB64
+            $sw.Stop()
+            Check (($r.ExitCode -eq 1) -and ($r.StdErr -match "reparse point at `"[^`"]*sharelink`"") -and ($r.StdErr -notmatch [regex]::Escape($share.Target))) "an output path through a directory symbolic link to $($share.Target) is refused at the link, not followed"
+            Check ($sw.ElapsedMilliseconds -lt 2000) "an output path through a link to $($share.Target) is refused at once ($($sw.ElapsedMilliseconds) ms)"
+            cmd /c rmdir "$shareLink" 2>&1 | Out-Null
+        }
+        Check (-not (Test-Path '\\localhost\C$\Windows\hkdfguard-probe.key')) "no key file was written to the share"
+
         # Fallback cleanup, if retire couldn't run. Full path, not just
         # "certutil" - this test's PATH is whatever ctest baked into its
         # ENVIRONMENT property at configure time (see tests/CMakeLists.txt),
