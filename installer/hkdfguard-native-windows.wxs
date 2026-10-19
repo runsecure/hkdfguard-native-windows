@@ -4,7 +4,9 @@
 
   What it does:
     - Installs HkdfGuard.dll and hkdfguard.exe
-      side by side into  %ProgramFiles%\HkdfGuard\ .
+      side by side into  %ProgramFiles%\HkdfGuard\v1\ . The "v1" folder is
+      the one place the major version appears: a future incompatible major
+      version installs beside it (HkdfGuard\v2\) rather than replacing it.
     - Writes that folder to
         HKLM\Software\hkdfguard-native-windows  InstallPath  (REG_SZ)
       so consumers (e.g. a C# wrapper) can load the DLL by absolute path via
@@ -63,7 +65,9 @@
     <MediaTemplate EmbedCab="yes" />
 
     <StandardDirectory Id="ProgramFiles64Folder">
-      <Directory Id="HkdfGuardInstallDir" Name="HkdfGuard" />
+      <Directory Id="HkdfGuardRootDir" Name="HkdfGuard">
+        <Directory Id="HkdfGuardInstallDir" Name="v1" />
+      </Directory>
     </StandardDirectory>
 
     <ComponentGroup Id="HkdfGuardComponents" Directory="HkdfGuardInstallDir">

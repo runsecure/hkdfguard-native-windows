@@ -2057,7 +2057,7 @@ namespace {
             for (const wchar_t *c = group; *c != L'\0'; ++c) {
                 narrow.push_back(*c >= 0x20 && *c < 0x7F ? static_cast<char>(*c) : '?');
             }
-            result.description = "a " + (narrow.empty() ? std::string("(unnamed)") : narrow) + " key";
+            result.description = "a key of algorithm group " + (narrow.empty() ? std::string("(unnamed)") : narrow);
             return result;
         }
 

@@ -716,7 +716,7 @@ msiexec /i hkdfguard-native-windows-0.9.0-win-x64.msi /qn /l*v install.log
 
 The MSI does four things:
 
-- **Installs both files** to `C:\Program Files\HkdfGuard\`. That folder
+- **Installs both files** to `C:\Program Files\HkdfGuard\v1\`. That folder
   inherits the Program Files ACL, where only Administrators, SYSTEM and TrustedInstaller
   can write. This is what stops a less-privileged user from planting a fake DLL next to
   the CLI and getting code execution the next time an administrator runs the elevated
@@ -736,7 +736,7 @@ The MSI does four things:
 Then, once per service, elevated:
 
 ```
-"C:\Program Files\HkdfGuard\hkdfguard.exe" provision --service-name myapp
+"C:\Program Files\HkdfGuard\v1\hkdfguard.exe" provision --service-name myapp
 ```
 
 **Upgrades** remove the previous version before installing the new one. A service with

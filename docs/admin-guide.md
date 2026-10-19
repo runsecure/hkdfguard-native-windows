@@ -109,7 +109,7 @@ with a restart required. For anything else, see `install.log`.
 
 | Change | Detail |
 |---|---|
-| Files | `C:\Program Files\HkdfGuard\HkdfGuard.dll` and `hkdfguard.exe`. The folder inherits the Program Files ACL, so only Administrators, SYSTEM and TrustedInstaller can write to it. The location can't be changed. |
+| Files | `C:\Program Files\HkdfGuard\v1\HkdfGuard.dll` and `hkdfguard.exe`. The folder inherits the Program Files ACL, so only Administrators, SYSTEM and TrustedInstaller can write to it. The location can't be changed. |
 | Registry | `HKLM\Software\hkdfguard-native-windows`, value `InstallPath` (`REG_SZ`). Applications read it to find the DLL. |
 | Event log | Registers the Application log source `hkdfguard-native-windows`. |
 | Local group | Creates `HkdfGuardUsers` if it doesn't already exist. |
@@ -121,9 +121,9 @@ machine policy, such as Group Policy, Intune or SCCM.
 
 ```powershell
 Get-ItemProperty HKLM:\Software\hkdfguard-native-windows | Select-Object InstallPath
-Get-ChildItem "C:\Program Files\HkdfGuard"
+Get-ChildItem "C:\Program Files\HkdfGuard\v1"
 net localgroup HkdfGuardUsers
-& "C:\Program Files\HkdfGuard\hkdfguard.exe" --help
+& "C:\Program Files\HkdfGuard\v1\hkdfguard.exe" --help
 ```
 
 ## Set up a service
@@ -175,7 +175,7 @@ Both groups must be local groups on this machine. The installer never creates
 ### 2. Provision the KEK (elevated, once per service)
 
 ```powershell
-& "C:\Program Files\HkdfGuard\hkdfguard.exe" provision --service-name myapp
+& "C:\Program Files\HkdfGuard\v1\hkdfguard.exe" provision --service-name myapp
 ```
 
 `provision` creates the KEK if it's missing. If the KEK already exists, `provision` checks
@@ -206,7 +206,7 @@ group is refused. Without `--group`, only the owner can read the file, so an
 application running as another account can't open it.
 
 ```powershell
-$exe = "C:\Program Files\HkdfGuard\hkdfguard.exe"
+$exe = "C:\Program Files\HkdfGuard\v1\hkdfguard.exe"
 
 # One-time: a group for the account that reads the key file.
 net localgroup App_1234 /add
@@ -275,7 +275,7 @@ path built from the `InstallPath` registry value, never by bare file name. See
 To see a service's KEK, run `status` from any account that can use the key:
 
 ```powershell
-& "C:\Program Files\HkdfGuard\hkdfguard.exe" status --service-name myapp
+& "C:\Program Files\HkdfGuard\v1\hkdfguard.exe" status --service-name myapp
 ```
 
 It prints whether the KEK is `present`, `absent`, `corrupt` or `unusable`. It also prints
@@ -290,7 +290,7 @@ service name (for example from `myapp` to `myapp.v2`) and no key file wrapped un
 name is still needed. From an elevated prompt:
 
 ```powershell
-& "C:\Program Files\HkdfGuard\hkdfguard.exe" retire --service-name myapp --fingerprint <recorded fingerprint>
+& "C:\Program Files\HkdfGuard\v1\hkdfguard.exe" retire --service-name myapp --fingerprint <recorded fingerprint>
 ```
 
 `retire` deletes the KEK only if its fingerprint matches the one you give. Otherwise it
