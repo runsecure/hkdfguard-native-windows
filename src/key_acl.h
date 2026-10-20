@@ -98,13 +98,17 @@ namespace hkdfguard {
     // a key file (see SecurityModel in policy.h): the SID of
     // HkdfGuardDeployers (if present - see the constant above) and of each
     // DeployerGroups entry, each vetted exactly as ValidateKeyUseGroups
-    // vets a key-use entry, plus the SID of every *direct* member of each
-    // of those groups. Members are read from this machine's own group
-    // database by SID (NetLocalGroupGetMembers, level 0), so no name is
-    // resolved and no domain controller is contacted; a group nested inside
-    // a deployer group is trusted as a principal, but its own members are
-    // not expanded. A well-known group (an NT SERVICE or NT AUTHORITY
-    // principal) has no enumerable members and contributes only its SID.
+    // vets a key-use entry, plus the SID of each *direct* member that is a
+    // single account: a user account, or one service's own NT SERVICE SID.
+    // A group nested inside a deployer group - local, domain or well-known
+    // (Authenticated Users, Domain Users, ...) - is not trusted at all,
+    // neither as a principal nor through its members, and nothing
+    // over-broad ever is. Members are read from this machine's group
+    // database (NetLocalGroupGetMembers, level 1); resolving a domain
+    // member's account type asks its domain controller over LSA, and a
+    // member whose type can't be determined is not trusted. A well-known
+    // deployer group (an NT SERVICE or NT AUTHORITY principal) has no
+    // enumerable members and contributes only its own SID.
     // Throws HkdfGuardError(HKDFGUARD_ERR_WIN_GROUP_INVALID) for an entry
     // that fails vetting, or a group whose members can't be read.
     std::vector<std::vector<BYTE>> ResolveDeployerPrincipals(

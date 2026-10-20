@@ -119,3 +119,11 @@ add_test(
 set_tests_properties(roles PROPERTIES
     ENVIRONMENT "PATH=$<TARGET_FILE_DIR:hkdfguard>\\;${HKDFGUARD_TEST_PATH}"
 )
+
+# roundtrip, cli and roles each change machine-wide state while they run -
+# KEKs, local accounts and groups, and the SecurityModel policy value, which
+# roundtrip and cli set and then restore. Run concurrently (ctest -j), one
+# could save the other's temporary value and "restore" it, leaving the
+# machine in the developer model. A shared lock makes ctest run them one at
+# a time, whatever -j says; harden_process touches none of it.
+set_tests_properties(roundtrip cli roles PROPERTIES RESOURCE_LOCK HkdfGuardMachineState)

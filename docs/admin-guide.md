@@ -180,10 +180,13 @@ net localgroup HkdfGuardUsers "NT SERVICE\MyAppService" /add
 net localgroup HkdfGuardDeployers "CONTOSO\deploy-agent" /add
 ```
 
-Deployer membership is read every time a key file is opened, and only **direct** members
-count: a group nested inside `HkdfGuardDeployers` is trusted as a group, but its own
-members aren't. Remove someone from `HkdfGuardDeployers` and the key files they own stop
-being trusted, so redeploy them under a current deployer.
+Deployer membership is read every time a key file is opened. Only **individual accounts**
+added **directly** to `HkdfGuardDeployers` count: user accounts (local or domain) and
+service accounts (`NT SERVICE\<name>`). A group added to it - local, domain or built-in,
+such as `Domain Users` or `Authenticated Users` - is ignored, and so are its members, so
+adding a broad group can never make everyone a deployer. Add each deploying account
+itself. Remove someone from `HkdfGuardDeployers` and the key files they own stop being
+trusted, so redeploy them under a current deployer.
 
 Because the KEK's access list names the group, you can change who has access later by
 changing the group's membership. You don't need a new KEK. A running service only picks up

@@ -51,8 +51,11 @@ defended against:
   replaced, before the first release, an ECIES construction in which the
   public key alone sufficed - so anyone who had ever obtained it (a former
   key-use principal, a copy taken off the host) could forge payloads
-  offline, indefinitely, without touching the KEK. Now removing an account
-  from the key-use groups really ends its ability to create payloads.
+  offline, indefinitely, without touching the KEK. Now, for a Platform
+  Crypto Provider (TPM) KEK, removing an account from the key-use groups
+  really ends its ability to create payloads. For a Software KSP KEK it
+  does not: key use there is read access to the key file, which is enough
+  to take the private key (section 9).
   What remains is accepted: every principal currently granted key use
   (`KeyUseGroups`, `HkdfGuardUsers`) can wrap, and so can mint a valid
   payload around a DEK of its own choosing. The payload is authenticated as
@@ -342,6 +345,27 @@ use) are still granted by *name*, now restricted to local groups.
   (`HKDFGUARD_ERR_KEK_ACCESS_DENIED`, elevation required), confirming creation
   and use are genuinely governed by separate mechanisms (elevation vs.
   ACL). Both the KEK and the test account/group were removed afterward.
+- On the **Software KSP** (provider_type 2), that `GENERIC_READ` grant is
+  effectively a grant of the private key itself. A Software KSP machine key
+  is a file under `%ProgramData%\Microsoft\Crypto\Keys`, protected with
+  machine-scope DPAPI, which any local account can decrypt. A principal that
+  can read the file can recover the raw P-256 scalar, whatever
+  `NCRYPT_EXPORT_POLICY_PROPERTY` says, and from then on wrap and unwrap
+  for that service offline, indefinitely, even after it is removed from
+  the key-use groups. So on a Software KSP KEK every key-use principal must
+  be treated as holding the KEK, not just as able to use it. A KEK in the
+  Platform Crypto Provider keeps its private key in the TPM and does not
+  have this property. Where it matters, use `RequireTpm`, and treat a
+  `PreferTpm` fallback to the Software KSP (event 1001) as a security
+  event. **Not verified on this project:** this rests on documented
+  Windows behaviour (Software KSP key storage and machine-scope DPAPI). No
+  scalar was extracted from a HkdfGuard KEK.
+- Key-use authorization is per host, not per service. Every KEK gets the
+  same policy-derived DACL, and the `service` name selects a key and is
+  bound into its derivation, but it is never an authorization input. Any
+  key-use principal can wrap and unwrap for every service on the host.
+  Service separation is cryptographic (independent keys), not access
+  control.
 
 ## 10. Payload integrity and the KEK fingerprint (verified where noted)
 

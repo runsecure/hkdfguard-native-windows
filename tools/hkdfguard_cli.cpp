@@ -1157,7 +1157,13 @@ namespace {
             if (!InitializeAcl(acl, aclSize, ACL_REVISION)) {
                 throw CliError("InitializeAcl failed: " + FormatWin32Error(GetLastError()));
             }
-            if (!AddAccessAllowedAce(acl, ACL_REVISION, FILE_GENERIC_READ | FILE_GENERIC_WRITE, owner)) {
+            // DELETE too, so the owner can replace its own key file with the
+            // next release's (`wrap --force` overwrites it, then deletes it
+            // through that handle). Without it a deployer - who, by the
+            // recommended folder grant, has Modify on the key folder but not
+            // "delete subfolders and files" - couldn't, since this DACL is
+            // protected and inherits nothing from the folder.
+            if (!AddAccessAllowedAce(acl, ACL_REVISION, FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE, owner)) {
                 throw CliError("AddAccessAllowedAce(owner) failed: " + FormatWin32Error(GetLastError()));
             }
             if (group != nullptr && !AddAccessAllowedAce(acl, ACL_REVISION, FILE_GENERIC_READ, group)) {
@@ -1307,6 +1313,10 @@ namespace {
         if (!hkdfguard_nofollow::OpenFolderChain(AnsiToWide(full), chain, error)) {
             const std::string at = WideToAnsi(error.at);
             switch (error.failure) {
+                case hkdfguard_nofollow::Failure::NotLocalDrive:
+                    throw CliError(
+                        what + " is not on a local drive (UNC paths, mapped network and SUBST drives, and devices are "
+                        "refused)");
                 case hkdfguard_nofollow::Failure::ReparsePoint:
                     throw CliError(
                         what + " resolves through a symbolic link, junction or other reparse point at \"" + at +

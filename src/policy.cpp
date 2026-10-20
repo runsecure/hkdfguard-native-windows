@@ -470,19 +470,29 @@ namespace hkdfguard {
 
         RegCloseKey(key);
 
-        // Same reasoning: the *value* missing under an existing key is
-        // still "never configured," not "configured wrong."
-        if (status != ERROR_SUCCESS) {
+        // Same reasoning: only the *value* missing under an existing key is
+        // still "never configured". Any other failure - a REG_QWORD or a
+        // long REG_SZ doesn't fit a DWORD (ERROR_MORE_DATA) - is a value
+        // that was set to *something*, so it's the "present but invalid"
+        // case, never the default.
+        return ParseKeyStoragePolicy(
+            status != ERROR_FILE_NOT_FOUND,
+            status == ERROR_SUCCESS && size == sizeof(value),
+            type,
+            value);
+    }
+
+    KeyStoragePolicy ParseKeyStoragePolicy(bool found, bool readable, unsigned long type, unsigned long value) noexcept
+    {
+        if (!found) {
             return kDefaultPolicy;
         }
-
-        // A value of the wrong REG_* type was, unambiguously, deliberately
-        // set to something - just not a DWORD - so this is the "present but
-        // invalid" case: report it as such rather than defaulting.
-        if (type != REG_DWORD) {
+        // Present but unreadable as a DWORD, or of another REG_* type: it
+        // was deliberately set to something, just not a policy this code
+        // knows - report it rather than defaulting.
+        if (!readable || type != REG_DWORD) {
             return KeyStoragePolicy::Invalid;
         }
-
         return ParsePolicyValue(value);
     }
 

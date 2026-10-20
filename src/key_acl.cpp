@@ -862,6 +862,28 @@ namespace hkdfguard {
         // account that is a direct member. A well-known group (NT SERVICE,
         // NT AUTHORITY) isn't in the local group database and has no
         // enumerable members: it contributes only its own SID.
+        // Whether a direct member of a deployer group may be trusted to have
+        // written a key file: a single account, never a group. Trusted: a
+        // user account, and an individual service's own SID (NT SERVICE\x,
+        // S-1-5-80-<...>) - which Windows reports as a well-known group but
+        // which names exactly one service. Never trusted: a nested group of
+        // any kind (local, domain or well-known - Authenticated Users,
+        // Domain Users, ...), whose members would otherwise all become key
+        // file authors, nor anything over-broad, nor a member whose type
+        // couldn't be determined (deleted, unknown, unresolvable).
+        bool IsTrustableDeployerMember(PSID member, SID_NAME_USE use) {
+            if (IsOverBroadSid(member)) {
+                return false;
+            }
+            if (use == SidTypeUser) {
+                return true;
+            }
+            const SID_IDENTIFIER_AUTHORITY nt = SECURITY_NT_AUTHORITY;
+            const PSID_IDENTIFIER_AUTHORITY authority = GetSidIdentifierAuthority(member);
+            return std::memcmp(authority, &nt, sizeof(nt)) == 0 && *GetSidSubAuthorityCount(member) >= 2 &&
+                   *GetSidSubAuthority(member, 0) == SECURITY_SERVICE_ID_BASE_RID;
+        }
+
         void AppendDirectMembers(const SidBuffer &sid, std::vector<SidBuffer> &out) {
             wchar_t name[256] = {};
             wchar_t domain[256] = {};
@@ -882,17 +904,22 @@ namespace hkdfguard {
                 BYTE *buffer = nullptr;
                 DWORD read = 0;
                 DWORD total = 0;
-                status = NetLocalGroupGetMembers(nullptr, name, 0, &buffer, MAX_PREFERRED_LENGTH, &read, &total,
+                // Level 1: each member's SID and account type. Resolving the
+                // type of a domain member asks its domain controller (LSA,
+                // never SMB); a member whose type can't be determined is
+                // simply not trusted.
+                status = NetLocalGroupGetMembers(nullptr, name, 1, &buffer, MAX_PREFERRED_LENGTH, &read, &total,
                                                  &resume);
                 if (status != NERR_Success && status != ERROR_MORE_DATA) {
                     if (buffer != nullptr) NetApiBufferFree(buffer);
                     throw HkdfGuardError(HKDFGUARD_ERR_WIN_GROUP_INVALID,
                                          "the members of a deployer group could not be read");
                 }
-                const auto *members = reinterpret_cast<const LOCALGROUP_MEMBERS_INFO_0 *>(buffer);
+                const auto *members = reinterpret_cast<const LOCALGROUP_MEMBERS_INFO_1 *>(buffer);
                 for (DWORD i = 0; i < read; ++i) {
-                    PSID member = members[i].lgrmi0_sid;
-                    if (member != nullptr && IsValidSid(member)) {
+                    PSID member = members[i].lgrmi1_sid;
+                    if (member != nullptr && IsValidSid(member) &&
+                        IsTrustableDeployerMember(member, members[i].lgrmi1_sidusage)) {
                         const auto *bytes = static_cast<const BYTE *>(member);
                         out.emplace_back(bytes, bytes + GetLengthSid(member));
                     }

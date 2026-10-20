@@ -31,13 +31,11 @@ param(
     [Parameter(Mandatory = $true)][string]$DllPath
 )
 
-# Windows PowerShell started from PowerShell 7 (or by a tool that passes
-# PowerShell 7's PSModulePath along) can't auto-load its own modules, so the
-# two this script uses are imported by full path.
-foreach ($module in "Microsoft.PowerShell.Security", "Microsoft.PowerShell.LocalAccounts") {
-    $path = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\Modules\$module"
-    if (Test-Path -LiteralPath $path) { Import-Module $path -ErrorAction SilentlyContinue }
-}
+# This script uses no PowerShell module - not LocalAccounts (Get-LocalGroup
+# and friends) nor Security (Get-Acl / Set-Acl). A Windows PowerShell that
+# ctest starts from a PowerShell 7 session can fail to load either, even when
+# imported by full path. Accounts and groups go through ADSI (WinNT://) and
+# file permissions through .NET's ACL API, both always present.
 
 $ErrorActionPreference = "Stop"
 $failures = 0
@@ -59,7 +57,7 @@ if (-not $principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Adm
 $model = $null
 try { $model = (Get-ItemProperty -Path "HKLM:\Software\Policies\HkdfGuard" -Name SecurityModel -ErrorAction Stop).SecurityModel } catch { }
 if ($null -ne $model -and $model -ne 0) {
-    Write-Host "[SKIP] role checks: this machine's SecurityModel policy is $model, not production"
+    Write-Host "[SKIP] role checks: this machine's SecurityModel policy is $model, not production. If that isn't deliberate, an interrupted test run may have left it: remove HKLM\Software\Policies\HkdfGuard\SecurityModel." -ForegroundColor Yellow
     exit 0
 }
 
@@ -105,28 +103,79 @@ function Invoke-As {
     return $result
 }
 
+# ---- Local accounts and groups, through ADSI. ----
+$computer = [ADSI]"WinNT://$env:COMPUTERNAME,computer"
+# A SecureString for a PSCredential, built directly (ConvertTo-SecureString
+# lives in the Security module).
+function ConvertTo-Secure([string]$Plain) {
+    $secure = New-Object System.Security.SecureString
+    foreach ($c in $Plain.ToCharArray()) { $secure.AppendChar($c) }
+    $secure.MakeReadOnly()
+    return $secure
+}
+# DirectoryEntry.Exists actually checks; binding [ADSI] to a missing name
+# returns a placeholder instead of failing.
+function Test-LocalGroupExists([string]$Name) {
+    return [System.DirectoryServices.DirectoryEntry]::Exists("WinNT://$env:COMPUTERNAME/$Name,group")
+}
+function New-TestLocalGroup([string]$Name) {
+    $group = $computer.Create("group", $Name)
+    $group.Put("description", "created by hkdfguard test_roles.ps1")
+    $group.SetInfo()
+}
+# The password is set through ADSI, never on a command line.
+function New-TestLocalUser([string]$Name, [string]$Password, [string]$Description) {
+    $user = $computer.Create("user", $Name)
+    $user.SetPassword($Password)
+    $user.Put("description", $Description)
+    $user.SetInfo()
+}
+function Add-TestGroupMember([string]$Group, [string]$User) {
+    ([ADSI]"WinNT://$env:COMPUTERNAME/$Group,group").Add("WinNT://$env:COMPUTERNAME/$User,user")
+}
+function Remove-TestGroupMember([string]$Group, [string]$User) {
+    ([ADSI]"WinNT://$env:COMPUTERNAME/$Group,group").Remove("WinNT://$env:COMPUTERNAME/$User,user")
+}
+function Get-GroupSid([string]$Name) {
+    return (New-Object System.Security.Principal.NTAccount($Name)).Translate([System.Security.Principal.SecurityIdentifier]).Value
+}
+
+# ---- File permissions, through .NET. PowerShell 7 exposes them as
+#      FileSystemAclExtensions, Windows PowerShell as instance methods. ----
+$aclExtensions = [Type]::GetType("System.IO.FileSystemAclExtensions, System.IO.FileSystem.AccessControl", $false)
+# Sets a folder's owner and DACL from SDDL (no SACL, which would need
+# SeSecurityPrivilege).
 function Set-ProtectedAcl([string]$Path, [string]$Sddl) {
-    $acl = Get-Acl -LiteralPath $Path
-    $acl.SetSecurityDescriptorSddlForm($Sddl)
-    Set-Acl -LiteralPath $Path -AclObject $acl
+    $info = New-Object System.IO.DirectoryInfo($Path)
+    $security = New-Object System.Security.AccessControl.DirectorySecurity
+    $security.SetSecurityDescriptorSddlForm($Sddl, [System.Security.AccessControl.AccessControlSections]"Owner, Access")
+    if ($aclExtensions) { $aclExtensions::SetAccessControl($info, $security) } else { $info.SetAccessControl($security) }
+}
+function Get-FileOwnerName([string]$Path) {
+    $info = New-Object System.IO.FileInfo($Path)
+    $security = if ($aclExtensions) { $aclExtensions::GetAccessControl($info) } else { $info.GetAccessControl() }
+    return $security.GetOwner([System.Security.Principal.NTAccount]).Value
 }
 
 try {
     # ---- Groups and accounts. ----
     foreach ($group in "HkdfGuardUsers", "HkdfGuardDeployers") {
-        if (-not (Get-LocalGroup -Name $group -ErrorAction SilentlyContinue)) {
-            New-LocalGroup -Name $group -Description "created by hkdfguard test_roles.ps1" | Out-Null
+        if (-not (Test-LocalGroupExists $group)) {
+            New-TestLocalGroup $group
             $createdGroups += $group
         }
     }
-    $depPassword = ConvertTo-SecureString (New-Password) -AsPlainText -Force
-    $appPassword = ConvertTo-SecureString (New-Password) -AsPlainText -Force
-    New-LocalUser -Name $depName -Password $depPassword -Description "hkdfguard role test: deployer" -AccountNeverExpires | Out-Null
+    $depPlain = New-Password
+    $appPlain = New-Password
+    $depPassword = ConvertTo-Secure $depPlain
+    $appPassword = ConvertTo-Secure $appPlain
+    New-TestLocalUser $depName $depPlain "hkdfguard role test: deployer"
     $createdUsers += $depName
-    New-LocalUser -Name $appName -Password $appPassword -Description "hkdfguard role test: application" -AccountNeverExpires | Out-Null
+    New-TestLocalUser $appName $appPlain "hkdfguard role test: application"
+    $depPlain = $null; $appPlain = $null
     $createdUsers += $appName
-    Add-LocalGroupMember -Group "HkdfGuardDeployers" -Member $depName
-    Add-LocalGroupMember -Group "HkdfGuardUsers" -Member $appName
+    Add-TestGroupMember "HkdfGuardDeployers" $depName
+    Add-TestGroupMember "HkdfGuardUsers" $appName
     $dep = New-Object System.Management.Automation.PSCredential("$env:COMPUTERNAME\$depName", $depPassword)
     $app = New-Object System.Management.Automation.PSCredential("$env:COMPUTERNAME\$appName", $appPassword)
 
@@ -135,8 +184,8 @@ try {
     New-Item -ItemType Directory -Path $root, $bin, $keys, $out | Out-Null
     Set-ProtectedAcl $root "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)"
     Set-ProtectedAcl $out "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"
-    $deployers = (Get-LocalGroup -Name "HkdfGuardDeployers").SID.Value
-    $users = (Get-LocalGroup -Name "HkdfGuardUsers").SID.Value
+    $deployers = Get-GroupSid "HkdfGuardDeployers"
+    $users = Get-GroupSid "HkdfGuardUsers"
     Set-ProtectedAcl $keys "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1301bf;;;$deployers)(A;OICI;0x1200a9;;;$users)"
     foreach ($file in $CliExePath, $ProbeExePath, $DllPath) { Copy-Item -LiteralPath $file -Destination $bin }
     $cli = Join-Path $bin (Split-Path -Leaf $CliExePath)
@@ -159,11 +208,24 @@ try {
     $r = Invoke-As $dep $cli @("wrap", "-kf", $keyFile, "-sn", $service, "--dek-stdin", "-g", "HkdfGuardUsers") -StdIn ([Convert]::ToBase64String($dekBytes))
     Check (($r.ExitCode -eq 0) -and (Test-Path -LiteralPath $keyFile)) "deployer: wrap persists a key file in the key folder"
     if ($r.ExitCode -ne 0) { Write-Host "    stderr: $($r.StdErr)" }
-    $owner = (Get-Acl -LiteralPath $keyFile -ErrorAction SilentlyContinue).Owner
+    $owner = try { Get-FileOwnerName $keyFile } catch { $null }
     Check ($owner -like "*\$depName") "deployer: the key file is owned by the deployer's own account (not Administrators)"
 
     $r = Invoke-As $dep $probe @("unwrap", $service, $keyFile)
     Check ($r.StdOut -match "open=0 unwrap=0") "deployer: may unwrap the key file it deployed"
+
+    # The next release: the deployer replaces its own key file in place with
+    # `wrap --force` - which overwrites, then deletes, the old file before
+    # writing the new one - not elevated, as a deployer runs it.
+    $before = [System.IO.File]::ReadAllBytes($keyFile)
+    $nextDek = New-Object byte[] 32
+    [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($nextDek)
+    $r = Invoke-As $dep $cli @("wrap", "-kf", $keyFile, "-sn", $service, "--dek-stdin", "-g", "HkdfGuardUsers", "--force") -StdIn ([Convert]::ToBase64String($nextDek))
+    $after = if (Test-Path -LiteralPath $keyFile) { [System.IO.File]::ReadAllBytes($keyFile) } else { $null }
+    Check (($r.ExitCode -eq 0) -and $after -and -not [System.Linq.Enumerable]::SequenceEqual([byte[]]$before, [byte[]]$after)) "deployer: wrap --force replaces its own key file with the next release's"
+    if ($r.ExitCode -ne 0) { Write-Host "    stderr: $($r.StdErr)" }
+    $r = Invoke-As $dep $probe @("unwrap", $service, $keyFile)
+    Check ($r.StdOut -match "open=0 unwrap=0") "deployer: the replaced key file reads and unwraps"
 
     # ---- Application runner. ----
     $r = Invoke-As $app $probe @("model")
@@ -196,7 +258,7 @@ try {
 
     # Membership is read when the file is opened: no longer a deployer, the
     # deployer's files are no longer trusted.
-    Remove-LocalGroupMember -Group "HkdfGuardDeployers" -Member $depName
+    Remove-TestGroupMember "HkdfGuardDeployers" $depName
     $r = Invoke-As $app $probe @("open", $keyFile)
     Check ($r.StdOut -match "open=-39") "application: once its author leaves HkdfGuardDeployers, the key file is refused"
 }
@@ -208,8 +270,8 @@ finally {
         & $CliExePath retire --service-name $service --fingerprint $fingerprint 2>&1 | Out-Null
         Check ($LASTEXITCODE -eq 0) "cleanup: the security admin retires the test KEK"
     }
-    foreach ($user in $createdUsers) { Remove-LocalUser -Name $user -ErrorAction SilentlyContinue }
-    foreach ($group in $createdGroups) { Remove-LocalGroup -Name $group -ErrorAction SilentlyContinue }
+    foreach ($user in $createdUsers) { try { $computer.Delete("user", $user) } catch { Write-Host "[WARN] could not remove test account ${user}: $($_.Exception.Message)" } }
+    foreach ($group in $createdGroups) { try { $computer.Delete("group", $group) } catch { Write-Host "[WARN] could not remove group ${group}: $($_.Exception.Message)" } }
     foreach ($dir in $root, $plantDir) { if (Test-Path -LiteralPath $dir) { Remove-Item -Recurse -Force -LiteralPath $dir -ErrorAction SilentlyContinue } }
 }
 
