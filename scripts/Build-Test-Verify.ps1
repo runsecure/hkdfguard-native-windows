@@ -176,10 +176,13 @@ if ($LASTEXITCODE -eq 0) {
 Write-Section "CLI provision + wrap + DLL unwrap round-trip verification"
 
 # The key file goes in a scratch folder under %TEMP%, not under the repo:
-# hkdfguard_open_file refuses a file when any folder above it lets another
-# account delete or replace entries, and a checkout outside a user profile
-# often does - GitHub's hosted runners use C:\a\..., which inherits
-# Authenticated Users: Modify from C:\. %TEMP% may be spelled with an 8.3
+# hkdfguard_open_file refuses a file when any folder above it, below the
+# drive root, lets another account create, delete or replace entries, and a
+# checkout outside a user profile often does - GitHub's hosted runners use
+# C:\a\..., which inherits Authenticated Users: Modify from C:\ - as do
+# C:\ProgramData and C:\Windows\Temp (Users may create entries). %TEMP% is
+# the user profile's own, private to this account, SYSTEM and
+# Administrators, so it passes. %TEMP% may be spelled with an 8.3
 # short name (C:\Users\RUNNER~1\... on those runners), which open_file also
 # refuses, so it's expanded to its long form first - as tests/test_cli.ps1 does.
 Add-Type -Namespace HkdfGuardVerify -Name Path -MemberDefinition @"

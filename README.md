@@ -152,12 +152,30 @@ and a path containing one is refused.
 
 The file and every folder above it must also be owned by SYSTEM, Administrators,
 TrustedInstaller or the account the process runs as, and must not let any other account
-write, delete, rename or re-permission them (creating new files in a folder is fine, so
-`C:\ProgramData\<app>\` works). Otherwise it fails with `HKDFGUARD_ERR_FILE_UNTRUSTED`:
-reading a wrapped DEK gains nothing, but anyone who could replace it, and could also wrap
-under the service's KEK, could plant a DEK they know. Read access for other accounts is
-never refused. A folder made directly under `C:\` inherits `Authenticated Users: Modify` and
-is refused until its permissions are narrowed.
+write, delete, rename or re-permission them. Every folder **below the drive root** - the
+key file's own folder and each one above it - must also not let any other account
+**create** files or folders in it, as the Linux build refuses any directory writable by
+group or others, sticky (`/tmp`-style) or not. Otherwise it fails with
+`HKDFGUARD_ERR_FILE_UNTRUSTED`: reading a wrapped DEK gains nothing, but anyone who could
+replace it, and could also wrap under the service's KEK, could plant a DEK they know. Read
+access for other accounts is never refused.
+
+What that means in practice:
+
+- `C:\ProgramData` and `C:\Windows\Temp` let Users create entries, so **no key file
+  anywhere under them is trusted** - including a folder created under `C:\ProgramData` with
+  its default, inherited permissions.
+- A folder made directly under `C:\` inherits `Authenticated Users: Modify` and is refused
+  until its inherited permissions are removed.
+- **The drive root is the one exception to the create rule.** A default `C:\` lets
+  Authenticated Users create folders; that can't displace a folder already there, and every
+  folder below it is judged itself, so the drive root is held only to the owner and
+  write/delete/rename/re-permission rule. (Without this, no key file on `C:` could ever be
+  trusted.) A key file directly in the drive root is judged by the drive-root rule.
+
+Keep key files in a folder of their own prepared with `icacls /inheritance:r` - for example
+`C:\HkdfGuardKeys\<app>\`; [docs/admin-guide.md](docs/admin-guide.md#where-to-keep-key-files)
+gives the exact commands.
 
 It checks the file's size before reading anything, and fails with
 `HKDFGUARD_ERR_FILE_PLAINTEXT_KEY` for a file of exactly 32 bytes (the size of an
@@ -314,6 +332,16 @@ reports and away from other processes.
   hard link is refused too, so `--force` cannot overwrite a file at some other path
   that shares its data.
 
+  The folders above `--key-file-path` must be ones `hkdfguard_open_file` will read from
+  (see above): owned by SYSTEM, Administrators, TrustedInstaller or you, and - below the
+  drive root - letting no other account create, delete or rename entries in them. `wrap`
+  checks this up front, before it reads the DEK or touches a key storage provider, and
+  refuses with the folder, the account and the `icacls` commands that fix it (or, for
+  `C:\ProgramData` and `C:\Windows\Temp`, a pointer to a folder of its own instead). `wrap`
+  never creates a missing folder - one it made would inherit its parent's permissions,
+  create rights included - so prepare the folder first, as
+  [docs/admin-guide.md](docs/admin-guide.md#where-to-keep-key-files) describes.
+
 - **`status`** - read-only. Reports whether the service has a KEK, which provider holds
   it and its fingerprint. It also lists any other key under the service's name on the
   provider the `KeyStoragePolicy` doesn't select. Such a key is unused today, but a
@@ -361,13 +389,19 @@ freshly-generated DEK under it on every later release:
 net localgroup App_1234 /add
 net localgroup App_1234 "NT SERVICE\MyAppService" /add
 
+# One-time: a key folder no other account can create, delete or rename entries in
+# (not under C:\ProgramData - see docs/admin-guide.md, "Where to keep key files").
+New-Item -ItemType Directory -Force C:\HkdfGuardKeys\myapp | Out-Null
+icacls C:\HkdfGuardKeys /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" "*S-1-5-32-545:(OI)(CI)RX"
+icacls C:\HkdfGuardKeys /setowner "*S-1-5-32-544" /T
+
 # Every release: mint a random 32-byte DEK and wrap it, piping the base64 DEK to the
 # tool's stdin rather than passing it as an argument.
 $dekBytes = New-Object byte[] 32
 [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($dekBytes)
 $dekBase64 = [Convert]::ToBase64String($dekBytes)
 $dekBase64 | .\hkdfguard.exe wrap `
-    --key-file-path C:\ProgramData\myapp\myapp.v1.key --service-name myapp `
+    --key-file-path C:\HkdfGuardKeys\myapp\myapp.v1.key --service-name myapp `
     --dek-stdin --group App_1234 --force
 ```
 

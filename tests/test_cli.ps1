@@ -585,6 +585,97 @@ try {
         if ($r.StdErr -notmatch "is not on a local drive") { Write-Host "    stderr: $($r.StdErr)" }
     }
 
+    # ---- 12e. The key file's folders must be ones hkdfguard_open_file ----
+    #           trusts: below the drive root, no account but SYSTEM,
+    #           Administrators, TrustedInstaller and this one may create
+    #           (or delete, or rename) entries in any of them. Refused up
+    #           front - the DEK below is not even valid base64, and the
+    #           folder is what's reported - with the fix in the message, and
+    #           nothing created. All unelevated: icacls on folders this test
+    #           owns, and paths in system folders that are never written.
+    $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $createGrants = @(
+        @{ Sid = "*S-1-5-32-545"; Rights = "(WD,AD)"; What = "Users may create files and folders" },
+        @{ Sid = "*S-1-5-11"; Rights = "(AD)"; What = "Authenticated Users may create folders" },
+        @{ Sid = "*S-1-1-0"; Rights = "(WD)"; What = "Everyone may create files" })
+    $n = 0
+    foreach ($grant in $createGrants) {
+        $openDir = Join-Path $workDir ("create-open-" + $n++)
+        New-Item -ItemType Directory -Path $openDir | Out-Null
+        & icacls $openDir /grant "$($grant.Sid):$($grant.Rights)" | Out-Null
+        $openKey = Join-Path $openDir "open.key"
+        $r = Invoke-Cli @("wrap", "--key-file-path", $openKey, "--service-name", $neverProvisionedService, "--dek-stdin") -StdIn "not-valid-base64!!!"
+        $ok = ($r.ExitCode -eq 1) -and ($r.StdErr -match "create files or folders in it") -and ($r.StdErr -match [regex]::Escape($openDir)) -and
+              ($r.StdErr -match "HKDFGUARD_ERR_FILE_UNTRUSTED, -39") -and ($r.StdErr -match "icacls") -and ($r.StdErr -match "/inheritance:r") -and
+              ($r.StdErr -notmatch "not valid base64")
+        Check $ok "wrap refuses a key-file folder where $($grant.What), before reading the DEK, naming the folder and the icacls fix"
+        if (-not $ok) { Write-Host "    exit $($r.ExitCode); stderr: $($r.StdErr)" }
+        Check (-not (Test-Path $openKey)) "wrap into a folder where $($grant.What) creates no key file"
+    }
+
+    # A folder that *inherited* create rights - as every new folder under
+    # C:\ProgramData does - is refused; after the documented fix
+    # (icacls /inheritance:r plus explicit grants) the same folder is
+    # accepted and wrap gets as far as the KEK lookup. The parent passes the
+    # rights to subfolders only (CI)(IO), so the child is what's judged.
+    $inheritParent = Join-Path $workDir "inherit-parent"
+    $inheritChild = Join-Path $inheritParent "keys"
+    New-Item -ItemType Directory -Path $inheritParent | Out-Null
+    & icacls $inheritParent /grant "*S-1-5-32-545:(CI)(IO)(WD,AD)" | Out-Null
+    New-Item -ItemType Directory -Path $inheritChild | Out-Null
+    $inheritKey = Join-Path $inheritChild "inherited.key"
+    $r = Invoke-Cli @("wrap", "--key-file-path", $inheritKey, "--service-name", $neverProvisionedService, "--dek-stdin") -StdIn $validB64
+    Check (($r.ExitCode -eq 1) -and ($r.StdErr -match "create files or folders in it") -and ($r.StdErr -match [regex]::Escape($inheritChild))) "wrap refuses a folder that inherited Users' create rights"
+    if ($r.StdErr -notmatch "create files or folders in it") { Write-Host "    stderr: $($r.StdErr)" }
+    & icacls $inheritChild /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" "*${me}:(OI)(CI)F" | Out-Null
+    Check ($LASTEXITCODE -eq 0) "test setup: icacls <folder> /inheritance:r /grant:r SYSTEM, Administrators, owner"
+    $r = Invoke-Cli @("wrap", "--key-file-path", $inheritKey, "--service-name", $neverProvisionedService, "--dek-stdin") -StdIn $validB64
+    Check (($r.ExitCode -eq 1) -and ($r.StdErr -match "no KEK is provisioned for service")) "the same folder after icacls /inheritance:r is accepted (wrap reaches the KEK lookup)"
+    if ($r.StdErr -notmatch "no KEK is provisioned") { Write-Host "    stderr: $($r.StdErr)" }
+
+    # Shared system folders that let Users create entries are refused, and
+    # the message says to keep the key elsewhere rather than to change them.
+    $windowsTempKey = Join-Path $env:SystemRoot ("Temp\hkdfguard-cli-" + [Guid]::NewGuid().ToString("N") + ".key")
+    $programDataKey = Join-Path $env:ProgramData ("hkdfguard-cli-" + [Guid]::NewGuid().ToString("N") + ".key")
+    $elevatedNow = (New-Object System.Security.Principal.WindowsPrincipal([System.Security.Principal.WindowsIdentity]::GetCurrent())).IsInRole(
+        [System.Security.Principal.WindowsBuiltInRole]::Administrator)
+    foreach ($shared in @($windowsTempKey, $programDataKey)) {
+        $r = Invoke-Cli @("wrap", "--key-file-path", $shared, "--service-name", $neverProvisionedService, "--dek-stdin") -StdIn $validB64
+        $ok = ($r.ExitCode -eq 1) -and ($r.StdErr -match "create files or folders in it") -and ($r.StdErr -match "shared system folder") -and
+              ($r.StdErr -match "do not change its permissions")
+        if (-not $elevatedNow -and $shared -eq $windowsTempKey) {
+            # Unelevated, C:\Windows\Temp can't even be opened to read its
+            # permissions (Users get only traverse and create there), which
+            # is refused just the same.
+            $ok = $ok -or (($r.ExitCode -eq 1) -and ($r.StdErr -match "cannot open the folder"))
+        }
+        Check $ok "wrap refuses a key file directly in $(Split-Path -Parent $shared) and says to keep it elsewhere"
+        if (-not $ok) { Write-Host "    exit $($r.ExitCode); stderr: $($r.StdErr)" }
+        Check (-not (Test-Path $shared)) "wrap into $(Split-Path -Parent $shared) creates no key file"
+    }
+
+    # The drive root keeps its allowance: this run's scratch folder sits on a
+    # drive whose root lets Authenticated Users create folders (a default
+    # C:\), and every accepted wrap above passed through it.
+    $rootAcl = Get-Acl -LiteralPath ([IO.Path]::GetPathRoot($workDir))
+    $rootCreate = @($rootAcl.Access | Where-Object {
+            $_.AccessControlType -eq "Allow" -and -not ($_.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly) -and
+            (($_.FileSystemRights -band ([Security.AccessControl.FileSystemRights]::CreateFiles -bor [Security.AccessControl.FileSystemRights]::CreateDirectories)) -ne 0) -and
+            ($_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value -in @("S-1-5-11", "S-1-5-32-545", "S-1-1-0")) })
+    if ($rootCreate.Count -gt 0) {
+        $r = Invoke-Cli @("wrap", "--key-file-path", (Join-Path $workDir "root-allowance.key"), "--service-name", $neverProvisionedService, "--dek-stdin") -StdIn $validB64
+        Check (($r.ExitCode -eq 1) -and ($r.StdErr -match "no KEK is provisioned for service")) "the drive root's create rights for other accounts are allowed (wrap below it reaches the KEK lookup)"
+        if ($r.StdErr -notmatch "no KEK is provisioned") { Write-Host "    stderr: $($r.StdErr)" }
+    } else {
+        Write-Host "[SKIP] the drive-root allowance (this drive's root lets no other account create entries)"
+    }
+
+    # wrap never creates a missing folder (one it made would inherit its
+    # parent's rights, create rights included): a missing folder is an error.
+    $missingDir = Join-Path $workDir "not-there"
+    $r = Invoke-Cli @("wrap", "--key-file-path", (Join-Path $missingDir "k.key"), "--service-name", $neverProvisionedService, "--dek-stdin") -StdIn $validB64
+    Check (($r.ExitCode -eq 1) -and ($r.StdErr -match "does not exist") -and -not (Test-Path $missingDir)) "wrap refuses a missing key-file folder and does not create it"
+
     # ---- 12c. UTF-16 input is refused with a message that says so, rather ----
     #           than a generic "not valid base64".
     $utf16KeyFile = Join-Path $workDir "utf16.key"

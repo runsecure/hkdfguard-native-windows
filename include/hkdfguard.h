@@ -150,7 +150,7 @@ extern "C" {
 #define HKDFGUARD_ERR_FILE_TOO_LONG             (-36) /* hkdfguard_open_file: file is longer than HKDFGUARD_WRAPPED_MAX_LEN */
 #define HKDFGUARD_ERR_FILE_PLAINTEXT_KEY        (-37) /* hkdfguard_open_file: file holds what looks like an unwrapped key - HKDFGUARD_DEK_LEN raw bytes, or its hex or base64 */
 #define HKDFGUARD_ERR_FILE_MALFORMED            (-38) /* hkdfguard_open_file: file is the right size but its contents are not a valid WrappedDekV1 payload (including an unknown version) */
-#define HKDFGUARD_ERR_FILE_UNTRUSTED            (-39) /* hkdfguard_open_file: path is, or passes through, a symbolic link, junction or other reparse point, uses an 8.3 short name, or is not on a local drive (UNC, mapped or SUBST drive, device); or the file or a folder above it is owned by, or lets, an account other than SYSTEM, Administrators, TrustedInstaller or the caller write or replace it */
+#define HKDFGUARD_ERR_FILE_UNTRUSTED            (-39) /* hkdfguard_open_file: path is, or passes through, a symbolic link, junction or other reparse point, uses an 8.3 short name, or is not on a local drive (UNC, mapped or SUBST drive, device); or the file or a folder above it is owned by, or lets, an account other than SYSTEM, Administrators, TrustedInstaller or the caller write or replace it; or a folder above it other than the drive root lets such an account create files or folders in it (C:\ProgramData, C:\Windows\Temp) */
 /* -40..-63 reserved for future common codes */
 // ---- Windows-specific (-64..-79) ----
 #define HKDFGUARD_ERR_WIN_GROUP_INVALID         (-64) /* refines HKDFGUARD_ERR_POLICY_INVALID: a KeyUseGroups policy entry is unresolvable, not a group, not host-local, or over-broad */
@@ -438,13 +438,28 @@ HKDFGUARD_API int hkdfguard_generate_and_wrap_dek(
  *           file, write, append, write attributes or extended attributes,
  *           delete, change permissions or take ownership; on a folder,
  *           delete entries in it, delete the folder itself, change its
- *           permissions or take ownership. (Creating new entries in a
- *           folder is fine - C:\ProgramData lets Users do that.)
+ *           permissions or take ownership.
+ *           Every folder below the drive root - the file's own folder and
+ *           each one above it, but not the drive root itself - must also
+ *           grant no other account the right to create entries in it
+ *           ("create files / write data" or "create folders / append
+ *           data"), as the Linux build refuses any directory writable by
+ *           group or others, sticky or not. So C:\ProgramData and
+ *           C:\Windows\Temp, which let Users create entries, and any folder
+ *           under them, are refused, and so is a folder created under
+ *           C:\ProgramData with its default, inherited permissions. The
+ *           drive root is exempt from the create rule only: a default
+ *           C:\ lets Authenticated Users create folders in it, which cannot
+ *           displace a folder already there, and the folders below it are
+ *           judged themselves. A key file directly in the drive root is
+ *           judged by the drive-root rule.
  *           Otherwise HKDFGUARD_ERR_FILE_UNTRUSTED: reading a wrapped DEK
  *           gains nothing, but anyone able to replace it, and to wrap
  *           under the service's KEK, could plant a DEK they know. A folder
  *           created directly under C:\ inherits "Authenticated Users:
- *           Modify" and fails this until its permissions are narrowed.
+ *           Modify" and fails this until its inherited permissions are
+ *           removed (icacls <folder> /inheritance:r plus explicit grants -
+ *           see docs/admin-guide.md, "Where to keep key files").
  *           Read access for other accounts is never a reason to refuse:
  *           the file is ciphertext.
  * out     - caller-owned output buffer. May be NULL only if *out_len is

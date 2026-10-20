@@ -148,13 +148,33 @@ namespace hkdfguard {
         // or rename an entry in it (FILE_DELETE_CHILD), remove or rename the
         // folder itself (DELETE), or take it over (WRITE_DAC, WRITE_OWNER) -
         // any of which lets them put a file of their choosing where the key
-        // was. Creating new entries (FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY,
-        // and GENERIC_WRITE, which maps to those) is not here: it can't
-        // displace an existing entry, which is why C:\ProgramData - where
-        // Users may create but not delete others' files - is acceptable.
-        // That is the Windows counterpart of the Linux build allowing a
-        // sticky (/tmp-style) directory.
+        // was. Refused on every folder in the path, the drive root included.
         constexpr ACCESS_MASK kFolderReplaceRights = FILE_DELETE_CHILD | DELETE | WRITE_DAC | WRITE_OWNER | GENERIC_ALL;
+
+        // Rights on a folder that let a principal create new entries in it:
+        // "create files / write data" (FILE_ADD_FILE), "create folders /
+        // append data" (FILE_ADD_SUBDIRECTORY), and GENERIC_WRITE, which
+        // maps to both. The Windows counterpart of a directory's write bit
+        // for group or others, which the Linux build refuses whether or not
+        // the directory is sticky (/tmp-style). Refused on the key file's
+        // own folder and every folder above it - except the drive root (see
+        // kDriveRootRights) - so C:\ProgramData and C:\Windows\Temp, which
+        // let Users create entries, and a folder that inherited that from
+        // them, are refused.
+        constexpr ACCESS_MASK kFolderCreateRights = FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY | GENERIC_WRITE;
+
+        // What a folder between the drive root and the key file - its own
+        // folder included - may grant nobody untrusted.
+        constexpr ACCESS_MASK kFolderRights = kFolderReplaceRights | kFolderCreateRights;
+
+        // What the drive root may grant nobody untrusted: only the replace
+        // rights. A default C:\ lets Authenticated Users create folders in
+        // it (FILE_ADD_SUBDIRECTORY), and applying kFolderCreateRights there
+        // would mean no key file on the system drive could ever be trusted.
+        // Creating a new folder beside the key's top-level folder can't
+        // displace that folder, and the folders below the root are held to
+        // kFolderRights themselves.
+        constexpr ACCESS_MASK kDriveRootRights = kFolderReplaceRights;
 
         // NT SERVICE\TrustedInstaller, which owns C:\ and much of the system
         // drive: S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464.
@@ -258,11 +278,24 @@ namespace hkdfguard {
                         // condition held, since it may.
                         const ACCESS_ALLOWED_ACE *allowed = static_cast<const ACCESS_ALLOWED_ACE *>(ace);
                         PSID sid = const_cast<DWORD *>(&allowed->SidStart);
-                        if ((allowed->Mask & forbidden) != 0 && !trusted.MayWrite(sid)) {
+                        const ACCESS_MASK granted = allowed->Mask & forbidden;
+                        if (granted != 0 && !trusted.MayWrite(sid)) {
+                            // Only create rights - a folder below the drive
+                            // root that, like C:\ProgramData, lets others
+                            // add entries - gets its own message, so the
+                            // fix (remove those rights) is obvious.
+                            // (On the file itself the same bits are write
+                            // access, reported as such.)
+                            const bool create_only =
+                                    forbidden == kFolderRights && (granted & ~kFolderCreateRights) == 0;
                             throw HkdfGuardError(
                                 HKDFGUARD_ERR_FILE_UNTRUSTED,
-                                (std::string(what) + " grants write, delete or ownership rights to an account other "
-                                "than SYSTEM, Administrators, TrustedInstaller or this account").c_str());
+                                (std::string(what) +
+                                 (create_only
+                                      ? " lets an account other than SYSTEM, Administrators, TrustedInstaller or this "
+                                        "account create files or folders in it"
+                                      : " grants write, delete or ownership rights to an account other than SYSTEM, "
+                                        "Administrators, TrustedInstaller or this account")).c_str());
                         }
                         continue;
                     }
@@ -298,17 +331,44 @@ namespace hkdfguard {
             LocalFree(sd);
         }
 
+        // UTF-16 -> UTF-8, for naming a folder in an error message only.
+        std::string NarrowForMessage(const std::wstring &wide) {
+            int len = WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), static_cast<int>(wide.size()), nullptr, 0,
+                                          nullptr, nullptr);
+            if (len <= 0) {
+                return "(unprintable path)";
+            }
+            std::string narrow(static_cast<size_t>(len), '\0');
+            WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), static_cast<int>(wide.size()), narrow.data(), len, nullptr,
+                                nullptr);
+            return narrow;
+        }
+
         // Every folder above the key file, from its own folder up to the
-        // drive root, must pass the same owner test and grant nobody else
-        // kFolderReplaceRights - otherwise someone else could rename a file
-        // of their choosing over the key, or the key's folder out of the way
-        // and one of their own into its place. Checked on the handles the
-        // walk opened each folder through (already confirmed real folders,
-        // not reparse points), so it is the folders actually traversed that
-        // are judged - nothing is looked up by name again.
+        // drive root, must pass the same owner test. The folders below the
+        // drive root - the key file's own folder included - must grant
+        // nobody else kFolderRights: no one else may rename a file of their
+        // choosing over the key, move the key's folder out of the way and
+        // one of their own into its place, or even create entries there
+        // (the Linux build's "no directory writable by group or others").
+        // The drive root itself (chain.handles[0]) is held to
+        // kDriveRootRights only: a trusted owner, and no one else may
+        // rename or delete what is directly beneath it, but creating new
+        // folders there - which a default C:\ allows every authenticated
+        // user - is permitted. A key file directly in the drive root gets
+        // the drive-root treatment for its folder.
+        //
+        // Checked on the handles the walk opened each folder through
+        // (already confirmed real folders, not reparse points), so it is the
+        // folders actually traversed that are judged - nothing is looked up
+        // by name again.
         void CheckFolderChain(const hkdfguard_nofollow::FolderChain &chain, const TrustedPrincipals &trusted) {
-            for (const hkdfguard_nofollow::Handle &folder : chain.handles) {
-                CheckHandleSecurity(folder.get(), kFolderReplaceRights, trusted, "a folder in the path");
+            for (size_t i = 0; i < chain.handles.size(); ++i) {
+                const bool drive_root = i == 0;
+                const std::string what = (drive_root ? "the drive root (" : "a folder in the path (") +
+                                         NarrowForMessage(chain.paths[i]) + ")";
+                CheckHandleSecurity(chain.handles[i].get(), drive_root ? kDriveRootRights : kFolderRights, trusted,
+                                    what.c_str());
             }
         }
 
@@ -456,7 +516,7 @@ namespace hkdfguard {
         }
     } // namespace
 
-    void CheckKeyFileSecurity(PSECURITY_DESCRIPTOR sd, bool is_folder) {
+    void CheckKeyFileSecurity(PSECURITY_DESCRIPTOR sd, KeyFileObject object) {
         PSID owner = nullptr;
         BOOL owner_defaulted = FALSE;
         PACL dacl = nullptr;
@@ -467,8 +527,17 @@ namespace hkdfguard {
             throw HkdfGuardError(HKDFGUARD_ERR_FILE_UNTRUSTED, "security descriptor could not be read");
         }
         TrustedPrincipals trusted;
-        CheckOwnerAndDacl(owner, dacl, dacl_present != FALSE, is_folder ? kFolderReplaceRights : kFileWriteRights,
-                          trusted, is_folder ? "a folder in the path" : "the file");
+        switch (object) {
+            case KeyFileObject::File:
+                CheckOwnerAndDacl(owner, dacl, dacl_present != FALSE, kFileWriteRights, trusted, "the file");
+                break;
+            case KeyFileObject::Folder:
+                CheckOwnerAndDacl(owner, dacl, dacl_present != FALSE, kFolderRights, trusted, "a folder in the path");
+                break;
+            case KeyFileObject::DriveRoot:
+                CheckOwnerAndDacl(owner, dacl, dacl_present != FALSE, kDriveRootRights, trusted, "the drive root");
+                break;
+        }
     }
 
     bool LooksLikePlaintextKeyForTest(const uint8_t *bytes, size_t len) {
@@ -580,9 +649,10 @@ namespace hkdfguard {
         // know, and unwrap would accept it as genuine. So the file and every
         // folder above it must be owned by SYSTEM, Administrators,
         // TrustedInstaller or this account, and grant nobody else write,
-        // delete or ownership rights (see kFileWriteRights and
-        // kFolderReplaceRights) - the Linux build's owner and mode checks,
-        // in ACL form. Checked on the open handle, after the path checks
+        // delete or ownership rights - nor, on the folders below the drive
+        // root, the right to create entries (see kFileWriteRights,
+        // kFolderRights and kDriveRootRights) - the Linux build's owner and
+        // mode checks, in ACL form. Checked on the open handle, after the path checks
         // above, so it's the file actually read that is judged. (The OS
         // refusing the open itself was HKDFGUARD_ERR_FILE_ACCESS_DENIED,
         // above.)

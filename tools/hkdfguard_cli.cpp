@@ -90,7 +90,11 @@
 // link, and allowing one would let whoever can plant a link in the output
 // directory redirect an elevated `wrap --force` at an arbitrary file. See the
 // "output path must be a real file" section below for exactly how that is
-// enforced on open handles rather than on re-queried paths.
+// enforced on open handles rather than on re-queried paths. And the folders
+// above it must be ones hkdfguard_open_file will read from: no account but
+// SYSTEM, Administrators, TrustedInstaller and the caller may create, delete
+// or rename entries in any of them below the drive root (see "The folders a
+// key file may be read from" below) - refused before the DEK is read.
 
 #include "hkdfguard.h"
 #include "no_follow_open.h" // the path walk shared with hkdfguard_open_file - see tools/CMakeLists.txt
@@ -252,8 +256,15 @@ namespace {
             L"\n"
             L"Examples:\n"
             L"  %ls provision -sn svc\n"
-            L"  $dekBase64 | %ls wrap -kf C:\\ProgramData\\app\\key.bin -sn svc --dek-stdin\n"
-            L"  %ls wrap -kf C:\\ProgramData\\app\\key.bin -sn svc --dek-file C:\\ProgramData\\app\\dek.b64\n"
+            L"  $dekBase64 | %ls wrap -kf C:\\HkdfGuardKeys\\app\\key.bin -sn svc --dek-stdin\n"
+            L"  %ls wrap -kf C:\\HkdfGuardKeys\\app\\key.bin -sn svc --dek-file C:\\Users\\me\\dek.b64\n"
+            L"\n"
+            L"Every folder above --key-file-path, up to but not including the drive root, must let\n"
+            L"no account but SYSTEM, Administrators, TrustedInstaller and the reader create, delete\n"
+            L"or rename entries in it -- so not C:\\ProgramData or C:\\Windows\\Temp. Prepare a folder\n"
+            L"of its own from an elevated prompt:\n"
+            L"  icacls C:\\HkdfGuardKeys /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F\n"
+            L"         *S-1-5-32-545:(OI)(CI)RX\n"
             L"  %ls status -sn svc\n"
             L"  %ls retire -sn svc -fp <fingerprint printed by provision>\n",
             kProgramName, kProgramName, kProgramName, kProgramName, kProgramName, kProgramName, kProgramName,
@@ -800,7 +811,7 @@ namespace {
             case HKDFGUARD_ERR_FILE_TOO_LONG: return "the wrapped-key file is longer than a wrapped key";
             case HKDFGUARD_ERR_FILE_PLAINTEXT_KEY: return "the file looks like an UNWRAPPED 32-byte key (raw, or its hex or base64) - it may hold a plaintext key; treat it as exposed";
             case HKDFGUARD_ERR_FILE_MALFORMED: return "the wrapped-key file is the right size but does not hold a valid wrapped key";
-            case HKDFGUARD_ERR_FILE_UNTRUSTED: return "the wrapped-key path is, or passes through, a symbolic link, junction or other reparse point, uses an 8.3 short name, or is not on a local drive (UNC, mapped or SUBST drive, device); or the file or a folder above it is owned by, or lets, an account other than SYSTEM, Administrators, TrustedInstaller or the caller write or replace it";
+            case HKDFGUARD_ERR_FILE_UNTRUSTED: return "the wrapped-key path is, or passes through, a symbolic link, junction or other reparse point, uses an 8.3 short name, or is not on a local drive (UNC, mapped or SUBST drive, device); or the file or a folder above it is owned by, or lets, an account other than SYSTEM, Administrators, TrustedInstaller or the caller write or replace it; or a folder above it, other than the drive root, lets such an account create files or folders in it (as C:\\ProgramData and C:\\Windows\\Temp do)";
             default: return "unknown status code " + std::to_string(code);
         }
     }
@@ -1435,11 +1446,194 @@ namespace {
         }
     }
 
+    std::vector<BYTE> GetProcessUserSid();
+    std::string AccountNameOf(PSID sid);
+
+    // MARK: - The folders a key file may be read from
+    //
+    // hkdfguard_open_file refuses a key file (HKDFGUARD_ERR_FILE_UNTRUSTED)
+    // unless every folder above it - the drive root included - is owned by
+    // SYSTEM, Administrators, TrustedInstaller or the reading account and
+    // lets no other account delete, rename or take over its entries, and
+    // unless every folder below the drive root - the key file's own folder
+    // included - also lets no other account create files or folders in it
+    // (the Linux build's "no directory writable by group or others", sticky
+    // or not). The drive root is exempt from that last part only: a default
+    // C:\ lets Authenticated Users create folders, and the folders below it
+    // are judged themselves. See src/key_file.cpp, whose rule this mirrors
+    // ACE for ACE so that wrap never writes a file the library would refuse
+    // to read. (The library judges against the account *reading* the file;
+    // here "this account" is the one running wrap - the closest this tool
+    // can know.)
+    //
+    // So C:\ProgramData (Users may create entries in it), any folder under
+    // it, C:\Windows\Temp, and a folder made directly under C:\ that still
+    // inherits Authenticated Users: Modify are all refused, before the DEK
+    // is read or a provider is touched, with the fix in the message.
+
+    // Rights the library refuses to anyone untrusted, on every folder (the
+    // drive root included) and, below the drive root, also the create rights.
+    constexpr ACCESS_MASK kFolderReplaceRights = FILE_DELETE_CHILD | DELETE | WRITE_DAC | WRITE_OWNER | GENERIC_ALL;
+    constexpr ACCESS_MASK kFolderCreateRights = FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY | GENERIC_WRITE;
+
+    // Shared system folders that let every user create entries. Never the
+    // thing to fix - the key belongs somewhere else - so the message says so
+    // instead of suggesting icacls on them.
+    bool IsSharedSystemFolder(const std::string &folder) {
+        auto same = [&folder](const std::string &other) {
+            return !other.empty() && _stricmp(TrimTrailingSeparators(other).c_str(), folder.c_str()) == 0;
+        };
+        auto env = [](const char *name) {
+            char value[MAX_PATH * 2] = {};
+            DWORD len = GetEnvironmentVariableA(name, value, static_cast<DWORD>(sizeof(value)));
+            return (len > 0 && len < sizeof(value)) ? std::string(value, len) : std::string();
+        };
+        char windows[MAX_PATH + 1] = {};
+        UINT len = GetSystemWindowsDirectoryA(windows, MAX_PATH + 1);
+        const std::string windowsTemp = (len > 0 && len <= MAX_PATH) ? std::string(windows, len) + "\\Temp" : "";
+        return same(env("ProgramData")) || same(env("PUBLIC")) || same(windowsTemp);
+    }
+
+    // The fix for a folder that fails the rule, as icacls commands an
+    // administrator can paste into an elevated prompt. /inheritance:r drops
+    // every inherited ACE and /grant:r sets the three that are wanted; an
+    // ACE set on the folder itself (`explicitSid`, as "*S-1-..."; empty when
+    // the offending ACE was inherited) survives both, so it is removed first.
+    std::string KeyFolderFix(const std::string &folder, const std::string &explicitSid = std::string()) {
+        if (IsSharedSystemFolder(folder)) {
+            return "; " + folder + " is a shared system folder - do not change its permissions; keep key files in a "
+                   "folder of their own instead, for example one directly under the drive root, prepared from an "
+                   "elevated prompt with:\n"
+                   "  mkdir C:\\HkdfGuardKeys\\<app>\n"
+                   "  icacls C:\\HkdfGuardKeys /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F "
+                   "*S-1-5-32-545:(OI)(CI)RX\n"
+                   "  icacls C:\\HkdfGuardKeys /setowner *S-1-5-32-544 /T\n"
+                   "(see \"Where to keep key files\" in docs/admin-guide.md)";
+        }
+        return "; remove every other account's rights to it, from an elevated prompt:\n" +
+               (explicitSid.empty() ? std::string()
+                                    : "  icacls \"" + folder + "\" /remove:g " + explicitSid + "\n") +
+               "  icacls \"" + folder + "\" /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F "
+               "*S-1-5-32-545:(OI)(CI)RX\n"
+               "  icacls \"" + folder + "\" /setowner *S-1-5-32-544 /T\n"
+               "then check that `icacls \"" + folder + "\"` lists only SYSTEM, Administrators and Users (RX), and "
+               "that every folder above it passes too (see \"Where to keep key files\" in docs/admin-guide.md)";
+    }
+
+    // "*S-1-..." for icacls, or empty if the SID can't be rendered.
+    std::string IcaclsSid(PSID sid) {
+        LPSTR text = nullptr;
+        if (!ConvertSidToStringSidA(sid, &text)) {
+            return std::string();
+        }
+        std::string s = std::string("*") + text;
+        LocalFree(text);
+        return s;
+    }
+
+    // Applies the library's folder rule to every folder of a walked chain,
+    // on the handles the walk opened (so it is the folders actually
+    // traversed that are judged). `path` is --key-file-path as given.
+    void RequireTrustedKeyFileFolders(const hkdfguard_nofollow::FolderChain &chain, const std::string &path) {
+        std::vector<BYTE> user = GetProcessUserSid();
+        PSID trustedInstaller = nullptr;
+        if (!ConvertStringSidToSidA("S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464",
+                                    &trustedInstaller)) {
+            throw CliError("ConvertStringSidToSid(TrustedInstaller) failed: " + FormatWin32Error(GetLastError()));
+        }
+        struct FreeSid {
+            PSID p;
+            ~FreeSid() { LocalFree(p); }
+        } freeTrustedInstaller{trustedInstaller};
+        auto mayOwn = [&](PSID sid) {
+            return IsWellKnownSid(sid, WinLocalSystemSid) || IsWellKnownSid(sid, WinBuiltinAdministratorsSid) ||
+                   EqualSid(sid, trustedInstaller) || EqualSid(sid, user.data());
+        };
+        auto mayWrite = [&](PSID sid) {
+            return mayOwn(sid) || IsWellKnownSid(sid, WinCreatorOwnerRightsSid) ||
+                   IsWellKnownSid(sid, WinCreatorOwnerSid) || IsWellKnownSid(sid, WinCreatorGroupSid);
+        };
+        const std::string why =
+                "hkdfguard_open_file would refuse to read a key file there (HKDFGUARD_ERR_FILE_UNTRUSTED, -39): "
+                "every folder from the key file's own up to, but not including, the drive root must let no account "
+                "other than SYSTEM, Administrators, TrustedInstaller or the account reading it create, delete or "
+                "rename entries in it, or change its permissions";
+
+        for (size_t i = 0; i < chain.handles.size(); ++i) {
+            const bool driveRoot = i == 0;
+            const std::string folder = TrimTrailingSeparators(WideToAnsi(chain.paths[i]));
+            const std::string what = "--key-file-path " + path + ": " + (driveRoot ? "the drive root " : "the folder ") +
+                                     "\"" + folder + "\"";
+            PSID owner = nullptr;
+            PACL dacl = nullptr;
+            PSECURITY_DESCRIPTOR sd = nullptr;
+            DWORD rc = GetSecurityInfo(chain.handles[i].get(), SE_FILE_OBJECT,
+                                       OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION, &owner, nullptr, &dacl,
+                                       nullptr, &sd);
+            if (rc != ERROR_SUCCESS) {
+                throw CliError(what + ": its security could not be read (" + FormatWin32Error(rc) +
+                               "), so hkdfguard_open_file could not vouch for it either");
+            }
+            struct FreeSd {
+                PSECURITY_DESCRIPTOR p;
+                ~FreeSd() { LocalFree(p); }
+            } freeSd{sd};
+            const std::string fix = driveRoot ? std::string("; keep the key file on a drive whose root is not open "
+                                                            "to other accounts")
+                                              : KeyFolderFix(folder);
+            if (owner == nullptr || !mayOwn(owner)) {
+                throw CliError(what + " is owned by " + (owner ? AccountNameOf(owner) : std::string("no one")) +
+                               ", which is neither SYSTEM, Administrators, TrustedInstaller nor this account; " + why +
+                               fix);
+            }
+            if (dacl == nullptr) {
+                throw CliError(what + " has no DACL, so every account has full access to it; " + why + fix);
+            }
+            const ACCESS_MASK forbidden = driveRoot ? kFolderReplaceRights : (kFolderReplaceRights | kFolderCreateRights);
+            for (DWORD a = 0; a < dacl->AceCount; ++a) {
+                void *ace = nullptr;
+                if (!GetAce(dacl, a, &ace)) {
+                    throw CliError(what + ": its ACL could not be read: " + FormatWin32Error(GetLastError()));
+                }
+                const auto *header = static_cast<const ACE_HEADER *>(ace);
+                if (header->AceFlags & INHERIT_ONLY_ACE) {
+                    continue; // applies only to what is created inside it
+                }
+                switch (header->AceType) {
+                    case ACCESS_DENIED_ACE_TYPE:
+                    case ACCESS_DENIED_OBJECT_ACE_TYPE:
+                    case ACCESS_DENIED_CALLBACK_ACE_TYPE:
+                    case ACCESS_DENIED_CALLBACK_OBJECT_ACE_TYPE:
+                        continue;
+                    case ACCESS_ALLOWED_ACE_TYPE:
+                    case ACCESS_ALLOWED_CALLBACK_ACE_TYPE: {
+                        const auto *allowed = static_cast<const ACCESS_ALLOWED_ACE *>(ace);
+                        PSID sid = const_cast<DWORD *>(&allowed->SidStart);
+                        const ACCESS_MASK granted = allowed->Mask & forbidden;
+                        if (granted == 0 || mayWrite(sid)) {
+                            continue;
+                        }
+                        const bool createOnly = (granted & ~kFolderCreateRights) == 0;
+                        const bool inherited = (header->AceFlags & INHERITED_ACE) != 0;
+                        throw CliError(what + " lets " + AccountNameOf(sid) +
+                                       (createOnly ? " create files or folders in it"
+                                                   : " delete, rename or replace its entries, or change its permissions") +
+                                       (inherited ? " (an inherited permission)" : "") + "; " + why +
+                                       (driveRoot || inherited ? fix : KeyFolderFix(folder, IcaclsSid(sid))));
+                    }
+                    default:
+                        throw CliError(what + " has an access-allowed ACE of an unexpected type; " + why + fix);
+                }
+            }
+        }
+    }
+
     // Fail-fast version of the checks above, run before any KEK or DEK work
     // so a bad output path is rejected without touching the key store or
     // reading the DEK at all: every folder down to the file's must be real
-    // (WalkToParent), and if something already exists at the leaf it must
-    // pass checks (1)-(4). Returns whether something exists there. The
+    // (WalkToParent) and pass the library's folder rule
+    // (RequireTrustedKeyFileFolders), and if something already exists at the
+    // leaf it must pass checks (1)-(4). Returns whether something exists there. The
     // authoritative checks are still the ones made on the actual
     // write/overwrite handles later (SecureOverwriteAndRemoveIfExists /
     // WriteWrappedKeyFile) - this is the friendly early exit, not the
@@ -1448,6 +1642,7 @@ namespace {
     bool ValidateOutputPathIsReal(const std::string &path) {
         const std::string full = FullPath(path);
         hkdfguard_nofollow::FolderChain chain = WalkToParent(full, path);
+        RequireTrustedKeyFileFolders(chain, path);
 
         hkdfguard_nofollow::Handle leaf;
         DWORD err = 0;
@@ -1512,6 +1707,7 @@ namespace {
     void SecureOverwriteAndRemoveIfExists(const std::string &path) {
         const std::string full = FullPath(path);
         hkdfguard_nofollow::FolderChain chain = WalkToParent(full, path);
+        RequireTrustedKeyFileFolders(chain, path); // re-checked on these handles, before anything is destroyed
         hkdfguard_nofollow::Handle file;
         DWORD err = 0;
         if (!hkdfguard_nofollow::OpenRelative(
@@ -1614,6 +1810,7 @@ namespace {
         SECURITY_ATTRIBUTES sa = security.attributes();
         const std::string full = FullPath(path);
         hkdfguard_nofollow::FolderChain chain = WalkToParent(full, path);
+        RequireTrustedKeyFileFolders(chain, path); // re-checked on the handles the file is created through
         hkdfguard_nofollow::Handle file;
         DWORD err = 0;
         if (!hkdfguard_nofollow::OpenRelative(
@@ -2346,9 +2543,15 @@ namespace {
 
         // The output path must be a real file at a real location - no
         // symlink, junction, or other reparse point at or above it, and none
-        // followed to find out (see WalkToParent). Checked here, before any
-        // KEK or DEK work, so a bad path is rejected cheaply; the
-        // write/overwrite code re-checks on its own handles regardless.
+        // followed to find out (see WalkToParent) - in folders
+        // hkdfguard_open_file would trust (RequireTrustedKeyFileFolders: no
+        // other account may create, delete or rename entries in any folder
+        // below the drive root). Checked here, before any KEK or DEK work,
+        // so a bad path is rejected cheaply; the write/overwrite code
+        // re-checks on its own handles regardless. wrap never creates a
+        // missing folder - a folder it made would inherit its parent's
+        // rights, create rights included - so the operator prepares the
+        // folder (docs/admin-guide.md) and a missing one is an error.
         //
         // Then a fast, friendly pre-check: fail before ever touching the
         // TPM/Software Key Storage Provider if the output path already exists

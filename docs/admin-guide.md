@@ -212,11 +212,16 @@ $exe = "C:\Program Files\HkdfGuard\v1\hkdfguard.exe"
 net localgroup App_1234 /add
 net localgroup App_1234 "NT SERVICE\MyAppService" /add
 
+# One-time: the key folder - see "Where to keep key files" below.
+New-Item -ItemType Directory -Force C:\HkdfGuardKeys\myapp | Out-Null
+icacls C:\HkdfGuardKeys /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" "*S-1-5-32-545:(OI)(CI)RX"
+icacls C:\HkdfGuardKeys /setowner "*S-1-5-32-544" /T
+
 # Every release: generate a random 32-byte DEK and wrap it.
 $dek = New-Object byte[] 32
 [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($dek)
 [Convert]::ToBase64String($dek) | & $exe wrap `
-    --key-file-path C:\ProgramData\myapp\myapp.key --service-name myapp `
+    --key-file-path C:\HkdfGuardKeys\myapp\myapp.key --service-name myapp `
     --dek-stdin --group App_1234 --force
 ```
 
@@ -228,9 +233,11 @@ environment variable without expanding it first: Windows can set those variables
 names (for example `C:\Users\RUNNER~1\AppData\Local\Temp` on GitHub-hosted runners), and a
 path containing one is refused.
 
-**Where to keep the key file.** Applications read it back through the library with the
-same rules, so the path must be a plain local NTFS folder, for example
-`C:\ProgramData\<app>\`. In addition to links and network paths, the
+#### Where to keep key files
+
+Applications read the key file back through the library with the same rules, so the path
+must be a plain local NTFS folder that no other account can tamper with - **not**
+`C:\ProgramData` (see below). In addition to links and network paths, the
 library refuses files on volumes with **Data Deduplication** enabled and **cloud
 placeholder files** (OneDrive, Dropbox and similar), because Windows stores both as
 reparse points. An application that hits this reports `HKDFGUARD_ERR_FILE_UNTRUSTED`
@@ -242,19 +249,79 @@ environment variable, it must expand it to its long form first with the Windows
 `GetLongPathNameW` function, or the library refuses it with -39. Don't assume a framework's
 path helpers do this: some keep short names (PowerShell's `Resolve-Path`, for one).
 
-**Who may own and change the folder.** The library also refuses the file with -39 unless
-the file and every folder above it, up to the drive root, are owned by SYSTEM,
-Administrators, TrustedInstaller or the account the application runs as, and no other
-account may write the file or delete, rename, re-permission or take ownership of it or of
-any of those folders. Read access for other accounts is fine, and so is a folder that lets
-others create new files but not delete existing ones. A folder you create under
-`C:\ProgramData` as an administrator passes. A folder created directly under `C:\` (such as
-`C:\secrets`) does not: it inherits `Authenticated Users: Modify`, which lets any signed-in
-user rename the folder away and put their own in its place. Narrow it first:
+**Who may own and change the folders.** The library also refuses the file with -39 unless:
+
+- the file and every folder above it, **up to and including the drive root**, are owned by
+  SYSTEM, Administrators, TrustedInstaller or the account the application runs as, and no
+  other account may write the file or delete, rename, re-permission or take ownership of
+  it or of any of those folders; and
+- every folder **below the drive root** - the key file's own folder and each folder above
+  it - lets no other account **create** files or folders in it ("Create files / write
+  data" or "Create folders / append data"). This is the Windows form of the Linux build's
+  rule that no directory above a key file may be writable by group or others, sticky
+  (`/tmp`-style) or not.
+
+Read access for other accounts is fine everywhere: the file is ciphertext.
+
+The **drive root** is the one exception to the create rule. A default `C:\` lets
+Authenticated Users create folders in it; that can't displace a folder already there, and
+every folder below the root is judged on its own, so the root is held only to the owner and
+write/delete/rename/re-permission rule. (If the create rule applied to the root too, no key
+file on `C:` could ever be trusted.) A key file placed directly in the drive root is judged
+by the drive-root rule - but keep it in a folder of its own anyway.
+
+What this rules out:
+
+- **`C:\ProgramData` and everything under it.** `C:\ProgramData` itself lets Users create
+  files and folders, so a key file anywhere below it is refused, whatever the permissions of
+  its own folder. Don't change the permissions of `C:\ProgramData`.
+- **`C:\Windows\Temp`**, which lets Users create files and folders.
+- **A folder created directly under `C:\` with its default permissions** (such as
+  `C:\secrets`): it inherits `Authenticated Users: Modify`, which lets any signed-in user
+  create entries in it, or rename the folder away and put their own in its place.
+- Any folder that inherited create rights from one of those.
+
+**Recommended location: a folder of its own directly under the drive root, with inherited
+permissions removed**, for example `C:\HkdfGuardKeys\<app>\`. From an elevated prompt:
 
 ```powershell
-icacls C:\secrets /inheritance:r /grant:r "SYSTEM:(OI)(CI)F" "Administrators:(OI)(CI)F" "App_1234:(OI)(CI)RX"
+# Create the folders. As an elevated administrator, they are owned by Administrators.
+New-Item -ItemType Directory -Force C:\HkdfGuardKeys\myapp | Out-Null
+
+# Remove every inherited permission (Authenticated Users: Modify from C:\) and grant
+# exactly: SYSTEM and Administrators full control, Users read. Subfolders and files
+# inherit these.
+icacls C:\HkdfGuardKeys /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" "*S-1-5-32-545:(OI)(CI)RX"
+
+# Make Administrators the owner of the folder and everything in it, in case it was
+# created by a non-elevated account.
+icacls C:\HkdfGuardKeys /setowner "*S-1-5-32-544" /T
+
+# Check: only SYSTEM, Administrators and Users (RX) are listed, none of them (I)nherited
+# from C:\ - and the same for C:\HkdfGuardKeys\myapp, where they show as inherited from
+# C:\HkdfGuardKeys.
+icacls C:\HkdfGuardKeys
+icacls C:\HkdfGuardKeys\myapp
 ```
+
+The SIDs are used so the commands work in any display language: `S-1-5-18` is SYSTEM,
+`S-1-5-32-544` is Administrators, `S-1-5-32-545` is Users. The application's account needs
+read access to every folder on the way (the library reads each folder's permissions), which
+the Users grant gives; to restrict that to the application, grant its group instead, for
+example `"App_1234:(OI)(CI)RX"` in place of the Users entry. The key file itself is
+protected separately: `wrap` gives it its own non-inherited ACL (the owner, plus
+`--group`, read-only).
+
+If you must use a folder that already exists, apply the same two `icacls` commands to it.
+`/inheritance:r` drops only *inherited* entries; an entry set on the folder itself survives,
+so remove it first with `icacls <folder> /remove:g <account>` - `wrap` names the account
+and prints these commands when it refuses a folder. Every folder above it, below the drive
+root, must pass too.
+
+`wrap` checks all of this before it reads the DEK or touches a key store, so it never
+writes a key file the library would then refuse. It never creates a missing folder (a
+folder it made would inherit its parent's permissions, create rights included): create and
+prepare the folder first.
 
 If the key file was written by `wrap` run without elevation, it is owned by that user, and
 an application running as a different account refuses it. Run `wrap` elevated, or as the
@@ -408,7 +475,7 @@ User field is the calling account.
 
 Wrap and unwrap events include a SHA-256 of the wrapped payload, so each unwrap can be
 traced to the wrap that produced it. To compare against a key file:
-`(Get-FileHash C:\ProgramData\myapp\myapp.key -Algorithm SHA256).Hash.ToLower()`.
+`(Get-FileHash C:\HkdfGuardKeys\myapp\myapp.key -Algorithm SHA256).Hash.ToLower()`.
 
 ```powershell
 Get-WinEvent -LogName Application -FilterXPath "*[System[Provider[@Name='hkdfguard-native-windows']]]" -MaxEvents 50 |
@@ -457,6 +524,7 @@ was attempted) and `1` for an operational failure. On failure it prints an `erro
 | `KEK provider/key open or create failed` | Under `RequireTpm`: no usable TPM. Otherwise, the key store failed. | Check the TPM (`Get-Tpm`) and event 2005 for details. |
 | `a KEK already exists under this service name, but its ACL is ...` | The existing KEK's access list was changed, or a key was planted under that name. It was left untouched. | Investigate it as a security event. To move on, provision a new versioned service name. |
 | `wrapped payload was not produced under this service's current KEK` | The key file belongs to a different service or a different KEK. | Check the service name, and that the file was wrapped on this machine. |
+| `hkdfguard_open_file would refuse to read a key file there` | `wrap`'s `--key-file-path` is in a folder that another account can create, delete or rename entries in (for example anywhere under `C:\ProgramData`), or that isn't owned by SYSTEM, Administrators, TrustedInstaller or you. Nothing was read or written. | Use a folder prepared as in [Where to keep key files](#where-to-keep-key-files); the message names the folder and account and prints the `icacls` commands. |
 | `service name is missing or malformed` | The name uses characters other than ASCII letters, digits and `.`, starts with `.`, contains `..`, or is longer than 128. | Use a valid name. |
 
 An application that can't load the DLL usually has an architecture mismatch (see
@@ -468,7 +536,7 @@ command-line tool itself never produces:
 
 | Code | Meaning | What to do |
 |---|---|---|
-| -39 `FILE_UNTRUSTED` | The key file's path is a link, passes through a junction or SUBST drive, uses an 8.3 short name (`PROGRA~1`), is on a network or deduplicated volume, or is a cloud placeholder. Or the file or a folder above it is owned by, or can be changed, deleted or renamed by, an account other than SYSTEM, Administrators, TrustedInstaller or the application's own. | Configure the application with the full long path (if it comes from `%TEMP%` or another environment variable, expand it first), or move the file to a plain local folder. For an ownership or permissions refusal, narrow the folder's permissions or re-run `wrap` elevated. See [Where to keep the key file](#3-wrap-a-dek-into-a-key-file-every-release). |
+| -39 `FILE_UNTRUSTED` | The key file's path is a link, passes through a junction or SUBST drive, uses an 8.3 short name (`PROGRA~1`), is on a network or deduplicated volume, or is a cloud placeholder. Or the file or a folder above it is owned by, or can be changed, deleted or renamed by, an account other than SYSTEM, Administrators, TrustedInstaller or the application's own. Or a folder above it, other than the drive root, lets such an account create files or folders in it - every folder under `C:\ProgramData` or `C:\Windows\Temp`, and a folder under `C:\` with its default permissions. | Configure the application with the full long path (if it comes from `%TEMP%` or another environment variable, expand it first), or move the file to a plain local folder. For an ownership or permissions refusal, move the file to a folder prepared with `icacls /inheritance:r` (or prepare its folder that way) and re-run `wrap` elevated. See [Where to keep key files](#where-to-keep-key-files). |
 | -38 `FILE_MALFORMED` | The file is 132 bytes but does not hold a valid wrapped key (corrupted, edited, or not a key file at all). | Re-run `wrap` to rewrite the file. |
 | -37 `FILE_PLAINTEXT_KEY` | The file is 32 raw bytes, or 32 bytes as hex or base64: probably an unwrapped key on disk. Event 2006 names it. | Treat the key as exposed. Find out how the file was written, remove it, and re-mint the DEK. |
 | -35 / -36 `FILE_TOO_SHORT` / `FILE_TOO_LONG` | The file isn't 132 bytes, so it isn't a wrapped key. | Check the application is pointed at the right file; re-run `wrap`. |

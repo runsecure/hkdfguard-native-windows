@@ -661,10 +661,12 @@ header:
 **Claim.** `hkdfguard_open_file` refuses a key file with
 `HKDFGUARD_ERR_FILE_UNTRUSTED` (-39) unless the file and every folder above it,
 up to the drive root, are owned by SYSTEM, BUILTIN\Administrators,
-TrustedInstaller or the process's own account, and no other account holds a
-right that would let it change what the path names. This is the Linux build's
-owner and mode check (`key_file.rs`: owned by root or this user, not group- or
-other-writable, sticky folders allowed), in ACL form. It also refuses a DEK
+TrustedInstaller or the process's own account, no other account holds a
+right that would let it change what the path names, and - in every folder
+below the drive root - no other account may even create entries. This is the
+Linux build's owner and mode check (`key_file.rs`: owned by root or this
+user, no directory group- or other-writable, sticky or not), in ACL form,
+with one Windows-specific exception for the drive root (below). It also refuses a DEK
 saved as text, in the same forms the Linux build does, with
 `HKDFGUARD_ERR_FILE_PLAINTEXT_KEY` (-37).
 
@@ -684,13 +686,45 @@ file that is read:
 - **File rights.** No ACE for another principal may grant write data, append,
   write EA or attributes, `DELETE`, `WRITE_DAC`, `WRITE_OWNER`,
   `GENERIC_WRITE` or `GENERIC_ALL`.
-- **Folder rights.** No ACE for another principal may grant
-  `FILE_DELETE_CHILD`, `DELETE`, `WRITE_DAC`, `WRITE_OWNER` or `GENERIC_ALL`.
-  Creating entries is allowed. A new entry can't displace an existing one: that
-  takes `DELETE` on the entry, or `FILE_DELETE_CHILD` on its folder. This is the
-  Windows counterpart of the sticky-folder allowance, and it is why
-  `C:\ProgramData` (Users: `WD,AD,WEA,WA`) and `C:\` (Authenticated Users: `AD`)
-  pass.
+- **Folder rights (every folder, the drive root included).** No ACE for
+  another principal may grant `FILE_DELETE_CHILD`, `DELETE`, `WRITE_DAC`,
+  `WRITE_OWNER` or `GENERIC_ALL`.
+- **Create rights (every folder below the drive root).** The key file's own
+  folder and every folder above it, up to but not including the drive root,
+  must also grant no other principal `FILE_ADD_FILE` ("create files / write
+  data"), `FILE_ADD_SUBDIRECTORY` ("create folders / append data") or
+  `GENERIC_WRITE` (which maps to both). Until 2026-10-19 creating entries was
+  allowed everywhere, as the Windows counterpart of the Linux build's sticky
+  `/tmp` allowance: a new entry can't displace an existing one, since that
+  takes `DELETE` on the entry or `FILE_DELETE_CHILD` on its folder. The Linux
+  build dropped that allowance (a key file is now refused if any directory
+  above it is group- or other-writable, sticky or not), and this build
+  follows: a folder others can create entries in is one an operator doesn't
+  control, where a look-alike file or folder can be pre-planted and the
+  permissions can't be reasoned about. So `C:\ProgramData` (Users:
+  `WD,AD,WEA,WA`, applying to the folder itself), every folder under it
+  (whatever its own ACL, since `C:\ProgramData` is above it), a folder
+  created under it with inherited permissions, and `C:\Windows\Temp` (Users:
+  `WD,AD,X`) are refused. Accepted consequence: operators keep key files in a
+  folder of their own with inherited permissions removed
+  (`icacls <folder> /inheritance:r` plus explicit grants;
+  `docs/admin-guide.md`, "Where to keep key files").
+- **The drive-root exception.** The drive root is held to the owner and
+  folder-rights rules only, not the create rule. A default `C:\` grants
+  Authenticated Users `FILE_ADD_SUBDIRECTORY` (`AD`); applying the create rule
+  to it would mean no key file on the system drive could ever be trusted.
+  This is the same concept as the .NET loader's: the drive root has a trusted
+  owner and lets no one else rename or delete a folder directly beneath it;
+  creating new folders there is permitted. A folder created at the root can't
+  displace the key's top-level folder (that needs `FILE_DELETE_CHILD` on the
+  root or `DELETE` on the folder, both refused), and every folder below the
+  root is judged on its own, create rule included. A key file directly in
+  the drive root gets the drive-root rule for its folder. The CLI's `wrap`
+  applies the same rule, with the same drive-root treatment, to
+  `--key-file-path` before it reads the DEK (`tools/hkdfguard_cli.cpp`,
+  `RequireTrustedKeyFileFolders`), so it never writes a file the library
+  would refuse; it never creates a missing folder, since one it made would
+  inherit its parent's create rights.
 - **Ignored ACEs.** Deny ACEs and inherit-only ACEs are skipped. A conditional
   (callback) allow ACE is judged as if its condition held. Any other
   allow-ACE type is refused, as one this code can't read.
@@ -732,8 +766,17 @@ file that is read:
 
 - **Real files and folders.** A file Everyone may write is refused, while one
   Everyone may only read opens. A folder granting Everyone
-  `FILE_DELETE_CHILD`, or `DELETE` on itself, is refused, while one granting
-  only create rights (`0x116`) opens.
+  `FILE_DELETE_CHILD`, or `DELETE` on itself, is refused, and so is one
+  granting Users, Authenticated Users or Everyone only create rights
+  (create files, create folders, or both); the refusal names the folder. A
+  folder whose create ACE is inherit-only opens. A folder that *inherited*
+  Users' create rights is refused, and the same folder after
+  `icacls /inheritance:r /grant:r` (SYSTEM, Administrators, owner) opens. A
+  key file in `C:\ProgramData` is refused for its create rights; one in
+  `C:\Windows\Temp` is refused (for its create rights when elevated;
+  unelevated, the folder's permissions can't even be read, which is refused
+  too). The live system drive root passes the drive-root rule, and files
+  below it open.
 - **Synthetic descriptors** (`CheckKeyFileSecurity` on SDDL):
   - **Owners:** Users, Everyone and LocalService are refused; SYSTEM,
     Administrators, TrustedInstaller and this account pass.
@@ -742,9 +785,26 @@ file that is read:
     on folders.
   - **ACE kinds:** deny, inherit-only and conditional ACEs are handled as
     described above.
-  - **Shipped ACLs:** the system drive root's ACL passes, and the
-    `Authenticated Users: Modify` that a new folder under `C:\` inherits is
-    refused.
+  - **Create rights:** `FILE_ADD_FILE`, `FILE_ADD_SUBDIRECTORY` and
+    `GENERIC_WRITE`, for Users, Authenticated Users, Everyone or another
+    user, are refused on a folder and allowed on the drive root; the
+    replace rights and an untrusted owner are refused on the drive root too.
+  - **Shipped ACLs:** the system drive root's ACL passes as the drive root
+    but is refused as a folder below it; `C:\ProgramData`'s and
+    `C:\Windows\Temp`'s are refused; the `Authenticated Users: Modify` that a
+    new folder under `C:\` inherits is refused; a folder after
+    `icacls /inheritance:r` with SYSTEM, Administrators and Users-read grants
+    passes.
+- **CLI (`tests/test_cli.ps1`, section 12e).** `wrap` refuses, before reading
+  the DEK, a key-file folder granting Users, Authenticated Users or Everyone
+  create rights, a folder that inherited them, and `C:\ProgramData` and
+  `C:\Windows\Temp`, naming the folder and printing the fix; it accepts the
+  same inherited folder after `icacls /inheritance:r`, accepts folders below a
+  drive root that lets others create folders, and never creates a missing
+  folder. `tests/container/Test-InContainer.ps1` checks the installed CLI
+  refuses a default `C:\ProgramData` subfolder and the installed DLL returns
+  -39 for a key file there, while a folder directly under `C:\` prepared with
+  the admin guide's `icacls` commands works end to end.
 - **Plaintext detector.** All six text forms (base64 padded or not, URL-safe
   padded or not, hex in either case) are refused, each with five whitespace
   variants. These near misses are refused as merely too short: 31 or 33 bytes
@@ -753,8 +813,10 @@ file that is read:
   vertical tab, which Rust doesn't trim either.
 
 These passed non-elevated on the development machine on 2026-10-15, and
-elevated, with a TPM, on 2026-10-16. The positive cases use the golden
-payload, so they don't depend on a KEK.
+elevated, with a TPM, on 2026-10-16. The create-rights cases passed
+non-elevated on 2026-10-19; elevated and in-container runs of them are
+pending. The positive cases use the golden payload, so they don't depend on
+a KEK.
 
 **Residual risk.**
 
@@ -776,6 +838,15 @@ payload, so they don't depend on a KEK.
   holds `WRITE_DAC` on it, which is what was just checked for.
 - **Configurations now refused.** Anything already in place that grants other
   accounts delete rights is refused, by design, including a folder created
-  directly under `C:\`. `docs/admin-guide.md` shows how to narrow it.
+  directly under `C:\`. Since 2026-10-19 so is anything that lets other
+  accounts create entries below the drive root: every key file under
+  `C:\ProgramData` (whatever its own folder's ACL) and under
+  `C:\Windows\Temp`. Deployments that followed the earlier advice to use
+  `C:\ProgramData\<app>\` must move their key files and re-run `wrap`.
+  `docs/admin-guide.md` shows where, and how to prepare the folder.
+- **The drive-root allowance.** Anyone who may create folders in the drive
+  root can create a look-alike top-level folder (`C:\HkdfGuardKeys2`); that
+  only matters if an application is configured with the wrong path, which
+  is outside what a file check can catch.
 - **Not yet run:** in the Server 2022/2025 containers, where
   ContainerAdministrator's ownership of `C:\` needs to be confirmed.

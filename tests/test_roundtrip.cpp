@@ -459,6 +459,34 @@ bool SetProtectedDacl(const std::wstring& path, const std::wstring& sddl) {
     return ok;
 }
 
+// Runs %SystemRoot%\System32\icacls.exe with `arguments` and returns its
+// exit code (-1 if it could not be started) - so section 24c can apply the
+// exact fix docs/admin-guide.md gives operators, rather than an equivalent.
+int RunIcacls(const std::wstring& arguments) {
+    wchar_t system[MAX_PATH + 1] = {};
+    const UINT len = GetSystemDirectoryW(system, MAX_PATH + 1);
+    if (len == 0 || len > MAX_PATH) return -1;
+    const std::wstring exe = std::wstring(system, len) + L"\\icacls.exe";
+    std::wstring command_line = L"\"" + exe + L"\" " + arguments;
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = nullptr;
+    si.hStdOutput = nullptr; // its "processed 1 files" chatter isn't wanted in the test log
+    si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+    PROCESS_INFORMATION pi{};
+    if (!CreateProcessW(exe.c_str(), command_line.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr,
+                        &si, &pi)) {
+        return -1;
+    }
+    WaitForSingleObject(pi.hProcess, 60000);
+    DWORD code = static_cast<DWORD>(-1);
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return static_cast<int>(code);
+}
+
 // The 8.3 short name of `path`, or empty if it has none. Where the volume
 // doesn't generate short names (8.3 creation is off by default on
 // container and many server volumes), one is assigned explicitly with
@@ -2099,13 +2127,13 @@ int main() {
         }
 
         // Who could have written the file: an ACE letting Everyone write it,
-        // or a folder letting Everyone delete its entries, is refused; a
-        // folder letting Everyone only create entries (C:\ProgramData-style)
-        // is fine. The owner is this account either way (or Administrators,
-        // elevated), both trusted; owners that would need privileges to set
-        // are covered by section 24d. The content is the golden payload
-        // (section 29): well-formed without any KEK, so the accepted cases
-        // mean something on a non-elevated run too, where `wrapped` is empty.
+        // or a folder letting Everyone delete its entries - or even create
+        // them (C:\ProgramData-style) - is refused. The owner is this account
+        // either way (or Administrators, elevated), both trusted; owners that
+        // would need privileges to set are covered by section 24d. The
+        // content is the golden payload (section 29): well-formed without
+        // any KEK, so the accepted cases mean something on a non-elevated
+        // run too, where `wrapped` is empty.
         {
             const std::vector<uint8_t> well_formed = FromHex(kGoldenPayloadHex);
             const std::wstring me = CurrentUserSidString();
@@ -2137,14 +2165,190 @@ int main() {
                   "test setup: let Everyone delete acl-folder itself");
             expectFailure(ToUtf8(sub_key), HKDFGUARD_ERR_FILE_UNTRUSTED,
                           "a file in a folder Everyone may delete or rename is untrusted");
-            Check(SetProtectedDacl(sub, L"D:" + trusted_aces + L"(A;;0x116;;;WD)"),
-                  "test setup: let Everyone only create entries in acl-folder");
+            // Create rights alone - "create files / write data" or "create
+            // folders / append data" - for Users, Authenticated Users or
+            // Everyone: refused, like a group- or world-writable directory
+            // on Linux, sticky or not.
+            struct CreateGrant {
+                const wchar_t* sid;
+                const wchar_t* mask;
+                const char* what;
+            };
+            const CreateGrant grants[] = {
+                {L"BU", L"0x116", "Users may create files and folders (C:\\ProgramData-style)"},
+                {L"BU", L"0x22", "Users may create files"},
+                {L"AU", L"0x24", "Authenticated Users may create folders"},
+                {L"AU", L"0x116", "Authenticated Users may create files and folders"},
+                {L"WD", L"0x22", "Everyone may create files"},
+                {L"WD", L"0x24", "Everyone may create folders"},
+            };
+            for (const CreateGrant& g : grants) {
+                Check(SetProtectedDacl(sub, L"D:" + trusted_aces + L"(A;;" + g.mask + L";;;" + g.sid + L")"),
+                      (std::string("test setup: ") + g.what + " in acl-folder").c_str());
+                expectFailure(ToUtf8(sub_key), HKDFGUARD_ERR_FILE_UNTRUSTED,
+                              std::string("a file in a folder where ") + g.what + " is untrusted (-39)");
+            }
+            // The message names the folder and the reason.
+            {
+                std::vector<uint8_t> direct(HKDFGUARD_WRAPPED_MAX_LEN);
+                std::string message;
+                try {
+                    hkdfguard::ReadWrappedKeyFile(ToUtf8(sub_key).c_str(), direct.data());
+                } catch (const hkdfguard::HkdfGuardError& e) {
+                    message = e.what();
+                }
+                Check(message.find("create files or folders") != std::string::npos &&
+                          message.find(ToUtf8(sub)) != std::string::npos,
+                      "a create-rights refusal names the folder and says others may create files or folders in it");
+                if (message.find("create files or folders") == std::string::npos) {
+                    std::printf("    (message: %s)\n", message.c_str());
+                }
+            }
+            // Only the folder's own rights count: the same grant as an
+            // inherit-only ACE (for new subfolders) doesn't apply to it.
+            Check(SetProtectedDacl(sub, L"D:" + trusted_aces + L"(A;CIIO;0x116;;;BU)"),
+                  "test setup: an inherit-only create ACE on acl-folder");
             r = open(ToUtf8(sub_key));
             Check(r.rc == HKDFGUARD_OK && r.out == well_formed,
-                  "a file in a folder where Everyone may only create entries is trusted");
+                  "a folder whose create ACE is inherit-only (subfolders only) is trusted");
 
             DeleteFileW(sub_key.c_str());
             RemoveDirectoryW(sub.c_str());
+        }
+
+        // A folder that *inherited* create rights - as every folder made
+        // under C:\ProgramData does - is refused, and the same folder after
+        // the documented fix (icacls <folder> /inheritance:r with explicit
+        // grants to SYSTEM, Administrators and its owner) is accepted. The
+        // parent grants Users create rights on subfolders only (CIIO), so
+        // the parent itself passes and the child alone is what's judged.
+        {
+            const std::vector<uint8_t> well_formed = FromHex(kGoldenPayloadHex);
+            const std::wstring me = CurrentUserSidString();
+            const std::wstring trusted_aces = L"(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;" + me + L")";
+            const std::wstring parent = dir + L"\\inherit-parent";
+            const std::wstring child = parent + L"\\keys";
+            const std::wstring key = child + L"\\inherited.key";
+            Check(CreateDirectoryW(parent.c_str(), nullptr) != FALSE, "test setup: create inherit-parent");
+            Check(SetProtectedDacl(parent, L"D:" + trusted_aces + L"(A;CIIO;0x116;;;BU)"),
+                  "test setup: inherit-parent passes Users create rights to its subfolders");
+            Check(CreateDirectoryW(child.c_str(), nullptr) != FALSE, "test setup: create inherit-parent\\keys");
+            Check(WriteTestFile(key, well_formed), "test setup: write inherit-parent\\keys\\inherited.key");
+            Check(SetProtectedDacl(key, L"D:" + trusted_aces), "test setup: protect inherited.key");
+            expectFailure(ToUtf8(key), HKDFGUARD_ERR_FILE_UNTRUSTED,
+                          "a file in a folder that inherited Users' create rights is untrusted (-39)");
+
+            const int icacls = RunIcacls(L"\"" + child + L"\" /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F "
+                                         L"*S-1-5-32-544:(OI)(CI)F *" + me + L":(OI)(CI)F");
+            Check(icacls == 0, "test setup: icacls <folder> /inheritance:r /grant:r SYSTEM, Administrators, owner");
+            r = open(ToUtf8(key));
+            Check(r.rc == HKDFGUARD_OK && r.out == well_formed,
+                  "the same folder after icacls /inheritance:r with SYSTEM/Administrators/owner grants is trusted");
+            if (r.rc != HKDFGUARD_OK) std::printf("    (hkdfguard_open_file returned %d)\n", r.rc);
+
+            DeleteFileW(key.c_str());
+            RemoveDirectoryW(child.c_str());
+            RemoveDirectoryW(parent.c_str());
+        }
+
+        // C:\Windows\Temp lets Users create files and folders, so a key file
+        // there is refused - even one only this account may write. Any
+        // account may create a file there, so this runs unelevated - but
+        // only an elevated run can read the folder's permissions (Users get
+        // traverse and create, not READ_CONTROL), so only there is the
+        // refusal's reason the create rule; unelevated, the folder can't be
+        // vouched for at all, which is refused (-39) just the same.
+        {
+            wchar_t windows[MAX_PATH + 1] = {};
+            const UINT windows_len = GetSystemWindowsDirectoryW(windows, MAX_PATH + 1);
+            const std::wstring windows_temp_key =
+                std::wstring(windows, windows_len) + L"\\Temp\\hkdfguard-openfile-" +
+                std::to_wstring(GetCurrentProcessId()) + L".key";
+            if (windows_len > 0 && windows_len <= MAX_PATH &&
+                WriteTestFile(windows_temp_key, FromHex(kGoldenPayloadHex))) {
+                const std::wstring me = CurrentUserSidString();
+                Check(SetProtectedDacl(windows_temp_key,
+                                       L"D:(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;" + me + L")"),
+                      "test setup: protect the key file in C:\\Windows\\Temp");
+                expectFailure(ToUtf8(windows_temp_key), HKDFGUARD_ERR_FILE_UNTRUSTED,
+                              "a key file in C:\\Windows\\Temp (Users may create entries there) is untrusted");
+                std::string message;
+                try {
+                    std::vector<uint8_t> direct(HKDFGUARD_WRAPPED_MAX_LEN);
+                    hkdfguard::ReadWrappedKeyFile(ToUtf8(windows_temp_key).c_str(), direct.data());
+                } catch (const hkdfguard::HkdfGuardError& e) {
+                    message = e.what();
+                }
+                if (IsElevated()) {
+                    Check(message.find("create files or folders") != std::string::npos,
+                          "...because C:\\Windows\\Temp lets other accounts create files or folders in it");
+                    if (message.find("create files or folders") == std::string::npos) {
+                        std::printf("    (message: %s)\n", message.c_str());
+                    }
+                } else {
+                    std::printf("[INFO] C:\\Windows\\Temp refused unelevated for: %s\n", message.c_str());
+                }
+                DeleteFileW(windows_temp_key.c_str());
+            } else {
+                Skip("open_file refuses a key file in C:\\Windows\\Temp (could not create a file there)");
+            }
+        }
+
+        // C:\ProgramData lets Users create files and folders too (and its
+        // permissions are readable by everyone), so a key file directly in
+        // it is refused for exactly that reason, elevated or not.
+        {
+            wchar_t program_data[MAX_PATH + 1] = {};
+            const DWORD pd_len = GetEnvironmentVariableW(L"ProgramData", program_data, MAX_PATH + 1);
+            const std::wstring pd_key = std::wstring(program_data, pd_len > MAX_PATH ? 0 : pd_len) +
+                                        L"\\hkdfguard-openfile-" + std::to_wstring(GetCurrentProcessId()) + L".key";
+            if (pd_len > 0 && pd_len <= MAX_PATH && WriteTestFile(pd_key, FromHex(kGoldenPayloadHex))) {
+                const std::wstring me = CurrentUserSidString();
+                Check(SetProtectedDacl(pd_key, L"D:(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;" + me + L")"),
+                      "test setup: protect the key file in C:\\ProgramData");
+                expectFailure(ToUtf8(pd_key), HKDFGUARD_ERR_FILE_UNTRUSTED,
+                              "a key file in C:\\ProgramData (Users may create entries there) is untrusted");
+                std::string message;
+                try {
+                    std::vector<uint8_t> direct(HKDFGUARD_WRAPPED_MAX_LEN);
+                    hkdfguard::ReadWrappedKeyFile(ToUtf8(pd_key).c_str(), direct.data());
+                } catch (const hkdfguard::HkdfGuardError& e) {
+                    message = e.what();
+                }
+                Check(message.find("create files or folders") != std::string::npos,
+                      "...because C:\\ProgramData lets other accounts create files or folders in it");
+                if (message.find("create files or folders") == std::string::npos) {
+                    std::printf("    (message: %s)\n", message.c_str());
+                }
+                DeleteFileW(pd_key.c_str());
+            } else {
+                Skip("open_file refuses a key file in C:\\ProgramData (could not create a file there)");
+            }
+        }
+
+        // The drive root keeps its allowance: the system drive's root lets
+        // Authenticated Users create folders, yet every key file above
+        // passed through it - and its live ACL passes the drive-root rule.
+        {
+            wchar_t windows[MAX_PATH + 1] = {};
+            const UINT windows_len = GetSystemWindowsDirectoryW(windows, MAX_PATH + 1);
+            const std::wstring root = std::wstring(windows, windows_len > 3 ? 3 : windows_len);
+            PSECURITY_DESCRIPTOR sd = nullptr;
+            const bool read = windows_len >= 3 &&
+                              GetNamedSecurityInfoW(root.c_str(), SE_FILE_OBJECT,
+                                                    OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION, nullptr,
+                                                    nullptr, nullptr, nullptr, &sd) == ERROR_SUCCESS;
+            Check(read, "test setup: read the system drive root's security");
+            if (read) {
+                Check(CodeOf([&] { hkdfguard::CheckKeyFileSecurity(sd, hkdfguard::KeyFileObject::DriveRoot); }) ==
+                          HKDFGUARD_OK,
+                      ("the system drive root (" + ToUtf8(root) + ") passes the drive-root rule").c_str());
+                LocalFree(sd);
+            }
+            r = open(fileFor(L"root-allowance.key", FromHex(kGoldenPayloadHex)));
+            Check(r.rc == HKDFGUARD_OK,
+                  "a key file below the system drive root still opens (the drive root's create rights are allowed)");
+            if (r.rc != HKDFGUARD_OK) std::printf("    (hkdfguard_open_file returned %d)\n", r.rc);
         }
 
         // Right size, wrong contents.
@@ -2528,73 +2732,121 @@ int main() {
     {
         const std::wstring me = CurrentUserSidString();
         const std::wstring trusted_installer = L"S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
-        auto verdict = [](const std::wstring& sddl, bool folder) {
+        // The file itself, a folder between the drive root and the file (its
+        // own folder included), and the drive root: each has its own rule.
+        constexpr hkdfguard::KeyFileObject kFile = hkdfguard::KeyFileObject::File;
+        constexpr hkdfguard::KeyFileObject kFolder = hkdfguard::KeyFileObject::Folder;
+        constexpr hkdfguard::KeyFileObject kRoot = hkdfguard::KeyFileObject::DriveRoot;
+        auto verdict = [](const std::wstring& sddl, hkdfguard::KeyFileObject object) {
             PSECURITY_DESCRIPTOR sd = nullptr;
             if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.c_str(), SDDL_REVISION_1, &sd, nullptr)) {
                 return static_cast<int32_t>(1); // the test's own SDDL is wrong
             }
-            int32_t code = CodeOf([&] { hkdfguard::CheckKeyFileSecurity(sd, folder); });
+            int32_t code = CodeOf([&] { hkdfguard::CheckKeyFileSecurity(sd, object); });
             LocalFree(sd);
             return code;
         };
         struct Case {
             std::wstring sddl;
-            bool folder;
+            hkdfguard::KeyFileObject object;
             int32_t want;
             const char* what;
         };
+        // The shipped ACLs of the folders the rule is about.
+        const std::wstring c_drive = L"O:" + trusted_installer +
+                                     L"D:P(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;0x1200a9;;;BU)"
+                                     L"(A;OICIIO;SDGXGWGR;;;AU)(A;;0x4;;;AU)";
+        const std::wstring program_data = L"O:SYD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICIIO;FA;;;CO)"
+                                          L"(A;OICI;0x1200a9;;;BU)(A;CI;0x116;;;BU)";
+        const std::wstring windows_temp = L"O:SYD:P(A;OICIIO;FA;;;CO)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"
+                                          L"(A;CI;0x100026;;;BU)";
+        // A folder after `icacls <folder> /inheritance:r /grant:r` of full
+        // control to SYSTEM and Administrators and read to Users.
+        const std::wstring prepared = L"O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)";
         const Case cases[] = {
             // Owners.
-            {L"O:SYD:P(A;;FA;;;SY)", false, HKDFGUARD_OK, "a file owned by SYSTEM is trusted"},
-            {L"O:BAD:P(A;;FA;;;BA)", false, HKDFGUARD_OK, "a file owned by Administrators is trusted"},
-            {L"O:" + trusted_installer + L"D:P(A;;FA;;;SY)", false, HKDFGUARD_OK, "a file owned by TrustedInstaller is trusted"},
-            {L"O:" + me + L"D:P(A;;FA;;;" + me + L")", false, HKDFGUARD_OK, "a file owned by this account is trusted"},
-            {L"O:BUD:P(A;;FA;;;SY)", false, HKDFGUARD_ERR_FILE_UNTRUSTED, "a file owned by BUILTIN\\Users is untrusted"},
-            {L"O:WDD:P(A;;FA;;;SY)", false, HKDFGUARD_ERR_FILE_UNTRUSTED, "a file owned by Everyone is untrusted"},
-            {L"O:BUD:P(A;;FA;;;SY)", true, HKDFGUARD_ERR_FILE_UNTRUSTED, "a folder owned by BUILTIN\\Users is untrusted"},
-            {L"O:LSD:P(A;;FA;;;SY)", true, HKDFGUARD_ERR_FILE_UNTRUSTED, "a folder owned by LocalService is untrusted"},
+            {L"O:SYD:P(A;;FA;;;SY)", kFile, HKDFGUARD_OK, "a file owned by SYSTEM is trusted"},
+            {L"O:BAD:P(A;;FA;;;BA)", kFile, HKDFGUARD_OK, "a file owned by Administrators is trusted"},
+            {L"O:" + trusted_installer + L"D:P(A;;FA;;;SY)", kFile, HKDFGUARD_OK, "a file owned by TrustedInstaller is trusted"},
+            {L"O:" + me + L"D:P(A;;FA;;;" + me + L")", kFile, HKDFGUARD_OK, "a file owned by this account is trusted"},
+            {L"O:BUD:P(A;;FA;;;SY)", kFile, HKDFGUARD_ERR_FILE_UNTRUSTED, "a file owned by BUILTIN\\Users is untrusted"},
+            {L"O:WDD:P(A;;FA;;;SY)", kFile, HKDFGUARD_ERR_FILE_UNTRUSTED, "a file owned by Everyone is untrusted"},
+            {L"O:BUD:P(A;;FA;;;SY)", kFolder, HKDFGUARD_ERR_FILE_UNTRUSTED, "a folder owned by BUILTIN\\Users is untrusted"},
+            {L"O:LSD:P(A;;FA;;;SY)", kFolder, HKDFGUARD_ERR_FILE_UNTRUSTED, "a folder owned by LocalService is untrusted"},
             // No DACL, or a NULL one, is unrestricted access.
-            {L"O:SY", false, HKDFGUARD_ERR_FILE_UNTRUSTED, "a file with no DACL is untrusted"},
-            {L"O:SYD:NO_ACCESS_CONTROL", false, HKDFGUARD_ERR_FILE_UNTRUSTED, "a file with a NULL DACL is untrusted"},
-            {L"O:SYD:P", false, HKDFGUARD_OK, "a file with an empty DACL is trusted (only its owner can change it)"},
+            {L"O:SY", kFile, HKDFGUARD_ERR_FILE_UNTRUSTED, "a file with no DACL is untrusted"},
+            {L"O:SYD:NO_ACCESS_CONTROL", kFile, HKDFGUARD_ERR_FILE_UNTRUSTED, "a file with a NULL DACL is untrusted"},
+            {L"O:SYD:P", kFile, HKDFGUARD_OK, "a file with an empty DACL is trusted (only its owner can change it)"},
             // File rights, one at a time.
-            {L"O:SYD:P(A;;FR;;;WD)", false, HKDFGUARD_OK, "Everyone reading a file is fine (it's ciphertext)"},
-            {L"O:SYD:P(A;;0x2;;;BU)", false, HKDFGUARD_ERR_FILE_UNTRUSTED, "Users with FILE_WRITE_DATA on a file is untrusted"},
-            {L"O:SYD:P(A;;0x4;;;BU)", false, HKDFGUARD_ERR_FILE_UNTRUSTED, "Users with FILE_APPEND_DATA on a file is untrusted"},
-            {L"O:SYD:P(A;;0x10;;;BU)", false, HKDFGUARD_ERR_FILE_UNTRUSTED, "Users with FILE_WRITE_EA on a file is untrusted"},
-            {L"O:SYD:P(A;;0x100;;;BU)", false, HKDFGUARD_ERR_FILE_UNTRUSTED, "Users with FILE_WRITE_ATTRIBUTES on a file is untrusted"},
-            {L"O:SYD:P(A;;SD;;;AU)", false, HKDFGUARD_ERR_FILE_UNTRUSTED, "Authenticated Users with DELETE on a file is untrusted"},
-            {L"O:SYD:P(A;;WD;;;BU)", false, HKDFGUARD_ERR_FILE_UNTRUSTED, "Users with WRITE_DAC on a file is untrusted"},
-            {L"O:SYD:P(A;;WO;;;BU)", false, HKDFGUARD_ERR_FILE_UNTRUSTED, "Users with WRITE_OWNER on a file is untrusted"},
-            {L"O:SYD:P(A;;GW;;;BU)", false, HKDFGUARD_ERR_FILE_UNTRUSTED, "Users with GENERIC_WRITE on a file is untrusted"},
-            {L"O:SYD:P(A;;GA;;;BU)", false, HKDFGUARD_ERR_FILE_UNTRUSTED, "Users with GENERIC_ALL on a file is untrusted"},
-            {L"O:SYD:P(A;;FA;;;S-1-5-21-1-2-3-1001)", false, HKDFGUARD_ERR_FILE_UNTRUSTED, "another user with full control of a file is untrusted"},
+            {L"O:SYD:P(A;;FR;;;WD)", kFile, HKDFGUARD_OK, "Everyone reading a file is fine (it's ciphertext)"},
+            {L"O:SYD:P(A;;0x2;;;BU)", kFile, HKDFGUARD_ERR_FILE_UNTRUSTED, "Users with FILE_WRITE_DATA on a file is untrusted"},
+            {L"O:SYD:P(A;;0x4;;;BU)", kFile, HKDFGUARD_ERR_FILE_UNTRUSTED, "Users with FILE_APPEND_DATA on a file is untrusted"},
+            {L"O:SYD:P(A;;0x10;;;BU)", kFile, HKDFGUARD_ERR_FILE_UNTRUSTED, "Users with FILE_WRITE_EA on a file is untrusted"},
+            {L"O:SYD:P(A;;0x100;;;BU)", kFile, HKDFGUARD_ERR_FILE_UNTRUSTED, "Users with FILE_WRITE_ATTRIBUTES on a file is untrusted"},
+            {L"O:SYD:P(A;;SD;;;AU)", kFile, HKDFGUARD_ERR_FILE_UNTRUSTED, "Authenticated Users with DELETE on a file is untrusted"},
+            {L"O:SYD:P(A;;WD;;;BU)", kFile, HKDFGUARD_ERR_FILE_UNTRUSTED, "Users with WRITE_DAC on a file is untrusted"},
+            {L"O:SYD:P(A;;WO;;;BU)", kFile, HKDFGUARD_ERR_FILE_UNTRUSTED, "Users with WRITE_OWNER on a file is untrusted"},
+            {L"O:SYD:P(A;;GW;;;BU)", kFile, HKDFGUARD_ERR_FILE_UNTRUSTED, "Users with GENERIC_WRITE on a file is untrusted"},
+            {L"O:SYD:P(A;;GA;;;BU)", kFile, HKDFGUARD_ERR_FILE_UNTRUSTED, "Users with GENERIC_ALL on a file is untrusted"},
+            {L"O:SYD:P(A;;FA;;;S-1-5-21-1-2-3-1001)", kFile, HKDFGUARD_ERR_FILE_UNTRUSTED, "another user with full control of a file is untrusted"},
             // Trusted principals may hold any right.
-            {L"O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;" + trusted_installer + L")(A;;FA;;;" + me + L")(A;;FA;;;OW)", false,
+            {L"O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;" + trusted_installer + L")(A;;FA;;;" + me + L")(A;;FA;;;OW)", kFile,
              HKDFGUARD_OK, "SYSTEM, Administrators, TrustedInstaller, this account and OWNER RIGHTS may write a file"},
             // ACE kinds.
-            {L"O:SYD:P(D;;FA;;;WD)(A;;FA;;;SY)", false, HKDFGUARD_OK, "a deny ACE is never a reason to refuse"},
-            {L"O:SYD:P(A;OIIO;FA;;;WD)", true, HKDFGUARD_OK, "an inherit-only ACE does not apply to the folder itself"},
-            {L"O:SYD:P(XA;;FA;;;WD;(Member_of {SID(BA)}))", false, HKDFGUARD_ERR_FILE_UNTRUSTED,
+            {L"O:SYD:P(D;;FA;;;WD)(A;;FA;;;SY)", kFile, HKDFGUARD_OK, "a deny ACE is never a reason to refuse"},
+            {L"O:SYD:P(A;OIIO;FA;;;WD)", kFolder, HKDFGUARD_OK, "an inherit-only ACE does not apply to the folder itself"},
+            {L"O:SYD:P(XA;;FA;;;WD;(Member_of {SID(BA)}))", kFile, HKDFGUARD_ERR_FILE_UNTRUSTED,
              "a conditional allow ACE is judged as if its condition held"},
-            // Folder rights: replacing entries is refused, creating them is not.
-            {L"O:SYD:P(A;;0x40;;;BU)", true, HKDFGUARD_ERR_FILE_UNTRUSTED, "Users with FILE_DELETE_CHILD on a folder is untrusted"},
-            {L"O:SYD:P(A;;SD;;;BU)", true, HKDFGUARD_ERR_FILE_UNTRUSTED, "Users with DELETE on a folder is untrusted"},
-            {L"O:SYD:P(A;;WD;;;BU)", true, HKDFGUARD_ERR_FILE_UNTRUSTED, "Users with WRITE_DAC on a folder is untrusted"},
-            {L"O:SYD:P(A;;WO;;;BU)", true, HKDFGUARD_ERR_FILE_UNTRUSTED, "Users with WRITE_OWNER on a folder is untrusted"},
-            {L"O:SYD:P(A;;0x1301bf;;;AU)", true, HKDFGUARD_ERR_FILE_UNTRUSTED,
+            // Folder rights: replacing entries is refused, on every folder
+            // and the drive root alike.
+            {L"O:SYD:P(A;;0x40;;;BU)", kFolder, HKDFGUARD_ERR_FILE_UNTRUSTED, "Users with FILE_DELETE_CHILD on a folder is untrusted"},
+            {L"O:SYD:P(A;;SD;;;BU)", kFolder, HKDFGUARD_ERR_FILE_UNTRUSTED, "Users with DELETE on a folder is untrusted"},
+            {L"O:SYD:P(A;;WD;;;BU)", kFolder, HKDFGUARD_ERR_FILE_UNTRUSTED, "Users with WRITE_DAC on a folder is untrusted"},
+            {L"O:SYD:P(A;;WO;;;BU)", kFolder, HKDFGUARD_ERR_FILE_UNTRUSTED, "Users with WRITE_OWNER on a folder is untrusted"},
+            {L"O:SYD:P(A;;0x1301bf;;;AU)", kFolder, HKDFGUARD_ERR_FILE_UNTRUSTED,
              "Authenticated Users: Modify on a folder (what a new folder under C:\\ inherits) is untrusted"},
-            {L"O:SYD:P(A;;0x116;;;BU)", true, HKDFGUARD_OK,
-             "Users creating files and folders in a folder (C:\\ProgramData-style) is fine"},
-            {L"O:SYD:P(A;;0x116;;;BU)", false, HKDFGUARD_ERR_FILE_UNTRUSTED, "...but the same mask on a file is write access"},
-            {L"O:SYD:P(A;;GW;;;BU)", true, HKDFGUARD_OK, "GENERIC_WRITE on a folder maps only to creating entries"},
-            // C:\ as it ships.
-            {L"O:" + trusted_installer + L"D:P(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;0x1200a9;;;BU)"
-                                         L"(A;OICIIO;SDGXGWGR;;;AU)(A;;0x4;;;AU)", true, HKDFGUARD_OK,
-             "the system drive root's shipped ACL is trusted"},
+            {L"O:SYD:P(A;;0x40;;;BU)", kRoot, HKDFGUARD_ERR_FILE_UNTRUSTED, "Users with FILE_DELETE_CHILD on the drive root is untrusted"},
+            {L"O:SYD:P(A;;SD;;;AU)", kRoot, HKDFGUARD_ERR_FILE_UNTRUSTED, "Authenticated Users with DELETE on the drive root is untrusted"},
+            {L"O:SYD:P(A;;WD;;;WD)", kRoot, HKDFGUARD_ERR_FILE_UNTRUSTED, "Everyone with WRITE_DAC on the drive root is untrusted"},
+            {L"O:BUD:P(A;;FA;;;SY)", kRoot, HKDFGUARD_ERR_FILE_UNTRUSTED, "a drive root owned by BUILTIN\\Users is untrusted"},
+            // Folder rights: creating entries is refused too, below the
+            // drive root - whoever is granted it, whichever create right.
+            {L"O:SYD:P(A;;0x116;;;BU)", kFolder, HKDFGUARD_ERR_FILE_UNTRUSTED,
+             "Users creating files and folders in a folder (C:\\ProgramData-style) is untrusted"},
+            {L"O:SYD:P(A;;0x22;;;BU)", kFolder, HKDFGUARD_ERR_FILE_UNTRUSTED, "Users with only FILE_ADD_FILE on a folder is untrusted"},
+            {L"O:SYD:P(A;;0x24;;;BU)", kFolder, HKDFGUARD_ERR_FILE_UNTRUSTED, "Users with only FILE_ADD_SUBDIRECTORY on a folder is untrusted"},
+            {L"O:SYD:P(A;;0x2;;;AU)", kFolder, HKDFGUARD_ERR_FILE_UNTRUSTED, "Authenticated Users with FILE_ADD_FILE on a folder is untrusted"},
+            {L"O:SYD:P(A;;0x4;;;AU)", kFolder, HKDFGUARD_ERR_FILE_UNTRUSTED, "Authenticated Users with FILE_ADD_SUBDIRECTORY on a folder is untrusted"},
+            {L"O:SYD:P(A;;0x2;;;WD)", kFolder, HKDFGUARD_ERR_FILE_UNTRUSTED, "Everyone with FILE_ADD_FILE on a folder is untrusted"},
+            {L"O:SYD:P(A;;0x4;;;WD)", kFolder, HKDFGUARD_ERR_FILE_UNTRUSTED, "Everyone with FILE_ADD_SUBDIRECTORY on a folder is untrusted"},
+            {L"O:SYD:P(A;;0x116;;;S-1-5-21-1-2-3-1001)", kFolder, HKDFGUARD_ERR_FILE_UNTRUSTED,
+             "another user creating entries in a folder is untrusted"},
+            {L"O:SYD:P(A;;GW;;;BU)", kFolder, HKDFGUARD_ERR_FILE_UNTRUSTED, "GENERIC_WRITE on a folder (create files and folders) is untrusted"},
+            {L"O:SYD:P(A;CIIO;0x116;;;BU)", kFolder, HKDFGUARD_OK,
+             "an inherit-only create ACE (for subfolders only) does not apply to the folder itself"},
+            {L"O:SYD:P(A;;0x116;;;BU)", kFile, HKDFGUARD_ERR_FILE_UNTRUSTED, "...and the same mask on a file is write access"},
+            {L"O:SYD:P(A;;0x116;;;SY)(A;;0x116;;;BA)(A;;0x116;;;" + me + L")(A;;0x116;;;" + trusted_installer + L")",
+             kFolder, HKDFGUARD_OK, "SYSTEM, Administrators, TrustedInstaller and this account may create entries in a folder"},
+            {L"O:SYD:P(A;;0x1200a9;;;BU)(A;;0x1200a9;;;AU)(A;;0x1200a9;;;WD)", kFolder, HKDFGUARD_OK,
+             "Users, Authenticated Users and Everyone reading and traversing a folder is fine"},
+            {L"O:SYD:P(A;;0x110;;;BU)", kFolder, HKDFGUARD_OK,
+             "write-attributes and write-EA rights on a folder are not create rights (as before)"},
+            // ...but not on the drive root: a default C:\ lets Authenticated
+            // Users create folders, and no key file on it could be trusted
+            // otherwise.
+            {L"O:SYD:P(A;;0x4;;;AU)", kRoot, HKDFGUARD_OK, "Authenticated Users creating folders in the drive root is allowed"},
+            {L"O:SYD:P(A;;0x116;;;BU)", kRoot, HKDFGUARD_OK, "Users creating files and folders in the drive root is allowed"},
+            {L"O:SYD:P(A;;GW;;;WD)", kRoot, HKDFGUARD_OK, "GENERIC_WRITE (create only) on the drive root is allowed"},
+            // The shipped ACLs.
+            {c_drive, kRoot, HKDFGUARD_OK, "the system drive root's shipped ACL is trusted as the drive root"},
+            {c_drive, kFolder, HKDFGUARD_ERR_FILE_UNTRUSTED,
+             "...but the same ACL on a folder below the root is untrusted (Authenticated Users may create folders)"},
+            {program_data, kFolder, HKDFGUARD_ERR_FILE_UNTRUSTED, "C:\\ProgramData's shipped ACL is untrusted (Users may create entries)"},
+            {windows_temp, kFolder, HKDFGUARD_ERR_FILE_UNTRUSTED, "C:\\Windows\\Temp's shipped ACL is untrusted (Users may create entries)"},
+            {prepared, kFolder, HKDFGUARD_OK, "a folder after icacls /inheritance:r with SYSTEM, Administrators and Users-read grants is trusted"},
         };
         for (const Case& c : cases) {
-            int32_t got = verdict(c.sddl, c.folder);
+            int32_t got = verdict(c.sddl, c.object);
             Check(got == c.want, (std::string("key-file trust: ") + c.what).c_str());
             if (got != c.want) std::printf("    (CheckKeyFileSecurity returned %d)\n", got);
         }
