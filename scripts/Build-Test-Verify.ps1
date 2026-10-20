@@ -30,7 +30,10 @@
     Users or Everyone, which the CLI refuses. Default: Administrators.
 
 .PARAMETER NoCleanup
-    Skip deleting the verification KEK and wrapped-key file afterward.
+    Skip deleting the verification KEK and wrapped-key file afterward. Without
+    it, the KEK is retired with the CLI just built (status for the fingerprint,
+    then retire --fingerprint), which is checked like every other step: the
+    service must then be absent and the retirement logged as event 1004.
 #>
 param(
     [ValidateSet("Debug", "Release")]
@@ -104,6 +107,20 @@ Write-Ok "cl, cmake, ninja, dumpbin resolved"
 
 # ---- Configure + build --------------------------------------------------
 Write-Section "Configuring (cmake -G Ninja)"
+# A build folder configured for another checkout - this repository moved, or
+# was copied - can't be reused: CMake refuses a cache generated for a
+# different source directory. Drop that cache so the folder is configured
+# afresh; the build tree it describes is regenerated anyway.
+$cache = Join-Path $RepoRoot "build\CMakeCache.txt"
+if (Test-Path -LiteralPath $cache) {
+    $cacheSource = (Select-String -LiteralPath $cache -Pattern '^CMAKE_HOME_DIRECTORY:INTERNAL=(.*)$' |
+        Select-Object -First 1).Matches.Groups[1].Value
+    if ($cacheSource -and ([IO.Path]::GetFullPath($cacheSource).TrimEnd('\') -ne [IO.Path]::GetFullPath($RepoRoot).TrimEnd('\'))) {
+        Write-Host "build\ was configured for '$cacheSource'; removing its stale CMake cache." -ForegroundColor Yellow
+        Remove-Item -LiteralPath $cache -Force
+        Remove-Item -LiteralPath (Join-Path $RepoRoot "build\CMakeFiles") -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
 cmake -S . -B build -G Ninja "-DCMAKE_BUILD_TYPE=$Configuration"
 if ($LASTEXITCODE -ne 0) { throw "cmake configure failed (exit $LASTEXITCODE)" }
 Write-Ok "configure succeeded"
@@ -158,22 +175,24 @@ if ($LASTEXITCODE -eq 0) {
 # ---- CLI provision + wrap + independent DLL unwrap verification ----------
 Write-Section "CLI provision + wrap + DLL unwrap round-trip verification"
 
-# The key file goes in a scratch folder under %TEMP%, not under the repo:
-# hkdfguard_open_file refuses a file when any folder above it lets another
-# account delete or replace entries, and a checkout outside a user profile
-# often does - GitHub's hosted runners use C:\a\..., which inherits
-# Authenticated Users: Modify from C:\. %TEMP% may be spelled with an 8.3
-# short name (C:\Users\RUNNER~1\... on those runners), which open_file also
-# refuses, so it's expanded to its long form first - as tests/test_cli.ps1 does.
-Add-Type -Namespace HkdfGuardVerify -Name Path -MemberDefinition @"
-[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-public static extern uint GetLongPathNameW(string shortPath, System.Text.StringBuilder longPath, uint size);
-"@
-$tempLong = New-Object System.Text.StringBuilder 32768
-$tempLen = [HkdfGuardVerify.Path]::GetLongPathNameW($env:TEMP, $tempLong, 32768)
-$tempDir = if ($tempLen -gt 0 -and $tempLen -lt 32768) { $tempLong.ToString() } else { $env:TEMP }
-$verifyDir = Join-Path $tempDir ("hkdfguard-verify-" + [Guid]::NewGuid().ToString("N"))
+# The key file goes in an administrator-owned folder under C:\ - the key
+# folder layout docs/admin-guide.md describes - not under the repo or
+# %TEMP%. hkdfguard_open_file refuses a file when any folder above it is
+# owned by, or below the drive root lets create, delete or replace entries,
+# an account it doesn't trust. Under the production security model (the
+# default) that is everyone but SYSTEM, Administrators, TrustedInstaller and
+# the deployer groups - so not this account's own profile (%TEMP% is under
+# it, owned by the user), nor a checkout under C:\a\... (which inherits
+# Authenticated Users: Modify from C:\), nor C:\ProgramData. This script
+# runs elevated, so the folder is made Administrators-owned with SYSTEM and
+# Administrators full control and Users read, as the admin guide does with
+# icacls.
+$verifyDir = Join-Path $env:SystemDrive ("\hkdfguard-verify-" + [Guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Force -Path $verifyDir | Out-Null
+& icacls.exe $verifyDir /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" "*S-1-5-32-545:(OI)(CI)RX" | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "icacls could not prepare the verification key folder $verifyDir" }
+& icacls.exe $verifyDir /setowner "*S-1-5-32-544" /T | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "icacls could not make Administrators the owner of $verifyDir" }
 $keyFile = Join-Path $verifyDir "verify.key"
 # Alphanumeric only - hkdfguard.exe's ValidateServiceCharset
 # rejects anything else (including hyphens) in --service-name.
@@ -349,15 +368,51 @@ if (-not $NoCleanup) {
     if (Test-Path $verifyDir) {
         Remove-Item -Recurse -Force $verifyDir
     }
-    if ($providerName) {
-        # Matches kek_store.cpp's KeyName(): every piece of the persisted
-        # name is lowercase, and $service is already lowercase.
-        $keyName = "hkdfguardwin_${service}_v1"
-        & certutil -csp $providerName -delkey $keyName | Out-Null
-        if ($LASTEXITCODE -eq 0) {
-            Write-Host "removed persisted KEK '$keyName' from $providerName"
-        } else {
-            Write-Host "note: could not remove persisted KEK '$keyName' (certutil exit $LASTEXITCODE) - harmless, just left behind in key storage" -ForegroundColor Yellow
+    if ($provisionExit -eq 0) {
+        # Retire the verification KEK with the CLI this run built - the only
+        # supported way to delete a KEK - which also verifies `status` and
+        # `retire` end to end: status reports the fingerprint, retire deletes
+        # only the key carrying it, logs event 1004, and status then reports
+        # the service absent. Runs whenever provision succeeded, so a failed
+        # wrap or unwrap doesn't leave the key behind either.
+        $env:PATH = "$dllDir;$env:PATH"
+        try {
+            $statusOutput = @(& $cliPath status --service-name $serviceName 2>&1 | ForEach-Object { "$_" })
+            $fingerprint = ($statusOutput | Where-Object { $_ -match '^fingerprint:\s*[0-9a-f]{64}\s*$' } |
+                Select-Object -First 1) -replace '^fingerprint:\s*', ''
+            if (-not $fingerprint) {
+                Write-Bad "hkdfguard.exe status reported no fingerprint for '$service':`n$($statusOutput -join "`n")"
+            } else {
+                $retireStart = (Get-Date).AddSeconds(-2)
+                & $cliPath retire --service-name $serviceName --fingerprint $fingerprint.Trim()
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Bad "hkdfguard.exe retire exited $LASTEXITCODE; the KEK for '$service' was left in place"
+                } else {
+                    Write-Ok "retired the verification KEK for '$service' (fingerprint $($fingerprint.Trim()))"
+
+                    $after = @(& $cliPath status --service-name $serviceName 2>&1 | ForEach-Object { "$_" })
+                    if ($after -contains 'kek: absent') {
+                        Write-Ok "status reports '$service' absent after retire"
+                    } else {
+                        Write-Bad "status still reports a KEK for '$service' after retire:`n$($after -join "`n")"
+                    }
+
+                    $sinceUtc = $retireStart.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+                    $xpath = "*[System[Provider[@Name='hkdfguard-native-windows'] and EventID=1004 and TimeCreated[@SystemTime>='$sinceUtc']]]"
+                    $events = @()
+                    try { $events = @(Get-WinEvent -LogName Application -FilterXPath $xpath -ErrorAction Stop) } catch { }
+                    $retired = @($events | Where-Object {
+                        ([string]$_.Properties[0].Value).Contains($service) -and
+                        ([string]$_.Properties[0].Value).Contains($fingerprint.Trim()) })
+                    if ($retired.Count -ge 1) {
+                        Write-Ok "retire recorded in the event log (event 1004) with this KEK's fingerprint"
+                    } else {
+                        Write-Bad "no retire event 1004 found for service '$service' with fingerprint $($fingerprint.Trim())"
+                    }
+                }
+            }
+        } finally {
+            $env:PATH = $oldPath
         }
     }
 }

@@ -16,6 +16,12 @@ namespace hkdfguard {
     inline constexpr wchar_t kHkdfGuardUsersGroup[] =
         L"HkdfGuardUsers";
 
+    // The local group whose members deploy key files (see SecurityModel in
+    // policy.h). Like the two above it is honored only if it exists, is a
+    // group, and is in this machine's own SAM. The MSI creates it.
+    inline constexpr wchar_t kHkdfGuardDeployersGroup[] =
+        L"HkdfGuardDeployers";
+
     // Whether `domain` - a ReferencedDomainName as reported by
     // LookupAccountName/LookupAccountSid - is one this host's KEK protection
     // treats as local: this machine's own NetBIOS computer name, "BUILTIN",
@@ -51,7 +57,9 @@ namespace hkdfguard {
     //
     // Key Use / Unwrap:
     //   HkdfGuardUsers (if present, a group, and in this host's own SAM)
+    //   HkdfGuardDeployers (likewise) - deployers wrap, so they need key use
     //   additionalGroups - each vetted exactly as ValidateKeyUseGroups does
+    //     (CreateKek passes KeyUseGroups and DeployerGroups together)
     //
     // Throws HkdfGuardError on failure.
     void ApplyKeyAcl(
@@ -85,5 +93,21 @@ namespace hkdfguard {
     void VerifyKeyAcl(
         NCRYPT_KEY_HANDLE key,
         const std::vector<std::wstring>& additionalGroups);
+
+    // Every principal the production security model trusts to have written
+    // a key file (see SecurityModel in policy.h): the SID of
+    // HkdfGuardDeployers (if present - see the constant above) and of each
+    // DeployerGroups entry, each vetted exactly as ValidateKeyUseGroups
+    // vets a key-use entry, plus the SID of every *direct* member of each
+    // of those groups. Members are read from this machine's own group
+    // database by SID (NetLocalGroupGetMembers, level 0), so no name is
+    // resolved and no domain controller is contacted; a group nested inside
+    // a deployer group is trusted as a principal, but its own members are
+    // not expanded. A well-known group (an NT SERVICE or NT AUTHORITY
+    // principal) has no enumerable members and contributes only its SID.
+    // Throws HkdfGuardError(HKDFGUARD_ERR_WIN_GROUP_INVALID) for an entry
+    // that fails vetting, or a group whose members can't be read.
+    std::vector<std::vector<BYTE>> ResolveDeployerPrincipals(
+        const std::vector<std::wstring>& deployerGroups);
 
 }

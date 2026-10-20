@@ -3,6 +3,7 @@
 
 #include <windows.h>
 #include <aclapi.h>
+#include <lm.h>   // NetLocalGroupGetMembers - ResolveDeployerPrincipals
 #include <sddl.h> // ConvertStringSidToSidW
 
 #include <cstring> // memcmp - IsDomainUsersRid compares SID identifier authorities
@@ -508,15 +509,17 @@ namespace hkdfguard {
                     optionalSids.back());
             }
 
-            if (auto group =
-                    TryResolveAccountSid(
-                        kHkdfGuardUsersGroup)) {
-                optionalSids.push_back(
-                    std::move(*group));
+            for (const wchar_t *keyUseGroup: {kHkdfGuardUsersGroup, kHkdfGuardDeployersGroup}) {
+                if (auto group =
+                        TryResolveAccountSid(
+                            keyUseGroup)) {
+                    optionalSids.push_back(
+                        std::move(*group));
 
-                AddKeyUseAce(
-                    entries,
-                    optionalSids.back());
+                    AddKeyUseAce(
+                        entries,
+                        optionalSids.back());
+                }
             }
 
             for (const auto &name: additionalGroups) {
@@ -827,12 +830,14 @@ namespace hkdfguard {
                 *sid);
         }
 
-        if (auto sid =
-                TryResolveAccountSid(
-                    kHkdfGuardUsersGroup)) {
-            VerifyPrincipalPresent(
-                acl,
-                *sid);
+        for (const wchar_t *keyUseGroup: {kHkdfGuardUsersGroup, kHkdfGuardDeployersGroup}) {
+            if (auto sid =
+                    TryResolveAccountSid(
+                        keyUseGroup)) {
+                VerifyPrincipalPresent(
+                    acl,
+                    *sid);
+            }
         }
 
         for (const auto &group: additionalGroups) {
@@ -848,5 +853,70 @@ namespace hkdfguard {
             // Resolution is the validation; the SID itself isn't needed here.
             ResolveKeyUseGroupSid(entry);
         }
+    }
+
+    namespace {
+        // Appends the SID of every direct member of the local group `sid`.
+        // Level 0 returns members by SID only, so nothing is resolved by
+        // name and no domain controller is contacted, even for a domain
+        // account that is a direct member. A well-known group (NT SERVICE,
+        // NT AUTHORITY) isn't in the local group database and has no
+        // enumerable members: it contributes only its own SID.
+        void AppendDirectMembers(const SidBuffer &sid, std::vector<SidBuffer> &out) {
+            wchar_t name[256] = {};
+            wchar_t domain[256] = {};
+            DWORD name_len = ARRAYSIZE(name);
+            DWORD domain_len = ARRAYSIZE(domain);
+            SID_NAME_USE use = SidTypeUnknown;
+            if (!LookupAccountSidW(nullptr, const_cast<BYTE *>(sid.data()), name, &name_len, domain, &domain_len,
+                                   &use)) {
+                throw HkdfGuardError(HKDFGUARD_ERR_WIN_GROUP_INVALID, "a deployer group could not be resolved");
+            }
+            if (use == SidTypeWellKnownGroup) {
+                return;
+            }
+
+            DWORD_PTR resume = 0;
+            NET_API_STATUS status = ERROR_MORE_DATA;
+            while (status == ERROR_MORE_DATA) {
+                BYTE *buffer = nullptr;
+                DWORD read = 0;
+                DWORD total = 0;
+                status = NetLocalGroupGetMembers(nullptr, name, 0, &buffer, MAX_PREFERRED_LENGTH, &read, &total,
+                                                 &resume);
+                if (status != NERR_Success && status != ERROR_MORE_DATA) {
+                    if (buffer != nullptr) NetApiBufferFree(buffer);
+                    throw HkdfGuardError(HKDFGUARD_ERR_WIN_GROUP_INVALID,
+                                         "the members of a deployer group could not be read");
+                }
+                const auto *members = reinterpret_cast<const LOCALGROUP_MEMBERS_INFO_0 *>(buffer);
+                for (DWORD i = 0; i < read; ++i) {
+                    PSID member = members[i].lgrmi0_sid;
+                    if (member != nullptr && IsValidSid(member)) {
+                        const auto *bytes = static_cast<const BYTE *>(member);
+                        out.emplace_back(bytes, bytes + GetLengthSid(member));
+                    }
+                }
+                if (buffer != nullptr) NetApiBufferFree(buffer);
+            }
+        }
+    } // namespace
+
+    std::vector<std::vector<BYTE>> ResolveDeployerPrincipals(
+        const std::vector<std::wstring> &deployerGroups) {
+        std::vector<SidBuffer> groups;
+        if (auto fixed = TryResolveAccountSid(kHkdfGuardDeployersGroup)) {
+            groups.push_back(std::move(*fixed));
+        }
+        for (const auto &entry: deployerGroups) {
+            groups.push_back(ResolveKeyUseGroupSid(entry));
+        }
+
+        std::vector<SidBuffer> principals;
+        for (const SidBuffer &group: groups) {
+            principals.push_back(group);
+            AppendDirectMembers(group, principals);
+        }
+        return principals;
     }
 } // namespace hkdfguard

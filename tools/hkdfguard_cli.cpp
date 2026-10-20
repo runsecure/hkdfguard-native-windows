@@ -90,9 +90,14 @@
 // link, and allowing one would let whoever can plant a link in the output
 // directory redirect an elevated `wrap --force` at an arbitrary file. See the
 // "output path must be a real file" section below for exactly how that is
-// enforced on open handles rather than on re-queried paths.
+// enforced on open handles rather than on re-queried paths. And the folders
+// above it must be ones hkdfguard_open_file will read from: no account but
+// SYSTEM, Administrators, TrustedInstaller and the caller may create, delete
+// or rename entries in any of them below the drive root (see "The folders a
+// key file may be read from" below) - refused before the DEK is read.
 
 #include "hkdfguard.h"
+#include "no_follow_open.h" // the path walk shared with hkdfguard_open_file - see tools/CMakeLists.txt
 
 #include <windows.h>
 #include <aclapi.h> // SetSecurityInfo - protecting the key file's DACL on its handle
@@ -182,35 +187,6 @@ namespace {
         return result;
     }
 
-    // Minimal RAII wrapper for a Win32 file HANDLE - this tool's own local
-    // copy of the same idea src/handle_traits.h uses for NCrypt/BCrypt handles
-    // elsewhere in this project, kept local since this tool intentionally
-    // depends only on the public hkdfguard.h header, nothing from src/.
-    class ScopedFileHandle {
-    public:
-        explicit ScopedFileHandle(HANDLE h = INVALID_HANDLE_VALUE) : handle_(h) {
-        }
-
-        ~ScopedFileHandle() { reset(); }
-
-        ScopedFileHandle(const ScopedFileHandle &) = delete;
-
-        ScopedFileHandle &operator=(const ScopedFileHandle &) = delete;
-
-        void reset(HANDLE h = INVALID_HANDLE_VALUE) {
-            if (handle_ != INVALID_HANDLE_VALUE && handle_ != nullptr) {
-                CloseHandle(handle_);
-            }
-            handle_ = h;
-        }
-
-        HANDLE get() const { return handle_; }
-        bool valid() const { return handle_ != INVALID_HANDLE_VALUE && handle_ != nullptr; }
-
-    private:
-        HANDLE handle_;
-    };
-
     // MARK: - Argument parsing
 
     struct ProvisionArgs {
@@ -280,8 +256,15 @@ namespace {
             L"\n"
             L"Examples:\n"
             L"  %ls provision -sn svc\n"
-            L"  $dekBase64 | %ls wrap -kf C:\\ProgramData\\app\\key.bin -sn svc --dek-stdin\n"
-            L"  %ls wrap -kf C:\\ProgramData\\app\\key.bin -sn svc --dek-file C:\\ProgramData\\app\\dek.b64\n"
+            L"  $dekBase64 | %ls wrap -kf C:\\HkdfGuardKeys\\app\\key.bin -sn svc --dek-stdin\n"
+            L"  %ls wrap -kf C:\\HkdfGuardKeys\\app\\key.bin -sn svc --dek-file C:\\Users\\me\\dek.b64\n"
+            L"\n"
+            L"Every folder above --key-file-path, up to but not including the drive root, must let\n"
+            L"no account but SYSTEM, Administrators, TrustedInstaller and the reader create, delete\n"
+            L"or rename entries in it -- so not C:\\ProgramData or C:\\Windows\\Temp. Prepare a folder\n"
+            L"of its own from an elevated prompt:\n"
+            L"  icacls C:\\HkdfGuardKeys /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F\n"
+            L"         *S-1-5-32-545:(OI)(CI)RX\n"
             L"  %ls status -sn svc\n"
             L"  %ls retire -sn svc -fp <fingerprint printed by provision>\n",
             kProgramName, kProgramName, kProgramName, kProgramName, kProgramName, kProgramName, kProgramName,
@@ -815,8 +798,8 @@ namespace {
             case HKDFGUARD_ERR_INTERNAL_ERROR: return "an internal error occurred in HkdfGuard.dll";
             case HKDFGUARD_ERR_PROCESS_HARDENING_FAILED: return "could not harden this process against memory disclosure (crash-report heap, same-user debugging and code injection)";
             case HKDFGUARD_ERR_INVALID_SERVICE_NAME: return "service name is missing or malformed (ASCII letters, digits and '.' only, 1-128 bytes, not starting with '.', no \"..\")";
-            case HKDFGUARD_ERR_POLICY_INVALID: return "invalid key storage policy";
-            case HKDFGUARD_ERR_WIN_GROUP_INVALID: return "a KeyUseGroups policy entry is unresolvable, not a group, over-broad, or not host-local";
+            case HKDFGUARD_ERR_POLICY_INVALID: return "invalid machine policy: HKLM\\Software\\Policies\\HkdfGuard\\KeyStoragePolicy is not 0, 1 or 2, or SecurityModel is not 0 or 1";
+            case HKDFGUARD_ERR_WIN_GROUP_INVALID: return "a KeyUseGroups or DeployerGroups policy entry is unresolvable, not a group, over-broad, or not host-local (or a deployer group's members could not be read)";
             case HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH: return "wrapped payload was not produced under this service's current KEK";
             case HKDFGUARD_ERR_KEK_NOT_FOUND: return "no KEK is provisioned for this service";
             case HKDFGUARD_ERR_KEK_ACCESS_DENIED: return "this KEK exists, but this account is not authorized to use it";
@@ -828,7 +811,7 @@ namespace {
             case HKDFGUARD_ERR_FILE_TOO_LONG: return "the wrapped-key file is longer than a wrapped key";
             case HKDFGUARD_ERR_FILE_PLAINTEXT_KEY: return "the file looks like an UNWRAPPED 32-byte key (raw, or its hex or base64) - it may hold a plaintext key; treat it as exposed";
             case HKDFGUARD_ERR_FILE_MALFORMED: return "the wrapped-key file is the right size but does not hold a valid wrapped key";
-            case HKDFGUARD_ERR_FILE_UNTRUSTED: return "the wrapped-key path is, or passes through, a symbolic link, junction or other reparse point, uses an 8.3 short name, or is not on a local drive (UNC, mapped or SUBST drive, device); or the file or a folder above it is owned by, or lets, an account other than SYSTEM, Administrators, TrustedInstaller or the caller write or replace it";
+            case HKDFGUARD_ERR_FILE_UNTRUSTED: return "the wrapped-key path is, or passes through, a symbolic link, junction or other reparse point, uses an 8.3 short name, or is not on a local drive (UNC, mapped or SUBST drive, device); or the file or a folder above it is owned by, or lets, an account other than SYSTEM, Administrators, TrustedInstaller or the caller write or replace it; or a folder above it, other than the drive root, lets such an account create files or folders in it (as C:\\ProgramData and C:\\Windows\\Temp do)";
             default: return "unknown status code " + std::to_string(code);
         }
     }
@@ -1247,64 +1230,36 @@ namespace {
     // to could redirect an (often elevated) `wrap --force` into overwriting
     // and deleting an arbitrary file, or a plain `wrap` into creating one
     // somewhere it never meant to (CREATE_NEW happily follows a *dangling*
-    // symlink and creates its target). So: refuse, don't tolerate. The
-    // helpers below enforce that four ways, all on handles already open
-    // (never by re-querying a path that could be swapped underneath):
+    // symlink and creates its target). And a directory symbolic link can
+    // point at \\server\share: following one would make this process connect
+    // and authenticate to that server before anything could refuse it. So:
+    // refuse, don't tolerate - and never follow a link even to find out.
     //
+    //   0. The path is walked, never resolved by name (no_follow_open.h):
+    //      the drive root, then each folder opened relative to the handle of
+    //      the one above it, each refused if it is a reparse point before
+    //      anything is opened through it, then the file relative to its
+    //      folder. Nothing reached through a link is ever opened.
     //   1. The object itself must not carry FILE_ATTRIBUTE_REPARSE_POINT -
-    //      every CreateFile in this section passes
-    //      FILE_FLAG_OPEN_REPARSE_POINT precisely so a symlink at the path
-    //      opens *as the link* and gets caught here, rather than being
-    //      silently followed.
+    //      it is opened with FILE_OPEN_REPARSE_POINT, so a link at the path
+    //      opens *as the link* and gets caught here.
     //   2. It must be a file, not a directory.
     //   3. The kernel's own resolved path for the handle
     //      (GetFinalPathNameByHandle) must equal the fully-qualified form of
-    //      what the caller typed - which is what catches a junction or
-    //      symlink in a *parent* component, where flag (1) on the leaf can't
-    //      see it. (A path using 8.3 short names is refused before this, in
-    //      FullLongPath.)
+    //      what the caller typed. After (0) the only way they can differ is
+    //      a component spelled with its 8.3 short name ("PROGRA~1"), which
+    //      is refused.
     //   4. The file must have exactly one name (no hard links), since
     //      neither (1) nor (3) can tell that a file is also reachable at
     //      another path, and overwriting it would change that file too.
     //
-    // A consequence of (3) worth knowing: a path through a SUBST drive or a
-    // mapped network drive resolves to a different canonical form and is
-    // refused too. A secrets file belongs on a real local path anyway.
+    // SUBST and mapped network drives are refused before (0), from the
+    // drive letter alone. A secrets file belongs on a real local path.
 
-    // GetLongPathName for a path that must exist; empty on failure, with
-    // GetLastError() left set for the caller.
-    std::string TryLongPathName(const std::string &path) {
-        DWORD needed = GetLongPathNameA(path.c_str(), nullptr, 0);
-        if (needed == 0) {
-            return {};
-        }
-        std::string longForm(needed, '\0');
-        DWORD written = GetLongPathNameA(path.c_str(), longForm.data(), needed);
-        if (written == 0 || written >= needed) {
-            return {};
-        }
-        longForm.resize(written);
-        return longForm;
-    }
-
-    // Fully-qualified form of `path`, as the caller spelled it - *not*
-    // resolved through any reparse point. This is the "expected" side of
-    // check (3) above.
-    //
-    // 8.3 short names ("PROGRA~1") are refused rather than expanded, here
-    // and in HkdfGuard.dll's hkdfguard_open_file alike: they are a second,
-    // auto-generated name for the same file, with a history of checks that
-    // matched one spelling but not the other. The test is exact, not a guess
-    // from "~" characters: GetLongPathName walks the path through the
-    // directory listing, and a path is refused only if that changes one of
-    // its components (ignoring case). A genuine long name such as
-    // "report~1.key" passes.
-    //
-    // GetLongPathName only works on paths that exist, and the wrapped-key
-    // file usually doesn't yet. So if the full path doesn't resolve, the
-    // parent directory (which must exist) is checked instead; the leaf of a
-    // file that doesn't exist yet has no short name to check.
-    std::string FullLongPath(const std::string &path) {
+    // Fully-qualified form of `path`, as the caller spelled it -
+    // GetFullPathName works on the text alone, so nothing is opened and no
+    // link is followed. This is the "expected" side of check (3) above.
+    std::string FullPath(const std::string &path) {
         DWORD needed = GetFullPathNameA(path.c_str(), 0, nullptr, nullptr);
         if (needed == 0) {
             throw CliError("GetFullPathName failed for " + path + ": " + FormatWin32Error(GetLastError()));
@@ -1315,45 +1270,70 @@ namespace {
             throw CliError("GetFullPathName failed for " + path + ": " + FormatWin32Error(GetLastError()));
         }
         full.resize(written);
-
-        auto refuseShortName = [&path]() {
-            throw CliError(
-                path + " uses an 8.3 short name (such as PROGRA~1); spell every folder and the file "
-                "with its full name");
-        };
-
-        std::string longForm = TryLongPathName(full);
-        if (!longForm.empty()) {
-            if (_stricmp(longForm.c_str(), full.c_str()) != 0) {
-                refuseShortName();
-            }
-            return full;
-        }
-        DWORD err = GetLastError();
-        if (err != ERROR_FILE_NOT_FOUND) {
-            throw CliError("GetLongPathName failed for " + full + ": " + FormatWin32Error(err));
-        }
-
-        size_t sep = full.find_last_of("\\/");
-        if (sep == std::string::npos || sep + 1 >= full.size()) {
-            throw CliError("cannot determine the file name in " + path);
-        }
-        std::string parent = (sep <= 2) ? full.substr(0, sep + 1) : full.substr(0, sep);
-        std::string parentLong = TryLongPathName(parent);
-        if (parentLong.empty()) {
-            throw CliError(
-                "the directory for " + path + " (" + parent + ") does not exist or cannot be resolved: " +
-                FormatWin32Error(GetLastError()));
-        }
-        if (_stricmp(parentLong.c_str(), parent.c_str()) != 0) {
-            refuseShortName();
-        }
         return full;
+    }
+
+    // This tool's paths are ANSI (argv, the A-suffixed Win32 calls); the
+    // walk is in UTF-16. Converted with the same code page CreateFileA would
+    // use, so the same names are meant.
+    std::wstring AnsiToWide(const std::string &s) {
+        if (s.empty()) return {};
+        int len = MultiByteToWideChar(CP_ACP, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
+        std::wstring wide(static_cast<size_t>(len > 0 ? len : 0), L'\0');
+        if (len > 0) MultiByteToWideChar(CP_ACP, 0, s.data(), static_cast<int>(s.size()), wide.data(), len);
+        return wide;
+    }
+
+    std::string WideToAnsi(const std::wstring &w) {
+        if (w.empty()) return {};
+        int len = WideCharToMultiByte(CP_ACP, 0, w.data(), static_cast<int>(w.size()), nullptr, 0, nullptr, nullptr);
+        std::string narrow(static_cast<size_t>(len > 0 ? len : 0), '\0');
+        if (len > 0) WideCharToMultiByte(CP_ACP, 0, w.data(), static_cast<int>(w.size()), narrow.data(), len, nullptr, nullptr);
+        return narrow;
+    }
+
+    std::string FinalPathOfHandle(HANDLE file, const std::string &path);
+    std::string TrimTrailingSeparators(std::string p);
+
+    // Check (0): opens every folder from the drive root down to the one
+    // holding `full`'s last component, never following a link (see
+    // no_follow_open.h), then refuses an 8.3 short name anywhere in those
+    // folders - check (3) on the deepest one, whose canonical path spells
+    // every folder above it. `what` names the path in messages. `full` must
+    // already have passed RequireLocalDrivePath.
+    hkdfguard_nofollow::FolderChain WalkToParent(const std::string &full, const std::string &what) {
+        hkdfguard_nofollow::FolderChain chain;
+        hkdfguard_nofollow::Error error;
+        if (!hkdfguard_nofollow::OpenFolderChain(AnsiToWide(full), chain, error)) {
+            const std::string at = WideToAnsi(error.at);
+            switch (error.failure) {
+                case hkdfguard_nofollow::Failure::ReparsePoint:
+                    throw CliError(
+                        what + " resolves through a symbolic link, junction or other reparse point at \"" + at +
+                        "\"; it must be a real local path with no links in it (nothing was opened through the link)");
+                case hkdfguard_nofollow::Failure::NotADirectory:
+                    throw CliError(what + ": \"" + at + "\" is a file, not a folder");
+                case hkdfguard_nofollow::Failure::OpenFailed:
+                    if (error.win32 == ERROR_FILE_NOT_FOUND || error.win32 == ERROR_PATH_NOT_FOUND) {
+                        throw CliError("the directory for " + what + " (" + at + ") does not exist");
+                    }
+                    throw CliError("cannot open the folder \"" + at + "\" in " + what + ": " + FormatWin32Error(error.win32));
+                default:
+                    throw CliError(what + " names an alternate data stream or has an empty folder name");
+            }
+        }
+        const std::string parent = WideToAnsi(chain.parentPath());
+        const std::string actual = TrimTrailingSeparators(FinalPathOfHandle(chain.parent(), what));
+        if (_stricmp(actual.c_str(), TrimTrailingSeparators(parent).c_str()) != 0) {
+            throw CliError(
+                what + " uses an 8.3 short name (such as PROGRA~1); spell every folder and the file with its full name");
+        }
+        return chain;
     }
 
     // The kernel's canonical DOS path for an open handle, with the "\\?\"
     // (or "\\?\UNC\") prefix GetFinalPathNameByHandle always adds stripped
-    // back off so it compares directly against FullLongPath's output. This is
+    // back off so it compares directly against FullPath's output. This is
     // the "actual" side of check (3) above - it reflects every reparse point
     // that was traversed to reach the object, which is the whole point.
     std::string FinalPathOfHandle(HANDLE file, const std::string &path) {
@@ -1400,7 +1380,7 @@ namespace {
     }
 
     // Checks (1)-(4) above against an already-open handle. `expected` is the
-    // FullLongPath form the handle is supposed to be sitting at;
+    // FullPath form the handle is supposed to be sitting at;
     // `allowDirectory` is set only for the parent-directory pre-check in
     // ValidateOutputPathIsReal, never for the wrapped-key file itself.
     void RequireRealObjectAtExpectedPath(
@@ -1432,24 +1412,26 @@ namespace {
                 "overwriting it cannot alter a file at some other path");
         }
 
+        // Reached only through the walk, so a difference here can only be an
+        // 8.3 short name in the last component.
         std::string actual = TrimTrailingSeparators(FinalPathOfHandle(file, path));
         std::string want = TrimTrailingSeparators(expected);
         if (_stricmp(actual.c_str(), want.c_str()) != 0) {
             throw CliError(
-                path + " resolves through a symbolic link, junction, SUBST or mapped drive to \"" + actual +
-                "\"; the wrapped-key path must be a real local path with no links in it");
+                path + " uses an 8.3 short name (such as PROGRA~1), resolving to \"" + actual +
+                "\"; spell every folder and the file with its full name");
         }
     }
 
     // Refuses `path` unless it names a file on a local drive: never a UNC
     // path (\\server\share\..., \\?\UNC\...), a device or \\?\ path, or a
-    // mapped network drive. Decided from the path text alone (GetFullPathName
-    // does no I/O; GetDriveType asks only the local mount manager) and before
-    // anything touches the path, so this process never connects or
-    // authenticates to a server named in it - which would hand that server
-    // the caller's NTLM credentials. A SUBST drive passes here and is caught
-    // later, where the opened handle's real path must match the spelled one.
-    // `what` names the path in the message.
+    // mapped network drive, nor a SUBST drive (whose target is another path,
+    // possibly a share). Decided from the path text and the drive letter
+    // alone (see hkdfguard_nofollow::IsLocalDrivePath - nothing is opened)
+    // and before anything touches the path, so this process never connects
+    // or authenticates to a server named in it - which would hand that
+    // server the caller's NTLM credentials. Links further down the path are
+    // the walk's job (WalkToParent). `what` names the path in the message.
     void RequireLocalDrivePath(const std::string &path, const std::string &what) {
         char fullBuf[MAX_PATH * 4];
         DWORD fullLen = GetFullPathNameA(path.c_str(), static_cast<DWORD>(sizeof(fullBuf)), fullBuf, nullptr);
@@ -1457,63 +1439,243 @@ namespace {
             throw CliError("failed to resolve " + what + ": " + FormatWin32Error(GetLastError()));
         }
         const std::string full(fullBuf, fullLen);
-        const bool driveLetter = full.size() >= 3 && std::isalpha(static_cast<unsigned char>(full[0])) &&
-                                 full[1] == ':' && full[2] == '\\';
-        if (!driveLetter || GetDriveTypeA(full.substr(0, 3).c_str()) == DRIVE_REMOTE) {
+        if (!hkdfguard_nofollow::IsLocalDrivePath(AnsiToWide(full))) {
             throw CliError(
-                what + " is not on a local drive (UNC paths, mapped network drives and devices are refused)");
+                what + " is not on a local drive (UNC paths, mapped network and SUBST drives, and devices are "
+                "refused)");
+        }
+    }
+
+    std::vector<BYTE> GetProcessUserSid();
+    std::string AccountNameOf(PSID sid);
+
+    // MARK: - The folders a key file may be read from
+    //
+    // hkdfguard_open_file refuses a key file (HKDFGUARD_ERR_FILE_UNTRUSTED)
+    // unless every folder above it - the drive root included - is owned by
+    // SYSTEM, Administrators, TrustedInstaller or the reading account and
+    // lets no other account delete, rename or take over its entries, and
+    // unless every folder below the drive root - the key file's own folder
+    // included - also lets no other account create files or folders in it
+    // (the Linux build's "no directory writable by group or others", sticky
+    // or not). The drive root is exempt from that last part only: a default
+    // C:\ lets Authenticated Users create folders, and the folders below it
+    // are judged themselves. See src/key_file.cpp, whose rule this mirrors
+    // ACE for ACE so that wrap never writes a file the library would refuse
+    // to read. (The library judges against the account *reading* the file;
+    // here "this account" is the one running wrap - the closest this tool
+    // can know.)
+    //
+    // So C:\ProgramData (Users may create entries in it), any folder under
+    // it, C:\Windows\Temp, and a folder made directly under C:\ that still
+    // inherits Authenticated Users: Modify are all refused, before the DEK
+    // is read or a provider is touched, with the fix in the message.
+
+    // Rights the library refuses to anyone untrusted, on every folder (the
+    // drive root included) and, below the drive root, also the create rights.
+    constexpr ACCESS_MASK kFolderReplaceRights = FILE_DELETE_CHILD | DELETE | WRITE_DAC | WRITE_OWNER | GENERIC_ALL;
+    constexpr ACCESS_MASK kFolderCreateRights = FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY | GENERIC_WRITE;
+
+    // Shared system folders that let every user create entries. Never the
+    // thing to fix - the key belongs somewhere else - so the message says so
+    // instead of suggesting icacls on them.
+    bool IsSharedSystemFolder(const std::string &folder) {
+        auto same = [&folder](const std::string &other) {
+            return !other.empty() && _stricmp(TrimTrailingSeparators(other).c_str(), folder.c_str()) == 0;
+        };
+        auto env = [](const char *name) {
+            char value[MAX_PATH * 2] = {};
+            DWORD len = GetEnvironmentVariableA(name, value, static_cast<DWORD>(sizeof(value)));
+            return (len > 0 && len < sizeof(value)) ? std::string(value, len) : std::string();
+        };
+        char windows[MAX_PATH + 1] = {};
+        UINT len = GetSystemWindowsDirectoryA(windows, MAX_PATH + 1);
+        const std::string windowsTemp = (len > 0 && len <= MAX_PATH) ? std::string(windows, len) + "\\Temp" : "";
+        return same(env("ProgramData")) || same(env("PUBLIC")) || same(windowsTemp);
+    }
+
+    // The fix for a folder that fails the rule, as icacls commands an
+    // administrator can paste into an elevated prompt. /inheritance:r drops
+    // every inherited ACE and /grant:r sets the three that are wanted; an
+    // ACE set on the folder itself (`explicitSid`, as "*S-1-..."; empty when
+    // the offending ACE was inherited) survives both, so it is removed first.
+    std::string KeyFolderFix(const std::string &folder, const std::string &explicitSid = std::string()) {
+        if (IsSharedSystemFolder(folder)) {
+            return "; " + folder + " is a shared system folder - do not change its permissions; keep key files in a "
+                   "folder of their own instead, for example one directly under the drive root, prepared from an "
+                   "elevated prompt with:\n"
+                   "  mkdir C:\\HkdfGuardKeys\\<app>\n"
+                   "  icacls C:\\HkdfGuardKeys /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F "
+                   "*S-1-5-32-545:(OI)(CI)RX HkdfGuardDeployers:(OI)(CI)M\n"
+                   "  icacls C:\\HkdfGuardKeys /setowner *S-1-5-32-544 /T\n"
+                   "(see \"Where to keep key files\" in docs/admin-guide.md)";
+        }
+        return "; remove every other account's rights to it, from an elevated prompt:\n" +
+               (explicitSid.empty() ? std::string()
+                                    : "  icacls \"" + folder + "\" /remove:g " + explicitSid + "\n") +
+               "  icacls \"" + folder + "\" /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F "
+               "*S-1-5-32-545:(OI)(CI)RX HkdfGuardDeployers:(OI)(CI)M\n"
+               "  icacls \"" + folder + "\" /setowner *S-1-5-32-544 /T\n"
+               "then check that `icacls \"" + folder + "\"` lists only SYSTEM, Administrators, Users (RX) and "
+               "HkdfGuardDeployers (M), and "
+               "that every folder above it passes too (see \"Where to keep key files\" in docs/admin-guide.md)";
+    }
+
+    // "*S-1-..." for icacls, or empty if the SID can't be rendered.
+    std::string IcaclsSid(PSID sid) {
+        LPSTR text = nullptr;
+        if (!ConvertSidToStringSidA(sid, &text)) {
+            return std::string();
+        }
+        std::string s = std::string("*") + text;
+        LocalFree(text);
+        return s;
+    }
+
+    // Applies the library's folder rule to every folder of a walked chain,
+    // on the handles the walk opened (so it is the folders actually
+    // traversed that are judged). `path` is --key-file-path as given. Who
+    // is trusted is the library's answer, under the machine's security
+    // model (hkdfguard_key_file_principal_trusted), not a copy of its rule:
+    // SYSTEM, Administrators and TrustedInstaller always, then the deployer
+    // groups and their members (production) or this account (developer).
+    void RequireTrustedKeyFileFolders(const hkdfguard_nofollow::FolderChain &chain, const std::string &path) {
+        int model = HKDFGUARD_SECURITY_MODEL_PRODUCTION;
+        int ignored = 0;
+        int32_t modelRc = hkdfguard_security_model(&model, &ignored);
+        if (modelRc != HKDFGUARD_OK) {
+            throw CliError("could not read the security model: " + DescribeStatus(modelRc));
+        }
+        const bool developer = model == HKDFGUARD_SECURITY_MODEL_DEVELOPER;
+        const std::string others = developer ? "this account" : "a deployer group (HkdfGuardDeployers or DeployerGroups) "
+                                                                "or a direct member of one";
+        std::vector<std::pair<std::vector<BYTE>, bool>> cache;
+        auto mayOwn = [&](PSID sid) {
+            for (const auto &entry: cache) {
+                if (EqualSid(sid, const_cast<BYTE *>(entry.first.data()))) return entry.second;
+            }
+            LPSTR text = nullptr;
+            if (!ConvertSidToStringSidA(sid, &text)) {
+                throw CliError("ConvertSidToStringSid failed: " + FormatWin32Error(GetLastError()));
+            }
+            int trusted = 0;
+            int32_t rc = hkdfguard_key_file_principal_trusted(text, &trusted);
+            LocalFree(text);
+            if (rc != HKDFGUARD_OK) {
+                throw CliError("could not check who may write key files: " + DescribeStatus(rc));
+            }
+            const auto *bytes = static_cast<const BYTE *>(sid);
+            cache.emplace_back(std::vector<BYTE>(bytes, bytes + GetLengthSid(sid)), trusted != 0);
+            return trusted != 0;
+        };
+        auto mayWrite = [&](PSID sid) {
+            return mayOwn(sid) || IsWellKnownSid(sid, WinCreatorOwnerRightsSid) ||
+                   IsWellKnownSid(sid, WinCreatorOwnerSid) || IsWellKnownSid(sid, WinCreatorGroupSid);
+        };
+        const std::string why =
+                "hkdfguard_open_file would refuse to read a key file there (HKDFGUARD_ERR_FILE_UNTRUSTED, -39): "
+                "every folder from the key file's own up to, but not including, the drive root must let no account "
+                "other than SYSTEM, Administrators, TrustedInstaller or " + others + " create, delete or "
+                "rename entries in it, or change its permissions (" + (developer ? "developer" : "production") +
+                " security model)";
+
+        for (size_t i = 0; i < chain.handles.size(); ++i) {
+            const bool driveRoot = i == 0;
+            const std::string folder = TrimTrailingSeparators(WideToAnsi(chain.paths[i]));
+            const std::string what = "--key-file-path " + path + ": " + (driveRoot ? "the drive root " : "the folder ") +
+                                     "\"" + folder + "\"";
+            PSID owner = nullptr;
+            PACL dacl = nullptr;
+            PSECURITY_DESCRIPTOR sd = nullptr;
+            DWORD rc = GetSecurityInfo(chain.handles[i].get(), SE_FILE_OBJECT,
+                                       OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION, &owner, nullptr, &dacl,
+                                       nullptr, &sd);
+            if (rc != ERROR_SUCCESS) {
+                throw CliError(what + ": its security could not be read (" + FormatWin32Error(rc) +
+                               "), so hkdfguard_open_file could not vouch for it either");
+            }
+            struct FreeSd {
+                PSECURITY_DESCRIPTOR p;
+                ~FreeSd() { LocalFree(p); }
+            } freeSd{sd};
+            const std::string fix = driveRoot ? std::string("; keep the key file on a drive whose root is not open "
+                                                            "to other accounts")
+                                              : KeyFolderFix(folder);
+            if (owner == nullptr || !mayOwn(owner)) {
+                throw CliError(what + " is owned by " + (owner ? AccountNameOf(owner) : std::string("no one")) +
+                               ", which is neither SYSTEM, Administrators, TrustedInstaller nor " + others + "; " +
+                               why + fix);
+            }
+            if (dacl == nullptr) {
+                throw CliError(what + " has no DACL, so every account has full access to it; " + why + fix);
+            }
+            const ACCESS_MASK forbidden = driveRoot ? kFolderReplaceRights : (kFolderReplaceRights | kFolderCreateRights);
+            for (DWORD a = 0; a < dacl->AceCount; ++a) {
+                void *ace = nullptr;
+                if (!GetAce(dacl, a, &ace)) {
+                    throw CliError(what + ": its ACL could not be read: " + FormatWin32Error(GetLastError()));
+                }
+                const auto *header = static_cast<const ACE_HEADER *>(ace);
+                if (header->AceFlags & INHERIT_ONLY_ACE) {
+                    continue; // applies only to what is created inside it
+                }
+                switch (header->AceType) {
+                    case ACCESS_DENIED_ACE_TYPE:
+                    case ACCESS_DENIED_OBJECT_ACE_TYPE:
+                    case ACCESS_DENIED_CALLBACK_ACE_TYPE:
+                    case ACCESS_DENIED_CALLBACK_OBJECT_ACE_TYPE:
+                        continue;
+                    case ACCESS_ALLOWED_ACE_TYPE:
+                    case ACCESS_ALLOWED_CALLBACK_ACE_TYPE: {
+                        const auto *allowed = static_cast<const ACCESS_ALLOWED_ACE *>(ace);
+                        PSID sid = const_cast<DWORD *>(&allowed->SidStart);
+                        const ACCESS_MASK granted = allowed->Mask & forbidden;
+                        if (granted == 0 || mayWrite(sid)) {
+                            continue;
+                        }
+                        const bool createOnly = (granted & ~kFolderCreateRights) == 0;
+                        const bool inherited = (header->AceFlags & INHERITED_ACE) != 0;
+                        throw CliError(what + " lets " + AccountNameOf(sid) +
+                                       (createOnly ? " create files or folders in it"
+                                                   : " delete, rename or replace its entries, or change its permissions") +
+                                       (inherited ? " (an inherited permission)" : "") + "; " + why +
+                                       (driveRoot || inherited ? fix : KeyFolderFix(folder, IcaclsSid(sid))));
+                    }
+                    default:
+                        throw CliError(what + " has an access-allowed ACE of an unexpected type; " + why + fix);
+                }
+            }
         }
     }
 
     // Fail-fast version of the checks above, run before any KEK or DEK work
     // so a bad output path is rejected without touching the key store or
-    // reading the DEK at all: the parent directory must be a real directory
-    // at its spelled location, and if something already exists at the leaf
-    // it must not be a reparse point. The authoritative checks are still the
-    // ones made on the actual write/overwrite handles later
-    // (SecureOverwriteAndRemoveIfExists / WriteWrappedKeyFile) - this is the
-    // friendly early exit, not the security boundary, since a path can
-    // always change between a pre-check and a later open.
-    void ValidateOutputPathIsReal(const std::string &path) {
-        std::string full = FullLongPath(path);
+    // reading the DEK at all: every folder down to the file's must be real
+    // (WalkToParent) and pass the library's folder rule
+    // (RequireTrustedKeyFileFolders), and if something already exists at the
+    // leaf it must pass checks (1)-(4). Returns whether something exists there. The
+    // authoritative checks are still the ones made on the actual
+    // write/overwrite handles later (SecureOverwriteAndRemoveIfExists /
+    // WriteWrappedKeyFile) - this is the friendly early exit, not the
+    // security boundary, since a path can always change between a
+    // pre-check and a later open.
+    bool ValidateOutputPathIsReal(const std::string &path) {
+        const std::string full = FullPath(path);
+        hkdfguard_nofollow::FolderChain chain = WalkToParent(full, path);
+        RequireTrustedKeyFileFolders(chain, path);
 
-        size_t sep = full.find_last_of("\\/");
-        if (sep == std::string::npos) {
-            throw CliError("cannot determine the parent directory of " + path);
+        hkdfguard_nofollow::Handle leaf;
+        DWORD err = 0;
+        if (hkdfguard_nofollow::OpenRelative(
+                chain.parent(), chain.leaf, FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_OPEN, 0, nullptr, leaf, err)) {
+            RequireRealObjectAtExpectedPath(leaf.get(), full, path, /*allowDirectory=*/false);
+            return true;
         }
-        // Keep the separator for a drive root ("C:\"), drop it otherwise.
-        std::string parent = (sep <= 2) ? full.substr(0, sep + 1) : full.substr(0, sep);
-
-        {
-            // FILE_FLAG_BACKUP_SEMANTICS is what CreateFile requires to open a
-            // *directory* handle at all; FILE_FLAG_OPEN_REPARSE_POINT so a
-            // junction opens as itself (see the section comment above).
-            ScopedFileHandle dir(CreateFile(
-                parent.c_str(), FILE_READ_ATTRIBUTES,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
-                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
-            if (!dir.valid()) {
-                throw CliError(
-                    "cannot open the directory for " + path + " (" + parent + "): " +
-                    FormatWin32Error(GetLastError()));
-            }
-            RequireRealObjectAtExpectedPath(dir.get(), parent, parent, /*allowDirectory=*/true);
-        }
-
-        {
-            // FILE_FLAG_BACKUP_SEMANTICS here too, so that if the leaf turns
-            // out to be a directory or junction it still opens and is caught
-            // by the checks, rather than failing to open and being deferred.
-            ScopedFileHandle leaf(CreateFile(
-                path.c_str(), FILE_READ_ATTRIBUTES,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
-                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
-            if (leaf.valid()) {
-                RequireRealObjectAtExpectedPath(leaf.get(), full, path, /*allowDirectory=*/false);
-            }
-            // Not existing yet is fine (that's the normal first-run case);
-            // any other open failure is left for the real write to report.
-        }
+        // Not existing yet is the normal first-run case. Anything else
+        // (access denied, in use) means something is there; the real
+        // write reports what.
+        return err != ERROR_FILE_NOT_FOUND && err != ERROR_PATH_NOT_FOUND;
     }
 
     // Marks the file behind an open handle for deletion when its last handle
@@ -1538,7 +1700,8 @@ namespace {
     // --force, an existing file is never touched at all
     // (WriteWrappedKeyFile's CREATE_NEW fails outright instead).
     //
-    // The file is opened with FILE_FLAG_OPEN_REPARSE_POINT and vetted by
+    // The file is reached by the walk (WalkToParent), opened relative to its
+    // folder without following a reparse point, and vetted by
     // RequireRealObjectAtExpectedPath before a single byte is written, and is
     // deleted through that same handle (DeleteViaHandle) rather than by
     // path - see the section comment above for why. A symlink or junction
@@ -1562,29 +1725,31 @@ namespace {
     // best-effort measure against casual recovery, not a cryptographic
     // guarantee against a determined attacker with access to the raw storage.
     void SecureOverwriteAndRemoveIfExists(const std::string &path) {
-        ScopedFileHandle file(CreateFile(
-            path.c_str(), GENERIC_WRITE | DELETE, 0 /* exclusive access for the duration of the passes */, nullptr,
-            OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
-        if (!file.valid()) {
-            DWORD err = GetLastError();
+        const std::string full = FullPath(path);
+        hkdfguard_nofollow::FolderChain chain = WalkToParent(full, path);
+        RequireTrustedKeyFileFolders(chain, path); // re-checked on these handles, before anything is destroyed
+        hkdfguard_nofollow::Handle file;
+        DWORD err = 0;
+        if (!hkdfguard_nofollow::OpenRelative(
+                chain.parent(), chain.leaf, GENERIC_WRITE | DELETE, 0 /* exclusive access for the duration of the passes */,
+                FILE_OPEN, FILE_NON_DIRECTORY_FILE, nullptr, file, err)) {
             if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND) {
                 return; // nothing to overwrite or delete
             }
             if (err == ERROR_ACCESS_DENIED || err == ERROR_SHARING_VIOLATION) {
                 // Can't write to it - skip the overwrite passes and go
                 // straight to removing it, still through a vetted handle.
-                ScopedFileHandle del(CreateFile(
-                    path.c_str(), DELETE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-                    OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
-                if (!del.valid()) {
-                    DWORD delErr = GetLastError();
+                hkdfguard_nofollow::Handle del;
+                DWORD delErr = 0;
+                if (!hkdfguard_nofollow::OpenRelative(
+                        chain.parent(), chain.leaf, DELETE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                        FILE_OPEN, FILE_NON_DIRECTORY_FILE, nullptr, del, delErr)) {
                     if (delErr == ERROR_FILE_NOT_FOUND || delErr == ERROR_PATH_NOT_FOUND) {
                         return;
                     }
                     throw CliError("failed to remove " + path + ": " + FormatWin32Error(delErr));
                 }
-                RequireRealObjectAtExpectedPath(del.get(), FullLongPath(path), path, /*allowDirectory=*/false);
+                RequireRealObjectAtExpectedPath(del.get(), full, path, /*allowDirectory=*/false);
                 DeleteViaHandle(del.get(), path);
                 return;
             }
@@ -1592,7 +1757,7 @@ namespace {
         }
 
         // Vet the handle before writing anything through it.
-        RequireRealObjectAtExpectedPath(file.get(), FullLongPath(path), path, /*allowDirectory=*/false);
+        RequireRealObjectAtExpectedPath(file.get(), full, path, /*allowDirectory=*/false);
 
         LARGE_INTEGER fileSize{};
         if (!GetFileSizeEx(file.get(), &fileSize)) {
@@ -1640,7 +1805,7 @@ namespace {
         }
 
         // Delete through the very handle that was vetted and overwritten -
-        // the file disappears when ScopedFileHandle closes it on return.
+        // the file disappears when its handle closes on return.
         DeleteViaHandle(file.get(), path);
     }
 
@@ -1652,31 +1817,33 @@ namespace {
     // inherited-from-parent-directory) permissions before being locked down
     // after the fact.
     //
-    // FILE_FLAG_OPEN_REPARSE_POINT matters even here: without it, CREATE_NEW
-    // *follows* a symlink whose target doesn't exist yet and creates that
-    // target - so an attacker-planted dangling link would turn "create my
-    // key file here" into "create a file wherever the link points." With the
-    // flag, a link at the path is seen as an existing object and CREATE_NEW
-    // fails with ERROR_FILE_EXISTS instead. The resolved-path check right
-    // after creation then catches a junction in a parent directory; on a
-    // mismatch the just-created (still empty) file is deleted through its
-    // own handle before anything is written to it.
+    // Created relative to its folder's handle from the walk (WalkToParent),
+    // so no link above it is followed. A link *at* the path is an existing
+    // name, so FILE_CREATE fails with "already exists" rather than following
+    // a dangling symlink to create its target - which would turn "create my
+    // key file here" into "create a file wherever the link points". The
+    // resolved-path check right after creation catches an 8.3 short name;
+    // on a mismatch the just-created (still empty) file is deleted through
+    // its own handle before anything is written to it.
     void WriteWrappedKeyFile(
         const std::string &path, const std::vector<uint8_t> &bytes, const KeyFileSecurity &security) {
         SECURITY_ATTRIBUTES sa = security.attributes();
-        ScopedFileHandle file(CreateFile(
-            path.c_str(), GENERIC_WRITE | DELETE | WRITE_DAC, 0, &sa, CREATE_NEW,
-            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
-        if (!file.valid()) {
-            DWORD err = GetLastError();
-            if (err == ERROR_FILE_EXISTS) {
+        const std::string full = FullPath(path);
+        hkdfguard_nofollow::FolderChain chain = WalkToParent(full, path);
+        RequireTrustedKeyFileFolders(chain, path); // re-checked on the handles the file is created through
+        hkdfguard_nofollow::Handle file;
+        DWORD err = 0;
+        if (!hkdfguard_nofollow::OpenRelative(
+                chain.parent(), chain.leaf, GENERIC_WRITE | DELETE | WRITE_DAC, 0, FILE_CREATE,
+                FILE_NON_DIRECTORY_FILE, sa.lpSecurityDescriptor, file, err)) {
+            if (err == ERROR_FILE_EXISTS || err == ERROR_ALREADY_EXISTS) {
                 throw CliError(path + " already exists; pass --force|-f to overwrite");
             }
             throw CliError("failed to open " + path + " for writing: " + FormatWin32Error(err));
         }
 
         try {
-            RequireRealObjectAtExpectedPath(file.get(), FullLongPath(path), path, /*allowDirectory=*/false);
+            RequireRealObjectAtExpectedPath(file.get(), full, path, /*allowDirectory=*/false);
         } catch (const CliError &) {
             // Nothing has been written yet; don't leave an empty file behind
             // at wherever the path actually resolved to.
@@ -1707,7 +1874,7 @@ namespace {
 
         // Write the payload and flush it to storage, so a reported success
         // survives a crash. On any failure the file is deleted through its
-        // own handle (it goes when ScopedFileHandle closes it): a failed wrap
+        // own handle (it goes when that handle closes): a failed wrap
         // never leaves an empty or truncated key file behind, for the next
         // `wrap` to call "already exists" or a service to read as malformed -
         // the same rule as the Linux tool's finish_key_file.
@@ -1858,22 +2025,25 @@ namespace {
     //   - on a local drive: never UNC, a mapped network drive or a device,
     //     decided before anything is opened, so this process never connects
     //     or authenticates to a server named in the path;
+    //   - reached by the walk (WalkToParent): no symbolic link or junction
+    //     above it is ever followed, so nothing is opened on another machine;
+    //   - a regular file, opened without following a reparse point;
     //   - no 8.3 short name anywhere in it;
-    //   - a regular file, opened without following a reparse point, and at
-    //     the spelled path: no symbolic link or junction at it or above it;
     // then RequireTrustedDekFile, then at most kMaxDekStdinLen bytes. Opened
     // with read sharing only, so nobody can change it while it's read.
     // Unlike the key file, a hard link isn't refused: nothing here writes
     // through it, and the Linux tool doesn't refuse one either.
     void ReadDekFile(const std::string &path, DekScratch &scratch) {
-        RequireLocalDrivePath(path, "--dek-file " + path);
-        const std::string expected = FullLongPath(path); // refuses 8.3 short names
+        const std::string what = "--dek-file " + path;
+        RequireLocalDrivePath(path, what);
+        const std::string expected = FullPath(path);
+        hkdfguard_nofollow::FolderChain chain = WalkToParent(expected, what);
 
-        ScopedFileHandle file(CreateFile(
-            path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-            FILE_FLAG_OPEN_REPARSE_POINT | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION, nullptr));
-        if (!file.valid()) {
-            throw CliError("failed to open --dek-file " + path + ": " + FormatWin32Error(GetLastError()));
+        hkdfguard_nofollow::Handle file;
+        DWORD err = 0;
+        if (!hkdfguard_nofollow::OpenRelative(
+                chain.parent(), chain.leaf, GENERIC_READ, FILE_SHARE_READ, FILE_OPEN, 0, nullptr, file, err)) {
+            throw CliError("failed to open " + what + ": " + FormatWin32Error(err));
         }
         if (GetFileType(file.get()) != FILE_TYPE_DISK) {
             throw CliError("--dek-file " + path + " is not a regular file");
@@ -1891,8 +2061,8 @@ namespace {
         const std::string actual = TrimTrailingSeparators(FinalPathOfHandle(file.get(), path));
         if (_stricmp(actual.c_str(), TrimTrailingSeparators(expected).c_str()) != 0) {
             throw CliError(
-                "--dek-file " + path + " resolves through a symbolic link, junction, SUBST or mapped drive to \"" +
-                actual + "\"; give its real local path");
+                what + " uses an 8.3 short name (such as PROGRA~1), resolving to \"" + actual +
+                "\"; give its full local path");
         }
         RequireTrustedDekFile(file.get(), path);
         ReadBoundedInto(file.get(), "--dek-file", scratch);
@@ -1909,7 +2079,7 @@ namespace {
     // creates or modifies a key.
 
     // RAII for an NCrypt provider or key handle - this tool's own copy of
-    // src/handle_traits.h's, for the same reason as ScopedFileHandle above.
+    // src/handle_traits.h's: this tool compiles nothing from src/.
     class ScopedNCryptHandle {
     public:
         ScopedNCryptHandle() = default;
@@ -2184,6 +2354,41 @@ namespace {
         return out;
     }
 
+    // MARK: - Security model
+
+    // The security model in force, and whether this account may persist key
+    // files under it (hkdfguard_security_model).
+    struct SecurityModelInfo {
+        int model = HKDFGUARD_SECURITY_MODEL_PRODUCTION;
+        bool mayWriteKeyFiles = false;
+    };
+
+    SecurityModelInfo ReadSecurityModel() {
+        int model = 0;
+        int mayWrite = 0;
+        int32_t rc = hkdfguard_security_model(&model, &mayWrite);
+        if (rc != HKDFGUARD_OK) {
+            throw CliError("could not read the security model: " + DescribeStatus(rc));
+        }
+        return SecurityModelInfo{model, mayWrite != 0};
+    }
+
+    const char *SecurityModelName(int model) {
+        return model == HKDFGUARD_SECURITY_MODEL_DEVELOPER ? "developer" : "production";
+    }
+
+    void RequireMayPersistKeyFiles() {
+        SecurityModelInfo info = ReadSecurityModel();
+        if (!info.mayWriteKeyFiles) {
+            throw CliError(
+                std::string("under the ") + SecurityModelName(info.model) +
+                " security model this account may not persist key files: only an elevated administrator or a "
+                "member of a deployer group (HkdfGuardDeployers, or a group in "
+                "HKLM\\Software\\Policies\\HkdfGuard\\DeployerGroups) may, and a key file this account wrote "
+                "would be refused by hkdfguard_open_file. Nothing was written");
+        }
+    }
+
     // MARK: - Run: status
 
     // Read-only. Exits 0 whenever there was a definite answer (present,
@@ -2194,6 +2399,11 @@ namespace {
         ValidateServiceCharset(args.serviceName);
         const std::string service = LowercaseService(args.serviceName);
         fprintf(stdout, "service: %s\n", service.c_str());
+        {
+            const SecurityModelInfo info = ReadSecurityModel();
+            fprintf(stdout, "security model: %s (this account %s persist key files)\n",
+                    SecurityModelName(info.model), info.mayWriteKeyFiles ? "may" : "may not");
+        }
 
         int32_t exists = 0;
         int32_t rc = hkdfguard_kek_exists(service.c_str(), &exists);
@@ -2391,23 +2601,27 @@ namespace {
             RequireLocalDrivePath(*args.dekFile, "--dek-file " + *args.dekFile);
         }
 
-        // Fast, friendly pre-check: fail before ever touching the TPM/Software
-        // Key Storage Provider if the output path obviously already exists and
-        // --force wasn't passed. WriteWrappedKeyFile's CREATE_NEW is the actual
-        // correctness guarantee against the exists-then-create race; this is
-        // purely a fail-fast convenience on top of it.
-        if (!args.force) {
-            DWORD attrs = GetFileAttributes(args.keyFilePath.c_str());
-            if (attrs != INVALID_FILE_ATTRIBUTES) {
-                throw CliError(args.keyFilePath + " already exists; pass --force|-f to overwrite");
-            }
-        }
-
         // The output path must be a real file at a real location - no
-        // symlink, junction, or other reparse point at or above it. Checked
-        // here, before any KEK or DEK work, so a bad path is rejected cheaply;
-        // the write/overwrite code re-checks on its own handles regardless.
-        ValidateOutputPathIsReal(args.keyFilePath);
+        // symlink, junction, or other reparse point at or above it, and none
+        // followed to find out (see WalkToParent) - in folders
+        // hkdfguard_open_file would trust (RequireTrustedKeyFileFolders: no
+        // other account may create, delete or rename entries in any folder
+        // below the drive root). Checked here, before any KEK or DEK work,
+        // so a bad path is rejected cheaply; the write/overwrite code
+        // re-checks on its own handles regardless. wrap never creates a
+        // missing folder - a folder it made would inherit its parent's
+        // rights, create rights included - so the operator prepares the
+        // folder (docs/admin-guide.md) and a missing one is an error.
+        //
+        // Then a fast, friendly pre-check: fail before ever touching the
+        // TPM/Software Key Storage Provider if the output path already exists
+        // and --force wasn't passed. WriteWrappedKeyFile's FILE_CREATE is the
+        // actual correctness guarantee against the exists-then-create race;
+        // this is purely a fail-fast convenience on top of it.
+        const bool exists = ValidateOutputPathIsReal(args.keyFilePath);
+        if (exists && !args.force) {
+            throw CliError(args.keyFilePath + " already exists; pass --force|-f to overwrite");
+        }
 
         // Resolved before any TPM/Software Key Storage Provider work, so a bad
         // --group name fails fast rather than after an expensive (and, with
@@ -2460,6 +2674,18 @@ namespace {
             // ends - only the wrapped (encrypted, no longer secret) form
             // survives past this point.
         }
+
+        // Wrapping in memory is open to any account with key use on the KEK;
+        // *persisting* the result is not. Under the production security
+        // model (the default) only SYSTEM, Administrators, TrustedInstaller
+        // and the deployer groups' members are trusted to have written a
+        // key file - see hkdfguard_security_model - so a file this account
+        // wrote would be refused by hkdfguard_open_file anyway. Asked of
+        // the library, which applies exactly the rule it reads files by,
+        // and checked before anything on disk is touched (--force's
+        // overwrite included). After the wrap, so that every input is
+        // still validated first.
+        RequireMayPersistKeyFiles();
 
         if (args.force) {
             SecureOverwriteAndRemoveIfExists(args.keyFilePath);

@@ -135,6 +135,27 @@ $tempLong = New-Object System.Text.StringBuilder 32768
 $tempLen = [HkdfGuardCliTest.Path]::GetLongPathNameW($env:TEMP, $tempLong, 32768)
 $tempDir = if ($tempLen -gt 0 -and $tempLen -lt 32768) { $tempLong.ToString() } else { $env:TEMP }
 $workDir = Join-Path $tempDir ("hkdfguard-cli-test-" + [Guid]::NewGuid().ToString("N"))
+
+# The security model. These scenarios keep key files under %TEMP%, in this
+# account's own profile, and expect wrap to reach the KEK lookup there: the
+# developer model's rule (the caller's own files are trusted). Under the
+# production model, the default, the profile folder - owned by this account,
+# not a deployer - is refused, as it should be; test_roles.ps1 covers
+# production with real deployer and application accounts. So, elevated, the
+# model is set to developer for this script and put back in the finally
+# block; not elevated under production, only the checks that don't wrap run.
+$policyKey = "HKLM:\Software\Policies\HkdfGuard"
+$priorModel = $null
+try { $priorModel = (Get-ItemProperty -Path $policyKey -Name SecurityModel -ErrorAction Stop).SecurityModel } catch { }
+$isAdminRun = (New-Object System.Security.Principal.WindowsPrincipal(
+    [System.Security.Principal.WindowsIdentity]::GetCurrent())).IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
+$pinnedModel = $false
+if ($isAdminRun) {
+    if (-not (Test-Path $policyKey)) { New-Item -Path $policyKey -Force | Out-Null }
+    Set-ItemProperty -Path $policyKey -Name SecurityModel -Type DWord -Value 1
+    $pinnedModel = $true
+}
+$developerModel = $pinnedModel -or ($priorModel -eq 1)
 New-Item -ItemType Directory -Force -Path $workDir | Out-Null
 
 try {
@@ -231,6 +252,12 @@ try {
     $absentService = "hkdfguardabsent" + [Guid]::NewGuid().ToString("N")
     $r = Invoke-Cli @("status", "-sn", $absentService)
     Check (($r.ExitCode -eq 0) -and ($r.StdOut -match "kek: absent")) "status reports a never-provisioned service as absent (exit 0)"
+    Check ($r.StdOut -match "security model: (production|developer) \(this account (may|may not) persist key files\)") "status reports the security model and whether this account may persist key files"
+
+    if (-not $developerModel) {
+        Write-Host "[SKIP] the wrap scenarios: production security model and not elevated - this account's own key folders aren't trusted, and SecurityModel can't be set for the run"
+        if ($failures -eq 0) { exit 0 } else { exit 1 }
+    }
 
     # ---- 4. wrap: missing a required flag (--dek-stdin). ----
     $keyFile = Join-Path $workDir "missing-dek.key"
@@ -585,6 +612,97 @@ try {
         if ($r.StdErr -notmatch "is not on a local drive") { Write-Host "    stderr: $($r.StdErr)" }
     }
 
+    # ---- 12e. The key file's folders must be ones hkdfguard_open_file ----
+    #           trusts: below the drive root, no account but SYSTEM,
+    #           Administrators, TrustedInstaller and this one may create
+    #           (or delete, or rename) entries in any of them. Refused up
+    #           front - the DEK below is not even valid base64, and the
+    #           folder is what's reported - with the fix in the message, and
+    #           nothing created. All unelevated: icacls on folders this test
+    #           owns, and paths in system folders that are never written.
+    $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $createGrants = @(
+        @{ Sid = "*S-1-5-32-545"; Rights = "(WD,AD)"; What = "Users may create files and folders" },
+        @{ Sid = "*S-1-5-11"; Rights = "(AD)"; What = "Authenticated Users may create folders" },
+        @{ Sid = "*S-1-1-0"; Rights = "(WD)"; What = "Everyone may create files" })
+    $n = 0
+    foreach ($grant in $createGrants) {
+        $openDir = Join-Path $workDir ("create-open-" + $n++)
+        New-Item -ItemType Directory -Path $openDir | Out-Null
+        & icacls $openDir /grant "$($grant.Sid):$($grant.Rights)" | Out-Null
+        $openKey = Join-Path $openDir "open.key"
+        $r = Invoke-Cli @("wrap", "--key-file-path", $openKey, "--service-name", $neverProvisionedService, "--dek-stdin") -StdIn "not-valid-base64!!!"
+        $ok = ($r.ExitCode -eq 1) -and ($r.StdErr -match "create files or folders in it") -and ($r.StdErr -match [regex]::Escape($openDir)) -and
+              ($r.StdErr -match "HKDFGUARD_ERR_FILE_UNTRUSTED, -39") -and ($r.StdErr -match "icacls") -and ($r.StdErr -match "/inheritance:r") -and
+              ($r.StdErr -notmatch "not valid base64")
+        Check $ok "wrap refuses a key-file folder where $($grant.What), before reading the DEK, naming the folder and the icacls fix"
+        if (-not $ok) { Write-Host "    exit $($r.ExitCode); stderr: $($r.StdErr)" }
+        Check (-not (Test-Path $openKey)) "wrap into a folder where $($grant.What) creates no key file"
+    }
+
+    # A folder that *inherited* create rights - as every new folder under
+    # C:\ProgramData does - is refused; after the documented fix
+    # (icacls /inheritance:r plus explicit grants) the same folder is
+    # accepted and wrap gets as far as the KEK lookup. The parent passes the
+    # rights to subfolders only (CI)(IO), so the child is what's judged.
+    $inheritParent = Join-Path $workDir "inherit-parent"
+    $inheritChild = Join-Path $inheritParent "keys"
+    New-Item -ItemType Directory -Path $inheritParent | Out-Null
+    & icacls $inheritParent /grant "*S-1-5-32-545:(CI)(IO)(WD,AD)" | Out-Null
+    New-Item -ItemType Directory -Path $inheritChild | Out-Null
+    $inheritKey = Join-Path $inheritChild "inherited.key"
+    $r = Invoke-Cli @("wrap", "--key-file-path", $inheritKey, "--service-name", $neverProvisionedService, "--dek-stdin") -StdIn $validB64
+    Check (($r.ExitCode -eq 1) -and ($r.StdErr -match "create files or folders in it") -and ($r.StdErr -match [regex]::Escape($inheritChild))) "wrap refuses a folder that inherited Users' create rights"
+    if ($r.StdErr -notmatch "create files or folders in it") { Write-Host "    stderr: $($r.StdErr)" }
+    & icacls $inheritChild /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" "*${me}:(OI)(CI)F" | Out-Null
+    Check ($LASTEXITCODE -eq 0) "test setup: icacls <folder> /inheritance:r /grant:r SYSTEM, Administrators, owner"
+    $r = Invoke-Cli @("wrap", "--key-file-path", $inheritKey, "--service-name", $neverProvisionedService, "--dek-stdin") -StdIn $validB64
+    Check (($r.ExitCode -eq 1) -and ($r.StdErr -match "no KEK is provisioned for service")) "the same folder after icacls /inheritance:r is accepted (wrap reaches the KEK lookup)"
+    if ($r.StdErr -notmatch "no KEK is provisioned") { Write-Host "    stderr: $($r.StdErr)" }
+
+    # Shared system folders that let Users create entries are refused, and
+    # the message says to keep the key elsewhere rather than to change them.
+    $windowsTempKey = Join-Path $env:SystemRoot ("Temp\hkdfguard-cli-" + [Guid]::NewGuid().ToString("N") + ".key")
+    $programDataKey = Join-Path $env:ProgramData ("hkdfguard-cli-" + [Guid]::NewGuid().ToString("N") + ".key")
+    $elevatedNow = (New-Object System.Security.Principal.WindowsPrincipal([System.Security.Principal.WindowsIdentity]::GetCurrent())).IsInRole(
+        [System.Security.Principal.WindowsBuiltInRole]::Administrator)
+    foreach ($shared in @($windowsTempKey, $programDataKey)) {
+        $r = Invoke-Cli @("wrap", "--key-file-path", $shared, "--service-name", $neverProvisionedService, "--dek-stdin") -StdIn $validB64
+        $ok = ($r.ExitCode -eq 1) -and ($r.StdErr -match "create files or folders in it") -and ($r.StdErr -match "shared system folder") -and
+              ($r.StdErr -match "do not change its permissions")
+        if (-not $elevatedNow -and $shared -eq $windowsTempKey) {
+            # Unelevated, C:\Windows\Temp can't even be opened to read its
+            # permissions (Users get only traverse and create there), which
+            # is refused just the same.
+            $ok = $ok -or (($r.ExitCode -eq 1) -and ($r.StdErr -match "cannot open the folder"))
+        }
+        Check $ok "wrap refuses a key file directly in $(Split-Path -Parent $shared) and says to keep it elsewhere"
+        if (-not $ok) { Write-Host "    exit $($r.ExitCode); stderr: $($r.StdErr)" }
+        Check (-not (Test-Path $shared)) "wrap into $(Split-Path -Parent $shared) creates no key file"
+    }
+
+    # The drive root keeps its allowance: this run's scratch folder sits on a
+    # drive whose root lets Authenticated Users create folders (a default
+    # C:\), and every accepted wrap above passed through it.
+    $rootAcl = Get-Acl -LiteralPath ([IO.Path]::GetPathRoot($workDir))
+    $rootCreate = @($rootAcl.Access | Where-Object {
+            $_.AccessControlType -eq "Allow" -and -not ($_.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly) -and
+            (($_.FileSystemRights -band ([Security.AccessControl.FileSystemRights]::CreateFiles -bor [Security.AccessControl.FileSystemRights]::CreateDirectories)) -ne 0) -and
+            ($_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value -in @("S-1-5-11", "S-1-5-32-545", "S-1-1-0")) })
+    if ($rootCreate.Count -gt 0) {
+        $r = Invoke-Cli @("wrap", "--key-file-path", (Join-Path $workDir "root-allowance.key"), "--service-name", $neverProvisionedService, "--dek-stdin") -StdIn $validB64
+        Check (($r.ExitCode -eq 1) -and ($r.StdErr -match "no KEK is provisioned for service")) "the drive root's create rights for other accounts are allowed (wrap below it reaches the KEK lookup)"
+        if ($r.StdErr -notmatch "no KEK is provisioned") { Write-Host "    stderr: $($r.StdErr)" }
+    } else {
+        Write-Host "[SKIP] the drive-root allowance (this drive's root lets no other account create entries)"
+    }
+
+    # wrap never creates a missing folder (one it made would inherit its
+    # parent's rights, create rights included): a missing folder is an error.
+    $missingDir = Join-Path $workDir "not-there"
+    $r = Invoke-Cli @("wrap", "--key-file-path", (Join-Path $missingDir "k.key"), "--service-name", $neverProvisionedService, "--dek-stdin") -StdIn $validB64
+    Check (($r.ExitCode -eq 1) -and ($r.StdErr -match "does not exist") -and -not (Test-Path $missingDir)) "wrap refuses a missing key-file folder and does not create it"
+
     # ---- 12c. UTF-16 input is refused with a message that says so, rather ----
     #           than a generic "not valid base64".
     $utf16KeyFile = Join-Path $workDir "utf16.key"
@@ -934,6 +1052,44 @@ try {
             if ($tpmFp) { Invoke-Cli @("retire", "-sn", $bothService, "-fp", $tpmFp) | Out-Null }
         }
 
+        # ---- 16. A directory symbolic link to a share, in the --dek-file ----
+        #          or output path, is refused without being followed:
+        #          following it would connect and authenticate to that server
+        #          (an NTLM challenge-response it could relay) before any
+        #          check on the result. Windows follows local-to-remote
+        #          symbolic links by default; creating one needs elevation.
+        #          Targets: \\localhost\C$\Windows (exists, so a refusal isn't
+        #          just "unreachable") and \\192.0.2.1\share (TEST-NET-1, never
+        #          routed: even trying to connect stalls for seconds, so a fast
+        #          refusal shows no connection was tried). The refusal must
+        #          name the link, never the resolved UNC path.
+        foreach ($share in @(@{ Target = '\\localhost\C$\Windows'; File = 'win.ini' }, @{ Target = '\\192.0.2.1\share'; File = 'dek.b64' })) {
+            $shareLink = Join-Path $workDir "sharelink"
+            cmd /c mklink /D "$shareLink" $share.Target 2>&1 | Out-Null
+            # The link's own attributes (GetFileAttributes doesn't follow the
+            # last component), so this never contacts the target either.
+            $linkMade = $false
+            try { $linkMade = ([IO.File]::GetAttributes($shareLink) -band [IO.FileAttributes]::ReparsePoint) -ne 0 } catch { }
+            if (-not $linkMade) {
+                Check $false "test setup: create a directory symbolic link to $($share.Target)"
+                continue
+            }
+            $sw = [Diagnostics.Stopwatch]::StartNew()
+            $r = Invoke-Cli @("wrap", "-kf", (Join-Path $workDir "share.key"), "-sn", $neverProvisionedService, "--dek-file", (Join-Path $shareLink $share.File))
+            $sw.Stop()
+            Check (($r.ExitCode -eq 1) -and ($r.StdErr -match "reparse point at `"[^`"]*sharelink`"") -and ($r.StdErr -notmatch [regex]::Escape($share.Target))) "--dek-file through a directory symbolic link to $($share.Target) is refused at the link, not followed"
+            if ($r.StdErr -match [regex]::Escape($share.Target)) { Write-Host "    stderr: $($r.StdErr)" }
+            Check ($sw.ElapsedMilliseconds -lt 2000) "--dek-file through a link to $($share.Target) is refused at once ($($sw.ElapsedMilliseconds) ms)"
+
+            $sw = [Diagnostics.Stopwatch]::StartNew()
+            $r = Invoke-Cli @("wrap", "-kf", (Join-Path $shareLink "hkdfguard-probe.key"), "-sn", $neverProvisionedService, "--dek-stdin") -StdIn $validB64
+            $sw.Stop()
+            Check (($r.ExitCode -eq 1) -and ($r.StdErr -match "reparse point at `"[^`"]*sharelink`"") -and ($r.StdErr -notmatch [regex]::Escape($share.Target))) "an output path through a directory symbolic link to $($share.Target) is refused at the link, not followed"
+            Check ($sw.ElapsedMilliseconds -lt 2000) "an output path through a link to $($share.Target) is refused at once ($($sw.ElapsedMilliseconds) ms)"
+            cmd /c rmdir "$shareLink" 2>&1 | Out-Null
+        }
+        Check (-not (Test-Path '\\localhost\C$\Windows\hkdfguard-probe.key')) "no key file was written to the share"
+
         # Fallback cleanup, if retire couldn't run. Full path, not just
         # "certutil" - this test's PATH is whatever ctest baked into its
         # ENVIRONMENT property at configure time (see tests/CMakeLists.txt),
@@ -971,6 +1127,13 @@ try {
     }
 }
 finally {
+    if ($pinnedModel) {
+        if ($null -eq $priorModel) {
+            Remove-ItemProperty -Path $policyKey -Name SecurityModel -ErrorAction SilentlyContinue
+        } else {
+            Set-ItemProperty -Path $policyKey -Name SecurityModel -Type DWord -Value $priorModel
+        }
+    }
     Remove-Item -Recurse -Force $workDir -ErrorAction SilentlyContinue
 }
 

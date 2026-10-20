@@ -1057,8 +1057,14 @@ namespace hkdfguard {
         // that isn't a real, non-over-broad group must fail the call
         // outright rather than leave a key behind that was created and then
         // abandoned part-way through ACL application.
+        // Deployers wrap, so every deployer group gets key use as well:
+        // KeyUseGroups and DeployerGroups are vetted and granted together.
         std::vector<std::wstring> aclGroups =
             LoadKeyUseGroupsPolicy();
+        for (std::wstring &deployer: LoadDeployerGroupsPolicy())
+        {
+            aclGroups.push_back(std::move(deployer));
+        }
 
         ValidateKeyUseGroups(aclGroups);
 

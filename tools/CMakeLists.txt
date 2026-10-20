@@ -10,7 +10,12 @@
 # brings along its PUBLIC include/ directory, so no separate
 # target_include_directories call is needed here for hkdfguard.h.
 add_executable(hkdfguard-cli hkdfguard_cli.cpp)
-target_link_libraries(hkdfguard-cli PRIVATE hkdfguard bcrypt.lib ncrypt.lib advapi32.lib)
+target_link_libraries(hkdfguard-cli PRIVATE hkdfguard bcrypt.lib ncrypt.lib advapi32.lib ntdll.lib)
+# The one header shared from src/: no_follow_open.h, header-only and
+# exception-free - the path walk that never follows a link, which the
+# wrapped-key and --dek-file paths must use exactly as hkdfguard_open_file
+# does. Nothing from src/ is compiled or linked into this tool.
+target_include_directories(hkdfguard-cli PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 
 # The executable is hkdfguard.exe. The CMake *target* can't share that name:
 # "hkdfguard" is already the DLL's target (output HkdfGuard.dll), so the

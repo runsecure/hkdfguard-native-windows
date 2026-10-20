@@ -44,6 +44,12 @@ Language=English
 %1
 .
 
+MessageId=1005
+SymbolicName=HKDFGUARD_EVT_DEVELOPER_MODE
+Language=English
+%1
+.
+
 MessageId=2000
 SymbolicName=HKDFGUARD_EVT_ACCESS_DENIED
 Language=English
