@@ -188,11 +188,38 @@ Write-Section "CLI provision + wrap + DLL unwrap round-trip verification"
 # Administrators full control and Users read, as the admin guide does with
 # icacls.
 $verifyDir = Join-Path $env:SystemDrive ("\hkdfguard-verify-" + [Guid]::NewGuid().ToString("N"))
-New-Item -ItemType Directory -Force -Path $verifyDir | Out-Null
-& icacls.exe $verifyDir /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" "*S-1-5-32-545:(OI)(CI)RX" | Out-Null
-if ($LASTEXITCODE -ne 0) { throw "icacls could not prepare the verification key folder $verifyDir" }
-& icacls.exe $verifyDir /setowner "*S-1-5-32-544" /T | Out-Null
-if ($LASTEXITCODE -ne 0) { throw "icacls could not make Administrators the owner of $verifyDir" }
+$verifyDirInfo = New-Item -ItemType Directory -Force -Path $verifyDir
+# The whole security descriptor is replaced in one step - owner
+# Administrators, a protected DACL of exactly SYSTEM and Administrators full
+# control and Users read - rather than edited with icacls: on GitHub's
+# hosted runners an Authenticated Users entry survived
+# `icacls /inheritance:r /grant:r` on a folder made under C:\, and a
+# replaced DACL can't keep anything. Then read back and checked, so a
+# runner image that still manages to differ fails here, showing the SDDL,
+# instead of in the wrap below. PowerShell 7 (.NET) exposes the ACL calls
+# as FileSystemAclExtensions; Windows PowerShell as DirectoryInfo methods.
+# Only the owner and DACL sections are set: loading a whole SDDL would mark
+# the SACL for writing too, which needs SeSecurityPrivilege.
+$verifySddl = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)"
+$verifySecurity = New-Object System.Security.AccessControl.DirectorySecurity
+$verifySecurity.SetSecurityDescriptorSddlForm($verifySddl, [System.Security.AccessControl.AccessControlSections]::Access)
+$verifySecurity.SetOwner((New-Object System.Security.Principal.SecurityIdentifier("S-1-5-32-544")))
+$aclExtensions = [Type]::GetType("System.IO.FileSystemAclExtensions, System.IO.FileSystem.AccessControl", $false)
+if ($aclExtensions) {
+    $aclExtensions::SetAccessControl($verifyDirInfo, $verifySecurity)
+    $appliedSddl = $aclExtensions::GetAccessControl($verifyDirInfo).GetSecurityDescriptorSddlForm("Owner, Access")
+} else {
+    $verifyDirInfo.SetAccessControl($verifySecurity)
+    $appliedSddl = $verifyDirInfo.GetAccessControl().GetSecurityDescriptorSddlForm("Owner, Access")
+}
+# Windows may normalize the flags it reads back (D:P as D:PAI), so the check
+# is on what matters: owned by Administrators, protected, and every entry for
+# SYSTEM, Administrators or Users.
+$appliedAceSids = @([regex]::Matches($appliedSddl, '\(([^;]*;){5}([^)]*)\)') | ForEach-Object { $_.Groups[2].Value })
+if ($appliedSddl -notmatch '^O:BAD:P' -or $appliedAceSids.Count -eq 0 -or
+    @($appliedAceSids | Where-Object { $_ -notin 'SY', 'BA', 'BU' }).Count -gt 0) {
+    throw "the verification key folder $verifyDir didn't get the intended permissions: wanted '$verifySddl', got '$appliedSddl'"
+}
 $keyFile = Join-Path $verifyDir "verify.key"
 # Alphanumeric only - hkdfguard.exe's ValidateServiceCharset
 # rejects anything else (including hyphens) in --service-name.
