@@ -1017,7 +1017,12 @@ namespace {
     };
 
     constexpr const char *kOverBroadGroupSidStrings[] = {
-        "S-1-5-80-0", // NT SERVICE\ALL SERVICES
+        "S-1-5-80-0",   // NT SERVICE\ALL SERVICES
+        "S-1-5-17",     // NT AUTHORITY\IUSR: every anonymous IIS request
+        "S-1-5-32-568", // BUILTIN\IIS_IUSRS: every IIS application pool
+        "S-1-5-1",      // NT AUTHORITY\DIALUP
+        "S-1-5-1000",   // NT AUTHORITY\OTHER ORGANIZATION
+        "S-1-5-64-36",  // NT AUTHORITY\Cloud Account Authentication
     };
 
     // S-1-5-21-<domain>-513: "Domain Users", called "None" in the local SAM -
@@ -2537,24 +2542,29 @@ namespace {
                 "deleting " + where + " failed: " + NCryptErrorText(status) + "; run `" + kProgramNameNarrow +
                 " status` to see whether it remains");
         }
-        if (OpenKekDirect(service, provider)) {
-            throw CliError(where + " was deleted, but a key under its name is still found; investigate before relying on it being gone");
-        }
 
+        // Recorded the moment the delete succeeds, before anything else can
+        // fail: a KEK deleted with no event in the log is the one outcome
+        // this must never have.
         const std::string identity =
             args.fingerprint ? "fingerprint " + HexString(*args.fingerprint)
                              : "corrupt: " + target.inspection.description + ", not a P-256 ECDH key";
         const bool logged = LogKekRetired(
             "KEK retired for service '" + service + "' on the " + ProviderLabel(provider) + " (" + identity +
             ") by " + kProgramNameNarrow + " retire. Every DEK wrapped under it is permanently unrecoverable.");
+        if (!logged) {
+            fprintf(stderr, "warning: the retirement could not be recorded in the Application event log (event 1004)\n");
+        }
+
+        // Then confirm it's gone, by reopening the name on that provider.
+        if (OpenKekDirect(service, provider)) {
+            throw CliError(where + " was deleted, but a key under its name is still found; investigate before relying on it being gone");
+        }
 
         fprintf(stdout, "retired KEK for service \"%s\" (%s, %s)\n", service.c_str(), identity.c_str(),
                 ProviderLabel(provider));
         if (args.fingerprint) {
             fprintf(stdout, "every payload wrapped under it is now permanently unrecoverable\n");
-        }
-        if (!logged) {
-            fprintf(stderr, "warning: the retirement could not be recorded in the Application event log (event 1004)\n");
         }
 
         // A key on the other provider, if any, is untouched - and may be the

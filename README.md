@@ -331,8 +331,10 @@ away from other processes.
   older payload to be swapped in (see above). Refused groups are `Everyone`,
   `Authenticated Users`, `BUILTIN\Users`, `BUILTIN\Guests`, `NT AUTHORITY\Local account`,
   `NT SERVICE\ALL SERVICES`, `This Organization`, the logon-type groups, the
-  authentication-package groups (`NTLM Authentication` and its siblings), the local
-  SAM's `None` group and the anonymous and NULL principals - the same set refused as a
+  authentication-package groups (`NTLM Authentication` and its siblings), `IUSR` and
+  `IIS_IUSRS` (every anonymous IIS request and every IIS application pool), `DIALUP`,
+  `OTHER ORGANIZATION`, the local SAM's `None` group and the anonymous and NULL
+  principals - the same set refused as a
   KEK key-use group. As for a
   key-use group, the group must be on this host (a local group, `BUILTIN`, `NT AUTHORITY`
   or `NT SERVICE`): a domain group is refused, since its members could never be granted
@@ -708,7 +710,11 @@ It is read on every setup call.
   an already-provisioned service, which just re-verifies it - including that the existing
   key's ACL is a real DACL with SYSTEM and Administrators on it and grants nothing to an
   over-broad principal such as Everyone (`HKDFGUARD_ERR_KEK_INVALID` otherwise; the
-  key is left untouched). `hkdfguard_wrap_dek` and `hkdfguard_unwrap_dek` only ever *open*
+  key is left untouched). Wrap, unwrap and `hkdfguard_kek_fingerprint` apply the same
+  check whenever the calling account can read the KEK's ACL, so a KEK widened after
+  provisioning is refused as soon as an administrator or deployer uses it; an
+  application account with key use alone can't read the ACL, and for it the
+  provisioning-time check stands. `hkdfguard_wrap_dek` and `hkdfguard_unwrap_dek` only ever *open*
   an existing KEK, never create one; unwrap opens the exact provider/key recorded in the
   payload. Every create/open/delete call passes `NCRYPT_MACHINE_KEY_FLAG` (and
   `NCRYPT_SILENT_FLAG`, so a key with an unexpected UI-requiring protection policy fails

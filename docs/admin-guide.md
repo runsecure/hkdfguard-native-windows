@@ -456,9 +456,11 @@ setting doesn't affect KEKs that already exist. Each entry must be a group name 
 - isn't over-broad. `Everyone`, `Authenticated Users`, `BUILTIN\Users`, `BUILTIN\Guests`,
   `NT AUTHORITY\Local account`, `NT SERVICE\ALL SERVICES`, `This Organization`, the
   logon-type groups (including `TERMINAL SERVER USER`), the authentication-package
-  groups (`NTLM Authentication`, `SChannel Authentication`, `Digest Authentication`),
-  the local SAM's `None` group (every local account's primary group; `Domain Users` on
-  a domain), and the anonymous and NULL principals are all refused.
+  groups (`NTLM Authentication`, `SChannel Authentication`, `Digest Authentication`,
+  `Cloud Account Authentication`), `IUSR` (every anonymous IIS request), `IIS_IUSRS`
+  (every IIS application pool), `DIALUP`, `OTHER ORGANIZATION`, the local SAM's `None`
+  group (every local account's primary group; `Domain Users` on a domain), and the
+  anonymous and NULL principals are all refused.
 
 One invalid entry makes provisioning fail, and no KEK is created.
 

@@ -298,7 +298,7 @@ try {
     $broadGroups = @(
         "Users", "BUILTIN\Users", "Everyone", "Authenticated Users",
         "NT AUTHORITY\Local account", "NT SERVICE\ALL SERVICES", "Guests",
-        "None", "NT AUTHORITY\NTLM Authentication")
+        "None", "NT AUTHORITY\NTLM Authentication", "NT AUTHORITY\IUSR", "NT AUTHORITY\DIALUP")
     foreach ($broad in $broadGroups) {
         $broadKeyFile = Join-Path $workDir ("broad-" + ($broad -replace '[\\ ]', '_') + ".key")
         $r = Invoke-Cli @(

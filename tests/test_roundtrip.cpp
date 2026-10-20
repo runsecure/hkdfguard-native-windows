@@ -1321,6 +1321,11 @@ int main() {
             {L"S-1-5-64-10", "create_kek rejects NT AUTHORITY\\NTLM Authentication (S-1-5-64-10)"},
             {L"S-1-5-64-14", "create_kek rejects NT AUTHORITY\\SChannel Authentication (S-1-5-64-14)"},
             {L"S-1-5-64-21", "create_kek rejects NT AUTHORITY\\Digest Authentication (S-1-5-64-21)"},
+            {L"S-1-5-17", "create_kek rejects NT AUTHORITY\\IUSR, every anonymous IIS request (S-1-5-17)"},
+            {L"S-1-5-32-568", "create_kek rejects BUILTIN\\IIS_IUSRS, every IIS application pool (S-1-5-32-568)"},
+            {L"S-1-5-1", "create_kek rejects NT AUTHORITY\\DIALUP (S-1-5-1)"},
+            {L"S-1-5-1000", "create_kek rejects NT AUTHORITY\\OTHER ORGANIZATION (S-1-5-1000)"},
+            {L"S-1-5-64-36", "create_kek rejects NT AUTHORITY\\Cloud Account Authentication (S-1-5-64-36)"},
         };
         for (const BroadPrincipal &p: broad) {
             hkdfguard::SetTestKeyUseGroupsOverride(std::vector<std::wstring>{p.sid});
@@ -3441,6 +3446,8 @@ int main() {
         Check(
             InternalCreateKekResult(kServiceAclWidenedWide) == HKDFGUARD_OK,
             "create_kek accepts its own, unmodified existing KEK");
+        Check(CodeOf([&] { hkdfguard::OpenKekForWrap(kServiceAclWidenedWide); }) == HKDFGUARD_OK,
+              "wrap's KEK open accepts its own, unmodified KEK (the ACL check doesn't reject our own keys)");
 
         // Widen the finalized key's DACL to include Everyone, as an
         // administrator (or a pre-planted key) could.
@@ -3493,6 +3500,15 @@ int main() {
             Check(
                 InternalCreateKekResult(kServiceAclWidenedWide) == HKDFGUARD_ERR_KEK_INVALID,
                 "create_kek rejects an existing KEK whose ACL grants an over-broad principal (KEK_INVALID)");
+            // Not only at provisioning: wrap and unwrap refuse it too, for a
+            // caller that can read the ACL (this elevated test can).
+            Check(CodeOf([&] { hkdfguard::OpenKekForWrap(kServiceAclWidenedWide); }) == HKDFGUARD_ERR_KEK_INVALID,
+                  "wrap refuses a KEK whose ACL was widened after provisioning (KEK_INVALID)");
+            Check(CodeOf([&] {
+                      hkdfguard::OpenKekForUnwrap(kServiceAclWidenedWide, hkdfguard::kProviderTypeSoftware,
+                                                  hkdfguard::kCurrentKeyId);
+                  }) == HKDFGUARD_ERR_KEK_INVALID,
+                  "unwrap refuses a KEK whose ACL was widened after provisioning (KEK_INVALID)");
             Check(
                 hkdfguard::KekExists(kServiceAclWidenedWide),
                 "a KEK rejected for its ACL is left in place, not deleted");

@@ -98,7 +98,12 @@ namespace hkdfguard {
         // Over-broad principals with no WELL_KNOWN_SID_TYPE constant of their
         // own, given as SID strings instead.
         constexpr const wchar_t *kOverBroadSidStrings[] = {
-            L"S-1-5-80-0", // NT SERVICE\ALL SERVICES: every service process
+            L"S-1-5-80-0",   // NT SERVICE\ALL SERVICES: every service process
+            L"S-1-5-17",     // NT AUTHORITY\IUSR: IIS's identity for every anonymous web request
+            L"S-1-5-32-568", // BUILTIN\IIS_IUSRS: IIS adds every application pool identity to it
+            L"S-1-5-1",      // NT AUTHORITY\DIALUP: every dial-up logon
+            L"S-1-5-1000",   // NT AUTHORITY\OTHER ORGANIZATION: every account from a trusted forest
+            L"S-1-5-64-36",  // NT AUTHORITY\Cloud Account Authentication: every cloud-account logon
         };
 
         // Whether `sid` is S-1-5-21-<domain>-513: "Domain Users", which the

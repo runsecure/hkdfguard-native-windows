@@ -197,6 +197,7 @@ try {
     $pr = & $cli provision --service-name $service 2>&1 | Out-String
     Check ($LASTEXITCODE -eq 0) "security admin provisions the service's KEK"
     if ($pr -match "fingerprint: ([0-9a-f]{64})") { $fingerprint = $Matches[1] }
+    Check ($null -ne $fingerprint) "security admin: provision prints the KEK's fingerprint (retire needs it)"
 
     # ---- Deployer. ----
     $r = Invoke-As $dep $probe @("model")
@@ -266,13 +267,32 @@ catch {
     Check $false "role test setup or run: $($_.Exception.Message)"
 }
 finally {
-    if ($fingerprint) {
-        & $CliExePath retire --service-name $service --fingerprint $fingerprint 2>&1 | Out-Null
-        Check ($LASTEXITCODE -eq 0) "cleanup: the security admin retires the test KEK"
+    # Every step stands alone, so one failure can't skip the rest. And none
+    # runs under "Stop": in Windows PowerShell a native command's stderr
+    # output (retire's warnings, say) would otherwise become a terminating
+    # error and end this block early, leaving accounts behind.
+    $ErrorActionPreference = "Continue"
+
+    # The KEK: by the fingerprint provision printed, or - if that was never
+    # captured - by the one status reports now, so it is never left behind.
+    try {
+        if (-not $fingerprint) {
+            $statusText = & $CliExePath status --service-name $service 2>&1 | Out-String
+            if ($statusText -match "fingerprint: ([0-9a-f]{64})") { $fingerprint = $Matches[1] }
+        }
+        if ($fingerprint) {
+            $retireText = & $CliExePath retire --service-name $service --fingerprint $fingerprint 2>&1 | Out-String
+            Check ($LASTEXITCODE -eq 0) "cleanup: the security admin retires the test KEK"
+            if ($LASTEXITCODE -ne 0) { Write-Host "    $retireText" }
+        }
+    } catch {
+        Write-Host "[WARN] could not retire the test KEK for ${service}: $($_.Exception.Message)"
     }
     foreach ($user in $createdUsers) { try { $computer.Delete("user", $user) } catch { Write-Host "[WARN] could not remove test account ${user}: $($_.Exception.Message)" } }
     foreach ($group in $createdGroups) { try { $computer.Delete("group", $group) } catch { Write-Host "[WARN] could not remove group ${group}: $($_.Exception.Message)" } }
-    foreach ($dir in $root, $plantDir) { if (Test-Path -LiteralPath $dir) { Remove-Item -Recurse -Force -LiteralPath $dir -ErrorAction SilentlyContinue } }
+    foreach ($dir in $root, $plantDir) {
+        try { if (Test-Path -LiteralPath $dir) { Remove-Item -Recurse -Force -LiteralPath $dir } } catch { Write-Host "[WARN] could not remove ${dir}: $($_.Exception.Message)" }
+    }
 }
 
 if ($failures -eq 0) {

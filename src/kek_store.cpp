@@ -554,6 +554,31 @@ namespace hkdfguard {
             }
         }
 
+        // The ACL invariants hkdfguard_create_kek enforces (VerifyExistingKeyAcl:
+        // a real DACL, SYSTEM and Administrators on it, nothing over-broad),
+        // checked again on every wrap, unwrap and fingerprint - but only when
+        // the caller can read the ACL. An account with key use alone can't
+        // (reading it needs READ_CONTROL, which key use doesn't grant), and
+        // for it the provisioning-time check stands. So a KEK whose ACL was
+        // widened after provisioning is refused with KEK_INVALID (event 2002)
+        // as soon as an administrator, deployer or tool that can read it
+        // uses it, without ever failing an application that merely can't
+        // look. Any read failure other than a violation is ignored here.
+        void VerifyAclIfReadable(NCRYPT_KEY_HANDLE key)
+        {
+            try
+            {
+                VerifyExistingKeyAcl(key);
+            }
+            catch (const HkdfGuardError& e)
+            {
+                if (e.code() == HKDFGUARD_ERR_KEK_INVALID)
+                {
+                    throw;
+                }
+            }
+        }
+
         ResolvedKek OpenKekOnProvider(
             const std::wstring& service,
             LPCWSTR provider_name,
@@ -604,6 +629,7 @@ namespace hkdfguard {
                 result.provider.get(),
                 policy,
                 provider_type);
+            VerifyAclIfReadable(result.key.get());
 
             return result;
         }
@@ -1302,6 +1328,7 @@ namespace hkdfguard {
             result.provider.get(),
             policy,
             result.provider_type);
+        VerifyAclIfReadable(result.key.get());
 
         return result;
     }
