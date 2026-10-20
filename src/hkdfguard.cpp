@@ -441,6 +441,43 @@ extern "C" HKDFGUARD_API int hkdfguard_kek_exists(
     }
 }
 
+extern "C" HKDFGUARD_API int hkdfguard_kek_fingerprint(
+    const char *service,
+    uint8_t *out, int *out_len) {
+    // The same argument order as hkdfguard_wrap_dek: out_len, capacity, the
+    // service name, then the buffer - so a size probe touches no provider.
+    if (out_len == nullptr) {
+        return HKDFGUARD_ERR_INVALID_ARGUMENT;
+    }
+    const int32_t capacity = *out_len;
+    if (capacity < 0) {
+        return HKDFGUARD_ERR_INVALID_ARGUMENT;
+    }
+
+    try {
+        std::string normalized_service = NormalizeService(service);
+        if (out == nullptr && capacity > 0) {
+            return HKDFGUARD_ERR_INVALID_ARGUMENT; // a declared capacity with nowhere to write
+        }
+        if (capacity < static_cast<int32_t>(kFingerprintLen)) {
+            *out_len = static_cast<int32_t>(kFingerprintLen);
+            return HKDFGUARD_ERR_BUFFER_TOO_SMALL;
+        }
+
+        // Exactly the KEK a wrap would use, verified the same way - so the
+        // value printed after provisioning is the one stamped into every
+        // payload. Not gated: like wrap, it only opens an existing key.
+        ResolvedKek kek = OpenKekForWrap(ServiceToWide(normalized_service));
+        ComputeKekFingerprint(kek.key.get(), out);
+        *out_len = static_cast<int32_t>(kFingerprintLen);
+        return HKDFGUARD_OK;
+    } catch (const HkdfGuardError &e) {
+        return Audit(AuditOp::KekFingerprint, service, e.code());
+    } catch (...) {
+        return Audit(AuditOp::KekFingerprint, service, HKDFGUARD_ERR_INTERNAL_ERROR);
+    }
+}
+
 extern "C" HKDFGUARD_API int hkdfguard_create_kek(
     const char *service) {
     try {

@@ -849,7 +849,9 @@ int main() {
     {
         HMODULE dll = GetModuleHandleW(L"HkdfGuard.dll");
         Check(dll != nullptr, "the HkdfGuard DLL is loaded in this test process");
-        const DWORD ids[] = {1000, 1001, 1002, 1003, 2000, 2002, 2003, 2004, 2005, 2006, 2007};
+        // 1004 is written by hkdfguard.exe retire, not event_log.cpp, but
+        // renders from the same table.
+        const DWORD ids[] = {1000, 1001, 1002, 1003, 1004, 2000, 2002, 2003, 2004, 2005, 2006, 2007};
         bool allPresent = dll != nullptr;
         for (DWORD id : ids) {
             if (dll == nullptr) break;
@@ -899,6 +901,7 @@ int main() {
         kServiceLifecycle, dek.data(), static_cast<int32_t>(dek.size()), lifecycle_wrapped.data(),
         &lifecycle_wrapped_len);
     Check(rc == HKDFGUARD_OK, "wrap succeeds once create_kek has provisioned the KEK");
+    const bool lifecycle_wrap_ok = (rc == HKDFGUARD_OK);
 
     // ---- 0b. wrap fails outright for a service with no KEK - wrap never ----
     //          creates one implicitly (only create_kek does).
@@ -907,6 +910,55 @@ int main() {
     rc = hkdfguard_wrap_dek(
         kServiceNoKek, dek.data(), static_cast<int32_t>(dek.size()), no_kek_scratch.data(), &no_kek_scratch_len);
     Check(rc == HKDFGUARD_ERR_KEK_NOT_FOUND, "wrap fails with KEK_NOT_FOUND when no KEK has been provisioned for the service");
+
+    // ---- 0b2. hkdfguard_kek_fingerprint: the buffer contract every other ----
+    //           function follows, and the value is the one stamped into
+    //           every payload (bytes 100..131).
+    {
+        uint8_t fp[HKDFGUARD_KEK_FINGERPRINT_LEN] = {};
+        int32_t fp_len = 0;
+        rc = hkdfguard_kek_fingerprint(kServiceLifecycle, nullptr, &fp_len);
+        Check(rc == HKDFGUARD_ERR_BUFFER_TOO_SMALL && fp_len == HKDFGUARD_KEK_FINGERPRINT_LEN,
+              "kek_fingerprint size probe reports the required size");
+
+        fp_len = 8;
+        rc = hkdfguard_kek_fingerprint(kServiceLifecycle, nullptr, &fp_len);
+        Check(rc == HKDFGUARD_ERR_INVALID_ARGUMENT && fp_len == 8,
+              "kek_fingerprint rejects a NULL buffer with a positive capacity, leaving out_len unchanged");
+
+        rc = hkdfguard_kek_fingerprint(kServiceLifecycle, fp, nullptr);
+        Check(rc == HKDFGUARD_ERR_INVALID_ARGUMENT, "kek_fingerprint rejects a NULL out_len");
+
+        fp_len = -1;
+        rc = hkdfguard_kek_fingerprint(kServiceLifecycle, fp, &fp_len);
+        Check(rc == HKDFGUARD_ERR_INVALID_ARGUMENT, "kek_fingerprint rejects a negative capacity");
+
+        fp_len = 0;
+        rc = hkdfguard_kek_fingerprint("..bad", nullptr, &fp_len);
+        Check(rc == HKDFGUARD_ERR_INVALID_SERVICE_NAME && fp_len == 0,
+              "kek_fingerprint reports an invalid service name before a too-small buffer");
+
+        fp_len = static_cast<int32_t>(sizeof(fp));
+        rc = hkdfguard_kek_fingerprint(kServiceNoKek, fp, &fp_len);
+        Check(rc == HKDFGUARD_ERR_KEK_NOT_FOUND && fp_len == static_cast<int32_t>(sizeof(fp)),
+              "kek_fingerprint reports KEK_NOT_FOUND for an unprovisioned service, out_len unchanged");
+
+        if (lifecycle_wrap_ok) {
+            fp_len = static_cast<int32_t>(sizeof(fp));
+            rc = hkdfguard_kek_fingerprint(kServiceLifecycle, fp, &fp_len);
+            Check(rc == HKDFGUARD_OK && fp_len == HKDFGUARD_KEK_FINGERPRINT_LEN, "kek_fingerprint succeeds for a provisioned service");
+            Check(std::memcmp(fp, lifecycle_wrapped.data() + 100, sizeof(fp)) == 0,
+                  "kek_fingerprint equals the fingerprint embedded in a payload wrapped under that KEK");
+
+            uint8_t upper_fp[HKDFGUARD_KEK_FINGERPRINT_LEN] = {};
+            int32_t upper_len = static_cast<int32_t>(sizeof(upper_fp));
+            rc = hkdfguard_kek_fingerprint("HKDFGUARDWIN.TEST.LIFECYCLE", upper_fp, &upper_len);
+            Check(rc == HKDFGUARD_OK && std::memcmp(fp, upper_fp, sizeof(fp)) == 0,
+                  "kek_fingerprint is case-insensitive in the service name, like every other call");
+        } else {
+            Skip("kek_fingerprint against a provisioned KEK (the lifecycle wrap did not succeed)");
+        }
+    }
 
     // ---- 0c. kek_exists / create_kek argument validation. ----
     rc = hkdfguard_kek_exists(nullptr, &lifecycle_exists);

@@ -14,6 +14,7 @@ see the [README](../README.md).
 - [Download and verify](#download-and-verify)
 - [Install](#install)
 - [Set up a service](#set-up-a-service)
+- [Check or retire a KEK](#check-or-retire-a-kek)
 - [Machine policy settings](#machine-policy-settings)
 - [Monitoring and auditing](#monitoring-and-auditing)
 - [Upgrade](#upgrade)
@@ -108,7 +109,7 @@ with a restart required. For anything else, see `install.log`.
 
 | Change | Detail |
 |---|---|
-| Files | `C:\Program Files\HkdfGuard\HkdfGuard.dll` and `hkdfguard.exe`. The folder inherits the Program Files ACL, so only Administrators, SYSTEM and TrustedInstaller can write to it. The location can't be changed. |
+| Files | `C:\Program Files\HkdfGuard\v1\HkdfGuard.dll` and `hkdfguard.exe`. The folder inherits the Program Files ACL, so only Administrators, SYSTEM and TrustedInstaller can write to it. The location can't be changed. |
 | Registry | `HKLM\Software\hkdfguard-native-windows`, value `InstallPath` (`REG_SZ`). Applications read it to find the DLL. |
 | Event log | Registers the Application log source `hkdfguard-native-windows`. |
 | Local group | Creates `HkdfGuardUsers` if it doesn't already exist. |
@@ -120,9 +121,9 @@ machine policy, such as Group Policy, Intune or SCCM.
 
 ```powershell
 Get-ItemProperty HKLM:\Software\hkdfguard-native-windows | Select-Object InstallPath
-Get-ChildItem "C:\Program Files\HkdfGuard"
+Get-ChildItem "C:\Program Files\HkdfGuard\v1"
 net localgroup HkdfGuardUsers
-& "C:\Program Files\HkdfGuard\hkdfguard.exe" --help
+& "C:\Program Files\HkdfGuard\v1\hkdfguard.exe" --help
 ```
 
 ## Set up a service
@@ -174,12 +175,20 @@ Both groups must be local groups on this machine. The installer never creates
 ### 2. Provision the KEK (elevated, once per service)
 
 ```powershell
-& "C:\Program Files\HkdfGuard\hkdfguard.exe" provision --service-name myapp
+& "C:\Program Files\HkdfGuard\v1\hkdfguard.exe" provision --service-name myapp
 ```
 
 `provision` creates the KEK if it's missing. If the KEK already exists, `provision` checks
 its properties and access list and changes nothing, so it's safe to run on every
 deployment.
+
+`provision` then prints the KEK's **fingerprint**, 64 hex characters. Record it with the
+service's deployment records:
+
+- `retire` requires it before it will delete the KEK.
+- On a later run, `provision` prints it again. If it ever differs from what you recorded,
+  the KEK under that service name has been replaced. **Investigate** before wrapping
+  anything new under it.
 
 There is no key rotation. If you need a new KEK, provision a new, versioned service name
 (for example `myapp.v2`) and wrap new DEKs under it. **Never delete a KEK that is still
@@ -197,7 +206,7 @@ group is refused. Without `--group`, only the owner can read the file, so an
 application running as another account can't open it.
 
 ```powershell
-$exe = "C:\Program Files\HkdfGuard\hkdfguard.exe"
+$exe = "C:\Program Files\HkdfGuard\v1\hkdfguard.exe"
 
 # One-time: a group for the account that reads the key file.
 net localgroup App_1234 /add
@@ -260,6 +269,43 @@ Applications unwrap the key file by calling `hkdfguard_unwrap_dek` in `HkdfGuard
 The command-line tool has no unwrap command. Applications must load the DLL by the full
 path built from the `InstallPath` registry value, never by bare file name. See
 [Consuming from other languages](../README.md#consuming-from-other-languages) in the README.
+
+## Check or retire a KEK
+
+To see a service's KEK, run `status` from any account that can use the key:
+
+```powershell
+& "C:\Program Files\HkdfGuard\v1\hkdfguard.exe" status --service-name myapp
+```
+
+It prints whether the KEK is `present`, `absent`, `corrupt` or `unusable`. It also prints
+which key store holds the KEK (TPM or software) and its fingerprint. It also lists any other
+key under the service's name in the key store the `KeyStoragePolicy` doesn't select. It
+never changes anything. It exits `0` when it got an answer and `1` when it couldn't tell,
+for example because access was denied.
+
+**Retiring a KEK deletes it, and every DEK wrapped under it becomes permanently
+unrecoverable.** Retire a KEK only after every application has moved to a new, versioned
+service name (for example from `myapp` to `myapp.v2`) and no key file wrapped under the old
+name is still needed. From an elevated prompt:
+
+```powershell
+& "C:\Program Files\HkdfGuard\v1\hkdfguard.exe" retire --service-name myapp --fingerprint <recorded fingerprint>
+```
+
+`retire` deletes the KEK only if its fingerprint matches the one you give. Otherwise it
+deletes nothing. It is the only way this product deletes a KEK. Applications can't delete
+one: the library has no delete function.
+
+- If a key under the service's name isn't a valid P-256 key at all, it has no fingerprint.
+  `status` reports it as `corrupt`. Retire it with `--corrupt` instead of `--fingerprint`.
+  `--corrupt` refuses a valid KEK, and refuses any key whose properties it couldn't read.
+- If the service has a key in both the TPM and the software key store, `retire` won't
+  choose between them. Run `status`, then add `--provider tpm` or `--provider software`.
+
+Each retirement is logged as event **1004**, with the service, key store, fingerprint and
+the account that ran it. Afterwards the service name can be provisioned again, which
+creates a new KEK with a new fingerprint.
 
 ## Machine policy settings
 
@@ -351,6 +397,7 @@ User field is the calling account.
 | 1001 | Warning | A KEK was created in the software key store because the TPM couldn't be used under `PreferTpm`. It isn't hardware-protected. |
 | 1002 | Information | A DEK was wrapped. |
 | 1003 | Information | A DEK was unwrapped. |
+| 1004 | Warning | A KEK was retired (deleted) with `hkdfguard.exe retire`. Every DEK wrapped under it is now unrecoverable. Names the service, key store, fingerprint and account. |
 | 2000 | Warning | Access denied: an unauthorized account used a KEK, or provisioning ran without elevation. |
 | 2002 | Error | An existing KEK has an access list this library would never create. **Investigate.** |
 | 2003 | Warning | Unwrap rejected a tampered, corrupted or misdirected payload. |
@@ -370,7 +417,7 @@ Get-WinEvent -LogName Application -FilterXPath "*[System[Provider[@Name='hkdfgua
 
 Any local user can write to the Application log, so treat these events as an operational
 aid, not tamper-proof evidence. Forward them to your SIEM for retention and alerting. Events
-2002, 2006, 2003 and 1001 are good candidates for alerts.
+2002, 2006, 2003, 1004 and 1001 are good candidates for alerts.
 
 ## Upgrade
 
@@ -390,7 +437,8 @@ msiexec /x hkdfguard-native-windows-0.9.0-win-x64.msi /qn /l*v uninstall.log
 You can also uninstall from **Settings → Apps**. Uninstalling removes the files, the
 `InstallPath` value and the event source registration. It deliberately keeps:
 
-- **All KEKs.** Deleting a KEK destroys every DEK wrapped under it.
+- **All KEKs.** Deleting a KEK destroys every DEK wrapped under it. To remove one on
+  purpose, [retire](#check-or-retire-a-kek) it before you uninstall.
 - **The `HkdfGuardUsers` group.** A recreated group would get a new SID and lose access to
   existing KEKs.
 - **Policy values** under `HKLM\Software\Policies\HkdfGuard`.
