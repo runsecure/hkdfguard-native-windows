@@ -15,6 +15,7 @@
 #include "key_acl.h"    // ValidateKeyUseGroups - vets the key-use policy list without touching any key
 
 #include <aclapi.h>  // SetEntriesInAclW - section 25d widens an existing KEK's ACL
+#include <lm.h>      // NetLocalGroupAdd/AddMembers - section 24e makes this account a deployer
 #include <winioctl.h> // FSCTL_SET_REPARSE_POINT - section 24c plants a junction
 #include <sddl.h>    // ConvertStringSecurityDescriptorToSecurityDescriptorW - section 28
 #include <algorithm> // std::equal - section 24c
@@ -443,6 +444,77 @@ std::wstring CurrentUserSidString() {
     return sid;
 }
 
+// Sets a REG_DWORD under HKLM\Software\Policies\HkdfGuard for as long as
+// the object lives - or until restore() - and then puts back whatever was
+// there: the old value, or nothing. HkdfGuard.dll reads the real registry,
+// so this is how a section pins the security model it tests (see
+// SecurityModel in policy.h). Needs elevation; active() says whether it
+// took effect.
+class ScopedMachinePolicyDword {
+public:
+    ScopedMachinePolicyDword(const wchar_t* name, DWORD value) : name_(name) {
+        if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, L"Software\\Policies\\HkdfGuard", 0, nullptr, 0,
+                            KEY_QUERY_VALUE | KEY_SET_VALUE | KEY_WOW64_64KEY, nullptr, &key_, nullptr) != ERROR_SUCCESS) {
+            key_ = nullptr;
+            return;
+        }
+        DWORD size = 0;
+        if (RegQueryValueExW(key_, name_, nullptr, &old_type_, nullptr, &size) == ERROR_SUCCESS) {
+            old_.resize(size);
+            had_old_ = RegQueryValueExW(key_, name_, nullptr, &old_type_, old_.data(), &size) == ERROR_SUCCESS;
+        }
+        active_ = RegSetValueExW(key_, name_, 0, REG_DWORD, reinterpret_cast<const BYTE*>(&value), sizeof(value)) ==
+                  ERROR_SUCCESS;
+    }
+    ~ScopedMachinePolicyDword() { restore(); }
+    ScopedMachinePolicyDword(const ScopedMachinePolicyDword&) = delete;
+    ScopedMachinePolicyDword& operator=(const ScopedMachinePolicyDword&) = delete;
+
+    bool active() const { return active_; }
+
+    void restore() {
+        if (key_ == nullptr) return;
+        if (active_) {
+            if (had_old_) {
+                RegSetValueExW(key_, name_, 0, old_type_, old_.data(), static_cast<DWORD>(old_.size()));
+            } else {
+                RegDeleteValueW(key_, name_);
+            }
+        }
+        RegCloseKey(key_);
+        key_ = nullptr;
+        active_ = false;
+    }
+
+private:
+    const wchar_t* name_;
+    HKEY key_ = nullptr;
+    bool active_ = false;
+    bool had_old_ = false;
+    DWORD old_type_ = 0;
+    std::vector<BYTE> old_;
+};
+
+// What HkdfGuard.dll itself reports through hkdfguard_security_model.
+struct SecurityModelState {
+    int32_t rc;
+    int model;
+    int may_write;
+};
+
+SecurityModelState QuerySecurityModel() {
+    SecurityModelState s{0, -1, -1};
+    s.rc = hkdfguard_security_model(&s.model, &s.may_write);
+    return s;
+}
+
+// Sets `path`'s owner to `sid`. This account may set itself or, elevated,
+// Administrators; anything else needs SeRestorePrivilege.
+bool SetOwner(const std::wstring& path, PSID sid) {
+    return SetNamedSecurityInfoW(const_cast<wchar_t*>(path.c_str()), SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION,
+                                 sid, nullptr, nullptr, nullptr) == ERROR_SUCCESS;
+}
+
 // Replaces an existing file's or folder's DACL with `sddl`'s, protected
 // from inheritance, so exactly those ACEs apply. (Setting an owner other
 // than oneself needs privileges, so only the DACL is set.)
@@ -865,6 +937,19 @@ int main() {
     std::printf("    (this machine's effective AuditUnwrapSuccess: %s)\n",
                 hkdfguard::LoadAuditUnwrapSuccess() ? "on" : "off");
 
+    // ---- -2b. The SecurityModel rule: absent is production; only an exact ----
+    //           REG_DWORD 0 or 1 picks a model, anything else fails closed.
+    {
+        using hkdfguard::ParseSecurityModel;
+        using hkdfguard::SecurityModel;
+        Check(ParseSecurityModel(false, 0, 0) == SecurityModel::Production, "SecurityModel absent: production");
+        Check(ParseSecurityModel(true, REG_DWORD, 0) == SecurityModel::Production, "SecurityModel REG_DWORD 0: production");
+        Check(ParseSecurityModel(true, REG_DWORD, 1) == SecurityModel::Developer, "SecurityModel REG_DWORD 1: developer");
+        Check(ParseSecurityModel(true, REG_DWORD, 2) == SecurityModel::Invalid, "SecurityModel REG_DWORD 2: invalid, not a default");
+        Check(ParseSecurityModel(true, REG_SZ, 1) == SecurityModel::Invalid, "SecurityModel of the wrong type (even \"1\"): invalid");
+        Check(ParseSecurityModel(true, REG_QWORD, 0) == SecurityModel::Invalid, "SecurityModel REG_QWORD 0: invalid");
+    }
+
 #if defined(_MSC_VER)
     // ---- -1. The DLL carries the event log message table. ----
     // The MSI registers HkdfGuard.dll as the event source's
@@ -879,7 +964,7 @@ int main() {
         Check(dll != nullptr, "the HkdfGuard DLL is loaded in this test process");
         // 1004 is written by hkdfguard.exe retire, not event_log.cpp, but
         // renders from the same table.
-        const DWORD ids[] = {1000, 1001, 1002, 1003, 1004, 2000, 2002, 2003, 2004, 2005, 2006, 2007};
+        const DWORD ids[] = {1000, 1001, 1002, 1003, 1004, 1005, 2000, 2002, 2003, 2004, 2005, 2006, 2007};
         bool allPresent = dll != nullptr;
         for (DWORD id : ids) {
             if (dll == nullptr) break;
@@ -985,6 +1070,47 @@ int main() {
                   "kek_fingerprint is case-insensitive in the service name, like every other call");
         } else {
             Skip("kek_fingerprint against a provisioned KEK (the lifecycle wrap did not succeed)");
+        }
+    }
+
+    // ---- 0b3. hkdfguard_security_model: arguments, and agreement with the ----
+    //           registry rule. An elevated administrator's files are owned
+    //           by Administrators, which every model trusts.
+    {
+        int model = -1, may_write = -1;
+        Check(hkdfguard_security_model(nullptr, &may_write) == HKDFGUARD_ERR_INVALID_ARGUMENT && may_write == -1,
+              "security_model rejects a NULL out_model, leaving the other output unchanged");
+        Check(hkdfguard_security_model(&model, nullptr) == HKDFGUARD_ERR_INVALID_ARGUMENT && model == -1,
+              "security_model rejects a NULL out_may_write_key_files, leaving the other output unchanged");
+        const hkdfguard::SecurityModel machine = hkdfguard::LoadSecurityModel();
+        SecurityModelState st = QuerySecurityModel();
+        if (machine == hkdfguard::SecurityModel::Invalid) {
+            Check(st.rc == HKDFGUARD_ERR_POLICY_INVALID, "security_model reports this machine's invalid SecurityModel as POLICY_INVALID");
+        } else {
+            const int want = machine == hkdfguard::SecurityModel::Developer ? HKDFGUARD_SECURITY_MODEL_DEVELOPER
+                                                                            : HKDFGUARD_SECURITY_MODEL_PRODUCTION;
+            Check(st.rc == HKDFGUARD_OK && st.model == want, "security_model reports the model the registry sets");
+            std::printf("    (this machine: %s model, this process %s write key files)\n",
+                        st.model == HKDFGUARD_SECURITY_MODEL_DEVELOPER ? "developer" : "production",
+                        st.may_write == 1 ? "may" : "may not");
+            if (IsElevated()) {
+                Check(st.may_write == 1, "an elevated administrator may write key files under either model");
+            }
+
+            // hkdfguard_key_file_principal_trusted: the same rule, per SID.
+            int trusted = -1;
+            Check(hkdfguard_key_file_principal_trusted(nullptr, &trusted) == HKDFGUARD_ERR_INVALID_ARGUMENT && trusted == -1,
+                  "key_file_principal_trusted rejects a NULL SID");
+            Check(hkdfguard_key_file_principal_trusted("S-1-5-18", nullptr) == HKDFGUARD_ERR_INVALID_ARGUMENT,
+                  "key_file_principal_trusted rejects a NULL out_trusted");
+            Check(hkdfguard_key_file_principal_trusted("not a SID", &trusted) == HKDFGUARD_ERR_INVALID_ARGUMENT && trusted == -1,
+                  "key_file_principal_trusted rejects a string that isn't a SID, leaving the output unchanged");
+            Check(hkdfguard_key_file_principal_trusted("S-1-5-18", &trusted) == HKDFGUARD_OK && trusted == 1,
+                  "key_file_principal_trusted: SYSTEM is trusted under every model");
+            Check(hkdfguard_key_file_principal_trusted("S-1-5-32-544", &trusted) == HKDFGUARD_OK && trusted == 1,
+                  "key_file_principal_trusted: Administrators is trusted under every model");
+            Check(hkdfguard_key_file_principal_trusted("S-1-1-0", &trusted) == HKDFGUARD_OK && trusted == 0,
+                  "key_file_principal_trusted: Everyone is not trusted");
         }
     }
 
@@ -2016,7 +2142,39 @@ int main() {
     // ---- 24c. hkdfguard_open_file: reads a wrapped-key file's bytes - ----
     //          still wrapped - checking size and structure, never
     //          unwrapping. Files are written to a scratch folder under %TEMP%.
-    {
+    //          These checks are written for the developer security model,
+    //          which trusts this account's own files (and %TEMP% is under its
+    //          profile, which it owns): elevated, SecurityModel is set to 1
+    //          for the section and put back right after it. Section 24e tests
+    //          the production model. Not elevated, and not already in the
+    //          developer model, the section only checks that production
+    //          refuses this account's own file.
+    ScopedMachinePolicyDword developer_model_for_24c(L"SecurityModel", 1);
+    const bool run_24c = developer_model_for_24c.active() ||
+                         QuerySecurityModel().model == HKDFGUARD_SECURITY_MODEL_DEVELOPER;
+    if (run_24c) {
+        SecurityModelState st = QuerySecurityModel();
+        Check(st.rc == HKDFGUARD_OK && st.model == HKDFGUARD_SECURITY_MODEL_DEVELOPER && st.may_write == 1,
+              "security_model reports the developer model, under which this process may write key files");
+    } else {
+        wchar_t temp[MAX_PATH + 1] = {};
+        GetTempPathW(MAX_PATH + 1, temp);
+        wchar_t temp_long[MAX_PATH + 1] = {};
+        DWORD temp_long_len = GetLongPathNameW(temp, temp_long, MAX_PATH + 1);
+        const std::wstring own = std::wstring((temp_long_len > 0 && temp_long_len <= MAX_PATH) ? temp_long : temp) +
+                                 L"hkdfguard-production-" + std::to_wstring(GetCurrentProcessId()) + L".key";
+        if (WriteTestFile(own, wrapped)) {
+            std::vector<uint8_t> out(HKDFGUARD_WRAPPED_MAX_LEN);
+            int32_t len = static_cast<int32_t>(out.size());
+            Check(hkdfguard_open_file(ToUtf8(own).c_str(), out.data(), &len) == HKDFGUARD_ERR_FILE_UNTRUSTED,
+                  "open_file: under the production model, a key file this account wrote itself is refused");
+            DeleteFileW(own.c_str());
+        } else {
+            Check(false, "test setup: write a key file under %TEMP%");
+        }
+        Skip("the open_file checks written for the developer model (not elevated, so SecurityModel can't be set for them)");
+    }
+    if (run_24c) {
         // %TEMP% itself may be spelled with an 8.3 short name - on GitHub's
         // hosted runners it is C:\Users\RUNNER~1\... - and open_file refuses
         // short names, so it's expanded to its long form first.
@@ -2723,6 +2881,7 @@ int main() {
         }
         RemoveDirectoryW(dir.c_str());
     }
+    developer_model_for_24c.restore();
 
     // ---- 24d. The key-file trust rule and plaintext detector, directly. ----
     // CheckKeyFileSecurity on descriptors built from SDDL, so owners that
@@ -2845,11 +3004,68 @@ int main() {
             {windows_temp, kFolder, HKDFGUARD_ERR_FILE_UNTRUSTED, "C:\\Windows\\Temp's shipped ACL is untrusted (Users may create entries)"},
             {prepared, kFolder, HKDFGUARD_OK, "a folder after icacls /inheritance:r with SYSTEM, Administrators and Users-read grants is trusted"},
         };
+        // The cases above treat "this account" as trusted: the developer
+        // model's rule.
+        hkdfguard::SetTestSecurityModelOverride(hkdfguard::SecurityModel::Developer);
         for (const Case& c : cases) {
             int32_t got = verdict(c.sddl, c.object);
             Check(got == c.want, (std::string("key-file trust: ") + c.what).c_str());
             if (got != c.want) std::printf("    (CheckKeyFileSecurity returned %d)\n", got);
         }
+
+        // The production model: this account is no longer trusted for
+        // being the caller; the deployer groups are. BUILTIN\Performance
+        // Log Users (S-1-5-32-559) stands in for a deployer group: a real,
+        // host-local, not over-broad group. This account is a member of
+        // neither it nor HkdfGuardDeployers on a test machine; if it is, the
+        // two "this account" cases can't hold and are skipped.
+        hkdfguard::SetTestSecurityModelOverride(hkdfguard::SecurityModel::Production);
+        hkdfguard::SetTestDeployerGroupsOverride(std::vector<std::wstring>{L"S-1-5-32-559"});
+        bool me_is_deployer = false;
+        {
+            PSID me_sid = nullptr;
+            if (ConvertStringSidToSidW(me.c_str(), &me_sid)) {
+                for (const auto& p : hkdfguard::ResolveDeployerPrincipals({L"S-1-5-32-559"})) {
+                    me_is_deployer = me_is_deployer || EqualSid(me_sid, const_cast<BYTE*>(p.data()));
+                }
+                LocalFree(me_sid);
+            }
+        }
+        const Case production_cases[] = {
+            {L"O:SYD:P(A;;FA;;;SY)", kFile, HKDFGUARD_OK, "production: a file owned by SYSTEM is trusted"},
+            {L"O:BAD:P(A;;FA;;;BA)", kFile, HKDFGUARD_OK, "production: a file owned by Administrators is trusted"},
+            {L"O:S-1-5-32-559D:P(A;;FA;;;SY)", kFile, HKDFGUARD_OK, "production: a file owned by a deployer group is trusted"},
+            {L"O:SYD:P(A;;0x1301bf;;;S-1-5-32-559)", kFolder, HKDFGUARD_OK,
+             "production: a deployer group with Modify on the key folder is trusted"},
+            {L"O:SYD:P(A;;0x1301bf;;;BU)", kFolder, HKDFGUARD_ERR_FILE_UNTRUSTED,
+             "production: anyone else with Modify on the key folder is untrusted"},
+        };
+        for (const Case& c : production_cases) {
+            int32_t got = verdict(c.sddl, c.object);
+            Check(got == c.want, (std::string("key-file trust: ") + c.what).c_str());
+            if (got != c.want) std::printf("    (CheckKeyFileSecurity returned %d)\n", got);
+        }
+        if (!me_is_deployer) {
+            Check(verdict(L"O:" + me + L"D:P(A;;FA;;;" + me + L")", kFile) == HKDFGUARD_ERR_FILE_UNTRUSTED,
+                  "key-file trust: production: a file owned by this account (not a deployer) is untrusted");
+            Check(verdict(L"O:SYD:P(A;;0x116;;;" + me + L")", kFolder) == HKDFGUARD_ERR_FILE_UNTRUSTED,
+                  "key-file trust: production: this account (not a deployer) creating entries in the key folder is untrusted");
+        } else {
+            Skip("production refuses this account's own files (this account is a member of a deployer group)");
+        }
+
+        // Policy that fails closed.
+        hkdfguard::SetTestDeployerGroupsOverride(std::vector<std::wstring>{L"Everyone"});
+        Check(verdict(L"O:SYD:P(A;;FA;;;SY)", kFile) == HKDFGUARD_ERR_WIN_GROUP_INVALID,
+              "key-file trust: production: an over-broad DeployerGroups entry fails closed (WIN_GROUP_INVALID)");
+        hkdfguard::SetTestDeployerGroupsOverride(std::vector<std::wstring>{L"ThisGroupShouldNotExist12345"});
+        Check(verdict(L"O:SYD:P(A;;FA;;;SY)", kFile) == HKDFGUARD_ERR_WIN_GROUP_INVALID,
+              "key-file trust: production: an unresolvable DeployerGroups entry fails closed (WIN_GROUP_INVALID)");
+        hkdfguard::SetTestSecurityModelOverride(hkdfguard::SecurityModel::Invalid);
+        Check(verdict(L"O:SYD:P(A;;FA;;;SY)", kFile) == HKDFGUARD_ERR_POLICY_INVALID,
+              "key-file trust: an invalid SecurityModel fails closed (POLICY_INVALID)");
+        hkdfguard::SetTestSecurityModelOverride(std::nullopt);
+        hkdfguard::SetTestDeployerGroupsOverride(std::nullopt);
 
         auto plain = [](const std::string& s) {
             return hkdfguard::LooksLikePlaintextKeyForTest(reinterpret_cast<const uint8_t*>(s.data()), s.size());
@@ -2878,6 +3094,94 @@ int main() {
         Check(!plain(std::string(63, 'a') + "g"), "detector: 64 characters with one not hex are not a DEK");
         Check(!plain(std::string(32, 'a') + "\n" + std::string(32, 'a')), "detector: whitespace inside the text is not trimmed");
         Check(!plain(b64.substr(0, 20) + "=" + b64.substr(21)), "detector: '=' anywhere but the end is not a DEK");
+    }
+
+    // ---- 24e. The production security model, end to end through the DLL ----
+    //           (elevated only). Key files go in an administrator-owned
+    //           folder under C:\ with SYSTEM and Administrators full control
+    //           and Users read - the deployment layout. A file owned by
+    //           Administrators is read; one owned by this account is refused,
+    //           until the account is made a direct member of
+    //           HkdfGuardDeployers, and refused again once it isn't.
+    if (!IsElevated()) {
+        Skip("production security model through hkdfguard_open_file (needs elevation)");
+    } else {
+        ScopedMachinePolicyDword production(L"SecurityModel", 0);
+        Check(production.active(), "test setup: pin SecurityModel to production");
+        SecurityModelState st = QuerySecurityModel();
+        Check(st.rc == HKDFGUARD_OK && st.model == HKDFGUARD_SECURITY_MODEL_PRODUCTION && st.may_write == 1,
+              "security_model reports production, under which an elevated administrator may write key files");
+
+        PSID admins = nullptr;
+        SID_IDENTIFIER_AUTHORITY nt = SECURITY_NT_AUTHORITY;
+        AllocateAndInitializeSid(&nt, 2, SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_ADMINS, 0, 0, 0, 0, 0, 0, &admins);
+        std::vector<BYTE> me_buffer;
+        {
+            DWORD size = 0;
+            GetTokenInformation(GetCurrentProcessToken(), TokenUser, nullptr, 0, &size);
+            me_buffer.resize(size);
+            GetTokenInformation(GetCurrentProcessToken(), TokenUser, me_buffer.data(), size, &size);
+        }
+        PSID me = reinterpret_cast<TOKEN_USER*>(me_buffer.data())->User.Sid;
+
+        const std::wstring folder = L"C:\\HkdfGuardProdTest-" + std::to_wstring(GetCurrentProcessId());
+        const bool folder_ok = CreateDirectoryW(folder.c_str(), nullptr) &&
+                               SetProtectedDacl(folder, L"D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)") &&
+                               SetOwner(folder, admins);
+        Check(folder_ok, "test setup: an administrator-owned key folder under C:\\");
+        const std::wstring admin_file = folder + L"\\deployed.key";
+        const std::wstring own_file = folder + L"\\own.key";
+        const bool files_ok = WriteTestFile(admin_file, wrapped) && SetOwner(admin_file, admins) &&
+                              WriteTestFile(own_file, wrapped) && SetOwner(own_file, me);
+        Check(files_ok, "test setup: one key file owned by Administrators, one by this account");
+
+        auto open_rc = [](const std::wstring& path) {
+            std::vector<uint8_t> out(HKDFGUARD_WRAPPED_MAX_LEN);
+            int32_t len = static_cast<int32_t>(out.size());
+            return hkdfguard_open_file(ToUtf8(path).c_str(), out.data(), &len);
+        };
+        if (folder_ok && files_ok) {
+            Check(open_rc(admin_file) == HKDFGUARD_OK, "production: a key file owned by Administrators is read");
+
+            // Is this account already a deployer, through the machine's own
+            // policy? Then "refused" can't be shown.
+            bool already_deployer = false;
+            for (const auto& p : hkdfguard::ResolveDeployerPrincipals(hkdfguard::LoadDeployerGroupsPolicy())) {
+                already_deployer = already_deployer || EqualSid(me, const_cast<BYTE*>(p.data()));
+            }
+            if (already_deployer) {
+                Skip("production refuses this account's own key file (it is already a deployer on this machine)");
+            } else {
+                Check(open_rc(own_file) == HKDFGUARD_ERR_FILE_UNTRUSTED,
+                      "production: a key file owned by this account (not a deployer) is refused");
+
+                // Make it a deployer: a direct member of HkdfGuardDeployers
+                // (created for the test if the MSI hasn't).
+                bool created_group = false;
+                LOCALGROUP_INFO_1 group_info{const_cast<LPWSTR>(L"HkdfGuardDeployers"),
+                                             const_cast<LPWSTR>(L"hkdfguard test")};
+                NET_API_STATUS add = NetLocalGroupAdd(nullptr, 1, reinterpret_cast<LPBYTE>(&group_info), nullptr);
+                created_group = add == NERR_Success;
+                LOCALGROUP_MEMBERS_INFO_0 member{me};
+                const bool added = NetLocalGroupAddMembers(nullptr, L"HkdfGuardDeployers", 0,
+                                                           reinterpret_cast<LPBYTE>(&member), 1) == NERR_Success;
+                Check(added, "test setup: add this account to HkdfGuardDeployers");
+                if (added) {
+                    Check(open_rc(own_file) == HKDFGUARD_OK,
+                          "production: a key file owned by a direct member of HkdfGuardDeployers is read");
+                    NetLocalGroupDelMembers(nullptr, L"HkdfGuardDeployers", 0, reinterpret_cast<LPBYTE>(&member), 1);
+                    Check(open_rc(own_file) == HKDFGUARD_ERR_FILE_UNTRUSTED,
+                          "production: ...and refused again once the account is no longer a member");
+                }
+                if (created_group) {
+                    NetLocalGroupDel(nullptr, L"HkdfGuardDeployers");
+                }
+            }
+        }
+        DeleteFileW(admin_file.c_str());
+        DeleteFileW(own_file.c_str());
+        RemoveDirectoryW(folder.c_str());
+        FreeSid(admins);
     }
 
     // ---- 25. KeyStoragePolicy is honored for all three values, forced via ----

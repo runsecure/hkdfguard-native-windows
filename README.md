@@ -42,8 +42,10 @@ Creating a KEK for the first time requires the calling process to be elevated -
 opening/using an already-created one does not. Who else may use it is machine policy,
 not something either the creating tool or a caller chooses: SYSTEM and
 `BUILTIN\Administrators` always get full control; the local groups `HkdfGuardAdmins` (full
-control) and `HkdfGuardUsers` (use access) are granted if they exist when the KEK is created
-(the MSI creates `HkdfGuardUsers`, never `HkdfGuardAdmins`); and every entry of the `REG_MULTI_SZ`
+control), `HkdfGuardUsers` and `HkdfGuardDeployers` (use access) are granted if they exist when
+the KEK is created (the MSI creates `HkdfGuardUsers` and `HkdfGuardDeployers`, never
+`HkdfGuardAdmins`); every entry of `HKLM\Software\Policies\HkdfGuard\DeployerGroups` gets use
+access too; and every entry of the `REG_MULTI_SZ`
 registry value `HKLM\Software\Policies\HkdfGuard\KeyUseGroups` is granted use (unwrap)
 access when the KEK is created - each entry must resolve to a real, host-local group
 (this machine's own SAM, `BUILTIN`, `NT AUTHORITY`, or `NT SERVICE`; domain groups are
@@ -56,7 +58,23 @@ If you need per-user isolation instead, that means leaving `NCRYPT_MACHINE_KEY_F
 unset (current-user scope) - not offered as a build option here, since this project
 targets the shared-service deployment model above.
 
-The library exposes a small, stable C ABI (`include/hkdfguard.h`) with nine functions.
+**Security model**: the `REG_DWORD` value `HKLM\Software\Policies\HkdfGuard\SecurityModel`
+decides whose *key files* the library trusts. Absent or `0` is **production**, the
+default. There, a key file and every folder above it must be owned by SYSTEM,
+Administrators, TrustedInstaller, or a deployer group (`HkdfGuardDeployers` and each
+`DeployerGroups` entry) or a direct member of one. `1` is **developer**, which also trusts
+the reading account's own files, so one account can provision, wrap to a file and read
+it back. Anything else fails closed with `HKDFGUARD_ERR_POLICY_INVALID`. Wrapping and
+unwrapping in memory are the same under both: any account with key use on the KEK may
+do either. What production adds is that an application, which unwraps and may wrap
+ephemeral keys, can't *persist* a key file its own service would accept. A file it
+wrote is owned by it, so it's refused. The key folder's permissions (deployers Modify,
+applications Read) stop it overwriting a deployed one. The roles, the folder recipe and
+the settings are in [docs/admin-guide.md](docs/admin-guide.md). The CLI's `wrap` refuses
+to persist under production for any account but a deployer or an elevated
+administrator, and `status` shows the model.
+
+The library exposes a small, stable C ABI (`include/hkdfguard.h`) with eleven functions.
 No Windows handle, CNG/NCrypt type, or COM interface crosses that boundary, and no C++
 exception ever escapes it - every call returns an integer status code.
 
@@ -64,6 +82,12 @@ exception ever escapes it - every call returns an integer status code.
 int hkdfguard_kek_exists(
     const char* service,
     int* out_exists);
+
+int hkdfguard_security_model(
+    int* out_model, int* out_may_write_key_files);
+
+int hkdfguard_key_file_principal_trusted(
+    const char* sid, int* out_trusted);
 
 int hkdfguard_kek_fingerprint(
     const char* service,
@@ -556,6 +580,7 @@ including the impersonated client when a service acts on someone's behalf.
 | 1002 | Information | A DEK was wrapped (`hkdfguard_wrap_dek` or `hkdfguard_generate_and_wrap_dek`). |
 | 1003 | Information | A DEK was unwrapped. |
 | 1004 | Warning | A KEK was retired (deleted) by `hkdfguard.exe retire`. Names the service, the provider and the fingerprint, or why the key was corrupt. Written by the CLI; the library has no delete. |
+| 1005 | Warning | `hkdfguard_open_file` read a key file under the developer security model, which trusts the caller's own key files. Once per process. Not expected on a production machine. |
 | 2000 | Warning | `KEK_ACCESS_DENIED` on any call: use of a KEK by an unauthorized account, or provisioning without elevation. |
 | 2002 | Error | `KEK_INVALID`: an existing KEK under the service name has an ACL this library would never create. Investigate it. |
 | 2003 | Warning | `PAYLOAD_AUTH_FAILED`, `KEK_FINGERPRINT_MISMATCH`, `PAYLOAD_MALFORMED` or `PAYLOAD_UNSUPPORTED` on unwrap: a tampered, corrupted, misdirected or unknown-version payload. |
@@ -836,11 +861,12 @@ loading it.
 - **Node**: `ffi-napi`/`koffi` given an absolute path, or a native addon (N-API) linking
   `HkdfGuard.lib`
 
-All five bindings map directly onto the nine exported functions
+All five bindings map directly onto the eleven exported functions
 (`hkdfguard_kek_exists`, `hkdfguard_kek_fingerprint`, `hkdfguard_create_kek`,
 `hkdfguard_wrap_dek`, `hkdfguard_unwrap_dek`, `hkdfguard_generate_and_wrap_dek`,
 `hkdfguard_open_file`, `hkdfguard_harden_process`,
-`hkdfguard_harden_process_with_flags`) and the status codes in
+`hkdfguard_harden_process_with_flags`, `hkdfguard_security_model`,
+`hkdfguard_key_file_principal_trusted`) and the status codes in
 `include/hkdfguard.h`; none of them need to know anything about TPMs, CNG, or NCrypt.
 
 ## License

@@ -112,7 +112,7 @@ with a restart required. For anything else, see `install.log`.
 | Files | `C:\Program Files\HkdfGuard\v1\HkdfGuard.dll` and `hkdfguard.exe`. The folder inherits the Program Files ACL, so only Administrators, SYSTEM and TrustedInstaller can write to it. The location can't be changed. |
 | Registry | `HKLM\Software\hkdfguard-native-windows`, value `InstallPath` (`REG_SZ`). Applications read it to find the DLL. |
 | Event log | Registers the Application log source `hkdfguard-native-windows`. |
-| Local group | Creates `HkdfGuardUsers` if it doesn't already exist. |
+| Local groups | Creates `HkdfGuardUsers` (applications: wrap and unwrap) and `HkdfGuardDeployers` (deployers: wrap, unwrap, and write key files) if they don't already exist. |
 
 The installer doesn't set any policy values. Those are left to whatever already manages
 machine policy, such as Group Policy, Intune or SCCM.
@@ -123,6 +123,7 @@ machine policy, such as Group Policy, Intune or SCCM.
 Get-ItemProperty HKLM:\Software\hkdfguard-native-windows | Select-Object InstallPath
 Get-ChildItem "C:\Program Files\HkdfGuard\v1"
 net localgroup HkdfGuardUsers
+net localgroup HkdfGuardDeployers
 & "C:\Program Files\HkdfGuard\v1\hkdfguard.exe" --help
 ```
 
@@ -135,6 +136,30 @@ case-insensitive. The same name must be used to wrap and to unwrap.
 
 ### 1. Decide who can use the key
 
+A machine runs one of two **security models**, set by the
+[`SecurityModel`](#securitymodel) policy. **Production is the default**: it applies unless
+an administrator sets the value to `1`.
+
+| Role | Production model | Who, on Windows |
+|---|---|---|
+| **Security admin** | Provisions and retires KEKs. | A local administrator, from an elevated prompt. |
+| **Deployer** | Wraps DEKs into key files and deploys them. May also unwrap. | A member of `HkdfGuardDeployers` (or of a group in [`DeployerGroups`](#deployergroups)). Not a local administrator, or the separation from the security admin is only on paper. |
+| **Application** | Unwraps key files, and wraps and unwraps ephemeral keys in memory. **Can't persist a key file its own service would accept.** | The service's account, a member of `HkdfGuardUsers`. |
+
+The application's limit is enforced two ways:
+
+- **By Windows:** the key folder gives deployers Modify and applications only Read (see
+  [Where to keep key files](#where-to-keep-key-files)), so an application can't overwrite
+  a deployed key file.
+- **By the library:** `hkdfguard_open_file` trusts a key file only if it, and every
+  folder above it, is owned by SYSTEM, Administrators, TrustedInstaller, or a deployer
+  group or a direct member of one. A key file the application wrote anywhere else is
+  owned by the application, so it's refused.
+
+Under the **developer** model (`SecurityModel` = `1`) the caller's own key files are
+trusted too, so one account can provision, wrap to a file and read it back. Use it on
+development machines only. Each process that reads a key file under it logs event 1005.
+
 A KEK's access list is fixed **when the KEK is created**. Set up groups and policy *before*
 provisioning.
 
@@ -143,13 +168,22 @@ provisioning.
 | SYSTEM, `BUILTIN\Administrators` | Full control | Always |
 | Local group `HkdfGuardAdmins` | Full control | Only if the group exists when the KEK is created. The installer doesn't create it. |
 | Local group `HkdfGuardUsers` | Use (wrap and unwrap) | If the group exists when the KEK is created. The installer creates it. |
+| Local group `HkdfGuardDeployers` | Use (wrap and unwrap) | If the group exists when the KEK is created. The installer creates it. |
+| Groups listed in [`DeployerGroups`](#deployergroups) | Use (wrap and unwrap) | Policy in force when the KEK is created |
 | Groups listed in [`KeyUseGroups`](#keyusegroups) | Use (wrap and unwrap) | Policy in force when the KEK is created |
 
-Usually you add the service's account to `HkdfGuardUsers`:
+Usually you add the service's account to `HkdfGuardUsers`, and the account that deploys
+key files to `HkdfGuardDeployers`:
 
 ```powershell
 net localgroup HkdfGuardUsers "NT SERVICE\MyAppService" /add
+net localgroup HkdfGuardDeployers "CONTOSO\deploy-agent" /add
 ```
+
+Deployer membership is read every time a key file is opened, and only **direct** members
+count: a group nested inside `HkdfGuardDeployers` is trusted as a group, but its own
+members aren't. Remove someone from `HkdfGuardDeployers` and the key files they own stop
+being trusted, so redeploy them under a current deployer.
 
 Because the KEK's access list names the group, you can change who has access later by
 changing the group's membership. You don't need a new KEK. A running service only picks up
@@ -196,6 +230,10 @@ needed.** Deleting it makes every DEK wrapped under it unrecoverable.
 
 ### 3. Wrap a DEK into a key file (every release)
 
+Run `wrap` as a **deployer** (a member of `HkdfGuardDeployers`) or as an elevated
+administrator. Under the production model it refuses any other account before writing
+anything: an application can wrap in memory, but not persist the result.
+
 `wrap` uses an existing KEK and never creates one. It reads the DEK as base64 from
 **stdin**, so the key never appears on a command line. The key file's ACL lets the owner
 read and write and no one else (the owner is Administrators when `wrap` runs elevated).
@@ -214,10 +252,10 @@ net localgroup App_1234 "NT SERVICE\MyAppService" /add
 
 # One-time: the key folder - see "Where to keep key files" below.
 New-Item -ItemType Directory -Force C:\HkdfGuardKeys\myapp | Out-Null
-icacls C:\HkdfGuardKeys /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" "*S-1-5-32-545:(OI)(CI)RX"
+icacls C:\HkdfGuardKeys /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" "*S-1-5-32-545:(OI)(CI)RX" "HkdfGuardDeployers:(OI)(CI)M"
 icacls C:\HkdfGuardKeys /setowner "*S-1-5-32-544" /T
 
-# Every release: generate a random 32-byte DEK and wrap it.
+# Every release, as a deployer: generate a random 32-byte DEK and wrap it.
 $dek = New-Object byte[] 32
 [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($dek)
 [Convert]::ToBase64String($dek) | & $exe wrap `
@@ -252,9 +290,10 @@ path helpers do this: some keep short names (PowerShell's `Resolve-Path`, for on
 **Who may own and change the folders.** The library also refuses the file with -39 unless:
 
 - the file and every folder above it, **up to and including the drive root**, are owned by
-  SYSTEM, Administrators, TrustedInstaller or the account the application runs as, and no
-  other account may write the file or delete, rename, re-permission or take ownership of
-  it or of any of those folders; and
+  SYSTEM, Administrators, TrustedInstaller or - under the production model - a deployer
+  group or a direct member of one (under the developer model: the account the application
+  runs as), and no other account may write the file or delete, rename, re-permission or
+  take ownership of it or of any of those folders; and
 - every folder **below the drive root** - the key file's own folder and each folder above
   it - lets no other account **create** files or folders in it ("Create files / write
   data" or "Create folders / append data"). This is the Windows form of the Linux build's
@@ -289,15 +328,16 @@ permissions removed**, for example `C:\HkdfGuardKeys\<app>\`. From an elevated p
 New-Item -ItemType Directory -Force C:\HkdfGuardKeys\myapp | Out-Null
 
 # Remove every inherited permission (Authenticated Users: Modify from C:\) and grant
-# exactly: SYSTEM and Administrators full control, Users read. Subfolders and files
-# inherit these.
-icacls C:\HkdfGuardKeys /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" "*S-1-5-32-545:(OI)(CI)RX"
+# exactly: SYSTEM and Administrators full control, deployers Modify (to write key files),
+# Users read. Subfolders and files inherit these.
+icacls C:\HkdfGuardKeys /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" "*S-1-5-32-545:(OI)(CI)RX" "HkdfGuardDeployers:(OI)(CI)M"
 
 # Make Administrators the owner of the folder and everything in it, in case it was
 # created by a non-elevated account.
 icacls C:\HkdfGuardKeys /setowner "*S-1-5-32-544" /T
 
-# Check: only SYSTEM, Administrators and Users (RX) are listed, none of them (I)nherited
+# Check: only SYSTEM, Administrators, Users (RX) and HkdfGuardDeployers (M) are listed,
+# none of them (I)nherited
 # from C:\ - and the same for C:\HkdfGuardKeys\myapp, where they show as inherited from
 # C:\HkdfGuardKeys.
 icacls C:\HkdfGuardKeys
@@ -376,7 +416,7 @@ creates a new KEK with a new fingerprint.
 
 ## Machine policy settings
 
-All four settings are values under `HKLM\Software\Policies\HkdfGuard`. Set them with Group
+All six settings are values under `HKLM\Software\Policies\HkdfGuard`. Set them with Group
 Policy, Intune or SCCM, or with `reg add` for testing. They're read on every call, so a
 change takes effect without a restart.
 
@@ -423,6 +463,37 @@ One invalid entry makes provisioning fail, and no KEK is created.
 reg add HKLM\Software\Policies\HkdfGuard /v KeyUseGroups /t REG_MULTI_SZ /d "App_1234\0App_5678" /f
 ```
 
+### SecurityModel
+
+`REG_DWORD`. Selects whose key files the library trusts. See
+[Decide who can use the key](#1-decide-who-can-use-the-key) for the roles.
+
+| Value | Model | Key files trusted when owned by |
+|---|---|---|
+| absent or `0` | Production | SYSTEM, Administrators, TrustedInstaller, a deployer group, or a direct member of one |
+| `1` | Developer | SYSTEM, Administrators, TrustedInstaller, or the account reading the file |
+
+Any other value, or a value of the wrong type, makes every key-file read and every `wrap`
+fail with `invalid machine policy`. It isn't treated as the default. Wrapping and
+unwrapping in memory work the same under both models. `hkdfguard.exe status` shows the
+model in force.
+
+```powershell
+reg add HKLM\Software\Policies\HkdfGuard /v SecurityModel /t REG_DWORD /d 1 /f   # developer machines only
+```
+
+### DeployerGroups
+
+`REG_MULTI_SZ`. Groups whose direct members are trusted, under the production model, to
+have written key files, in addition to `HkdfGuardDeployers`. Each entry is vetted exactly
+like a [`KeyUseGroups`](#keyusegroups) entry: a host-local group, not over-broad. One
+invalid entry makes every key-file read and every `wrap` fail. Each group is also granted
+use access on KEKs created while it is listed, since deployers wrap.
+
+```powershell
+reg add HKLM\Software\Policies\HkdfGuard /v DeployerGroups /t REG_MULTI_SZ /d "Deploy_1234" /f
+```
+
 ### AuditUnwrapSuccess
 
 `REG_DWORD`. Only an explicit `0` turns off the "DEK unwrapped" event (1003), for example
@@ -465,6 +536,7 @@ User field is the calling account.
 | 1002 | Information | A DEK was wrapped. |
 | 1003 | Information | A DEK was unwrapped. |
 | 1004 | Warning | A KEK was retired (deleted) with `hkdfguard.exe retire`. Every DEK wrapped under it is now unrecoverable. Names the service, key store, fingerprint and account. |
+| 1005 | Warning | A process read a key file under the **developer** security model, which trusts the caller's own key files. Logged once per process. **Investigate** on any production machine and remove `SecurityModel`. |
 | 2000 | Warning | Access denied: an unauthorized account used a KEK, or provisioning ran without elevation. |
 | 2002 | Error | An existing KEK has an access list this library would never create. **Investigate.** |
 | 2003 | Warning | Unwrap rejected a tampered, corrupted or misdirected payload. |
@@ -484,7 +556,7 @@ Get-WinEvent -LogName Application -FilterXPath "*[System[Provider[@Name='hkdfgua
 
 Any local user can write to the Application log, so treat these events as an operational
 aid, not tamper-proof evidence. Forward them to your SIEM for retention and alerting. Events
-2002, 2006, 2003, 1004 and 1001 are good candidates for alerts.
+2002, 2006, 2003, 1005, 1004 and 1001 are good candidates for alerts.
 
 ## Upgrade
 
@@ -519,12 +591,13 @@ was attempted) and `1` for an operational failure. On failure it prints an `erro
 |---|---|---|
 | `no KEK is provisioned for this service` | `wrap` ran before `provision`, or the service name differs. | Run `provision` elevated with the same service name. |
 | `this account is not authorized to use it` | Not elevated during `provision`, or the account isn't in a group on the KEK's access list. | Run `provision` from an elevated prompt. For `wrap`/unwrap, add the account to `HkdfGuardUsers` and restart the service. |
-| `a KeyUseGroups policy entry is unresolvable, not a group, over-broad, or not host-local` | A `KeyUseGroups` entry is invalid. | Fix the entry. See [KeyUseGroups](#keyusegroups). |
-| `invalid key storage policy` | `KeyStoragePolicy` isn't a `REG_DWORD` of `0`, `1` or `2`. | Correct or remove the value. |
 | `KEK provider/key open or create failed` | Under `RequireTpm`: no usable TPM. Otherwise, the key store failed. | Check the TPM (`Get-Tpm`) and event 2005 for details. |
 | `a KEK already exists under this service name, but its ACL is ...` | The existing KEK's access list was changed, or a key was planted under that name. It was left untouched. | Investigate it as a security event. To move on, provision a new versioned service name. |
 | `wrapped payload was not produced under this service's current KEK` | The key file belongs to a different service or a different KEK. | Check the service name, and that the file was wrapped on this machine. |
 | `hkdfguard_open_file would refuse to read a key file there` | `wrap`'s `--key-file-path` is in a folder that another account can create, delete or rename entries in (for example anywhere under `C:\ProgramData`), or that isn't owned by SYSTEM, Administrators, TrustedInstaller or you. Nothing was read or written. | Use a folder prepared as in [Where to keep key files](#where-to-keep-key-files); the message names the folder and account and prints the `icacls` commands. |
+| `this account may not persist key files` | Under the production model, `wrap` ran as an account that is neither an elevated administrator nor a member of `HkdfGuardDeployers` or a `DeployerGroups` group. Nothing was written. | Run `wrap` as a deployer: add the account to `HkdfGuardDeployers`, then sign in again. |
+| `invalid machine policy` | `KeyStoragePolicy` isn't a `REG_DWORD` of `0`, `1` or `2`, or `SecurityModel` isn't a `REG_DWORD` of `0` or `1`. | Correct or remove the value. |
+| `a KeyUseGroups or DeployerGroups policy entry is ...` | An entry in either value is invalid, or a deployer group's members couldn't be read. | Fix the entry. See [KeyUseGroups](#keyusegroups) and [DeployerGroups](#deployergroups). |
 | `service name is missing or malformed` | The name uses characters other than ASCII letters, digits and `.`, starts with `.`, contains `..`, or is longer than 128. | Use a valid name. |
 
 An application that can't load the DLL usually has an architecture mismatch (see

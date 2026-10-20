@@ -36,6 +36,15 @@ namespace hkdfguard {
         constexpr wchar_t kSetupMinDelayMsValue[] =
             L"SetupMinDelayMs";
 
+        // REG_DWORD under the same key: see LoadSecurityModel in policy.h.
+        constexpr wchar_t kSecurityModelValue[] =
+            L"SecurityModel";
+
+        // REG_MULTI_SZ under the same key: see LoadDeployerGroupsPolicy in
+        // policy.h.
+        constexpr wchar_t kDeployerGroupsValue[] =
+            L"DeployerGroups";
+
         // Security-focused default.
         //
         // Existing behavior today is:
@@ -53,6 +62,10 @@ namespace hkdfguard {
 
         // Same, for LoadKeyUseGroupsPolicy.
         std::optional<std::vector<std::wstring>> g_testKeyUseGroupsOverride;
+
+        // Same, for LoadSecurityModel and LoadDeployerGroupsPolicy.
+        std::optional<SecurityModel> g_testSecurityModelOverride;
+        std::optional<std::vector<std::wstring>> g_testDeployerGroupsOverride;
 #endif
 
         std::wstring TrimW(const std::wstring& s)
@@ -119,6 +132,86 @@ namespace hkdfguard {
     }
 #endif
 
+    namespace {
+        // Reads one REG_MULTI_SZ policy value of group entries - KeyUseGroups
+        // or DeployerGroups - normalized (trimmed, empties dropped). A
+        // missing value, a value of the wrong type, or any read failure
+        // yields an empty list (fail closed: no additional principals),
+        // never an exception.
+        std::vector<std::wstring> LoadGroupListValue(const wchar_t *valueName)
+        {
+            std::vector<std::wstring> result;
+
+            HKEY key = nullptr;
+
+            // KEY_WOW64_64KEY: makes this read the "real" 64-bit view of HKLM
+            // regardless of whether this process itself is 32- or 64-bit, so a
+            // 32-bit and a 64-bit HkdfGuard.dll on the same machine are
+            // guaranteed to see the identical policy rather than one of them
+            // silently reading a WOW64-redirected Software\WOW6432Node copy.
+            // (Software\Policies specifically is documented by Microsoft as
+            // excluded from WOW64 registry redirection in the first place, so
+            // this is defense in depth against relying on that exclusion,
+            // rather than a fix for an observed divergence.)
+            if (RegOpenKeyExW(
+                    HKEY_LOCAL_MACHINE,
+                    kPolicyKey,
+                    0,
+                    KEY_QUERY_VALUE | KEY_WOW64_64KEY,
+                    &key) != ERROR_SUCCESS)
+            {
+                return result;
+            }
+
+            DWORD type = 0;
+            DWORD size = 0;
+
+            LONG status = RegQueryValueExW(
+                key,
+                valueName,
+                nullptr,
+                &type,
+                nullptr,
+                &size);
+
+            if (status != ERROR_SUCCESS || type != REG_MULTI_SZ || size == 0)
+            {
+                RegCloseKey(key);
+                return result;
+            }
+
+            // Two extra zeroed wchar_t of padding guarantee the walk below always
+            // hits a terminator, even for a value stored without the trailing
+            // double NUL that REG_MULTI_SZ is supposed to end with, and even if
+            // `size` isn't a whole number of wchar_t.
+            std::vector<wchar_t> buffer(size / sizeof(wchar_t) + 2, L'\0');
+
+            status = RegQueryValueExW(
+                key,
+                valueName,
+                nullptr,
+                &type,
+                reinterpret_cast<LPBYTE>(buffer.data()),
+                &size);
+
+            RegCloseKey(key);
+
+            // A size change between the two queries surfaces as ERROR_MORE_DATA
+            // here; treated like any other failure - fail closed, grant nothing.
+            if (status != ERROR_SUCCESS || type != REG_MULTI_SZ)
+            {
+                return result;
+            }
+
+            for (const wchar_t* p = buffer.data(); *p != L'\0'; p += wcslen(p) + 1)
+            {
+                result.emplace_back(p);
+            }
+
+            return NormalizeEntries(result);
+        }
+    } // namespace
+
     std::vector<std::wstring> LoadKeyUseGroupsPolicy()
     {
 #if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
@@ -127,20 +220,57 @@ namespace hkdfguard {
             return NormalizeEntries(*g_testKeyUseGroupsOverride);
         }
 #endif
+        return LoadGroupListValue(kKeyUseGroupsValue);
+    }
 
-        std::vector<std::wstring> result;
+    std::vector<std::wstring> LoadDeployerGroupsPolicy()
+    {
+#if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
+        if (g_testDeployerGroupsOverride.has_value())
+        {
+            return NormalizeEntries(*g_testDeployerGroupsOverride);
+        }
+#endif
+        return LoadGroupListValue(kDeployerGroupsValue);
+    }
 
+    SecurityModel ParseSecurityModel(bool found, unsigned long type, unsigned long value) noexcept
+    {
+        // Absent: a production install. Present: only an exact REG_DWORD 0
+        // or 1 picks a model; anything else is a configuration error, not
+        // a default - an administrator who wrote *something* meant a
+        // specific model, and guessing could quietly loosen trust.
+        if (!found)
+        {
+            return SecurityModel::Production;
+        }
+        if (type != REG_DWORD)
+        {
+            return SecurityModel::Invalid;
+        }
+        switch (value)
+        {
+            case static_cast<unsigned long>(SecurityModel::Production):
+                return SecurityModel::Production;
+            case static_cast<unsigned long>(SecurityModel::Developer):
+                return SecurityModel::Developer;
+            default:
+                return SecurityModel::Invalid;
+        }
+    }
+
+    SecurityModel LoadSecurityModel() noexcept
+    {
+#if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
+        if (g_testSecurityModelOverride.has_value())
+        {
+            return *g_testSecurityModelOverride;
+        }
+#endif
         HKEY key = nullptr;
 
-        // KEY_WOW64_64KEY: makes this read the "real" 64-bit view of HKLM
-        // regardless of whether this process itself is 32- or 64-bit, so a
-        // 32-bit and a 64-bit HkdfGuard.dll on the same machine are
-        // guaranteed to see the identical policy rather than one of them
-        // silently reading a WOW64-redirected Software\WOW6432Node copy.
-        // (Software\Policies specifically is documented by Microsoft as
-        // excluded from WOW64 registry redirection in the first place, so
-        // this is defense in depth against relying on that exclusion,
-        // rather than a fix for an observed divergence.)
+        // KEY_WOW64_64KEY - see LoadGroupListValue's comment on the
+        // identical flag on its own RegOpenKeyExW call.
         if (RegOpenKeyExW(
                 HKEY_LOCAL_MACHINE,
                 kPolicyKey,
@@ -148,56 +278,47 @@ namespace hkdfguard {
                 KEY_QUERY_VALUE | KEY_WOW64_64KEY,
                 &key) != ERROR_SUCCESS)
         {
-            return result;
+            return ParseSecurityModel(false, 0, 0);
         }
 
+        DWORD value = 0;
         DWORD type = 0;
-        DWORD size = 0;
+        DWORD size = sizeof(value);
 
         LONG status = RegQueryValueExW(
             key,
-            kKeyUseGroupsValue,
+            kSecurityModelValue,
             nullptr,
             &type,
-            nullptr,
-            &size);
-
-        if (status != ERROR_SUCCESS || type != REG_MULTI_SZ || size == 0)
-        {
-            RegCloseKey(key);
-            return result;
-        }
-
-        // Two extra zeroed wchar_t of padding guarantee the walk below always
-        // hits a terminator, even for a value stored without the trailing
-        // double NUL that REG_MULTI_SZ is supposed to end with, and even if
-        // `size` isn't a whole number of wchar_t.
-        std::vector<wchar_t> buffer(size / sizeof(wchar_t) + 2, L'\0');
-
-        status = RegQueryValueExW(
-            key,
-            kKeyUseGroupsValue,
-            nullptr,
-            &type,
-            reinterpret_cast<LPBYTE>(buffer.data()),
+            reinterpret_cast<LPBYTE>(&value),
             &size);
 
         RegCloseKey(key);
 
-        // A size change between the two queries surfaces as ERROR_MORE_DATA
-        // here; treated like any other failure - fail closed, grant nothing.
-        if (status != ERROR_SUCCESS || type != REG_MULTI_SZ)
+        if (status == ERROR_FILE_NOT_FOUND)
         {
-            return result;
+            return ParseSecurityModel(false, 0, 0);
         }
-
-        for (const wchar_t* p = buffer.data(); *p != L'\0'; p += wcslen(p) + 1)
+        // Present but unreadable as a DWORD (too large: ERROR_MORE_DATA, or
+        // any other failure): never a silent default.
+        if (status != ERROR_SUCCESS || size != sizeof(value))
         {
-            result.emplace_back(p);
+            return SecurityModel::Invalid;
         }
-
-        return NormalizeEntries(result);
+        return ParseSecurityModel(true, type, value);
     }
+
+#if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
+    void SetTestSecurityModelOverride(std::optional<SecurityModel> model) noexcept
+    {
+        g_testSecurityModelOverride = model;
+    }
+
+    void SetTestDeployerGroupsOverride(std::optional<std::vector<std::wstring>> groups)
+    {
+        g_testDeployerGroupsOverride = std::move(groups);
+    }
+#endif
 
     bool ParseAuditUnwrapSuccess(bool found, unsigned long type, unsigned long value) noexcept
     {
@@ -211,7 +332,7 @@ namespace hkdfguard {
     {
         HKEY key = nullptr;
 
-        // KEY_WOW64_64KEY - see LoadKeyUseGroupsPolicy's comment on the
+        // KEY_WOW64_64KEY - see LoadGroupListValue's comment on the
         // identical flag on its own RegOpenKeyExW call.
         if (RegOpenKeyExW(
                 HKEY_LOCAL_MACHINE,
@@ -264,7 +385,7 @@ namespace hkdfguard {
     {
         HKEY key = nullptr;
 
-        // KEY_WOW64_64KEY - see LoadKeyUseGroupsPolicy's comment on the
+        // KEY_WOW64_64KEY - see LoadGroupListValue's comment on the
         // identical flag on its own RegOpenKeyExW call.
         if (RegOpenKeyExW(
                 HKEY_LOCAL_MACHINE,
@@ -318,7 +439,7 @@ namespace hkdfguard {
 
         HKEY key = nullptr;
 
-        // KEY_WOW64_64KEY - see LoadKeyUseGroupsPolicy's comment on the
+        // KEY_WOW64_64KEY - see LoadGroupListValue's comment on the
         // identical flag on its own RegOpenKeyExW call.
         LONG status = RegOpenKeyExW(
             HKEY_LOCAL_MACHINE,

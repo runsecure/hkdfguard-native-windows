@@ -117,7 +117,7 @@ target_include_directories(hkdfguard
 # The two Windows system libraries providing every NCrypt*/BCrypt* function
 # called throughout src/, plus wer.lib for process_hardening.cpp's
 # WerSetFlags.
-target_link_libraries(hkdfguard PRIVATE ncrypt.lib bcrypt.lib wer.lib ntdll.lib)
+target_link_libraries(hkdfguard PRIVATE ncrypt.lib bcrypt.lib wer.lib ntdll.lib netapi32.lib)
 
 # MSVC-specific hardening flags, applied only when compiling with MSVC (as
 # opposed to some other compiler CMake might be configured to use). Defined

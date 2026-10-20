@@ -66,4 +66,12 @@ namespace hkdfguard {
     // log::warn at the same point.
     void LogSetupCallsExceeded(unsigned long calls, unsigned long floor_ms) noexcept;
 
+    // hkdfguard_open_file is trusting key files under the developer
+    // security model (HKLM\Software\Policies\HkdfGuard\SecurityModel = 1):
+    // the calling account's own files are accepted, so an application that
+    // can write files could persist a key file of its own. Logged once per
+    // process, a warning, so a developer setting left on a production
+    // machine is noticed.
+    void LogDeveloperModeKeyFile() noexcept;
+
 } // namespace hkdfguard

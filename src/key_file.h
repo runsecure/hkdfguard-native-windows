@@ -39,6 +39,22 @@ namespace hkdfguard {
     // whitespace. Exposed for tests.
     bool LooksLikePlaintextKeyForTest(const uint8_t *bytes, size_t len);
 
+    // The security model in force (see SecurityModel in policy.h), and in
+    // `may_write` whether a key file this process wrote - owned by its
+    // token's default owner: its user, or Administrators when elevated -
+    // would pass ReadWrappedKeyFile's owner check under that model. The
+    // CLI's wrap asks this before persisting anything. Throws
+    // HkdfGuardError (HKDFGUARD_ERR_POLICY_INVALID or
+    // HKDFGUARD_ERR_WIN_GROUP_INVALID) for invalid policy.
+    enum class SecurityModel : uint32_t;
+    SecurityModel CallerMayWriteKeyFiles(bool &may_write);
+
+    // Whether ReadWrappedKeyFile, under the security model in force, trusts
+    // `sid` to own a key file or a folder above one, or to hold write-type
+    // rights on them - the rule itself, so the CLI's pre-check can ask
+    // instead of keeping a copy. Same exceptions as CallerMayWriteKeyFiles.
+    bool IsTrustedKeyFilePrincipal(PSID sid);
+
     // `path` (null-terminated UTF-8) converted to UTF-16, exactly as
     // ReadWrappedKeyFile converts it. Throws HkdfGuardError
     // (HKDFGUARD_ERR_INVALID_ARGUMENT) if it is empty, too long or not valid

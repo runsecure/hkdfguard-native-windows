@@ -6,6 +6,9 @@
 
 #include "../include/hkdfguard.h"
 #include "errors.h"
+#include "event_log.h"   // LogDeveloperModeKeyFile
+#include "key_acl.h"     // ResolveDeployerPrincipals
+#include "policy.h"      // LoadSecurityModel, LoadDeployerGroupsPolicy
 #include "wire_format.h" // ParseWrappedDek, kTotalLen
 
 #include "secure_buffer.h" // SecureBuffer - holds a small file's bytes while they're inspected
@@ -200,13 +203,36 @@ namespace hkdfguard {
             PSID sid_ = nullptr;
         };
 
+        // The SID of the account this process runs as (TokenUser), or the
+        // one new files get as their owner (TokenOwner - Administrators when
+        // elevated), as an owned buffer.
+        std::vector<BYTE> ProcessTokenSid(TOKEN_INFORMATION_CLASS which) {
+            DWORD size = 0;
+            GetTokenInformation(GetCurrentProcessToken(), which, nullptr, 0, &size);
+            std::vector<BYTE> info(size);
+            if (size == 0 || !GetTokenInformation(GetCurrentProcessToken(), which, info.data(), size, &size)) {
+                throw HkdfGuardError(HKDFGUARD_ERR_INTERNAL_ERROR, "GetTokenInformation failed");
+            }
+            PSID sid = which == TokenOwner ? reinterpret_cast<const TOKEN_OWNER *>(info.data())->Owner
+                                           : reinterpret_cast<const TOKEN_USER *>(info.data())->User.Sid;
+            const auto *bytes = static_cast<const BYTE *>(sid);
+            return std::vector<BYTE>(bytes, bytes + GetLengthSid(sid));
+        }
+
         // The principals a key file and its folders may be owned by, and
-        // the only ones that may hold the write-type rights above: SYSTEM,
-        // BUILTIN\Administrators, TrustedInstaller, and the account this
-        // process runs as - the counterpart of the Linux build's "root or
-        // this process's user". (Administrators is here because an elevated
-        // administrator's files are owned by the group, not the user;
-        // that's who the CLI's wrap, run elevated, writes them as.)
+        // the only ones that may hold the write-type rights above. Always
+        // SYSTEM, BUILTIN\Administrators and TrustedInstaller
+        // (Administrators because an elevated administrator's files are
+        // owned by the group, not the user). Then, by security model (see
+        // SecurityModel in policy.h):
+        //
+        //   Production: each deployer group (HkdfGuardDeployers and the
+        //     DeployerGroups policy) and each direct member of one - see
+        //     ResolveDeployerPrincipals. The account this process runs as is
+        //     trusted only if it is such a member, so an application runner
+        //     can't persist a key file its own service would accept.
+        //   Developer: the account this process runs as - the counterpart of
+        //     the Linux build's "root or this process's user".
         //
         // OWNER RIGHTS is accepted in an ACE because it means "whoever owns
         // this", and the owner is checked separately. CREATOR OWNER and
@@ -214,21 +240,36 @@ namespace hkdfguard {
         // they match nobody.
         class TrustedPrincipals {
         public:
-            TrustedPrincipals() {
-                DWORD size = 0;
-                GetTokenInformation(GetCurrentProcessToken(), TokenUser, nullptr, 0, &size);
-                if (size == 0) {
-                    throw HkdfGuardError(HKDFGUARD_ERR_INTERNAL_ERROR, "GetTokenInformation(TokenUser) failed");
-                }
-                user_buffer_.resize(size);
-                if (!GetTokenInformation(GetCurrentProcessToken(), TokenUser, user_buffer_.data(), size, &size)) {
-                    throw HkdfGuardError(HKDFGUARD_ERR_INTERNAL_ERROR, "GetTokenInformation(TokenUser) failed");
+            // Reads the security model (and, for Production, the deployer
+            // groups) now. Throws HkdfGuardError(HKDFGUARD_ERR_POLICY_INVALID)
+            // for an invalid SecurityModel value, and
+            // HKDFGUARD_ERR_WIN_GROUP_INVALID for a bad DeployerGroups entry.
+            TrustedPrincipals() : model_(LoadSecurityModel()) {
+                switch (model_) {
+                    case SecurityModel::Developer:
+                        extra_.push_back(ProcessTokenSid(TokenUser));
+                        break;
+                    case SecurityModel::Production:
+                        extra_ = ResolveDeployerPrincipals(LoadDeployerGroupsPolicy());
+                        break;
+                    default:
+                        throw HkdfGuardError(HKDFGUARD_ERR_POLICY_INVALID, "invalid SecurityModel policy");
                 }
             }
 
+            SecurityModel model() const { return model_; }
+
             bool MayOwn(PSID sid) const {
-                return IsWellKnownSid(sid, WinLocalSystemSid) || IsWellKnownSid(sid, WinBuiltinAdministratorsSid) ||
-                       EqualSid(sid, trusted_installer_.get()) || EqualSid(sid, User());
+                if (IsWellKnownSid(sid, WinLocalSystemSid) || IsWellKnownSid(sid, WinBuiltinAdministratorsSid) ||
+                    EqualSid(sid, trusted_installer_.get())) {
+                    return true;
+                }
+                for (const std::vector<BYTE> &extra: extra_) {
+                    if (EqualSid(sid, const_cast<BYTE *>(extra.data()))) {
+                        return true;
+                    }
+                }
+                return false;
             }
 
             bool MayWrite(PSID sid) const {
@@ -236,10 +277,15 @@ namespace hkdfguard {
                        IsWellKnownSid(sid, WinCreatorOwnerSid) || IsWellKnownSid(sid, WinCreatorGroupSid);
             }
 
-        private:
-            PSID User() const { return reinterpret_cast<const TOKEN_USER *>(user_buffer_.data())->User.Sid; }
+            // Who, besides SYSTEM, Administrators and TrustedInstaller, is
+            // trusted - for error messages.
+            const char *Others() const {
+                return model_ == SecurityModel::Developer ? "this account" : "a deployer group or its member";
+            }
 
-            std::vector<BYTE> user_buffer_;
+        private:
+            SecurityModel model_;
+            std::vector<std::vector<BYTE>> extra_;
             TrustedInstallerSid trusted_installer_;
         };
 
@@ -250,7 +296,8 @@ namespace hkdfguard {
             if (owner == nullptr || !trusted.MayOwn(owner)) {
                 throw HkdfGuardError(
                     HKDFGUARD_ERR_FILE_UNTRUSTED,
-                    (std::string(what) + " is not owned by SYSTEM, Administrators, TrustedInstaller or this account").c_str());
+                    (std::string(what) + " is not owned by SYSTEM, Administrators, TrustedInstaller or " +
+                     trusted.Others()).c_str());
             }
             if (!dacl_present || dacl == nullptr) {
                 throw HkdfGuardError(HKDFGUARD_ERR_FILE_UNTRUSTED,
@@ -292,10 +339,10 @@ namespace hkdfguard {
                                 HKDFGUARD_ERR_FILE_UNTRUSTED,
                                 (std::string(what) +
                                  (create_only
-                                      ? " lets an account other than SYSTEM, Administrators, TrustedInstaller or this "
-                                        "account create files or folders in it"
+                                      ? " lets an account other than SYSTEM, Administrators, TrustedInstaller or "
                                       : " grants write, delete or ownership rights to an account other than SYSTEM, "
-                                        "Administrators, TrustedInstaller or this account")).c_str());
+                                        "Administrators, TrustedInstaller or ") +
+                                 trusted.Others() + (create_only ? " create files or folders in it" : "")).c_str());
                         }
                         continue;
                     }
@@ -540,6 +587,17 @@ namespace hkdfguard {
         }
     }
 
+    bool IsTrustedKeyFilePrincipal(PSID sid) {
+        return TrustedPrincipals().MayOwn(sid);
+    }
+
+    SecurityModel CallerMayWriteKeyFiles(bool &may_write) {
+        TrustedPrincipals trusted;
+        std::vector<BYTE> owner = ProcessTokenSid(TokenOwner);
+        may_write = trusted.MayOwn(owner.data());
+        return trusted.model();
+    }
+
     bool LooksLikePlaintextKeyForTest(const uint8_t *bytes, size_t len) {
         return LooksLikePlaintextDek(bytes, len);
     }
@@ -655,8 +713,12 @@ namespace hkdfguard {
         // mode checks, in ACL form. Checked on the open handle, after the path checks
         // above, so it's the file actually read that is judged. (The OS
         // refusing the open itself was HKDFGUARD_ERR_FILE_ACCESS_DENIED,
-        // above.)
+        // above.) Who counts as trusted depends on the security model - see
+        // TrustedPrincipals; developer mode is announced in the event log.
         TrustedPrincipals trusted;
+        if (trusted.model() == SecurityModel::Developer) {
+            LogDeveloperModeKeyFile();
+        }
         CheckHandleSecurity(file, kFileWriteRights, trusted, "the file");
         CheckFolderChain(chain, trusted);
 

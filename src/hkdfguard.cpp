@@ -9,7 +9,7 @@
 #include "ecdh_hkdf.h"
 #include "errors.h"
 #include "event_log.h"
-#include "policy.h" // LoadAuditUnwrapSuccess
+#include "policy.h" // LoadAuditUnwrapSuccess, SecurityModel
 #include "process_hardening.h" // HardenProcess - hkdfguard_harden_process's implementation
 #include "kek_store.h"
 #include "key_file.h" // ReadWrappedKeyFile - hkdfguard_open_file's implementation
@@ -22,6 +22,7 @@
 // new DEK's randomness). cstring: strnlen, memcpy. string: std::wstring.
 #include <windows.h>
 #include <bcrypt.h>
+#include <sddl.h> // ConvertStringSidToSidA - hkdfguard_key_file_principal_trusted
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -744,6 +745,50 @@ extern "C" HKDFGUARD_API int hkdfguard_open_file(
     } catch (...) {
         return fail(HKDFGUARD_ERR_INTERNAL_ERROR);
     }
+}
+
+extern "C" HKDFGUARD_API int hkdfguard_security_model(
+    int *out_model,
+    int *out_may_write_key_files) {
+    if (out_model == nullptr || out_may_write_key_files == nullptr) {
+        return HKDFGUARD_ERR_INVALID_ARGUMENT;
+    }
+    // Not audited: it reads policy and changes nothing.
+    try {
+        bool may_write = false;
+        const SecurityModel model = CallerMayWriteKeyFiles(may_write);
+        *out_model = model == SecurityModel::Developer ? HKDFGUARD_SECURITY_MODEL_DEVELOPER
+                                                       : HKDFGUARD_SECURITY_MODEL_PRODUCTION;
+        *out_may_write_key_files = may_write ? 1 : 0;
+        return HKDFGUARD_OK;
+    } catch (const HkdfGuardError &e) {
+        return e.code();
+    } catch (...) {
+        return HKDFGUARD_ERR_INTERNAL_ERROR;
+    }
+}
+
+extern "C" HKDFGUARD_API int hkdfguard_key_file_principal_trusted(
+    const char *sid,
+    int *out_trusted) {
+    if (sid == nullptr || out_trusted == nullptr) {
+        return HKDFGUARD_ERR_INVALID_ARGUMENT;
+    }
+    PSID parsed = nullptr;
+    if (strnlen(sid, 256) >= 256 || !ConvertStringSidToSidA(sid, &parsed)) {
+        return HKDFGUARD_ERR_INVALID_ARGUMENT;
+    }
+    // Not audited: it reads policy and changes nothing.
+    int32_t rc = HKDFGUARD_OK;
+    try {
+        *out_trusted = IsTrustedKeyFilePrincipal(parsed) ? 1 : 0;
+    } catch (const HkdfGuardError &e) {
+        rc = e.code();
+    } catch (...) {
+        rc = HKDFGUARD_ERR_INTERNAL_ERROR;
+    }
+    LocalFree(parsed);
+    return rc;
 }
 
 extern "C" HKDFGUARD_API int hkdfguard_harden_process(void) {

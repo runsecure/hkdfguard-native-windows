@@ -850,3 +850,66 @@ a KEK.
   is outside what a file check can catch.
 - **Not yet run:** in the Server 2022/2025 containers, where
   ContainerAdministrator's ownership of `C:\` needs to be confirmed.
+
+## 16. Security models: who may persist a key file (design decision + verified)
+
+**Claim.** Under the production security model (`SecurityModel` absent or `0`, the
+default), an account that may unwrap - and wrap ephemeral keys in memory - but is not a
+deployer cannot persist a key file that `hkdfguard_open_file` accepts. Under the developer
+model (`1`) the caller's own key files are trusted, as before.
+
+**Why.** Wrap and unwrap are the same operation on the KEK (ECDH with its private key),
+so no key ACL can let an account unwrap without letting it wrap. Wrapping in memory is
+harmless on its own. What must be kept from an application runner is turning a payload
+for a DEK it knows into a key file its own service will load. That's a file-system
+question, so it's answered with file ownership and permissions, not cryptography. No
+payload format change is needed.
+
+**How.**
+
+- **Trusted owners and writers** (`src/key_file.cpp`, `TrustedPrincipals`). Always
+  SYSTEM, Administrators and TrustedInstaller. Production adds each deployer group
+  (`HkdfGuardDeployers` if present, and each `DeployerGroups` entry, vetted like
+  `KeyUseGroups`) and each *direct* member of one (`ResolveDeployerPrincipals`,
+  `src/key_acl.cpp`). Developer adds the calling account instead. The rule is applied to
+  the file and every folder above it, as in section 15.
+- **Membership** is read when the file is opened (`NetLocalGroupGetMembers`, level 0),
+  by SID, from this machine's own group database. No name is resolved and no domain
+  controller is contacted. A group nested in a deployer group is trusted as a principal,
+  but its members aren't expanded.
+- **KEK access.** Deployer groups get key use on KEKs created while they exist, since
+  deployers wrap.
+- **The CLI** asks the library rather than keeping a copy of the rule.
+  `hkdfguard_security_model` tells `wrap` whether a file it writes would be trusted, and
+  `wrap` refuses before touching anything if not. `hkdfguard_key_file_principal_trusted`
+  answers its folder pre-check.
+- **Fail closed.** An invalid `SecurityModel` is `HKDFGUARD_ERR_POLICY_INVALID`. An
+  invalid `DeployerGroups` entry, or members that can't be read, is
+  `HKDFGUARD_ERR_WIN_GROUP_INVALID`. Developer mode logs event 1005 once per reading
+  process.
+
+**Verified how.**
+
+- `test_roundtrip` 24d: the rule on synthetic descriptors under each model, and the
+  fail-closed policy cases.
+- `test_roundtrip` 24e: end to end through the DLL. A key file owned by this account is
+  refused, accepted once the account is a direct member of `HkdfGuardDeployers`, and
+  refused again after it leaves.
+- `test_roles.ps1`: real, separate throwaway accounts.
+  - The deployer persists a key file, owned by its own account.
+  - The application unwraps that file and wraps and unwraps ephemeral keys.
+  - The CLI refuses to persist for the application.
+  - Windows refuses the application write access to the deployed file.
+  - A key file the application persists elsewhere is refused by
+    `hkdfguard_open_file`.
+  - Once the deployer leaves the group, the deployer's file is refused.
+
+**Residual risk.**
+
+- **Administrators.** A local administrator can do everything, including joining
+  `HkdfGuardDeployers` or setting `SecurityModel` to `1`. Security admins and deployers
+  are separate only if deployers are not local administrators.
+- **Direct membership only.** A deployer reached only through a nested group is not
+  trusted. That's deliberate: nothing is resolved through a domain controller.
+- **Removed deployers.** Key files owned by a deployer who leaves the group stop being
+  trusted. Redeploy them under a current deployer before removing one.

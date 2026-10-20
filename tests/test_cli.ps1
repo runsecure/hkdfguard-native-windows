@@ -135,6 +135,27 @@ $tempLong = New-Object System.Text.StringBuilder 32768
 $tempLen = [HkdfGuardCliTest.Path]::GetLongPathNameW($env:TEMP, $tempLong, 32768)
 $tempDir = if ($tempLen -gt 0 -and $tempLen -lt 32768) { $tempLong.ToString() } else { $env:TEMP }
 $workDir = Join-Path $tempDir ("hkdfguard-cli-test-" + [Guid]::NewGuid().ToString("N"))
+
+# The security model. These scenarios keep key files under %TEMP%, in this
+# account's own profile, and expect wrap to reach the KEK lookup there: the
+# developer model's rule (the caller's own files are trusted). Under the
+# production model, the default, the profile folder - owned by this account,
+# not a deployer - is refused, as it should be; test_roles.ps1 covers
+# production with real deployer and application accounts. So, elevated, the
+# model is set to developer for this script and put back in the finally
+# block; not elevated under production, only the checks that don't wrap run.
+$policyKey = "HKLM:\Software\Policies\HkdfGuard"
+$priorModel = $null
+try { $priorModel = (Get-ItemProperty -Path $policyKey -Name SecurityModel -ErrorAction Stop).SecurityModel } catch { }
+$isAdminRun = (New-Object System.Security.Principal.WindowsPrincipal(
+    [System.Security.Principal.WindowsIdentity]::GetCurrent())).IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
+$pinnedModel = $false
+if ($isAdminRun) {
+    if (-not (Test-Path $policyKey)) { New-Item -Path $policyKey -Force | Out-Null }
+    Set-ItemProperty -Path $policyKey -Name SecurityModel -Type DWord -Value 1
+    $pinnedModel = $true
+}
+$developerModel = $pinnedModel -or ($priorModel -eq 1)
 New-Item -ItemType Directory -Force -Path $workDir | Out-Null
 
 try {
@@ -231,6 +252,12 @@ try {
     $absentService = "hkdfguardabsent" + [Guid]::NewGuid().ToString("N")
     $r = Invoke-Cli @("status", "-sn", $absentService)
     Check (($r.ExitCode -eq 0) -and ($r.StdOut -match "kek: absent")) "status reports a never-provisioned service as absent (exit 0)"
+    Check ($r.StdOut -match "security model: (production|developer) \(this account (may|may not) persist key files\)") "status reports the security model and whether this account may persist key files"
+
+    if (-not $developerModel) {
+        Write-Host "[SKIP] the wrap scenarios: production security model and not elevated - this account's own key folders aren't trusted, and SecurityModel can't be set for the run"
+        if ($failures -eq 0) { exit 0 } else { exit 1 }
+    }
 
     # ---- 4. wrap: missing a required flag (--dek-stdin). ----
     $keyFile = Join-Path $workDir "missing-dek.key"
@@ -1100,6 +1127,13 @@ try {
     }
 }
 finally {
+    if ($pinnedModel) {
+        if ($null -eq $priorModel) {
+            Remove-ItemProperty -Path $policyKey -Name SecurityModel -ErrorAction SilentlyContinue
+        } else {
+            Set-ItemProperty -Path $policyKey -Name SecurityModel -Type DWord -Value $priorModel
+        }
+    }
     Remove-Item -Recurse -Force $workDir -ErrorAction SilentlyContinue
 }
 

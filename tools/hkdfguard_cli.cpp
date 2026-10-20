@@ -798,8 +798,8 @@ namespace {
             case HKDFGUARD_ERR_INTERNAL_ERROR: return "an internal error occurred in HkdfGuard.dll";
             case HKDFGUARD_ERR_PROCESS_HARDENING_FAILED: return "could not harden this process against memory disclosure (crash-report heap, same-user debugging and code injection)";
             case HKDFGUARD_ERR_INVALID_SERVICE_NAME: return "service name is missing or malformed (ASCII letters, digits and '.' only, 1-128 bytes, not starting with '.', no \"..\")";
-            case HKDFGUARD_ERR_POLICY_INVALID: return "invalid key storage policy";
-            case HKDFGUARD_ERR_WIN_GROUP_INVALID: return "a KeyUseGroups policy entry is unresolvable, not a group, over-broad, or not host-local";
+            case HKDFGUARD_ERR_POLICY_INVALID: return "invalid machine policy: HKLM\\Software\\Policies\\HkdfGuard\\KeyStoragePolicy is not 0, 1 or 2, or SecurityModel is not 0 or 1";
+            case HKDFGUARD_ERR_WIN_GROUP_INVALID: return "a KeyUseGroups or DeployerGroups policy entry is unresolvable, not a group, over-broad, or not host-local (or a deployer group's members could not be read)";
             case HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH: return "wrapped payload was not produced under this service's current KEK";
             case HKDFGUARD_ERR_KEK_NOT_FOUND: return "no KEK is provisioned for this service";
             case HKDFGUARD_ERR_KEK_ACCESS_DENIED: return "this KEK exists, but this account is not authorized to use it";
@@ -1506,7 +1506,7 @@ namespace {
                    "elevated prompt with:\n"
                    "  mkdir C:\\HkdfGuardKeys\\<app>\n"
                    "  icacls C:\\HkdfGuardKeys /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F "
-                   "*S-1-5-32-545:(OI)(CI)RX\n"
+                   "*S-1-5-32-545:(OI)(CI)RX HkdfGuardDeployers:(OI)(CI)M\n"
                    "  icacls C:\\HkdfGuardKeys /setowner *S-1-5-32-544 /T\n"
                    "(see \"Where to keep key files\" in docs/admin-guide.md)";
         }
@@ -1514,9 +1514,10 @@ namespace {
                (explicitSid.empty() ? std::string()
                                     : "  icacls \"" + folder + "\" /remove:g " + explicitSid + "\n") +
                "  icacls \"" + folder + "\" /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F "
-               "*S-1-5-32-545:(OI)(CI)RX\n"
+               "*S-1-5-32-545:(OI)(CI)RX HkdfGuardDeployers:(OI)(CI)M\n"
                "  icacls \"" + folder + "\" /setowner *S-1-5-32-544 /T\n"
-               "then check that `icacls \"" + folder + "\"` lists only SYSTEM, Administrators and Users (RX), and "
+               "then check that `icacls \"" + folder + "\"` lists only SYSTEM, Administrators, Users (RX) and "
+               "HkdfGuardDeployers (M), and "
                "that every folder above it passes too (see \"Where to keep key files\" in docs/admin-guide.md)";
     }
 
@@ -1533,21 +1534,39 @@ namespace {
 
     // Applies the library's folder rule to every folder of a walked chain,
     // on the handles the walk opened (so it is the folders actually
-    // traversed that are judged). `path` is --key-file-path as given.
+    // traversed that are judged). `path` is --key-file-path as given. Who
+    // is trusted is the library's answer, under the machine's security
+    // model (hkdfguard_key_file_principal_trusted), not a copy of its rule:
+    // SYSTEM, Administrators and TrustedInstaller always, then the deployer
+    // groups and their members (production) or this account (developer).
     void RequireTrustedKeyFileFolders(const hkdfguard_nofollow::FolderChain &chain, const std::string &path) {
-        std::vector<BYTE> user = GetProcessUserSid();
-        PSID trustedInstaller = nullptr;
-        if (!ConvertStringSidToSidA("S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464",
-                                    &trustedInstaller)) {
-            throw CliError("ConvertStringSidToSid(TrustedInstaller) failed: " + FormatWin32Error(GetLastError()));
+        int model = HKDFGUARD_SECURITY_MODEL_PRODUCTION;
+        int ignored = 0;
+        int32_t modelRc = hkdfguard_security_model(&model, &ignored);
+        if (modelRc != HKDFGUARD_OK) {
+            throw CliError("could not read the security model: " + DescribeStatus(modelRc));
         }
-        struct FreeSid {
-            PSID p;
-            ~FreeSid() { LocalFree(p); }
-        } freeTrustedInstaller{trustedInstaller};
+        const bool developer = model == HKDFGUARD_SECURITY_MODEL_DEVELOPER;
+        const std::string others = developer ? "this account" : "a deployer group (HkdfGuardDeployers or DeployerGroups) "
+                                                                "or a direct member of one";
+        std::vector<std::pair<std::vector<BYTE>, bool>> cache;
         auto mayOwn = [&](PSID sid) {
-            return IsWellKnownSid(sid, WinLocalSystemSid) || IsWellKnownSid(sid, WinBuiltinAdministratorsSid) ||
-                   EqualSid(sid, trustedInstaller) || EqualSid(sid, user.data());
+            for (const auto &entry: cache) {
+                if (EqualSid(sid, const_cast<BYTE *>(entry.first.data()))) return entry.second;
+            }
+            LPSTR text = nullptr;
+            if (!ConvertSidToStringSidA(sid, &text)) {
+                throw CliError("ConvertSidToStringSid failed: " + FormatWin32Error(GetLastError()));
+            }
+            int trusted = 0;
+            int32_t rc = hkdfguard_key_file_principal_trusted(text, &trusted);
+            LocalFree(text);
+            if (rc != HKDFGUARD_OK) {
+                throw CliError("could not check who may write key files: " + DescribeStatus(rc));
+            }
+            const auto *bytes = static_cast<const BYTE *>(sid);
+            cache.emplace_back(std::vector<BYTE>(bytes, bytes + GetLengthSid(sid)), trusted != 0);
+            return trusted != 0;
         };
         auto mayWrite = [&](PSID sid) {
             return mayOwn(sid) || IsWellKnownSid(sid, WinCreatorOwnerRightsSid) ||
@@ -1556,8 +1575,9 @@ namespace {
         const std::string why =
                 "hkdfguard_open_file would refuse to read a key file there (HKDFGUARD_ERR_FILE_UNTRUSTED, -39): "
                 "every folder from the key file's own up to, but not including, the drive root must let no account "
-                "other than SYSTEM, Administrators, TrustedInstaller or the account reading it create, delete or "
-                "rename entries in it, or change its permissions";
+                "other than SYSTEM, Administrators, TrustedInstaller or " + others + " create, delete or "
+                "rename entries in it, or change its permissions (" + (developer ? "developer" : "production") +
+                " security model)";
 
         for (size_t i = 0; i < chain.handles.size(); ++i) {
             const bool driveRoot = i == 0;
@@ -1583,8 +1603,8 @@ namespace {
                                               : KeyFolderFix(folder);
             if (owner == nullptr || !mayOwn(owner)) {
                 throw CliError(what + " is owned by " + (owner ? AccountNameOf(owner) : std::string("no one")) +
-                               ", which is neither SYSTEM, Administrators, TrustedInstaller nor this account; " + why +
-                               fix);
+                               ", which is neither SYSTEM, Administrators, TrustedInstaller nor " + others + "; " +
+                               why + fix);
             }
             if (dacl == nullptr) {
                 throw CliError(what + " has no DACL, so every account has full access to it; " + why + fix);
@@ -2334,6 +2354,41 @@ namespace {
         return out;
     }
 
+    // MARK: - Security model
+
+    // The security model in force, and whether this account may persist key
+    // files under it (hkdfguard_security_model).
+    struct SecurityModelInfo {
+        int model = HKDFGUARD_SECURITY_MODEL_PRODUCTION;
+        bool mayWriteKeyFiles = false;
+    };
+
+    SecurityModelInfo ReadSecurityModel() {
+        int model = 0;
+        int mayWrite = 0;
+        int32_t rc = hkdfguard_security_model(&model, &mayWrite);
+        if (rc != HKDFGUARD_OK) {
+            throw CliError("could not read the security model: " + DescribeStatus(rc));
+        }
+        return SecurityModelInfo{model, mayWrite != 0};
+    }
+
+    const char *SecurityModelName(int model) {
+        return model == HKDFGUARD_SECURITY_MODEL_DEVELOPER ? "developer" : "production";
+    }
+
+    void RequireMayPersistKeyFiles() {
+        SecurityModelInfo info = ReadSecurityModel();
+        if (!info.mayWriteKeyFiles) {
+            throw CliError(
+                std::string("under the ") + SecurityModelName(info.model) +
+                " security model this account may not persist key files: only an elevated administrator or a "
+                "member of a deployer group (HkdfGuardDeployers, or a group in "
+                "HKLM\\Software\\Policies\\HkdfGuard\\DeployerGroups) may, and a key file this account wrote "
+                "would be refused by hkdfguard_open_file. Nothing was written");
+        }
+    }
+
     // MARK: - Run: status
 
     // Read-only. Exits 0 whenever there was a definite answer (present,
@@ -2344,6 +2399,11 @@ namespace {
         ValidateServiceCharset(args.serviceName);
         const std::string service = LowercaseService(args.serviceName);
         fprintf(stdout, "service: %s\n", service.c_str());
+        {
+            const SecurityModelInfo info = ReadSecurityModel();
+            fprintf(stdout, "security model: %s (this account %s persist key files)\n",
+                    SecurityModelName(info.model), info.mayWriteKeyFiles ? "may" : "may not");
+        }
 
         int32_t exists = 0;
         int32_t rc = hkdfguard_kek_exists(service.c_str(), &exists);
@@ -2614,6 +2674,18 @@ namespace {
             // ends - only the wrapped (encrypted, no longer secret) form
             // survives past this point.
         }
+
+        // Wrapping in memory is open to any account with key use on the KEK;
+        // *persisting* the result is not. Under the production security
+        // model (the default) only SYSTEM, Administrators, TrustedInstaller
+        // and the deployer groups' members are trusted to have written a
+        // key file - see hkdfguard_security_model - so a file this account
+        // wrote would be refused by hkdfguard_open_file anyway. Asked of
+        // the library, which applies exactly the rule it reads files by,
+        // and checked before anything on disk is touched (--force's
+        // overwrite included). After the wrap, so that every input is
+        // still validated first.
+        RequireMayPersistKeyFiles();
 
         if (args.force) {
             SecureOverwriteAndRemoveIfExists(args.keyFilePath);

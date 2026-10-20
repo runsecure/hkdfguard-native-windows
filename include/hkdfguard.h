@@ -400,6 +400,72 @@ HKDFGUARD_API int hkdfguard_generate_and_wrap_dek(
     const char* service,
     uint8_t* out, int* out_len);
 
+/* Values of hkdfguard_security_model's *out_model. */
+#define HKDFGUARD_SECURITY_MODEL_PRODUCTION 0
+#define HKDFGUARD_SECURITY_MODEL_DEVELOPER  1
+
+/*
+ * Reports this machine's security model and whether this process may
+ * persist key files under it. Windows-only; not in the Linux or macOS
+ * builds.
+ *
+ * The model is the REG_DWORD value
+ *
+ *     HKLM\Software\Policies\HkdfGuard\SecurityModel
+ *
+ * absent or 0: HKDFGUARD_SECURITY_MODEL_PRODUCTION (the default - this is a
+ * production install unless an administrator says otherwise); 1:
+ * HKDFGUARD_SECURITY_MODEL_DEVELOPER; anything else fails every call that
+ * depends on it with HKDFGUARD_ERR_POLICY_INVALID. It decides whose key
+ * files hkdfguard_open_file trusts (see there):
+ *
+ *   Production: SYSTEM, Administrators, TrustedInstaller, and the deployer
+ *     groups - the local group HkdfGuardDeployers (the MSI creates it) and
+ *     each entry of the REG_MULTI_SZ value
+ *     HKLM\Software\Policies\HkdfGuard\DeployerGroups (vetted like
+ *     KeyUseGroups) - and their direct members. The calling account is
+ *     trusted only if it is such a member, so an application that unwraps,
+ *     and wraps ephemeral keys in memory, cannot persist a key file its own
+ *     service would accept.
+ *   Developer: SYSTEM, Administrators, TrustedInstaller and the calling
+ *     account itself.
+ *
+ * Wrapping and unwrapping are the same in both models: any account with
+ * key use on the KEK may do either, in memory.
+ *
+ * out_model               - receives HKDFGUARD_SECURITY_MODEL_*.
+ * out_may_write_key_files - receives 1 if a key file written by this
+ *                           process (owned by its token's default owner:
+ *                           its user, or Administrators when elevated)
+ *                           would be trusted under that model, else 0.
+ *
+ * Returns HKDFGUARD_OK; HKDFGUARD_ERR_INVALID_ARGUMENT for a NULL pointer;
+ * HKDFGUARD_ERR_POLICY_INVALID for an invalid SecurityModel value; or
+ * HKDFGUARD_ERR_WIN_GROUP_INVALID for a DeployerGroups entry that isn't a
+ * host-local, non-over-broad group (or whose members can't be read). Both
+ * outputs are left unchanged on failure.
+ */
+HKDFGUARD_API int hkdfguard_security_model(
+    int* out_model,
+    int* out_may_write_key_files);
+
+/*
+ * Whether hkdfguard_open_file, under this machine's security model (see
+ * hkdfguard_security_model), trusts the account or group `sid` - a SID
+ * string such as "S-1-5-32-544" - to own a key file or a folder above one,
+ * or to hold rights that could change, replace or create entries in them.
+ * Lets a tool that prepares or writes key files check a folder against the
+ * exact rule the library reads by. Windows-only.
+ *
+ * Returns HKDFGUARD_OK with *out_trusted set to 1 or 0;
+ * HKDFGUARD_ERR_INVALID_ARGUMENT for a NULL pointer or a string that isn't a
+ * SID; or HKDFGUARD_ERR_POLICY_INVALID / HKDFGUARD_ERR_WIN_GROUP_INVALID as
+ * hkdfguard_security_model. *out_trusted is left unchanged on failure.
+ */
+HKDFGUARD_API int hkdfguard_key_file_principal_trusted(
+    const char* sid,
+    int* out_trusted);
+
 /*
  * Reads a wrapped-key file (e.g. one written by hkdfguard.exe
  * wrap) and returns its WRAPPED DEK bytes in `out`, exactly as stored on
@@ -433,7 +499,10 @@ HKDFGUARD_API int hkdfguard_generate_and_wrap_dek(
  *           mid-write.
  *           The file, and every folder above it up to the drive root,
  *           must be owned by SYSTEM, BUILTIN\Administrators,
- *           TrustedInstaller or the account this process runs as, and
+ *           TrustedInstaller or - by security model, see
+ *           hkdfguard_security_model - a deployer group or a direct member
+ *           of one (production, the default) or the account this process
+ *           runs as (developer), and
  *           must grant no other account the right to change it: on the
  *           file, write, append, write attributes or extended attributes,
  *           delete, change permissions or take ownership; on a folder,

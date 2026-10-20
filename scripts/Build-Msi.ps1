@@ -212,12 +212,14 @@ $msgFileRow = $reg | Where-Object { $_[0] -eq '2' -and $_[1] -eq $eventSourceKey
 $typesRow = $reg | Where-Object { $_[0] -eq '2' -and $_[1] -eq $eventSourceKey -and $_[2] -eq 'TypesSupported' -and $_[3] -eq '#7' }
 Expect ($null -ne $msgFileRow -and $null -ne $typesRow) "registers the hkdfguard-native-windows event source with the DLL as its message file"
 
-$ca = Get-Rows "SELECT ``Action``, ``Type`` FROM ``CustomAction`` WHERE ``Action``='CreateHkdfGuardUsersGroup'" 2
 # msidbCustomActionTypeInScript (0x400) + NoImpersonate (0x800) = deferred,
 # as LocalSystem; ContinueOnReturn (0x40) must be clear so a failure fails
 # the install.
-$caType = if ($ca.Count -eq 1) { [int]$ca[0][1] } else { 0 }
-Expect ($ca.Count -eq 1 -and ($caType -band 0xC00) -eq 0xC00 -and ($caType -band 0x40) -eq 0) "creates HkdfGuardUsers in a deferred, non-impersonated, checked custom action"
+foreach ($group in 'HkdfGuardUsers', 'HkdfGuardDeployers') {
+    $ca = Get-Rows "SELECT ``Action``, ``Type`` FROM ``CustomAction`` WHERE ``Action``='Create${group}Group'" 2
+    $caType = if ($ca.Count -eq 1) { [int]$ca[0][1] } else { 0 }
+    Expect ($ca.Count -eq 1 -and ($caType -band 0xC00) -eq 0xC00 -and ($caType -band 0x40) -eq 0) "creates $group in a deferred, non-impersonated, checked custom action"
+}
 
 $seq = @{}
 foreach ($row in (Get-Rows "SELECT ``Action``, ``Sequence`` FROM ``InstallExecuteSequence``" 2)) { $seq[$row[0]] = [int]$row[1] }
