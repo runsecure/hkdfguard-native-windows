@@ -3184,6 +3184,114 @@ int main() {
         FreeSid(admins);
     }
 
+    // ---- 24d. The key-file trust rule and plaintext detector, directly. ----
+    // CheckKeyFileSecurity on descriptors built from SDDL, so owners that
+    // would need SeRestorePrivilege to set on a real file can be tried
+    // without elevation; and the plaintext detector on edge cases that
+    // never need a file.
+    {
+        const std::wstring me = CurrentUserSidString();
+        const std::wstring trusted_installer = L"S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
+        auto verdict = [](const std::wstring& sddl, bool folder) {
+            PSECURITY_DESCRIPTOR sd = nullptr;
+            if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.c_str(), SDDL_REVISION_1, &sd, nullptr)) {
+                return static_cast<int32_t>(1); // the test's own SDDL is wrong
+            }
+            int32_t code = CodeOf([&] { hkdfguard::CheckKeyFileSecurity(sd, folder); });
+            LocalFree(sd);
+            return code;
+        };
+        struct Case {
+            std::wstring sddl;
+            bool folder;
+            int32_t want;
+            const char* what;
+        };
+        const Case cases[] = {
+            // Owners.
+            {L"O:SYD:P(A;;FA;;;SY)", false, HKDFGUARD_OK, "a file owned by SYSTEM is trusted"},
+            {L"O:BAD:P(A;;FA;;;BA)", false, HKDFGUARD_OK, "a file owned by Administrators is trusted"},
+            {L"O:" + trusted_installer + L"D:P(A;;FA;;;SY)", false, HKDFGUARD_OK, "a file owned by TrustedInstaller is trusted"},
+            {L"O:" + me + L"D:P(A;;FA;;;" + me + L")", false, HKDFGUARD_OK, "a file owned by this account is trusted"},
+            {L"O:BUD:P(A;;FA;;;SY)", false, HKDFGUARD_ERR_FILE_UNTRUSTED, "a file owned by BUILTIN\\Users is untrusted"},
+            {L"O:WDD:P(A;;FA;;;SY)", false, HKDFGUARD_ERR_FILE_UNTRUSTED, "a file owned by Everyone is untrusted"},
+            {L"O:BUD:P(A;;FA;;;SY)", true, HKDFGUARD_ERR_FILE_UNTRUSTED, "a folder owned by BUILTIN\\Users is untrusted"},
+            {L"O:LSD:P(A;;FA;;;SY)", true, HKDFGUARD_ERR_FILE_UNTRUSTED, "a folder owned by LocalService is untrusted"},
+            // No DACL, or a NULL one, is unrestricted access.
+            {L"O:SY", false, HKDFGUARD_ERR_FILE_UNTRUSTED, "a file with no DACL is untrusted"},
+            {L"O:SYD:NO_ACCESS_CONTROL", false, HKDFGUARD_ERR_FILE_UNTRUSTED, "a file with a NULL DACL is untrusted"},
+            {L"O:SYD:P", false, HKDFGUARD_OK, "a file with an empty DACL is trusted (only its owner can change it)"},
+            // File rights, one at a time.
+            {L"O:SYD:P(A;;FR;;;WD)", false, HKDFGUARD_OK, "Everyone reading a file is fine (it's ciphertext)"},
+            {L"O:SYD:P(A;;0x2;;;BU)", false, HKDFGUARD_ERR_FILE_UNTRUSTED, "Users with FILE_WRITE_DATA on a file is untrusted"},
+            {L"O:SYD:P(A;;0x4;;;BU)", false, HKDFGUARD_ERR_FILE_UNTRUSTED, "Users with FILE_APPEND_DATA on a file is untrusted"},
+            {L"O:SYD:P(A;;0x10;;;BU)", false, HKDFGUARD_ERR_FILE_UNTRUSTED, "Users with FILE_WRITE_EA on a file is untrusted"},
+            {L"O:SYD:P(A;;0x100;;;BU)", false, HKDFGUARD_ERR_FILE_UNTRUSTED, "Users with FILE_WRITE_ATTRIBUTES on a file is untrusted"},
+            {L"O:SYD:P(A;;SD;;;AU)", false, HKDFGUARD_ERR_FILE_UNTRUSTED, "Authenticated Users with DELETE on a file is untrusted"},
+            {L"O:SYD:P(A;;WD;;;BU)", false, HKDFGUARD_ERR_FILE_UNTRUSTED, "Users with WRITE_DAC on a file is untrusted"},
+            {L"O:SYD:P(A;;WO;;;BU)", false, HKDFGUARD_ERR_FILE_UNTRUSTED, "Users with WRITE_OWNER on a file is untrusted"},
+            {L"O:SYD:P(A;;GW;;;BU)", false, HKDFGUARD_ERR_FILE_UNTRUSTED, "Users with GENERIC_WRITE on a file is untrusted"},
+            {L"O:SYD:P(A;;GA;;;BU)", false, HKDFGUARD_ERR_FILE_UNTRUSTED, "Users with GENERIC_ALL on a file is untrusted"},
+            {L"O:SYD:P(A;;FA;;;S-1-5-21-1-2-3-1001)", false, HKDFGUARD_ERR_FILE_UNTRUSTED, "another user with full control of a file is untrusted"},
+            // Trusted principals may hold any right.
+            {L"O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;" + trusted_installer + L")(A;;FA;;;" + me + L")(A;;FA;;;OW)", false,
+             HKDFGUARD_OK, "SYSTEM, Administrators, TrustedInstaller, this account and OWNER RIGHTS may write a file"},
+            // ACE kinds.
+            {L"O:SYD:P(D;;FA;;;WD)(A;;FA;;;SY)", false, HKDFGUARD_OK, "a deny ACE is never a reason to refuse"},
+            {L"O:SYD:P(A;OIIO;FA;;;WD)", true, HKDFGUARD_OK, "an inherit-only ACE does not apply to the folder itself"},
+            {L"O:SYD:P(XA;;FA;;;WD;(Member_of {SID(BA)}))", false, HKDFGUARD_ERR_FILE_UNTRUSTED,
+             "a conditional allow ACE is judged as if its condition held"},
+            // Folder rights: replacing entries is refused, creating them is not.
+            {L"O:SYD:P(A;;0x40;;;BU)", true, HKDFGUARD_ERR_FILE_UNTRUSTED, "Users with FILE_DELETE_CHILD on a folder is untrusted"},
+            {L"O:SYD:P(A;;SD;;;BU)", true, HKDFGUARD_ERR_FILE_UNTRUSTED, "Users with DELETE on a folder is untrusted"},
+            {L"O:SYD:P(A;;WD;;;BU)", true, HKDFGUARD_ERR_FILE_UNTRUSTED, "Users with WRITE_DAC on a folder is untrusted"},
+            {L"O:SYD:P(A;;WO;;;BU)", true, HKDFGUARD_ERR_FILE_UNTRUSTED, "Users with WRITE_OWNER on a folder is untrusted"},
+            {L"O:SYD:P(A;;0x1301bf;;;AU)", true, HKDFGUARD_ERR_FILE_UNTRUSTED,
+             "Authenticated Users: Modify on a folder (what a new folder under C:\\ inherits) is untrusted"},
+            {L"O:SYD:P(A;;0x116;;;BU)", true, HKDFGUARD_OK,
+             "Users creating files and folders in a folder (C:\\ProgramData-style) is fine"},
+            {L"O:SYD:P(A;;0x116;;;BU)", false, HKDFGUARD_ERR_FILE_UNTRUSTED, "...but the same mask on a file is write access"},
+            {L"O:SYD:P(A;;GW;;;BU)", true, HKDFGUARD_OK, "GENERIC_WRITE on a folder maps only to creating entries"},
+            // C:\ as it ships.
+            {L"O:" + trusted_installer + L"D:P(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;0x1200a9;;;BU)"
+                                         L"(A;OICIIO;SDGXGWGR;;;AU)(A;;0x4;;;AU)", true, HKDFGUARD_OK,
+             "the system drive root's shipped ACL is trusted"},
+        };
+        for (const Case& c : cases) {
+            int32_t got = verdict(c.sddl, c.folder);
+            Check(got == c.want, (std::string("key-file trust: ") + c.what).c_str());
+            if (got != c.want) std::printf("    (CheckKeyFileSecurity returned %d)\n", got);
+        }
+
+        auto plain = [](const std::string& s) {
+            return hkdfguard::LooksLikePlaintextKeyForTest(reinterpret_cast<const uint8_t*>(s.data()), s.size());
+        };
+        std::vector<uint8_t> zeros(HKDFGUARD_DEK_LEN, 0);
+        const std::string b64 = Base64Of(zeros, false, true); // "AAAA...A="
+        Check(plain(b64), "detector: base64 of a DEK");
+        Check(plain(std::string(30, ' ') + b64 + std::string(22, '\n')), "detector: base64 with 96 bytes in all");
+        Check(!plain(std::string(31, ' ') + b64 + std::string(22, '\n')), "detector: nothing over 96 bytes is a text DEK");
+        Check(!plain(b64.substr(0, 42) + "B="), "detector: base64 whose unused trailing bits are set is not a DEK");
+        Check(plain(b64.substr(0, 42) + "E="), "detector: base64 ending in a character with zero trailing bits is a DEK");
+        Check(plain("+" + b64.substr(1, 41) + "A"), "detector: 43 characters of standard-alphabet base64 is a DEK");
+        Check(!plain("+" + b64.substr(1, 40) + "-A"), "detector: base64 mixing the standard and URL-safe alphabets is not a DEK");
+        Check(!plain(b64.substr(0, 42) + "=="), "detector: 44 characters ending \"==\" is not a 32-byte DEK");
+        Check(!plain(b64 + "="), "detector: an extra '=' is not a DEK");
+        Check(!plain("\v" + b64), "detector: vertical tab is not trimmed (as Rust's trim_ascii)");
+        Check(plain(std::string(HKDFGUARD_DEK_LEN, '\0')), "detector: any 32 raw bytes");
+        // The constant-time rewrite: the same answers as the Linux build's
+        // edge-case test (the_detector_s_edge_cases_match_the_windows_build).
+        Check(plain("\f" + b64 + "\f"), "detector: form feed is trimmed");
+        Check(!plain(""), "detector: empty is not a DEK");
+        Check(!plain(std::string(50, ' ')), "detector: only whitespace is not a DEK");
+        Check(plain(Base64Of(zeros, true, false)), "detector: URL-safe base64 without padding is a DEK");
+        Check(plain(std::string(64, 'F')), "detector: 64 uppercase hex digits are a DEK");
+        Check(plain("  " + std::string(64, 'a') + "\r\n"), "detector: 64 hex digits with surrounding whitespace are a DEK");
+        Check(!plain(std::string(63, 'a') + "g"), "detector: 64 characters with one not hex are not a DEK");
+        Check(!plain(std::string(32, 'a') + "\n" + std::string(32, 'a')), "detector: whitespace inside the text is not trimmed");
+        Check(!plain(b64.substr(0, 20) + "=" + b64.substr(21)), "detector: '=' anywhere but the end is not a DEK");
+    }
+
     // ---- 25. KeyStoragePolicy is honored for all three values, forced via ----
     //          a test-only override so this doesn't depend on this
     //          machine's real registry policy setting or TPM/vTPM
