@@ -2438,9 +2438,16 @@ int main() {
                     message = e.what();
                 }
                 if (IsElevated()) {
-                    Check(message.find("create files or folders") != std::string::npos,
-                          "...because C:\\Windows\\Temp lets other accounts create files or folders in it");
-                    if (message.find("create files or folders") == std::string::npos) {
+                    // The first offending permission is the reason given: on a
+                    // stock Windows, Users' create rights; on images that also
+                    // let Users delete or replace entries there (GitHub's
+                    // hosted runners among them), that. Both are refusals of
+                    // other accounts' write access to the folder.
+                    const bool other_writer = message.find("create files or folders") != std::string::npos ||
+                                              message.find("write, delete or ownership rights") != std::string::npos;
+                    Check(other_writer,
+                          "...because C:\\Windows\\Temp lets other accounts create, delete or replace entries in it");
+                    if (!other_writer) {
                         std::printf("    (message: %s)\n", message.c_str());
                     }
                 } else {

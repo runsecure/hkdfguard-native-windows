@@ -662,13 +662,18 @@ try {
 
     # Shared system folders that let Users create entries are refused, and
     # the message says to keep the key elsewhere rather than to change them.
+    # The reason given is the first offending permission found: on a stock
+    # Windows that's Users' create rights, but some images (GitHub's hosted
+    # runners among them) also let Users delete or replace entries in
+    # C:\Windows\Temp, which is refused for that instead. Either refusal is
+    # right; the check accepts both.
     $windowsTempKey = Join-Path $env:SystemRoot ("Temp\hkdfguard-cli-" + [Guid]::NewGuid().ToString("N") + ".key")
     $programDataKey = Join-Path $env:ProgramData ("hkdfguard-cli-" + [Guid]::NewGuid().ToString("N") + ".key")
     $elevatedNow = (New-Object System.Security.Principal.WindowsPrincipal([System.Security.Principal.WindowsIdentity]::GetCurrent())).IsInRole(
         [System.Security.Principal.WindowsBuiltInRole]::Administrator)
     foreach ($shared in @($windowsTempKey, $programDataKey)) {
         $r = Invoke-Cli @("wrap", "--key-file-path", $shared, "--service-name", $neverProvisionedService, "--dek-stdin") -StdIn $validB64
-        $ok = ($r.ExitCode -eq 1) -and ($r.StdErr -match "create files or folders in it") -and ($r.StdErr -match "shared system folder") -and
+        $ok = ($r.ExitCode -eq 1) -and ($r.StdErr -match "create files or folders in it|delete, rename or replace its entries") -and ($r.StdErr -match "shared system folder") -and
               ($r.StdErr -match "do not change its permissions")
         if (-not $elevatedNow -and $shared -eq $windowsTempKey) {
             # Unelevated, C:\Windows\Temp can't even be opened to read its

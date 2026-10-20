@@ -72,7 +72,10 @@ trap {
 # file was in use) - both are installs or removals that took effect.
 function Test-MsiSuccess([int]$code) { return $code -eq 0 -or $code -eq 3010 }
 
-$InstallDir = Join-Path $env:ProgramFiles "HkdfGuard"
+# Where the MSI installs (installer/hkdfguard-native-windows.wxs): a "v1"
+# folder under Program Files\HkdfGuard, the one place the major version
+# appears, so a future major version installs beside it.
+$InstallDir = Join-Path $env:ProgramFiles "HkdfGuard\v1"
 $InstallKey = "HKLM:\Software\hkdfguard-native-windows"
 $EventSourceKey = "HKLM:\SYSTEM\CurrentControlSet\Services\EventLog\Application\hkdfguard-native-windows"
 New-Item -ItemType Directory -Force -Path $Out | Out-Null
