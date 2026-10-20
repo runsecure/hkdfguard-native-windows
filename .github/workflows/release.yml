@@ -142,12 +142,23 @@ jobs:
           $ProgressPreference = "SilentlyContinue"
           $msi = Join-Path $env:RUNNER_TEMP "ArtifactSigningClientTools.msi"
           $log = Join-Path $env:RUNNER_TEMP "ArtifactSigningClientTools-install.log"
+          # A line before each phase, so a stall shows which one it is.
+          function Step([string]$what) { Write-Host ("[{0:HH:mm:ss}] {1}" -f (Get-Date), $what) }
+          Step "Downloading the client tools installer"
           Invoke-WebRequest -UseBasicParsing -TimeoutSec 300 -Uri "https://download.microsoft.com/download/70ad2c3b-761f-4aa9-a9de-e7405aa2b4c1/ArtifactSigningClientTools.msi" -OutFile $msi
+          Step ("Downloaded {0:N0} bytes; checking its signature" -f (Get-Item $msi).Length)
           $sig = Get-AuthenticodeSignature -FilePath $msi
           if ($sig.Status -ne "Valid" -or $sig.SignerCertificate.Subject -notmatch "O=Microsoft Corporation") {
             throw "The downloaded client tools installer is not validly signed by Microsoft ($($sig.Status): $($sig.SignerCertificate.Subject))."
           }
-          $proc = Start-Process msiexec.exe -ArgumentList @("/i", "`"$msi`"", "/quiet", "/norestart", "/l*v", "`"$log`"") -Wait -PassThru
+          Step "Installing (msiexec, logging to $log)"
+          $proc = Start-Process msiexec.exe -ArgumentList @("/i", "`"$msi`"", "/quiet", "/norestart", "/l*v", "`"$log`"") -PassThru
+          # Don't wait forever: a hung install fails in 5 minutes, with its log.
+          if (-not $proc.WaitForExit(300000)) {
+            $proc.Kill()
+            if (Test-Path $log) { Get-Content $log -Tail 60 }
+            throw "client tools install did not finish within 5 minutes"
+          }
           if ($proc.ExitCode -ne 0 -and $proc.ExitCode -ne 3010) {
             if (Test-Path $log) { Get-Content $log -Tail 60 }
             throw "client tools install failed (msiexec exit $($proc.ExitCode))"
@@ -155,6 +166,7 @@ jobs:
           # The installer may install per-user or per-machine. Look where it
           # puts the plugin, then - still narrowly - inside any folder named
           # for signing under each Microsoft folder. Never a whole-disk search.
+          Step "Installed (msiexec exit $($proc.ExitCode)); looking for the plugin"
           $known = @(
             (Join-Path $env:LOCALAPPDATA "Microsoft\MicrosoftArtifactSigningClientTools\Azure.CodeSigning.Dlib.dll"),
             (Join-Path $env:ProgramFiles "Microsoft\MicrosoftArtifactSigningClientTools\Azure.CodeSigning.Dlib.dll"),
@@ -162,6 +174,7 @@ jobs:
           )
           $dlib = $known | Where-Object { Test-Path $_ } | Select-Object -First 1
           if (-not $dlib) {
+            Step "Not in the known folders; searching the Microsoft folders' *Signing* subfolders"
             $signingDirs = foreach ($base in $env:LOCALAPPDATA, $env:ProgramFiles, ${env:ProgramFiles(x86)}) {
               Get-ChildItem -Path (Join-Path $base "Microsoft") -Directory -Filter "*Signing*" -ErrorAction SilentlyContinue
             }
