@@ -50,6 +50,14 @@ namespace hkdfguard {
     // this always reads the registry.
     KeyStoragePolicy LoadEffectivePolicy() noexcept;
 
+    // The value-to-policy rule LoadEffectivePolicy applies, with no
+    // registry I/O, so it can be tested directly. `found`: the value exists
+    // (only a missing value is "never configured" and gets the PreferTpm
+    // default). `readable`: it was read whole as 4 bytes - a REG_QWORD or a
+    // long REG_SZ isn't. Anything present but unreadable, of another type,
+    // or not 0/1/2 is KeyStoragePolicy::Invalid.
+    KeyStoragePolicy ParseKeyStoragePolicy(bool found, bool readable, unsigned long type, unsigned long value) noexcept;
+
 // Test-only seam: makes LoadEffectivePolicy() return `policy` instead of
 // reading the registry, regardless of this machine's actual configured
 // policy - lets tests exercise all three KeyStoragePolicy branches

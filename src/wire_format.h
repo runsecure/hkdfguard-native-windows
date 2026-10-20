@@ -63,10 +63,12 @@ namespace hkdfguard {
     // for a matching fingerprint would let an attacker-controlled field
     // steer key selection.
     //
-    // The input hashed is the raw 64-byte X || Y - the same bytes this
-    // project's macOS implementation hashes (CryptoKit's rawRepresentation),
-    // so the two produce identical fingerprints for identical keys, though
-    // cross-platform payload parity is not otherwise a goal.
+    // The input hashed is the raw 64-byte X || Y, with no 0x04 prefix. The
+    // Linux and macOS implementations hash the uncompressed SEC1 encoding
+    // (0x04 || X || Y), so the same key fingerprints differently there. That
+    // is harmless - a payload is only ever opened on the host that wrapped
+    // it, and cross-platform payload parity is not a goal - but a
+    // fingerprint is only meaningful on the platform that produced it.
     //
     // Deliberately serialized field-by-field rather than via a packed C struct,
     // so the wire format has no dependency on compiler struct-packing rules.

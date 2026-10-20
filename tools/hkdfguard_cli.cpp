@@ -1017,7 +1017,12 @@ namespace {
     };
 
     constexpr const char *kOverBroadGroupSidStrings[] = {
-        "S-1-5-80-0", // NT SERVICE\ALL SERVICES
+        "S-1-5-80-0",   // NT SERVICE\ALL SERVICES
+        "S-1-5-17",     // NT AUTHORITY\IUSR: every anonymous IIS request
+        "S-1-5-32-568", // BUILTIN\IIS_IUSRS: every IIS application pool
+        "S-1-5-1",      // NT AUTHORITY\DIALUP
+        "S-1-5-1000",   // NT AUTHORITY\OTHER ORGANIZATION
+        "S-1-5-64-36",  // NT AUTHORITY\Cloud Account Authentication
     };
 
     // S-1-5-21-<domain>-513: "Domain Users", called "None" in the local SAM -
@@ -1157,7 +1162,13 @@ namespace {
             if (!InitializeAcl(acl, aclSize, ACL_REVISION)) {
                 throw CliError("InitializeAcl failed: " + FormatWin32Error(GetLastError()));
             }
-            if (!AddAccessAllowedAce(acl, ACL_REVISION, FILE_GENERIC_READ | FILE_GENERIC_WRITE, owner)) {
+            // DELETE too, so the owner can replace its own key file with the
+            // next release's (`wrap --force` overwrites it, then deletes it
+            // through that handle). Without it a deployer - who, by the
+            // recommended folder grant, has Modify on the key folder but not
+            // "delete subfolders and files" - couldn't, since this DACL is
+            // protected and inherits nothing from the folder.
+            if (!AddAccessAllowedAce(acl, ACL_REVISION, FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE, owner)) {
                 throw CliError("AddAccessAllowedAce(owner) failed: " + FormatWin32Error(GetLastError()));
             }
             if (group != nullptr && !AddAccessAllowedAce(acl, ACL_REVISION, FILE_GENERIC_READ, group)) {
@@ -1307,6 +1318,10 @@ namespace {
         if (!hkdfguard_nofollow::OpenFolderChain(AnsiToWide(full), chain, error)) {
             const std::string at = WideToAnsi(error.at);
             switch (error.failure) {
+                case hkdfguard_nofollow::Failure::NotLocalDrive:
+                    throw CliError(
+                        what + " is not on a local drive (UNC paths, mapped network and SUBST drives, and devices are "
+                        "refused)");
                 case hkdfguard_nofollow::Failure::ReparsePoint:
                     throw CliError(
                         what + " resolves through a symbolic link, junction or other reparse point at \"" + at +
@@ -2527,24 +2542,29 @@ namespace {
                 "deleting " + where + " failed: " + NCryptErrorText(status) + "; run `" + kProgramNameNarrow +
                 " status` to see whether it remains");
         }
-        if (OpenKekDirect(service, provider)) {
-            throw CliError(where + " was deleted, but a key under its name is still found; investigate before relying on it being gone");
-        }
 
+        // Recorded the moment the delete succeeds, before anything else can
+        // fail: a KEK deleted with no event in the log is the one outcome
+        // this must never have.
         const std::string identity =
             args.fingerprint ? "fingerprint " + HexString(*args.fingerprint)
                              : "corrupt: " + target.inspection.description + ", not a P-256 ECDH key";
         const bool logged = LogKekRetired(
             "KEK retired for service '" + service + "' on the " + ProviderLabel(provider) + " (" + identity +
             ") by " + kProgramNameNarrow + " retire. Every DEK wrapped under it is permanently unrecoverable.");
+        if (!logged) {
+            fprintf(stderr, "warning: the retirement could not be recorded in the Application event log (event 1004)\n");
+        }
+
+        // Then confirm it's gone, by reopening the name on that provider.
+        if (OpenKekDirect(service, provider)) {
+            throw CliError(where + " was deleted, but a key under its name is still found; investigate before relying on it being gone");
+        }
 
         fprintf(stdout, "retired KEK for service \"%s\" (%s, %s)\n", service.c_str(), identity.c_str(),
                 ProviderLabel(provider));
         if (args.fingerprint) {
             fprintf(stdout, "every payload wrapped under it is now permanently unrecoverable\n");
-        }
-        if (!logged) {
-            fprintf(stderr, "warning: the retirement could not be recorded in the Application event log (event 1004)\n");
         }
 
         // A key on the other provider, if any, is untouched - and may be the

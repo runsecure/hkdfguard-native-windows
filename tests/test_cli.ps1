@@ -150,15 +150,20 @@ try { $priorModel = (Get-ItemProperty -Path $policyKey -Name SecurityModel -Erro
 $isAdminRun = (New-Object System.Security.Principal.WindowsPrincipal(
     [System.Security.Principal.WindowsIdentity]::GetCurrent())).IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
 $pinnedModel = $false
-if ($isAdminRun) {
-    if (-not (Test-Path $policyKey)) { New-Item -Path $policyKey -Force | Out-Null }
-    Set-ItemProperty -Path $policyKey -Name SecurityModel -Type DWord -Value 1
-    $pinnedModel = $true
+if ($priorModel -eq 1) {
+    Write-Host "[WARN] SecurityModel is already 1 (developer) on this machine. If that isn't deliberate, an interrupted test run may have left it: remove HKLM\Software\Policies\HkdfGuard\SecurityModel." -ForegroundColor Yellow
 }
-$developerModel = $pinnedModel -or ($priorModel -eq 1)
 New-Item -ItemType Directory -Force -Path $workDir | Out-Null
 
 try {
+    # Set inside the try, so the finally block always puts it back.
+    if ($isAdminRun) {
+        if (-not (Test-Path $policyKey)) { New-Item -Path $policyKey -Force | Out-Null }
+        $pinnedModel = $true
+        Set-ItemProperty -Path $policyKey -Name SecurityModel -Type DWord -Value 1
+    }
+    $developerModel = $pinnedModel -or ($priorModel -eq 1)
+
     $validB64 = [Convert]::ToBase64String((New-Object byte[] 32)) # 32 zero bytes - valid shape, not used for a real wrap
 
     # The --group every scenario below passes when the group itself isn't what
@@ -293,7 +298,7 @@ try {
     $broadGroups = @(
         "Users", "BUILTIN\Users", "Everyone", "Authenticated Users",
         "NT AUTHORITY\Local account", "NT SERVICE\ALL SERVICES", "Guests",
-        "None", "NT AUTHORITY\NTLM Authentication")
+        "None", "NT AUTHORITY\NTLM Authentication", "NT AUTHORITY\IUSR", "NT AUTHORITY\DIALUP")
     foreach ($broad in $broadGroups) {
         $broadKeyFile = Join-Path $workDir ("broad-" + ($broad -replace '[\\ ]', '_') + ".key")
         $r = Invoke-Cli @(
@@ -1079,19 +1084,26 @@ try {
                 Check $false "test setup: create a directory symbolic link to $($share.Target)"
                 continue
             }
-            $sw = [Diagnostics.Stopwatch]::StartNew()
-            $r = Invoke-Cli @("wrap", "-kf", (Join-Path $workDir "share.key"), "-sn", $neverProvisionedService, "--dek-file", (Join-Path $shareLink $share.File))
-            $sw.Stop()
-            Check (($r.ExitCode -eq 1) -and ($r.StdErr -match "reparse point at `"[^`"]*sharelink`"") -and ($r.StdErr -notmatch [regex]::Escape($share.Target))) "--dek-file through a directory symbolic link to $($share.Target) is refused at the link, not followed"
-            if ($r.StdErr -match [regex]::Escape($share.Target)) { Write-Host "    stderr: $($r.StdErr)" }
-            Check ($sw.ElapsedMilliseconds -lt 2000) "--dek-file through a link to $($share.Target) is refused at once ($($sw.ElapsedMilliseconds) ms)"
+            # The link points at a real share (C$\Windows). It is removed - the
+            # link itself, never what it points to - the moment this scenario
+            # is done, however it ends, so no later failure can leave a
+            # recursive delete free to follow it.
+            try {
+                $sw = [Diagnostics.Stopwatch]::StartNew()
+                $r = Invoke-Cli @("wrap", "-kf", (Join-Path $workDir "share.key"), "-sn", $neverProvisionedService, "--dek-file", (Join-Path $shareLink $share.File))
+                $sw.Stop()
+                Check (($r.ExitCode -eq 1) -and ($r.StdErr -match "reparse point at `"[^`"]*sharelink`"") -and ($r.StdErr -notmatch [regex]::Escape($share.Target))) "--dek-file through a directory symbolic link to $($share.Target) is refused at the link, not followed"
+                if ($r.StdErr -match [regex]::Escape($share.Target)) { Write-Host "    stderr: $($r.StdErr)" }
+                Check ($sw.ElapsedMilliseconds -lt 2000) "--dek-file through a link to $($share.Target) is refused at once ($($sw.ElapsedMilliseconds) ms)"
 
-            $sw = [Diagnostics.Stopwatch]::StartNew()
-            $r = Invoke-Cli @("wrap", "-kf", (Join-Path $shareLink "hkdfguard-probe.key"), "-sn", $neverProvisionedService, "--dek-stdin") -StdIn $validB64
-            $sw.Stop()
-            Check (($r.ExitCode -eq 1) -and ($r.StdErr -match "reparse point at `"[^`"]*sharelink`"") -and ($r.StdErr -notmatch [regex]::Escape($share.Target))) "an output path through a directory symbolic link to $($share.Target) is refused at the link, not followed"
-            Check ($sw.ElapsedMilliseconds -lt 2000) "an output path through a link to $($share.Target) is refused at once ($($sw.ElapsedMilliseconds) ms)"
-            cmd /c rmdir "$shareLink" 2>&1 | Out-Null
+                $sw = [Diagnostics.Stopwatch]::StartNew()
+                $r = Invoke-Cli @("wrap", "-kf", (Join-Path $shareLink "hkdfguard-probe.key"), "-sn", $neverProvisionedService, "--dek-stdin") -StdIn $validB64
+                $sw.Stop()
+                Check (($r.ExitCode -eq 1) -and ($r.StdErr -match "reparse point at `"[^`"]*sharelink`"") -and ($r.StdErr -notmatch [regex]::Escape($share.Target))) "an output path through a directory symbolic link to $($share.Target) is refused at the link, not followed"
+                Check ($sw.ElapsedMilliseconds -lt 2000) "an output path through a link to $($share.Target) is refused at once ($($sw.ElapsedMilliseconds) ms)"
+            } finally {
+                try { [System.IO.Directory]::Delete($shareLink) } catch { }
+            }
         }
         Check (-not (Test-Path '\\localhost\C$\Windows\hkdfguard-probe.key')) "no key file was written to the share"
 
@@ -1138,6 +1150,27 @@ finally {
         } else {
             Set-ItemProperty -Path $policyKey -Name SecurityModel -Type DWord -Value $priorModel
         }
+    }
+    # Links first, each removed as itself: Windows PowerShell's recursive
+    # delete follows a directory link and empties its target, and scenarios
+    # here link to other folders and to \\localhost\C$\Windows. The walk never
+    # descends into a link, so nothing outside $workDir is touched.
+    function Remove-LinksUnder([string]$dir) {
+        foreach ($entry in [System.IO.Directory]::GetFileSystemEntries($dir)) {
+            $attributes = [System.IO.File]::GetAttributes($entry)
+            if ($attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+                if ($attributes -band [System.IO.FileAttributes]::Directory) {
+                    [System.IO.Directory]::Delete($entry)
+                } else {
+                    [System.IO.File]::Delete($entry)
+                }
+            } elseif ($attributes -band [System.IO.FileAttributes]::Directory) {
+                Remove-LinksUnder $entry
+            }
+        }
+    }
+    if (Test-Path -LiteralPath $workDir) {
+        try { Remove-LinksUnder $workDir } catch { Write-Host "[WARN] could not remove a link under ${workDir}: $($_.Exception.Message)" }
     }
     Remove-Item -Recurse -Force $workDir -ErrorAction SilentlyContinue
 }

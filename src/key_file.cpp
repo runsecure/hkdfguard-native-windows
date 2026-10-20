@@ -625,6 +625,8 @@ namespace hkdfguard {
         hkdfguard_nofollow::Error walk;
         if (!hkdfguard_nofollow::OpenFolderChain(expected, chain, walk)) {
             switch (walk.failure) {
+                case hkdfguard_nofollow::Failure::NotLocalDrive:
+                    throw HkdfGuardError(HKDFGUARD_ERR_FILE_UNTRUSTED, "path is not on a local drive");
                 case hkdfguard_nofollow::Failure::ReparsePoint:
                     throw HkdfGuardError(HKDFGUARD_ERR_FILE_UNTRUSTED,
                                          "a folder in the path is a symbolic link, junction or other reparse point");

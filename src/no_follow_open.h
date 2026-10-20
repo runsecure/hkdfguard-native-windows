@@ -108,13 +108,46 @@ namespace hkdfguard_nofollow {
         std::wstring at;  // the path up to and including the component that failed
     };
 
+    // Whether a drive letter's object-manager target (QueryDosDeviceW) is a
+    // local volume device: exactly "\Device\<name>", nothing after it, and
+    // not a network or redirector device. Case-insensitive, as the object
+    // manager is. A SUBST drive's target is a path ("\??\C:\folder",
+    // "\??\UNC\server\share"); a mapped drive's, or one redefined with a raw
+    // target, is a device *with* a path ("\Device\Mup\server\share",
+    // "\Device\LanmanRedirector\;Z:...\server\share"). Both are refused by
+    // the "nothing after it" rule; the name list catches a bare redirector.
+    inline bool IsLocalVolumeDeviceTarget(const std::wstring &device) {
+        static const wchar_t kPrefix[] = L"\\Device\\";
+        const size_t prefix_len = ARRAYSIZE(kPrefix) - 1;
+        if (device.size() <= prefix_len ||
+            CompareStringOrdinal(device.c_str(), static_cast<int>(prefix_len), kPrefix, static_cast<int>(prefix_len),
+                                 TRUE) != CSTR_EQUAL) {
+            return false;
+        }
+        const std::wstring name = device.substr(prefix_len);
+        if (name.find(L'\\') != std::wstring::npos || name.find(L'/') != std::wstring::npos) {
+            return false;
+        }
+        std::wstring upper = name;
+        CharUpperBuffW(upper.data(), static_cast<DWORD>(upper.size()));
+        for (const wchar_t *network : {L"MUP", L"REDIRECTOR", L"RDPDR", L"WEBDAV", L"NAMEDPIPE", L"MAILSLOT", L"NFS"}) {
+            if (upper.find(network) != std::wstring::npos) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     // Whether `full` - a fully-qualified path, as GetFullPathNameW returns it -
     // is on a local drive, decided without touching the file system: the
     // drive letter must name a local volume device. Refuses UNC and device
     // paths, mapped network drives, and SUBST drives (whose target is another
     // path, possibly a share - opening their root would already reach it).
-    // GetDriveTypeW asks only the mount manager, and QueryDosDeviceW reads the
-    // drive letter's object-manager link; neither opens anything.
+    // The drive letter's target is read first (QueryDosDeviceW reads an
+    // object-manager link and opens nothing); only for a local volume is
+    // GetDriveTypeW asked as well. OpenFolderChain checks this again before
+    // every walk, so a drive letter redefined after an earlier check is
+    // still caught before its root is opened.
     inline bool IsLocalDrivePath(const std::wstring &full) {
         const bool drive_path =
                 full.size() >= 3 &&
@@ -123,22 +156,15 @@ namespace hkdfguard_nofollow {
         if (!drive_path) {
             return false;
         }
-        if (GetDriveTypeW(full.substr(0, 3).c_str()) == DRIVE_REMOTE) {
-            return false;
-        }
-        // A local volume is "\Device\HarddiskVolumeN" (or a similar device).
-        // A SUBST drive is "\??\C:\folder" or "\??\UNC\server\share"; a
-        // mapped drive is under \Device\LanmanRedirector or \Device\Mup.
         wchar_t target[1024] = {};
         if (QueryDosDeviceW(full.substr(0, 2).c_str(), target, ARRAYSIZE(target)) == 0) {
             return false;
         }
-        const std::wstring device(target);
-        auto startsWith = [&device](const wchar_t *prefix) {
-            return device.compare(0, wcslen(prefix), prefix) == 0;
-        };
-        return startsWith(L"\\Device\\") && !startsWith(L"\\Device\\Mup") &&
-               device.find(L"Redirector") == std::wstring::npos;
+        if (!IsLocalVolumeDeviceTarget(target)) {
+            return false;
+        }
+        const UINT type = GetDriveTypeW(full.substr(0, 3).c_str());
+        return type != DRIVE_REMOTE && type != DRIVE_NO_ROOT_DIR && type != DRIVE_UNKNOWN;
     }
 
     // Opens or creates `name` - a single path component, never containing a
@@ -231,6 +257,14 @@ namespace hkdfguard_nofollow {
                 error = {Failure::InvalidPath, 0, full};
                 return false;
             }
+        }
+
+        // Checked again here, immediately before the root is opened by name -
+        // the one name-based open in the walk - so a drive letter redefined
+        // since the caller's own check can't send it to a server.
+        if (!IsLocalDrivePath(full)) {
+            error = {Failure::NotLocalDrive, 0, root};
+            return false;
         }
 
         Handle root_handle;

@@ -13,6 +13,7 @@
 #include "key_file.h"   // ReadWrappedKeyFile - hkdfguard_open_file's implementation, called directly in section 24c
 #include "errors.h"     // HkdfGuardError - caught by PointGateResult and CodeOf below to read error codes
 #include "key_acl.h"    // ValidateKeyUseGroups - vets the key-use policy list without touching any key
+#include "no_follow_open.h" // IsLocalDrivePath / IsLocalVolumeDeviceTarget - section -2d
 
 #include <aclapi.h>  // SetEntriesInAclW - section 25d widens an existing KEK's ACL
 #include <lm.h>      // NetLocalGroupAdd/AddMembers - section 24e makes this account a deployer
@@ -950,6 +951,80 @@ int main() {
         Check(ParseSecurityModel(true, REG_QWORD, 0) == SecurityModel::Invalid, "SecurityModel REG_QWORD 0: invalid");
     }
 
+    // ---- -2c. The KeyStoragePolicy rule: only a missing value gets the ----
+    //           PreferTpm default; anything present but not a readable
+    //           REG_DWORD 0/1/2 fails closed.
+    {
+        using hkdfguard::KeyStoragePolicy;
+        using hkdfguard::ParseKeyStoragePolicy;
+        Check(ParseKeyStoragePolicy(false, false, 0, 0) == KeyStoragePolicy::PreferTpm, "KeyStoragePolicy absent: PreferTpm");
+        Check(ParseKeyStoragePolicy(true, true, REG_DWORD, 1) == KeyStoragePolicy::RequireTpm, "KeyStoragePolicy REG_DWORD 1: RequireTpm");
+        Check(ParseKeyStoragePolicy(true, true, REG_DWORD, 2) == KeyStoragePolicy::SoftwareOnly, "KeyStoragePolicy REG_DWORD 2: SoftwareOnly");
+        Check(ParseKeyStoragePolicy(true, true, REG_DWORD, 3) == KeyStoragePolicy::Invalid, "KeyStoragePolicy REG_DWORD 3: invalid");
+        Check(ParseKeyStoragePolicy(true, false, REG_QWORD, 0) == KeyStoragePolicy::Invalid,
+              "KeyStoragePolicy present but too big for a DWORD (a REG_QWORD): invalid, not the default");
+        Check(ParseKeyStoragePolicy(true, false, REG_SZ, 0) == KeyStoragePolicy::Invalid,
+              "KeyStoragePolicy present but unreadable as a DWORD (a long REG_SZ): invalid, not the default");
+        Check(ParseKeyStoragePolicy(true, true, REG_SZ, 1) == KeyStoragePolicy::Invalid, "KeyStoragePolicy of the wrong type: invalid");
+    }
+
+    // ---- -2d. Which drive letters count as local: the drive letter's ----
+    //           target must be a bare local volume device - checked by name,
+    //           case-insensitively, with no path after it - and a drive
+    //           letter redefined to point at the network is refused without
+    //           anything being opened.
+    {
+        using hkdfguard_nofollow::IsLocalVolumeDeviceTarget;
+        Check(IsLocalVolumeDeviceTarget(L"\\Device\\HarddiskVolume3"), "drive target: \\Device\\HarddiskVolume3 is a local volume");
+        Check(IsLocalVolumeDeviceTarget(L"\\device\\harddiskvolume3"), "drive target: the device prefix is matched case-insensitively");
+        Check(!IsLocalVolumeDeviceTarget(L"\\Device\\Mup\\server\\share"), "drive target: \\Device\\Mup\\server\\share is refused");
+        Check(!IsLocalVolumeDeviceTarget(L"\\device\\mup\\server\\share"), "drive target: ...in any case");
+        Check(!IsLocalVolumeDeviceTarget(L"\\Device\\MUP"), "drive target: a bare \\Device\\MUP is refused");
+        Check(!IsLocalVolumeDeviceTarget(L"\\Device\\LanmanRedirector\\;Z:0000\\server\\share"), "drive target: a mapped drive is refused");
+        Check(!IsLocalVolumeDeviceTarget(L"\\Device\\HarddiskVolume3\\Windows"), "drive target: a device with a path after it is refused");
+        Check(!IsLocalVolumeDeviceTarget(L"\\??\\C:\\folder"), "drive target: a SUBST target is refused");
+        Check(!IsLocalVolumeDeviceTarget(L"\\Device\\RdpDr"), "drive target: a redirected Remote Desktop drive is refused");
+
+        // End to end: a free drive letter defined for this session with a
+        // raw target. Redefining a letter for one's own session needs no
+        // privilege - it's exactly what another process in the same logon
+        // session could do. QueryDosDevice is all that's asked, so a
+        // network target is refused without contacting it.
+        DWORD drives = GetLogicalDrives();
+        wchar_t letter = 0;
+        for (wchar_t c = L'Z'; c >= L'D'; --c) {
+            if (!(drives & (1u << (c - L'A')))) { letter = c; break; }
+        }
+        wchar_t windows_dir[MAX_PATH + 1] = {};
+        const UINT windows_len = GetSystemWindowsDirectoryW(windows_dir, MAX_PATH + 1);
+        const std::wstring system_drive = windows_len >= 2 ? std::wstring(windows_dir, 2) : std::wstring(L"C:");
+        wchar_t system_target[1024] = {};
+        if (letter == 0 || QueryDosDeviceW(system_drive.c_str(), system_target, ARRAYSIZE(system_target)) == 0) {
+            Skip("drive letters redefined to a network or local target (no free letter, or the system drive's target is unreadable)");
+        } else {
+            const std::wstring device = std::wstring(1, letter) + L":";
+            const std::wstring path = device + L"\\hkdfguard\\key.bin";
+            // "\Device\MUP\..." passed the old check, which matched
+            // "\Device\" but looked for "\Device\Mup" case-sensitively.
+            if (DefineDosDeviceW(DDD_RAW_TARGET_PATH, device.c_str(), L"\\Device\\MUP\\localhost\\c$")) {
+                Check(!hkdfguard_nofollow::IsLocalDrivePath(path),
+                      "a drive letter redefined to \\Device\\MUP\\... is not a local drive");
+                DefineDosDeviceW(DDD_RAW_TARGET_PATH | DDD_REMOVE_DEFINITION | DDD_EXACT_MATCH_ON_REMOVE, device.c_str(),
+                                 L"\\Device\\MUP\\localhost\\c$");
+            } else {
+                Check(false, "test setup: redefine a free drive letter to a network target");
+            }
+            if (DefineDosDeviceW(DDD_RAW_TARGET_PATH, device.c_str(), system_target)) {
+                Check(hkdfguard_nofollow::IsLocalDrivePath(path),
+                      "a drive letter defined with the system drive's own volume device is a local drive");
+                DefineDosDeviceW(DDD_RAW_TARGET_PATH | DDD_REMOVE_DEFINITION | DDD_EXACT_MATCH_ON_REMOVE, device.c_str(),
+                                 system_target);
+            } else {
+                Check(false, "test setup: define a free drive letter to the system volume");
+            }
+        }
+    }
+
 #if defined(_MSC_VER)
     // ---- -1. The DLL carries the event log message table. ----
     // The MSI registers HkdfGuard.dll as the event source's
@@ -1246,6 +1321,11 @@ int main() {
             {L"S-1-5-64-10", "create_kek rejects NT AUTHORITY\\NTLM Authentication (S-1-5-64-10)"},
             {L"S-1-5-64-14", "create_kek rejects NT AUTHORITY\\SChannel Authentication (S-1-5-64-14)"},
             {L"S-1-5-64-21", "create_kek rejects NT AUTHORITY\\Digest Authentication (S-1-5-64-21)"},
+            {L"S-1-5-17", "create_kek rejects NT AUTHORITY\\IUSR, every anonymous IIS request (S-1-5-17)"},
+            {L"S-1-5-32-568", "create_kek rejects BUILTIN\\IIS_IUSRS, every IIS application pool (S-1-5-32-568)"},
+            {L"S-1-5-1", "create_kek rejects NT AUTHORITY\\DIALUP (S-1-5-1)"},
+            {L"S-1-5-1000", "create_kek rejects NT AUTHORITY\\OTHER ORGANIZATION (S-1-5-1000)"},
+            {L"S-1-5-64-36", "create_kek rejects NT AUTHORITY\\Cloud Account Authentication (S-1-5-64-36)"},
         };
         for (const BroadPrincipal &p: broad) {
             hkdfguard::SetTestKeyUseGroupsOverride(std::vector<std::wstring>{p.sid});
@@ -3169,6 +3249,30 @@ int main() {
                                              const_cast<LPWSTR>(L"hkdfguard test")};
                 NET_API_STATUS add = NetLocalGroupAdd(nullptr, 1, reinterpret_cast<LPBYTE>(&group_info), nullptr);
                 created_group = add == NERR_Success;
+
+                // A group nested in HkdfGuardDeployers is never trusted, nor
+                // are its members: Authenticated Users, of which this account
+                // is a member, is added first - and this account's key file
+                // must stay refused.
+                PSID authenticated_users = nullptr;
+                ConvertStringSidToSidW(L"S-1-5-11", &authenticated_users);
+                LOCALGROUP_MEMBERS_INFO_0 nested{authenticated_users};
+                if (authenticated_users != nullptr &&
+                    NetLocalGroupAddMembers(nullptr, L"HkdfGuardDeployers", 0, reinterpret_cast<LPBYTE>(&nested), 1) ==
+                            NERR_Success) {
+                    Check(open_rc(own_file) == HKDFGUARD_ERR_FILE_UNTRUSTED,
+                          "production: Authenticated Users nested in HkdfGuardDeployers makes none of its members trusted");
+                    bool listed = false;
+                    for (const auto& p : hkdfguard::ResolveDeployerPrincipals({})) {
+                        listed = listed || EqualSid(authenticated_users, const_cast<BYTE*>(p.data()));
+                    }
+                    Check(!listed, "production: a nested over-broad group is never a trusted deployer principal");
+                    NetLocalGroupDelMembers(nullptr, L"HkdfGuardDeployers", 0, reinterpret_cast<LPBYTE>(&nested), 1);
+                } else {
+                    Check(false, "test setup: add Authenticated Users to HkdfGuardDeployers");
+                }
+                if (authenticated_users != nullptr) LocalFree(authenticated_users);
+
                 LOCALGROUP_MEMBERS_INFO_0 member{me};
                 const bool added = NetLocalGroupAddMembers(nullptr, L"HkdfGuardDeployers", 0,
                                                            reinterpret_cast<LPBYTE>(&member), 1) == NERR_Success;
@@ -3342,6 +3446,8 @@ int main() {
         Check(
             InternalCreateKekResult(kServiceAclWidenedWide) == HKDFGUARD_OK,
             "create_kek accepts its own, unmodified existing KEK");
+        Check(CodeOf([&] { hkdfguard::OpenKekForWrap(kServiceAclWidenedWide); }) == HKDFGUARD_OK,
+              "wrap's KEK open accepts its own, unmodified KEK (the ACL check doesn't reject our own keys)");
 
         // Widen the finalized key's DACL to include Everyone, as an
         // administrator (or a pre-planted key) could.
@@ -3394,6 +3500,15 @@ int main() {
             Check(
                 InternalCreateKekResult(kServiceAclWidenedWide) == HKDFGUARD_ERR_KEK_INVALID,
                 "create_kek rejects an existing KEK whose ACL grants an over-broad principal (KEK_INVALID)");
+            // Not only at provisioning: wrap and unwrap refuse it too, for a
+            // caller that can read the ACL (this elevated test can).
+            Check(CodeOf([&] { hkdfguard::OpenKekForWrap(kServiceAclWidenedWide); }) == HKDFGUARD_ERR_KEK_INVALID,
+                  "wrap refuses a KEK whose ACL was widened after provisioning (KEK_INVALID)");
+            Check(CodeOf([&] {
+                      hkdfguard::OpenKekForUnwrap(kServiceAclWidenedWide, hkdfguard::kProviderTypeSoftware,
+                                                  hkdfguard::kCurrentKeyId);
+                  }) == HKDFGUARD_ERR_KEK_INVALID,
+                  "unwrap refuses a KEK whose ACL was widened after provisioning (KEK_INVALID)");
             Check(
                 hkdfguard::KekExists(kServiceAclWidenedWide),
                 "a KEK rejected for its ACL is left in place, not deleted");

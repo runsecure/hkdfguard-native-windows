@@ -195,10 +195,10 @@ HKDFGUARD_API int hkdfguard_kek_exists(
  * (hkdfguard.exe retire). Never creates a KEK, and is not slowed by the setup
  * floor: it opens the KEK exactly as hkdfguard_wrap_dek does.
  *
- * Shared with the macOS build (same name and signature; on Windows the
- * buffer contract is the one every function here follows); not in the Linux
- * build. Each platform hashes its own public-key encoding, so the values are
- * only ever compared on the host that produced them.
+ * Shared with the Linux and macOS builds (same name and signature; on
+ * Windows the buffer contract is the one every function here follows). Those
+ * hash the uncompressed SEC1 encoding (0x04 || X || Y) rather than X || Y, so
+ * the values are only ever compared on the host that produced them.
  *
  * service - see hkdfguard_wrap_dek.
  * out     - caller-owned output buffer. May be NULL only if *out_len is 0, to
