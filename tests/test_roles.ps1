@@ -290,8 +290,19 @@ finally {
     }
     foreach ($user in $createdUsers) { try { $computer.Delete("user", $user) } catch { Write-Host "[WARN] could not remove test account ${user}: $($_.Exception.Message)" } }
     foreach ($group in $createdGroups) { try { $computer.Delete("group", $group) } catch { Write-Host "[WARN] could not remove group ${group}: $($_.Exception.Message)" } }
+    # The deployer's key files are protected and grant the deployer alone the
+    # right to delete them - Administrators have no entry on them at all - so
+    # each folder is first taken back: Administrators made the owner of
+    # everything in it (icacls enables the restore privilege to do that),
+    # then its permissions reset, then it's deleted and confirmed gone.
     foreach ($dir in $root, $plantDir) {
-        try { if (Test-Path -LiteralPath $dir) { Remove-Item -Recurse -Force -LiteralPath $dir } } catch { Write-Host "[WARN] could not remove ${dir}: $($_.Exception.Message)" }
+        if (-not (Test-Path -LiteralPath $dir)) { continue }
+        try {
+            & icacls.exe $dir /setowner "*S-1-5-32-544" /T /C /Q *> $null
+            & icacls.exe $dir /reset /T /C /Q *> $null
+            Remove-Item -Recurse -Force -LiteralPath $dir -ErrorAction SilentlyContinue
+        } catch { }
+        if (Test-Path -LiteralPath $dir) { Write-Host "[WARN] could not remove $dir; remove it by hand" -ForegroundColor Yellow }
     }
 }
 
