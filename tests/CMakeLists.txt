@@ -31,7 +31,7 @@ add_executable(test_roundtrip
 # calls) plus the two raw Windows crypto libraries directly (needed because
 # this executable now also compiles kek_store.cpp itself, which calls
 # NCrypt*/BCrypt* functions of its own).
-target_link_libraries(test_roundtrip PRIVATE hkdfguard ncrypt.lib bcrypt.lib)
+target_link_libraries(test_roundtrip PRIVATE hkdfguard ncrypt.lib bcrypt.lib ntdll.lib netapi32.lib)
 target_include_directories(test_roundtrip PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../include
     ${CMAKE_CURRENT_SOURCE_DIR}/../src
@@ -99,4 +99,23 @@ add_test(NAME harden_process COMMAND test_harden_process)
 set_tests_properties(harden_process PROPERTIES
     ENVIRONMENT "PATH=$<TARGET_FILE_DIR:hkdfguard>\\;${HKDFGUARD_TEST_PATH}"
     SKIP_RETURN_CODE 77
+)
+
+# test_roles.ps1 checks the production security model with real, separate
+# accounts: it creates a throwaway deployer and application account, then
+# runs the CLI and role_probe.exe (the public ABI, nothing more) as each of
+# them. Needs elevation; skipped otherwise. role_probe links only the
+# hkdfguard import library, like the CLI.
+add_executable(role_probe role_probe.cpp)
+target_link_libraries(role_probe PRIVATE hkdfguard bcrypt.lib)
+add_test(
+    NAME roles
+    COMMAND powershell.exe -NoProfile -ExecutionPolicy Bypass
+            -File "${CMAKE_CURRENT_SOURCE_DIR}/test_roles.ps1"
+            -CliExePath "$<TARGET_FILE:hkdfguard-cli>"
+            -ProbeExePath "$<TARGET_FILE:role_probe>"
+            -DllPath "$<TARGET_FILE:hkdfguard>"
+)
+set_tests_properties(roles PROPERTIES
+    ENVIRONMENT "PATH=$<TARGET_FILE_DIR:hkdfguard>\\;${HKDFGUARD_TEST_PATH}"
 )

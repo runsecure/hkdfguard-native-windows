@@ -72,7 +72,10 @@ trap {
 # file was in use) - both are installs or removals that took effect.
 function Test-MsiSuccess([int]$code) { return $code -eq 0 -or $code -eq 3010 }
 
-$InstallDir = Join-Path $env:ProgramFiles "HkdfGuard"
+# Where the MSI installs (installer/hkdfguard-native-windows.wxs): a "v1"
+# folder under Program Files\HkdfGuard, the one place the major version
+# appears, so a future major version installs beside it.
+$InstallDir = Join-Path $env:ProgramFiles "HkdfGuard\v1"
 $InstallKey = "HKLM:\Software\hkdfguard-native-windows"
 $EventSourceKey = "HKLM:\SYSTEM\CurrentControlSet\Services\EventLog\Application\hkdfguard-native-windows"
 New-Item -ItemType Directory -Force -Path $Out | Out-Null
@@ -142,19 +145,35 @@ Write-Section "CLI wrap -> hkdfguard_open_file -> hkdfguard_unwrap_dek (installe
 $cli = Join-Path $InstallDir "hkdfguard.exe"
 $dll = Join-Path $InstallDir "HkdfGuard.dll"
 $chainService = "hkdfguardcontainerchain"
-# The key files live in their own folder under C:\ProgramData, not in $work.
-# hkdfguard_open_file refuses a file if any folder above it lets another
-# account delete or rename it, and $work fails that by design: on the hosted
-# runners it is under D:\a, and in the containers it is C:\work, and a new
-# folder at a drive root inherits "Authenticated Users: Modify", which
-# includes DELETE. C:\ProgramData only lets Users create entries, so a plain
-# folder under it passes, which is also where docs/admin-guide.md tells
-# deployments to keep key files. test_roundtrip's own open_file checks pass
-# because they use %TEMP%, inside the user profile.
-$keyDir = Join-Path $env:ProgramData "hkdfguard-container-chain"
+# The key files live in a folder of their own directly under the system
+# drive's root, prepared exactly as docs/admin-guide.md ("Where to keep key
+# files") tells deployments to: inherited permissions removed, then full
+# control for SYSTEM and Administrators and read for Users, owned by
+# Administrators. hkdfguard_open_file refuses a file if any folder above it,
+# below the drive root, lets another account create, delete or rename
+# entries, and both $work and C:\ProgramData fail that by design: $work is
+# under D:\a on the hosted runners and is C:\work in the containers, and a
+# new folder at a drive root inherits "Authenticated Users: Modify"; and
+# C:\ProgramData lets Users create files and folders, so no key file
+# anywhere under it is trusted. (The drive root itself may let others
+# create folders.) test_roundtrip's own open_file checks pass because they
+# use %TEMP%, inside the user profile.
+$keyDir = Join-Path $env:SystemDrive "\hkdfguard-container-chain"
 Remove-Item -Recurse -Force $keyDir -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Path $keyDir | Out-Null
+& icacls.exe $keyDir /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" "*S-1-5-32-545:(OI)(CI)RX" *> "$Out\chain-icacls.log"
+Check ($LASTEXITCODE -eq 0) "icacls /inheritance:r /grant:r prepares the key folder $keyDir (as the admin guide says)"
+& icacls.exe $keyDir /setowner "*S-1-5-32-544" /T *>> "$Out\chain-icacls.log"
+Check ($LASTEXITCODE -eq 0) "icacls /setowner Administrators on $keyDir"
 $keyFile = Join-Path $keyDir "chain.key"
+
+# The same wrap into a folder made under C:\ProgramData with its default,
+# inherited permissions is refused up front - before the DEK is read - with
+# the reason and the fix, and writes nothing.
+$defaultDir = Join-Path $env:ProgramData "hkdfguard-container-default"
+Remove-Item -Recurse -Force $defaultDir -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Path $defaultDir | Out-Null
+$defaultKey = Join-Path $defaultDir "chain.key"
 & $cli provision --service-name $chainService *> "$Out\chain-provision.log"
 Check ($LASTEXITCODE -eq 0) "installed CLI provisions a KEK"
 $dek = New-Object byte[] 32
@@ -162,6 +181,23 @@ $dek = New-Object byte[] 32
 [Convert]::ToBase64String($dek) | & $cli wrap --key-file-path $keyFile --service-name $chainService `
     --dek-stdin --group Administrators --force *> "$Out\chain-wrap.log"
 Check ($LASTEXITCODE -eq 0) "installed CLI wraps a DEK to a file"
+
+$savedPreference = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+try {
+    $refusal = "not-base64!!" | & $cli wrap --key-file-path $defaultKey --service-name $chainService --dek-stdin 2>&1 | ForEach-Object { "$_" }
+    $refusalExit = $LASTEXITCODE
+} finally {
+    $ErrorActionPreference = $savedPreference
+}
+$refusalText = $refusal -join "`n"
+$refusal | Set-Content -Path "$Out\chain-wrap-programdata.log"
+Check ($refusalExit -eq 1 -and $refusalText -match "create files or folders in it" -and $refusalText -match "/inheritance:r" -and
+       $refusalText -notmatch "not valid base64") "installed CLI refuses to wrap into a default C:\ProgramData subfolder, before reading the DEK, with the icacls fix"
+Check (-not (Test-Path $defaultKey)) "the refused wrap wrote nothing under C:\ProgramData"
+# A copy of the good key file there, for the probe: hkdfguard_open_file must
+# refuse it (-39) because of the folders, not the file.
+Copy-Item -LiteralPath $keyFile -Destination $defaultKey
 
 # A 32-byte file - the size of a plaintext DEK - must be flagged, not read.
 $plainFile = Join-Path $keyDir "plain.key"
@@ -178,7 +214,7 @@ $plainFile = Join-Path $keyDir "plain.key"
 # The DEK goes to the child on stdin, never on its command line.
 $probe = Join-Path $work "chain-probe.ps1"
 Set-Content -Path $probe -Encoding ascii -Value @'
-param([string]$Dll, [string]$KeyFile, [string]$PlainFile, [string]$Service)
+param([string]$Dll, [string]$KeyFile, [string]$PlainFile, [string]$DefaultKeyFile, [string]$Service)
 $ErrorActionPreference = "Stop"
 $dekBase64 = [Console]::In.ReadLine()
 Add-Type -TypeDefinition @"
@@ -212,6 +248,9 @@ Result ($rc -eq 0 -and [Convert]::ToBase64String($plain) -eq $dekBase64) "a sepa
 
 $opened = Open-WrappedFile $PlainFile
 Result ($opened.Rc -eq -37 -and $opened.Len -eq 132) "hkdfguard_open_file reports a 32-byte file as HKDFGUARD_ERR_FILE_PLAINTEXT_KEY (rc $($opened.Rc)), out_len unchanged"
+
+$opened = Open-WrappedFile $DefaultKeyFile
+Result ($opened.Rc -eq -39) "hkdfguard_open_file refuses the same key file under C:\ProgramData as HKDFGUARD_ERR_FILE_UNTRUSTED (rc $($opened.Rc)): Users may create entries there"
 '@
 # Continue, not Stop, around the child: under Windows PowerShell 5.1, 2>&1
 # on a native process turns each stderr line into an error, which Stop would
@@ -220,7 +259,7 @@ $savedPreference = $ErrorActionPreference
 $ErrorActionPreference = "Continue"
 try {
     $probeOutput = [Convert]::ToBase64String($dek) | & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $probe `
-        -Dll $dll -KeyFile $keyFile -PlainFile $plainFile -Service $chainService 2>&1
+        -Dll $dll -KeyFile $keyFile -PlainFile $plainFile -DefaultKeyFile $defaultKey -Service $chainService 2>&1
     $probeExit = $LASTEXITCODE
 } finally {
     $ErrorActionPreference = $savedPreference
@@ -231,13 +270,14 @@ foreach ($line in $results) {
     $parts = $line.Split("|", 3)
     Check ($parts[1] -eq "1") $parts[2]
 }
-Check ($probeExit -eq 0 -and $results.Count -eq 4) "the installed-DLL probe ran all 4 checks in its own process (exit $probeExit, $($results.Count) results)"
-if ($probeExit -ne 0 -or $results.Count -ne 4) {
+Check ($probeExit -eq 0 -and $results.Count -eq 5) "the installed-DLL probe ran all 5 checks in its own process (exit $probeExit, $($results.Count) results)"
+if ($probeExit -ne 0 -or $results.Count -ne 5) {
     $probeOutput | ForEach-Object { Write-Host "    probe: $_" }
 }
 Remove-Item -Force $probe -ErrorAction SilentlyContinue
 
 Remove-Item -Recurse -Force $keyDir -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force $defaultDir -ErrorAction SilentlyContinue
 
 # ---- 4. Audit events render through the registered source -------------------------
 Write-Section "Event log"

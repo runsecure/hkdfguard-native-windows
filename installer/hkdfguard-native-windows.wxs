@@ -4,12 +4,16 @@
 
   What it does:
     - Installs HkdfGuard.dll and hkdfguard.exe
-      side by side into  %ProgramFiles%\HkdfGuard\ .
+      side by side into  %ProgramFiles%\HkdfGuard\v1\ . The "v1" folder is
+      the one place the major version appears: a future incompatible major
+      version installs beside it (HkdfGuard\v2\) rather than replacing it.
     - Writes that folder to
         HKLM\Software\hkdfguard-native-windows  InstallPath  (REG_SZ)
       so consumers (e.g. a C# wrapper) can load the DLL by absolute path via
       NativeLibrary.Load without hard-coding it.
-    - Creates the local group HkdfGuardUsers if it doesn't already exist.
+    - Creates the local groups HkdfGuardUsers (key use: wrap and unwrap) and
+      HkdfGuardDeployers (key use, and trusted to write key files under the
+      production security model) if they don't already exist.
     - Registers the "hkdfguard-native-windows" Application event log source,
       using the DLL's own message table.
 
@@ -31,9 +35,10 @@
   Lifecycle rules:
     - Uninstall removes the files and the InstallPath value only. It never
       touches KEKs (deleting one destroys every DEK wrapped under it) and
-      never removes the HkdfGuardUsers group: every KEK created while the
-      group existed has its SID in its ACL, and a recreated group would get
-      a new SID, silently locking its members out of those KEKs.
+      never removes the HkdfGuardUsers or HkdfGuardDeployers group: every
+      KEK created while a group existed has its SID in its ACL, and a
+      recreated group would get a new SID, silently locking its members out
+      of those KEKs (and, for deployers, making their key files untrusted).
     - The group must exist before a KEK is provisioned to be included in
       that KEK's ACL (ACLs are applied only at creation) - installing this
       MSI before running `provision` takes care of that.
@@ -63,7 +68,9 @@
     <MediaTemplate EmbedCab="yes" />
 
     <StandardDirectory Id="ProgramFiles64Folder">
-      <Directory Id="HkdfGuardInstallDir" Name="HkdfGuard" />
+      <Directory Id="HkdfGuardRootDir" Name="HkdfGuard">
+        <Directory Id="HkdfGuardInstallDir" Name="v1" />
+      </Directory>
     </StandardDirectory>
 
     <ComponentGroup Id="HkdfGuardComponents" Directory="HkdfGuardInstallDir">
@@ -127,8 +134,32 @@
         Impersonate="no"
         Return="check" />
 
+    <!--
+      The same, for HkdfGuardDeployers: key use on every KEK created while it
+      exists (key_acl.cpp), and - under the production security model, the
+      default - the only non-administrators trusted to have written a key
+      file (key_file.cpp). Kept out of HkdfGuardUsers on purpose: an
+      application runner can unwrap, and wrap ephemeral keys in memory, but
+      must not be able to persist a key file its own service would accept.
+    -->
+    <SetProperty
+        Id="CreateHkdfGuardDeployersGroup"
+        Value="&quot;[System64Folder]cmd.exe&quot; /d /c &quot;&quot;[System64Folder]net.exe&quot; localgroup HkdfGuardDeployers &gt;nul 2&gt;&amp;1 || &quot;[System64Folder]net.exe&quot; localgroup HkdfGuardDeployers /add&quot;"
+        Before="CreateHkdfGuardDeployersGroup"
+        Sequence="execute"
+        Condition="NOT REMOVE" />
+
+    <CustomAction
+        Id="CreateHkdfGuardDeployersGroup"
+        BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"
+        DllEntry="WixQuietExec"
+        Execute="deferred"
+        Impersonate="no"
+        Return="check" />
+
     <InstallExecuteSequence>
       <Custom Action="CreateHkdfGuardUsersGroup" After="InstallFiles" Condition="NOT REMOVE" />
+      <Custom Action="CreateHkdfGuardDeployersGroup" After="CreateHkdfGuardUsersGroup" Condition="NOT REMOVE" />
     </InstallExecuteSequence>
 
   </Package>

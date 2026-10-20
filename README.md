@@ -42,8 +42,10 @@ Creating a KEK for the first time requires the calling process to be elevated -
 opening/using an already-created one does not. Who else may use it is machine policy,
 not something either the creating tool or a caller chooses: SYSTEM and
 `BUILTIN\Administrators` always get full control; the local groups `HkdfGuardAdmins` (full
-control) and `HkdfGuardUsers` (use access) are granted if they exist when the KEK is created
-(the MSI creates `HkdfGuardUsers`, never `HkdfGuardAdmins`); and every entry of the `REG_MULTI_SZ`
+control), `HkdfGuardUsers` and `HkdfGuardDeployers` (use access) are granted if they exist when
+the KEK is created (the MSI creates `HkdfGuardUsers` and `HkdfGuardDeployers`, never
+`HkdfGuardAdmins`); every entry of `HKLM\Software\Policies\HkdfGuard\DeployerGroups` gets use
+access too; and every entry of the `REG_MULTI_SZ`
 registry value `HKLM\Software\Policies\HkdfGuard\KeyUseGroups` is granted use (unwrap)
 access when the KEK is created - each entry must resolve to a real, host-local group
 (this machine's own SAM, `BUILTIN`, `NT AUTHORITY`, or `NT SERVICE`; domain groups are
@@ -56,7 +58,23 @@ If you need per-user isolation instead, that means leaving `NCRYPT_MACHINE_KEY_F
 unset (current-user scope) - not offered as a build option here, since this project
 targets the shared-service deployment model above.
 
-The library exposes a small, stable C ABI (`include/hkdfguard.h`) with seven functions.
+**Security model**: the `REG_DWORD` value `HKLM\Software\Policies\HkdfGuard\SecurityModel`
+decides whose *key files* the library trusts. Absent or `0` is **production**, the
+default. There, a key file and every folder above it must be owned by SYSTEM,
+Administrators, TrustedInstaller, or a deployer group (`HkdfGuardDeployers` and each
+`DeployerGroups` entry) or a direct member of one. `1` is **developer**, which also trusts
+the reading account's own files, so one account can provision, wrap to a file and read
+it back. Anything else fails closed with `HKDFGUARD_ERR_POLICY_INVALID`. Wrapping and
+unwrapping in memory are the same under both: any account with key use on the KEK may
+do either. What production adds is that an application, which unwraps and may wrap
+ephemeral keys, can't *persist* a key file its own service would accept. A file it
+wrote is owned by it, so it's refused. The key folder's permissions (deployers Modify,
+applications Read) stop it overwriting a deployed one. The roles, the folder recipe and
+the settings are in [docs/admin-guide.md](docs/admin-guide.md). The CLI's `wrap` refuses
+to persist under production for any account but a deployer or an elevated
+administrator, and `status` shows the model.
+
+The library exposes a small, stable C ABI (`include/hkdfguard.h`) with eleven functions.
 No Windows handle, CNG/NCrypt type, or COM interface crosses that boundary, and no C++
 exception ever escapes it - every call returns an integer status code.
 
@@ -64,6 +82,16 @@ exception ever escapes it - every call returns an integer status code.
 int hkdfguard_kek_exists(
     const char* service,
     int* out_exists);
+
+int hkdfguard_security_model(
+    int* out_model, int* out_may_write_key_files);
+
+int hkdfguard_key_file_principal_trusted(
+    const char* sid, int* out_trusted);
+
+int hkdfguard_kek_fingerprint(
+    const char* service,
+    uint8_t* out, int* out_len);
 
 int hkdfguard_create_kek(
     const char* service);
@@ -148,12 +176,30 @@ and a path containing one is refused.
 
 The file and every folder above it must also be owned by SYSTEM, Administrators,
 TrustedInstaller or the account the process runs as, and must not let any other account
-write, delete, rename or re-permission them (creating new files in a folder is fine, so
-`C:\ProgramData\<app>\` works). Otherwise it fails with `HKDFGUARD_ERR_FILE_UNTRUSTED`:
-reading a wrapped DEK gains nothing, but anyone who could replace it, and could also wrap
-under the service's KEK, could plant a DEK they know. Read access for other accounts is
-never refused. A folder made directly under `C:\` inherits `Authenticated Users: Modify` and
-is refused until its permissions are narrowed.
+write, delete, rename or re-permission them. Every folder **below the drive root** - the
+key file's own folder and each one above it - must also not let any other account
+**create** files or folders in it, as the Linux build refuses any directory writable by
+group or others, sticky (`/tmp`-style) or not. Otherwise it fails with
+`HKDFGUARD_ERR_FILE_UNTRUSTED`: reading a wrapped DEK gains nothing, but anyone who could
+replace it, and could also wrap under the service's KEK, could plant a DEK they know. Read
+access for other accounts is never refused.
+
+What that means in practice:
+
+- `C:\ProgramData` and `C:\Windows\Temp` let Users create entries, so **no key file
+  anywhere under them is trusted** - including a folder created under `C:\ProgramData` with
+  its default, inherited permissions.
+- A folder made directly under `C:\` inherits `Authenticated Users: Modify` and is refused
+  until its inherited permissions are removed.
+- **The drive root is the one exception to the create rule.** A default `C:\` lets
+  Authenticated Users create folders; that can't displace a folder already there, and every
+  folder below it is judged itself, so the drive root is held only to the owner and
+  write/delete/rename/re-permission rule. (Without this, no key file on `C:` could ever be
+  trusted.) A key file directly in the drive root is judged by the drive-root rule.
+
+Keep key files in a folder of their own prepared with `icacls /inheritance:r` - for example
+`C:\HkdfGuardKeys\<app>\`; [docs/admin-guide.md](docs/admin-guide.md#where-to-keep-key-files)
+gives the exact commands.
 
 It checks the file's size before reading anything, and fails with
 `HKDFGUARD_ERR_FILE_PLAINTEXT_KEY` for a file of exactly 32 bytes (the size of an
@@ -221,7 +267,8 @@ with other processes. Window hooks into a GUI process stay outside it.
 ## Command-line tool
 
 `tools/hkdfguard_cli.cpp` builds `hkdfguard.exe`, a thin
-wrapper around the ABI above with two subcommands.
+wrapper around the ABI above with four subcommands: `provision`, `wrap`, `status` and
+`retire`.
 
 It hardens itself before reading anything, as the Linux CLI does. It calls
 `hkdfguard_harden_process_with_flags(HKDFGUARD_HARDEN_REQUIRE_PROTECTED_SIGNATURE)`, so
@@ -242,6 +289,9 @@ reports and away from other processes.
   DEK, never touches a file. This is the *only* subcommand that can create a KEK. Run
   it elevated: creating a KEK requires elevation (see "Deployment model" above), and
   verifying an existing one reads its ACL, which a key-use-only account cannot do.
+  Afterwards it prints the KEK's fingerprint (`hkdfguard_kek_fingerprint`). Record it:
+  `retire` requires it, and on a later run it lets you confirm that the KEK is still
+  the one you provisioned, not one another administrator planted under the same name.
 
   ```
   hkdfguard.exe provision --service-name|-sn <name>
@@ -306,6 +356,52 @@ reports and away from other processes.
   hard link is refused too, so `--force` cannot overwrite a file at some other path
   that shares its data.
 
+  The folders above `--key-file-path` must be ones `hkdfguard_open_file` will read from
+  (see above): owned by SYSTEM, Administrators, TrustedInstaller or you, and - below the
+  drive root - letting no other account create, delete or rename entries in them. `wrap`
+  checks this up front, before it reads the DEK or touches a key storage provider, and
+  refuses with the folder, the account and the `icacls` commands that fix it (or, for
+  `C:\ProgramData` and `C:\Windows\Temp`, a pointer to a folder of its own instead). `wrap`
+  never creates a missing folder - one it made would inherit its parent's permissions,
+  create rights included - so prepare the folder first, as
+  [docs/admin-guide.md](docs/admin-guide.md#where-to-keep-key-files) describes.
+
+- **`status`** - read-only. Reports whether the service has a KEK, which provider holds
+  it and its fingerprint. It also lists any other key under the service's name on the
+  provider the `KeyStoragePolicy` doesn't select. Such a key is unused today, but a
+  policy change would pick it up. Exits `0` whenever it got a definite answer (present,
+  absent, corrupt or unusable) and `1` when it couldn't tell (for example, access
+  denied).
+
+  ```
+  hkdfguard.exe status --service-name|-sn <name>
+  ```
+
+- **`retire`** - deletes a service's KEK. **Every DEK wrapped under it becomes
+  permanently unrecoverable**, so retire a KEK only after the service has moved to a
+  new, versioned service name. It is the only command that deletes keys. It lives in
+  the CLI, not the library, so no application that loads `HkdfGuard.dll` can wipe a
+  KEK in one call. It must run elevated, and it deletes only after the operator proves
+  which key they mean:
+
+  - `--fingerprint|-fp <hex>`: the 64 hex characters `provision` printed. The key under
+    the service's name must be a P-256 ECDH key with exactly that fingerprint.
+  - `--corrupt`: for a key under the service's name that is not a P-256 ECDH key at all,
+    so has no fingerprint. Deleted only when its properties read cleanly and say so. A
+    key that merely couldn't be read is never treated as corrupt.
+
+  A service can have a key on both the TPM and the software provider. Then `retire`
+  refuses to choose, and `--provider tpm|software` picks one. The key is opened once,
+  checked, and deleted through that same handle, so what is deleted is exactly what
+  was checked. The name is then re-opened to confirm the key is gone. Each retirement
+  is logged as event 1004 with the fingerprint and the calling user. This matches the
+  macOS tool's `retire`, plus `--provider`.
+
+  ```
+  hkdfguard.exe retire --service-name|-sn <name> (--fingerprint|-fp <hex> | --corrupt)
+                       [--provider tpm|software]
+  ```
+
 Example, from an elevated PowerShell prompt - provisioning a KEK once, then wrapping a
 freshly-generated DEK under it on every later release:
 
@@ -317,18 +413,23 @@ freshly-generated DEK under it on every later release:
 net localgroup App_1234 /add
 net localgroup App_1234 "NT SERVICE\MyAppService" /add
 
+# One-time: a key folder no other account can create, delete or rename entries in
+# (not under C:\ProgramData - see docs/admin-guide.md, "Where to keep key files").
+New-Item -ItemType Directory -Force C:\HkdfGuardKeys\myapp | Out-Null
+icacls C:\HkdfGuardKeys /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" "*S-1-5-32-545:(OI)(CI)RX"
+icacls C:\HkdfGuardKeys /setowner "*S-1-5-32-544" /T
+
 # Every release: mint a random 32-byte DEK and wrap it, piping the base64 DEK to the
 # tool's stdin rather than passing it as an argument.
 $dekBytes = New-Object byte[] 32
 [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($dekBytes)
 $dekBase64 = [Convert]::ToBase64String($dekBytes)
 $dekBase64 | .\hkdfguard.exe wrap `
-    --key-file-path C:\ProgramData\myapp\myapp.v1.key --service-name myapp `
+    --key-file-path C:\HkdfGuardKeys\myapp\myapp.v1.key --service-name myapp `
     --dek-stdin --group App_1234 --force
 ```
 
-`--help`/`-h` at the top level, or after either subcommand, prints usage for that
-level. Exit code `0` is success, `2` is a usage/argument error (nothing was attempted),
+`--help`/`-h` at the top level, or after any subcommand, prints the usage text. Exit code `0` is success, `2` is a usage/argument error (nothing was attempted),
 and `1` is an operational failure (parsing succeeded but the operation itself failed -
 see the printed `error: ...` text and `include/hkdfguard.h`'s `HKDFGUARD_ERR_*` codes
 for what it means). There is no `unwrap` subcommand - unwrapping is DLL-only; see
@@ -478,6 +579,8 @@ including the impersonated client when a service acts on someone's behalf.
 | 1001 | Warning | A KEK was created on the software provider because `PreferTpm`'s TPM attempt failed, so it isn't hardware-protected. |
 | 1002 | Information | A DEK was wrapped (`hkdfguard_wrap_dek` or `hkdfguard_generate_and_wrap_dek`). |
 | 1003 | Information | A DEK was unwrapped. |
+| 1004 | Warning | A KEK was retired (deleted) by `hkdfguard.exe retire`. Names the service, the provider and the fingerprint, or why the key was corrupt. Written by the CLI; the library has no delete. |
+| 1005 | Warning | `hkdfguard_open_file` read a key file under the developer security model, which trusts the caller's own key files. Once per process. Not expected on a production machine. |
 | 2000 | Warning | `KEK_ACCESS_DENIED` on any call: use of a KEK by an unauthorized account, or provisioning without elevation. |
 | 2002 | Error | `KEK_INVALID`: an existing KEK under the service name has an ACL this library would never create. Investigate it. |
 | 2003 | Warning | `PAYLOAD_AUTH_FAILED`, `KEK_FINGERPRINT_MISMATCH`, `PAYLOAD_MALFORMED` or `PAYLOAD_UNSUPPORTED` on unwrap: a tampered, corrupted, misdirected or unknown-version payload. |
@@ -596,11 +699,12 @@ It is read on every setup call.
   instead of prompting) - see the Deployment model note above. If a newly created key fails
   any post-finalize verification step, that same call deletes it before reporting the
   error, so a later wrap can't silently end up using a key that was never fully verified.
-  An *existing* KEK is never deleted or replaced by any library call.
+  An *existing* KEK is never deleted or replaced by any library call. Only the CLI's
+  `retire` deletes one, after the operator confirms its fingerprint.
 - **Memory security**: `src/secure_buffer.h` (RAII `SecureZeroMemory` wrapper) and
   `src/handle_traits.h` (RAII closers for every NCrypt/BCrypt handle type) ensure key
-  material and handles are wiped/closed on every exit path, including exceptions. All
-  six ABI entry points in `src/hkdfguard.cpp` catch every exception; `hkdfguard_unwrap_dek`
+  material and handles are wiped/closed on every exit path, including exceptions. Every
+  ABI entry point in `src/hkdfguard.cpp` catches every exception; `hkdfguard_unwrap_dek`
   additionally zeros the caller's output buffer on any failure (it calls into a CNG
   function - `BCryptDecrypt` - that can write unauthenticated plaintext before reporting
   a tag mismatch).
@@ -671,7 +775,7 @@ msiexec /i hkdfguard-native-windows-0.9.0-win-x64.msi /qn /l*v install.log
 
 The MSI does four things:
 
-- **Installs both files** to `C:\Program Files\HkdfGuard\`. That folder
+- **Installs both files** to `C:\Program Files\HkdfGuard\v1\`. That folder
   inherits the Program Files ACL, where only Administrators, SYSTEM and TrustedInstaller
   can write. This is what stops a less-privileged user from planting a fake DLL next to
   the CLI and getting code execution the next time an administrator runs the elevated
@@ -691,7 +795,7 @@ The MSI does four things:
 Then, once per service, elevated:
 
 ```
-"C:\Program Files\HkdfGuard\hkdfguard.exe" provision --service-name myapp
+"C:\Program Files\HkdfGuard\v1\hkdfguard.exe" provision --service-name myapp
 ```
 
 **Upgrades** remove the previous version before installing the new one. A service with
@@ -757,10 +861,12 @@ loading it.
 - **Node**: `ffi-napi`/`koffi` given an absolute path, or a native addon (N-API) linking
   `HkdfGuard.lib`
 
-All five bindings map directly onto the seven exported functions
-(`hkdfguard_kek_exists`, `hkdfguard_create_kek`, `hkdfguard_wrap_dek`,
-`hkdfguard_unwrap_dek`, `hkdfguard_generate_and_wrap_dek`, `hkdfguard_open_file`,
-`hkdfguard_harden_process`) and the status codes in
+All five bindings map directly onto the eleven exported functions
+(`hkdfguard_kek_exists`, `hkdfguard_kek_fingerprint`, `hkdfguard_create_kek`,
+`hkdfguard_wrap_dek`, `hkdfguard_unwrap_dek`, `hkdfguard_generate_and_wrap_dek`,
+`hkdfguard_open_file`, `hkdfguard_harden_process`,
+`hkdfguard_harden_process_with_flags`, `hkdfguard_security_model`,
+`hkdfguard_key_file_principal_trusted`) and the status codes in
 `include/hkdfguard.h`; none of them need to know anything about TPMs, CNG, or NCrypt.
 
 ## License

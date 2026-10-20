@@ -127,4 +127,55 @@ namespace hkdfguard {
     void SetTestKeyUseGroupsOverride(std::optional<std::vector<std::wstring>> groups);
 #endif
 
+    // Which security model this machine runs - who the library trusts to
+    // have written a key file (see hkdfguard_open_file in hkdfguard.h).
+    //
+    //   Production: key files must be owned, and their folders writable,
+    //     only by SYSTEM, Administrators, TrustedInstaller, or a deployer
+    //     group (HkdfGuardDeployers and the DeployerGroups policy) or a
+    //     direct member of one. The calling account's own files are not
+    //     trusted unless it is such a member - so an application that can
+    //     unwrap (and wrap ephemeral keys in memory) cannot persist a key
+    //     file its own service will accept.
+    //   Developer: the calling account's own files are trusted too, so one
+    //     account can provision, wrap to a file and read it back.
+    //
+    // Same values as the HKDFGUARD_SECURITY_MODEL_* constants in
+    // hkdfguard.h.
+    enum class SecurityModel : uint32_t {
+        Production = 0,
+        Developer = 1,
+
+        // Present but not 0 or 1 (or not a REG_DWORD): fails closed with
+        // HKDFGUARD_ERR_POLICY_INVALID, for the same reason as
+        // KeyStoragePolicy::Invalid - a typo must not pick a model.
+        Invalid = 0xFFFFFFFFu,
+    };
+
+    // The value-to-setting rule LoadSecurityModel applies, with no registry
+    // I/O, so it can be tested directly. Absent means Production: this is
+    // a production install unless an administrator says otherwise.
+    SecurityModel ParseSecurityModel(bool found, unsigned long type, unsigned long value) noexcept;
+
+    // The REG_DWORD value HKLM\Software\Policies\HkdfGuard\SecurityModel:
+    // absent or 0 = Production, 1 = Developer, anything else = Invalid.
+    // Read on every call that depends on it. Never throws.
+    SecurityModel LoadSecurityModel() noexcept;
+
+    // The REG_MULTI_SZ value HKLM\Software\Policies\HkdfGuard\DeployerGroups,
+    // read exactly like LoadKeyUseGroupsPolicy: trimmed, empties dropped,
+    // anything unreadable an empty list. Each entry names a group (or SID
+    // string) whose members deploy key files; key_acl.cpp vets them with
+    // the KeyUseGroups rules (a host-local group, never over-broad). Every
+    // entry is also granted key use on KEKs created while it is set, since
+    // a deployer must be able to wrap.
+    std::vector<std::wstring> LoadDeployerGroupsPolicy();
+
+#if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
+    // Test-only seams for the two above, with the same scope and caveats as
+    // SetTestPolicyOverride. std::nullopt clears each.
+    void SetTestSecurityModelOverride(std::optional<SecurityModel> model) noexcept;
+    void SetTestDeployerGroupsOverride(std::optional<std::vector<std::wstring>> groups);
+#endif
+
 } // namespace hkdfguard

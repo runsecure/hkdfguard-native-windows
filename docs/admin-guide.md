@@ -14,6 +14,7 @@ see the [README](../README.md).
 - [Download and verify](#download-and-verify)
 - [Install](#install)
 - [Set up a service](#set-up-a-service)
+- [Check or retire a KEK](#check-or-retire-a-kek)
 - [Machine policy settings](#machine-policy-settings)
 - [Monitoring and auditing](#monitoring-and-auditing)
 - [Upgrade](#upgrade)
@@ -108,10 +109,10 @@ with a restart required. For anything else, see `install.log`.
 
 | Change | Detail |
 |---|---|
-| Files | `C:\Program Files\HkdfGuard\HkdfGuard.dll` and `hkdfguard.exe`. The folder inherits the Program Files ACL, so only Administrators, SYSTEM and TrustedInstaller can write to it. The location can't be changed. |
+| Files | `C:\Program Files\HkdfGuard\v1\HkdfGuard.dll` and `hkdfguard.exe`. The folder inherits the Program Files ACL, so only Administrators, SYSTEM and TrustedInstaller can write to it. The location can't be changed. |
 | Registry | `HKLM\Software\hkdfguard-native-windows`, value `InstallPath` (`REG_SZ`). Applications read it to find the DLL. |
 | Event log | Registers the Application log source `hkdfguard-native-windows`. |
-| Local group | Creates `HkdfGuardUsers` if it doesn't already exist. |
+| Local groups | Creates `HkdfGuardUsers` (applications: wrap and unwrap) and `HkdfGuardDeployers` (deployers: wrap, unwrap, and write key files) if they don't already exist. |
 
 The installer doesn't set any policy values. Those are left to whatever already manages
 machine policy, such as Group Policy, Intune or SCCM.
@@ -120,9 +121,10 @@ machine policy, such as Group Policy, Intune or SCCM.
 
 ```powershell
 Get-ItemProperty HKLM:\Software\hkdfguard-native-windows | Select-Object InstallPath
-Get-ChildItem "C:\Program Files\HkdfGuard"
+Get-ChildItem "C:\Program Files\HkdfGuard\v1"
 net localgroup HkdfGuardUsers
-& "C:\Program Files\HkdfGuard\hkdfguard.exe" --help
+net localgroup HkdfGuardDeployers
+& "C:\Program Files\HkdfGuard\v1\hkdfguard.exe" --help
 ```
 
 ## Set up a service
@@ -134,6 +136,30 @@ case-insensitive. The same name must be used to wrap and to unwrap.
 
 ### 1. Decide who can use the key
 
+A machine runs one of two **security models**, set by the
+[`SecurityModel`](#securitymodel) policy. **Production is the default**: it applies unless
+an administrator sets the value to `1`.
+
+| Role | Production model | Who, on Windows |
+|---|---|---|
+| **Security admin** | Provisions and retires KEKs. | A local administrator, from an elevated prompt. |
+| **Deployer** | Wraps DEKs into key files and deploys them. May also unwrap. | A member of `HkdfGuardDeployers` (or of a group in [`DeployerGroups`](#deployergroups)). Not a local administrator, or the separation from the security admin is only on paper. |
+| **Application** | Unwraps key files, and wraps and unwraps ephemeral keys in memory. **Can't persist a key file its own service would accept.** | The service's account, a member of `HkdfGuardUsers`. |
+
+The application's limit is enforced two ways:
+
+- **By Windows:** the key folder gives deployers Modify and applications only Read (see
+  [Where to keep key files](#where-to-keep-key-files)), so an application can't overwrite
+  a deployed key file.
+- **By the library:** `hkdfguard_open_file` trusts a key file only if it, and every
+  folder above it, is owned by SYSTEM, Administrators, TrustedInstaller, or a deployer
+  group or a direct member of one. A key file the application wrote anywhere else is
+  owned by the application, so it's refused.
+
+Under the **developer** model (`SecurityModel` = `1`) the caller's own key files are
+trusted too, so one account can provision, wrap to a file and read it back. Use it on
+development machines only. Each process that reads a key file under it logs event 1005.
+
 A KEK's access list is fixed **when the KEK is created**. Set up groups and policy *before*
 provisioning.
 
@@ -142,13 +168,22 @@ provisioning.
 | SYSTEM, `BUILTIN\Administrators` | Full control | Always |
 | Local group `HkdfGuardAdmins` | Full control | Only if the group exists when the KEK is created. The installer doesn't create it. |
 | Local group `HkdfGuardUsers` | Use (wrap and unwrap) | If the group exists when the KEK is created. The installer creates it. |
+| Local group `HkdfGuardDeployers` | Use (wrap and unwrap) | If the group exists when the KEK is created. The installer creates it. |
+| Groups listed in [`DeployerGroups`](#deployergroups) | Use (wrap and unwrap) | Policy in force when the KEK is created |
 | Groups listed in [`KeyUseGroups`](#keyusegroups) | Use (wrap and unwrap) | Policy in force when the KEK is created |
 
-Usually you add the service's account to `HkdfGuardUsers`:
+Usually you add the service's account to `HkdfGuardUsers`, and the account that deploys
+key files to `HkdfGuardDeployers`:
 
 ```powershell
 net localgroup HkdfGuardUsers "NT SERVICE\MyAppService" /add
+net localgroup HkdfGuardDeployers "CONTOSO\deploy-agent" /add
 ```
+
+Deployer membership is read every time a key file is opened, and only **direct** members
+count: a group nested inside `HkdfGuardDeployers` is trusted as a group, but its own
+members aren't. Remove someone from `HkdfGuardDeployers` and the key files they own stop
+being trusted, so redeploy them under a current deployer.
 
 Because the KEK's access list names the group, you can change who has access later by
 changing the group's membership. You don't need a new KEK. A running service only picks up
@@ -174,18 +209,30 @@ Both groups must be local groups on this machine. The installer never creates
 ### 2. Provision the KEK (elevated, once per service)
 
 ```powershell
-& "C:\Program Files\HkdfGuard\hkdfguard.exe" provision --service-name myapp
+& "C:\Program Files\HkdfGuard\v1\hkdfguard.exe" provision --service-name myapp
 ```
 
 `provision` creates the KEK if it's missing. If the KEK already exists, `provision` checks
 its properties and access list and changes nothing, so it's safe to run on every
 deployment.
 
+`provision` then prints the KEK's **fingerprint**, 64 hex characters. Record it with the
+service's deployment records:
+
+- `retire` requires it before it will delete the KEK.
+- On a later run, `provision` prints it again. If it ever differs from what you recorded,
+  the KEK under that service name has been replaced. **Investigate** before wrapping
+  anything new under it.
+
 There is no key rotation. If you need a new KEK, provision a new, versioned service name
 (for example `myapp.v2`) and wrap new DEKs under it. **Never delete a KEK that is still
 needed.** Deleting it makes every DEK wrapped under it unrecoverable.
 
 ### 3. Wrap a DEK into a key file (every release)
+
+Run `wrap` as a **deployer** (a member of `HkdfGuardDeployers`) or as an elevated
+administrator. Under the production model it refuses any other account before writing
+anything: an application can wrap in memory, but not persist the result.
 
 `wrap` uses an existing KEK and never creates one. It reads the DEK as base64 from
 **stdin**, so the key never appears on a command line. The key file's ACL lets the owner
@@ -197,17 +244,22 @@ group is refused. Without `--group`, only the owner can read the file, so an
 application running as another account can't open it.
 
 ```powershell
-$exe = "C:\Program Files\HkdfGuard\hkdfguard.exe"
+$exe = "C:\Program Files\HkdfGuard\v1\hkdfguard.exe"
 
 # One-time: a group for the account that reads the key file.
 net localgroup App_1234 /add
 net localgroup App_1234 "NT SERVICE\MyAppService" /add
 
-# Every release: generate a random 32-byte DEK and wrap it.
+# One-time: the key folder - see "Where to keep key files" below.
+New-Item -ItemType Directory -Force C:\HkdfGuardKeys\myapp | Out-Null
+icacls C:\HkdfGuardKeys /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" "*S-1-5-32-545:(OI)(CI)RX" "HkdfGuardDeployers:(OI)(CI)M"
+icacls C:\HkdfGuardKeys /setowner "*S-1-5-32-544" /T
+
+# Every release, as a deployer: generate a random 32-byte DEK and wrap it.
 $dek = New-Object byte[] 32
 [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($dek)
 [Convert]::ToBase64String($dek) | & $exe wrap `
-    --key-file-path C:\ProgramData\myapp\myapp.key --service-name myapp `
+    --key-file-path C:\HkdfGuardKeys\myapp\myapp.key --service-name myapp `
     --dek-stdin --group App_1234 --force
 ```
 
@@ -219,9 +271,11 @@ environment variable without expanding it first: Windows can set those variables
 names (for example `C:\Users\RUNNER~1\AppData\Local\Temp` on GitHub-hosted runners), and a
 path containing one is refused.
 
-**Where to keep the key file.** Applications read it back through the library with the
-same rules, so the path must be a plain local NTFS folder, for example
-`C:\ProgramData\<app>\`. In addition to links and network paths, the
+#### Where to keep key files
+
+Applications read the key file back through the library with the same rules, so the path
+must be a plain local NTFS folder that no other account can tamper with - **not**
+`C:\ProgramData` (see below). In addition to links and network paths, the
 library refuses files on volumes with **Data Deduplication** enabled and **cloud
 placeholder files** (OneDrive, Dropbox and similar), because Windows stores both as
 reparse points. An application that hits this reports `HKDFGUARD_ERR_FILE_UNTRUSTED`
@@ -233,19 +287,81 @@ environment variable, it must expand it to its long form first with the Windows
 `GetLongPathNameW` function, or the library refuses it with -39. Don't assume a framework's
 path helpers do this: some keep short names (PowerShell's `Resolve-Path`, for one).
 
-**Who may own and change the folder.** The library also refuses the file with -39 unless
-the file and every folder above it, up to the drive root, are owned by SYSTEM,
-Administrators, TrustedInstaller or the account the application runs as, and no other
-account may write the file or delete, rename, re-permission or take ownership of it or of
-any of those folders. Read access for other accounts is fine, and so is a folder that lets
-others create new files but not delete existing ones. A folder you create under
-`C:\ProgramData` as an administrator passes. A folder created directly under `C:\` (such as
-`C:\secrets`) does not: it inherits `Authenticated Users: Modify`, which lets any signed-in
-user rename the folder away and put their own in its place. Narrow it first:
+**Who may own and change the folders.** The library also refuses the file with -39 unless:
+
+- the file and every folder above it, **up to and including the drive root**, are owned by
+  SYSTEM, Administrators, TrustedInstaller or - under the production model - a deployer
+  group or a direct member of one (under the developer model: the account the application
+  runs as), and no other account may write the file or delete, rename, re-permission or
+  take ownership of it or of any of those folders; and
+- every folder **below the drive root** - the key file's own folder and each folder above
+  it - lets no other account **create** files or folders in it ("Create files / write
+  data" or "Create folders / append data"). This is the Windows form of the Linux build's
+  rule that no directory above a key file may be writable by group or others, sticky
+  (`/tmp`-style) or not.
+
+Read access for other accounts is fine everywhere: the file is ciphertext.
+
+The **drive root** is the one exception to the create rule. A default `C:\` lets
+Authenticated Users create folders in it; that can't displace a folder already there, and
+every folder below the root is judged on its own, so the root is held only to the owner and
+write/delete/rename/re-permission rule. (If the create rule applied to the root too, no key
+file on `C:` could ever be trusted.) A key file placed directly in the drive root is judged
+by the drive-root rule - but keep it in a folder of its own anyway.
+
+What this rules out:
+
+- **`C:\ProgramData` and everything under it.** `C:\ProgramData` itself lets Users create
+  files and folders, so a key file anywhere below it is refused, whatever the permissions of
+  its own folder. Don't change the permissions of `C:\ProgramData`.
+- **`C:\Windows\Temp`**, which lets Users create files and folders.
+- **A folder created directly under `C:\` with its default permissions** (such as
+  `C:\secrets`): it inherits `Authenticated Users: Modify`, which lets any signed-in user
+  create entries in it, or rename the folder away and put their own in its place.
+- Any folder that inherited create rights from one of those.
+
+**Recommended location: a folder of its own directly under the drive root, with inherited
+permissions removed**, for example `C:\HkdfGuardKeys\<app>\`. From an elevated prompt:
 
 ```powershell
-icacls C:\secrets /inheritance:r /grant:r "SYSTEM:(OI)(CI)F" "Administrators:(OI)(CI)F" "App_1234:(OI)(CI)RX"
+# Create the folders. As an elevated administrator, they are owned by Administrators.
+New-Item -ItemType Directory -Force C:\HkdfGuardKeys\myapp | Out-Null
+
+# Remove every inherited permission (Authenticated Users: Modify from C:\) and grant
+# exactly: SYSTEM and Administrators full control, deployers Modify (to write key files),
+# Users read. Subfolders and files inherit these.
+icacls C:\HkdfGuardKeys /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" "*S-1-5-32-545:(OI)(CI)RX" "HkdfGuardDeployers:(OI)(CI)M"
+
+# Make Administrators the owner of the folder and everything in it, in case it was
+# created by a non-elevated account.
+icacls C:\HkdfGuardKeys /setowner "*S-1-5-32-544" /T
+
+# Check: only SYSTEM, Administrators, Users (RX) and HkdfGuardDeployers (M) are listed,
+# none of them (I)nherited
+# from C:\ - and the same for C:\HkdfGuardKeys\myapp, where they show as inherited from
+# C:\HkdfGuardKeys.
+icacls C:\HkdfGuardKeys
+icacls C:\HkdfGuardKeys\myapp
 ```
+
+The SIDs are used so the commands work in any display language: `S-1-5-18` is SYSTEM,
+`S-1-5-32-544` is Administrators, `S-1-5-32-545` is Users. The application's account needs
+read access to every folder on the way (the library reads each folder's permissions), which
+the Users grant gives; to restrict that to the application, grant its group instead, for
+example `"App_1234:(OI)(CI)RX"` in place of the Users entry. The key file itself is
+protected separately: `wrap` gives it its own non-inherited ACL (the owner, plus
+`--group`, read-only).
+
+If you must use a folder that already exists, apply the same two `icacls` commands to it.
+`/inheritance:r` drops only *inherited* entries; an entry set on the folder itself survives,
+so remove it first with `icacls <folder> /remove:g <account>` - `wrap` names the account
+and prints these commands when it refuses a folder. Every folder above it, below the drive
+root, must pass too.
+
+`wrap` checks all of this before it reads the DEK or touches a key store, so it never
+writes a key file the library would then refuse. It never creates a missing folder (a
+folder it made would inherit its parent's permissions, create rights included): create and
+prepare the folder first.
 
 If the key file was written by `wrap` run without elevation, it is owned by that user, and
 an application running as a different account refuses it. Run `wrap` elevated, or as the
@@ -261,9 +377,46 @@ The command-line tool has no unwrap command. Applications must load the DLL by t
 path built from the `InstallPath` registry value, never by bare file name. See
 [Consuming from other languages](../README.md#consuming-from-other-languages) in the README.
 
+## Check or retire a KEK
+
+To see a service's KEK, run `status` from any account that can use the key:
+
+```powershell
+& "C:\Program Files\HkdfGuard\v1\hkdfguard.exe" status --service-name myapp
+```
+
+It prints whether the KEK is `present`, `absent`, `corrupt` or `unusable`. It also prints
+which key store holds the KEK (TPM or software) and its fingerprint. It also lists any other
+key under the service's name in the key store the `KeyStoragePolicy` doesn't select. It
+never changes anything. It exits `0` when it got an answer and `1` when it couldn't tell,
+for example because access was denied.
+
+**Retiring a KEK deletes it, and every DEK wrapped under it becomes permanently
+unrecoverable.** Retire a KEK only after every application has moved to a new, versioned
+service name (for example from `myapp` to `myapp.v2`) and no key file wrapped under the old
+name is still needed. From an elevated prompt:
+
+```powershell
+& "C:\Program Files\HkdfGuard\v1\hkdfguard.exe" retire --service-name myapp --fingerprint <recorded fingerprint>
+```
+
+`retire` deletes the KEK only if its fingerprint matches the one you give. Otherwise it
+deletes nothing. It is the only way this product deletes a KEK. Applications can't delete
+one: the library has no delete function.
+
+- If a key under the service's name isn't a valid P-256 key at all, it has no fingerprint.
+  `status` reports it as `corrupt`. Retire it with `--corrupt` instead of `--fingerprint`.
+  `--corrupt` refuses a valid KEK, and refuses any key whose properties it couldn't read.
+- If the service has a key in both the TPM and the software key store, `retire` won't
+  choose between them. Run `status`, then add `--provider tpm` or `--provider software`.
+
+Each retirement is logged as event **1004**, with the service, key store, fingerprint and
+the account that ran it. Afterwards the service name can be provisioned again, which
+creates a new KEK with a new fingerprint.
+
 ## Machine policy settings
 
-All four settings are values under `HKLM\Software\Policies\HkdfGuard`. Set them with Group
+All six settings are values under `HKLM\Software\Policies\HkdfGuard`. Set them with Group
 Policy, Intune or SCCM, or with `reg add` for testing. They're read on every call, so a
 change takes effect without a restart.
 
@@ -310,6 +463,37 @@ One invalid entry makes provisioning fail, and no KEK is created.
 reg add HKLM\Software\Policies\HkdfGuard /v KeyUseGroups /t REG_MULTI_SZ /d "App_1234\0App_5678" /f
 ```
 
+### SecurityModel
+
+`REG_DWORD`. Selects whose key files the library trusts. See
+[Decide who can use the key](#1-decide-who-can-use-the-key) for the roles.
+
+| Value | Model | Key files trusted when owned by |
+|---|---|---|
+| absent or `0` | Production | SYSTEM, Administrators, TrustedInstaller, a deployer group, or a direct member of one |
+| `1` | Developer | SYSTEM, Administrators, TrustedInstaller, or the account reading the file |
+
+Any other value, or a value of the wrong type, makes every key-file read and every `wrap`
+fail with `invalid machine policy`. It isn't treated as the default. Wrapping and
+unwrapping in memory work the same under both models. `hkdfguard.exe status` shows the
+model in force.
+
+```powershell
+reg add HKLM\Software\Policies\HkdfGuard /v SecurityModel /t REG_DWORD /d 1 /f   # developer machines only
+```
+
+### DeployerGroups
+
+`REG_MULTI_SZ`. Groups whose direct members are trusted, under the production model, to
+have written key files, in addition to `HkdfGuardDeployers`. Each entry is vetted exactly
+like a [`KeyUseGroups`](#keyusegroups) entry: a host-local group, not over-broad. One
+invalid entry makes every key-file read and every `wrap` fail. Each group is also granted
+use access on KEKs created while it is listed, since deployers wrap.
+
+```powershell
+reg add HKLM\Software\Policies\HkdfGuard /v DeployerGroups /t REG_MULTI_SZ /d "Deploy_1234" /f
+```
+
 ### AuditUnwrapSuccess
 
 `REG_DWORD`. Only an explicit `0` turns off the "DEK unwrapped" event (1003), for example
@@ -351,6 +535,8 @@ User field is the calling account.
 | 1001 | Warning | A KEK was created in the software key store because the TPM couldn't be used under `PreferTpm`. It isn't hardware-protected. |
 | 1002 | Information | A DEK was wrapped. |
 | 1003 | Information | A DEK was unwrapped. |
+| 1004 | Warning | A KEK was retired (deleted) with `hkdfguard.exe retire`. Every DEK wrapped under it is now unrecoverable. Names the service, key store, fingerprint and account. |
+| 1005 | Warning | A process read a key file under the **developer** security model, which trusts the caller's own key files. Logged once per process. **Investigate** on any production machine and remove `SecurityModel`. |
 | 2000 | Warning | Access denied: an unauthorized account used a KEK, or provisioning ran without elevation. |
 | 2002 | Error | An existing KEK has an access list this library would never create. **Investigate.** |
 | 2003 | Warning | Unwrap rejected a tampered, corrupted or misdirected payload. |
@@ -361,7 +547,7 @@ User field is the calling account.
 
 Wrap and unwrap events include a SHA-256 of the wrapped payload, so each unwrap can be
 traced to the wrap that produced it. To compare against a key file:
-`(Get-FileHash C:\ProgramData\myapp\myapp.key -Algorithm SHA256).Hash.ToLower()`.
+`(Get-FileHash C:\HkdfGuardKeys\myapp\myapp.key -Algorithm SHA256).Hash.ToLower()`.
 
 ```powershell
 Get-WinEvent -LogName Application -FilterXPath "*[System[Provider[@Name='hkdfguard-native-windows']]]" -MaxEvents 50 |
@@ -370,7 +556,7 @@ Get-WinEvent -LogName Application -FilterXPath "*[System[Provider[@Name='hkdfgua
 
 Any local user can write to the Application log, so treat these events as an operational
 aid, not tamper-proof evidence. Forward them to your SIEM for retention and alerting. Events
-2002, 2006, 2003 and 1001 are good candidates for alerts.
+2002, 2006, 2003, 1005, 1004 and 1001 are good candidates for alerts.
 
 ## Upgrade
 
@@ -390,7 +576,8 @@ msiexec /x hkdfguard-native-windows-0.9.0-win-x64.msi /qn /l*v uninstall.log
 You can also uninstall from **Settings → Apps**. Uninstalling removes the files, the
 `InstallPath` value and the event source registration. It deliberately keeps:
 
-- **All KEKs.** Deleting a KEK destroys every DEK wrapped under it.
+- **All KEKs.** Deleting a KEK destroys every DEK wrapped under it. To remove one on
+  purpose, [retire](#check-or-retire-a-kek) it before you uninstall.
 - **The `HkdfGuardUsers` group.** A recreated group would get a new SID and lose access to
   existing KEKs.
 - **Policy values** under `HKLM\Software\Policies\HkdfGuard`.
@@ -404,11 +591,13 @@ was attempted) and `1` for an operational failure. On failure it prints an `erro
 |---|---|---|
 | `no KEK is provisioned for this service` | `wrap` ran before `provision`, or the service name differs. | Run `provision` elevated with the same service name. |
 | `this account is not authorized to use it` | Not elevated during `provision`, or the account isn't in a group on the KEK's access list. | Run `provision` from an elevated prompt. For `wrap`/unwrap, add the account to `HkdfGuardUsers` and restart the service. |
-| `a KeyUseGroups policy entry is unresolvable, not a group, over-broad, or not host-local` | A `KeyUseGroups` entry is invalid. | Fix the entry. See [KeyUseGroups](#keyusegroups). |
-| `invalid key storage policy` | `KeyStoragePolicy` isn't a `REG_DWORD` of `0`, `1` or `2`. | Correct or remove the value. |
 | `KEK provider/key open or create failed` | Under `RequireTpm`: no usable TPM. Otherwise, the key store failed. | Check the TPM (`Get-Tpm`) and event 2005 for details. |
 | `a KEK already exists under this service name, but its ACL is ...` | The existing KEK's access list was changed, or a key was planted under that name. It was left untouched. | Investigate it as a security event. To move on, provision a new versioned service name. |
 | `wrapped payload was not produced under this service's current KEK` | The key file belongs to a different service or a different KEK. | Check the service name, and that the file was wrapped on this machine. |
+| `hkdfguard_open_file would refuse to read a key file there` | `wrap`'s `--key-file-path` is in a folder that another account can create, delete or rename entries in (for example anywhere under `C:\ProgramData`), or that isn't owned by SYSTEM, Administrators, TrustedInstaller or you. Nothing was read or written. | Use a folder prepared as in [Where to keep key files](#where-to-keep-key-files); the message names the folder and account and prints the `icacls` commands. |
+| `this account may not persist key files` | Under the production model, `wrap` ran as an account that is neither an elevated administrator nor a member of `HkdfGuardDeployers` or a `DeployerGroups` group. Nothing was written. | Run `wrap` as a deployer: add the account to `HkdfGuardDeployers`, then sign in again. |
+| `invalid machine policy` | `KeyStoragePolicy` isn't a `REG_DWORD` of `0`, `1` or `2`, or `SecurityModel` isn't a `REG_DWORD` of `0` or `1`. | Correct or remove the value. |
+| `a KeyUseGroups or DeployerGroups policy entry is ...` | An entry in either value is invalid, or a deployer group's members couldn't be read. | Fix the entry. See [KeyUseGroups](#keyusegroups) and [DeployerGroups](#deployergroups). |
 | `service name is missing or malformed` | The name uses characters other than ASCII letters, digits and `.`, starts with `.`, contains `..`, or is longer than 128. | Use a valid name. |
 
 An application that can't load the DLL usually has an architecture mismatch (see
@@ -420,7 +609,7 @@ command-line tool itself never produces:
 
 | Code | Meaning | What to do |
 |---|---|---|
-| -39 `FILE_UNTRUSTED` | The key file's path is a link, passes through a junction or SUBST drive, uses an 8.3 short name (`PROGRA~1`), is on a network or deduplicated volume, or is a cloud placeholder. Or the file or a folder above it is owned by, or can be changed, deleted or renamed by, an account other than SYSTEM, Administrators, TrustedInstaller or the application's own. | Configure the application with the full long path (if it comes from `%TEMP%` or another environment variable, expand it first), or move the file to a plain local folder. For an ownership or permissions refusal, narrow the folder's permissions or re-run `wrap` elevated. See [Where to keep the key file](#3-wrap-a-dek-into-a-key-file-every-release). |
+| -39 `FILE_UNTRUSTED` | The key file's path is a link, passes through a junction or SUBST drive, uses an 8.3 short name (`PROGRA~1`), is on a network or deduplicated volume, or is a cloud placeholder. Or the file or a folder above it is owned by, or can be changed, deleted or renamed by, an account other than SYSTEM, Administrators, TrustedInstaller or the application's own. Or a folder above it, other than the drive root, lets such an account create files or folders in it - every folder under `C:\ProgramData` or `C:\Windows\Temp`, and a folder under `C:\` with its default permissions. | Configure the application with the full long path (if it comes from `%TEMP%` or another environment variable, expand it first), or move the file to a plain local folder. For an ownership or permissions refusal, move the file to a folder prepared with `icacls /inheritance:r` (or prepare its folder that way) and re-run `wrap` elevated. See [Where to keep key files](#where-to-keep-key-files). |
 | -38 `FILE_MALFORMED` | The file is 132 bytes but does not hold a valid wrapped key (corrupted, edited, or not a key file at all). | Re-run `wrap` to rewrite the file. |
 | -37 `FILE_PLAINTEXT_KEY` | The file is 32 raw bytes, or 32 bytes as hex or base64: probably an unwrapped key on disk. Event 2006 names it. | Treat the key as exposed. Find out how the file was written, remove it, and re-mint the DEK. |
 | -35 / -36 `FILE_TOO_SHORT` / `FILE_TOO_LONG` | The file isn't 132 bytes, so it isn't a wrapped key. | Check the application is pointed at the right file; re-run `wrap`. |

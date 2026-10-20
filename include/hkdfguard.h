@@ -150,7 +150,7 @@ extern "C" {
 #define HKDFGUARD_ERR_FILE_TOO_LONG             (-36) /* hkdfguard_open_file: file is longer than HKDFGUARD_WRAPPED_MAX_LEN */
 #define HKDFGUARD_ERR_FILE_PLAINTEXT_KEY        (-37) /* hkdfguard_open_file: file holds what looks like an unwrapped key - HKDFGUARD_DEK_LEN raw bytes, or its hex or base64 */
 #define HKDFGUARD_ERR_FILE_MALFORMED            (-38) /* hkdfguard_open_file: file is the right size but its contents are not a valid WrappedDekV1 payload (including an unknown version) */
-#define HKDFGUARD_ERR_FILE_UNTRUSTED            (-39) /* hkdfguard_open_file: path is, or passes through, a symbolic link, junction or other reparse point, uses an 8.3 short name, or is not on a local drive (UNC, mapped or SUBST drive, device); or the file or a folder above it is owned by, or lets, an account other than SYSTEM, Administrators, TrustedInstaller or the caller write or replace it */
+#define HKDFGUARD_ERR_FILE_UNTRUSTED            (-39) /* hkdfguard_open_file: path is, or passes through, a symbolic link, junction or other reparse point, uses an 8.3 short name, or is not on a local drive (UNC, mapped or SUBST drive, device); or the file or a folder above it is owned by, or lets, an account other than SYSTEM, Administrators, TrustedInstaller or the caller write or replace it; or a folder above it other than the drive root lets such an account create files or folders in it (C:\ProgramData, C:\Windows\Temp) */
 /* -40..-63 reserved for future common codes */
 // ---- Windows-specific (-64..-79) ----
 #define HKDFGUARD_ERR_WIN_GROUP_INVALID         (-64) /* refines HKDFGUARD_ERR_POLICY_INVALID: a KeyUseGroups policy entry is unresolvable, not a group, not host-local, or over-broad */
@@ -181,6 +181,45 @@ extern "C" {
 HKDFGUARD_API int hkdfguard_kek_exists(
     const char* service,
     int* out_exists);
+
+/* Length of a KEK fingerprint, as written by hkdfguard_kek_fingerprint. */
+#define HKDFGUARD_KEK_FINGERPRINT_LEN 32
+
+/*
+ * Writes the fingerprint of the KEK `service` currently resolves to under
+ * the KeyStoragePolicy - the KEK hkdfguard_wrap_dek would use - to `out`:
+ * SHA-256 of its public key's raw X || Y coordinates (64 bytes, no 0x04
+ * prefix), the same value embedded in every payload wrapped under it (bytes
+ * 100..131). Public-key material, not a secret. Lets an operator record which
+ * KEK a service uses after provisioning, and confirm it before retiring it
+ * (hkdfguard.exe retire). Never creates a KEK, and is not slowed by the setup
+ * floor: it opens the KEK exactly as hkdfguard_wrap_dek does.
+ *
+ * Shared with the macOS build (same name and signature; on Windows the
+ * buffer contract is the one every function here follows); not in the Linux
+ * build. Each platform hashes its own public-key encoding, so the values are
+ * only ever compared on the host that produced them.
+ *
+ * service - see hkdfguard_wrap_dek.
+ * out     - caller-owned output buffer. May be NULL only if *out_len is 0, to
+ *           probe the required size.
+ * out_len - in: capacity of out, in bytes (negative returns
+ *           HKDFGUARD_ERR_INVALID_ARGUMENT). out: on success
+ *           HKDFGUARD_KEK_FINGERPRINT_LEN. On HKDFGUARD_ERR_BUFFER_TOO_SMALL,
+ *           the required capacity (HKDFGUARD_KEK_FINGERPRINT_LEN), reported
+ *           after the service name is checked, without reaching a provider.
+ *           Left unchanged on every other failure.
+ *
+ * Returns HKDFGUARD_OK, or a negative HKDFGUARD_ERR_* code - notably
+ * HKDFGUARD_ERR_KEK_NOT_FOUND if no KEK is provisioned for the service,
+ * HKDFGUARD_ERR_KEK_ACCESS_DENIED if the calling account may not open it, and
+ * HKDFGUARD_ERR_PROVIDER_ERROR if a key exists under the service's name but
+ * fails the same property checks hkdfguard_wrap_dek applies (not a
+ * non-exportable P-256 ECDH key with the expected usage).
+ */
+HKDFGUARD_API int hkdfguard_kek_fingerprint(
+    const char* service,
+    uint8_t* out, int* out_len);
 
 /*
  * Creates the persistent KEK for `service` if it does not already exist, or
@@ -361,6 +400,72 @@ HKDFGUARD_API int hkdfguard_generate_and_wrap_dek(
     const char* service,
     uint8_t* out, int* out_len);
 
+/* Values of hkdfguard_security_model's *out_model. */
+#define HKDFGUARD_SECURITY_MODEL_PRODUCTION 0
+#define HKDFGUARD_SECURITY_MODEL_DEVELOPER  1
+
+/*
+ * Reports this machine's security model and whether this process may
+ * persist key files under it. Windows-only; not in the Linux or macOS
+ * builds.
+ *
+ * The model is the REG_DWORD value
+ *
+ *     HKLM\Software\Policies\HkdfGuard\SecurityModel
+ *
+ * absent or 0: HKDFGUARD_SECURITY_MODEL_PRODUCTION (the default - this is a
+ * production install unless an administrator says otherwise); 1:
+ * HKDFGUARD_SECURITY_MODEL_DEVELOPER; anything else fails every call that
+ * depends on it with HKDFGUARD_ERR_POLICY_INVALID. It decides whose key
+ * files hkdfguard_open_file trusts (see there):
+ *
+ *   Production: SYSTEM, Administrators, TrustedInstaller, and the deployer
+ *     groups - the local group HkdfGuardDeployers (the MSI creates it) and
+ *     each entry of the REG_MULTI_SZ value
+ *     HKLM\Software\Policies\HkdfGuard\DeployerGroups (vetted like
+ *     KeyUseGroups) - and their direct members. The calling account is
+ *     trusted only if it is such a member, so an application that unwraps,
+ *     and wraps ephemeral keys in memory, cannot persist a key file its own
+ *     service would accept.
+ *   Developer: SYSTEM, Administrators, TrustedInstaller and the calling
+ *     account itself.
+ *
+ * Wrapping and unwrapping are the same in both models: any account with
+ * key use on the KEK may do either, in memory.
+ *
+ * out_model               - receives HKDFGUARD_SECURITY_MODEL_*.
+ * out_may_write_key_files - receives 1 if a key file written by this
+ *                           process (owned by its token's default owner:
+ *                           its user, or Administrators when elevated)
+ *                           would be trusted under that model, else 0.
+ *
+ * Returns HKDFGUARD_OK; HKDFGUARD_ERR_INVALID_ARGUMENT for a NULL pointer;
+ * HKDFGUARD_ERR_POLICY_INVALID for an invalid SecurityModel value; or
+ * HKDFGUARD_ERR_WIN_GROUP_INVALID for a DeployerGroups entry that isn't a
+ * host-local, non-over-broad group (or whose members can't be read). Both
+ * outputs are left unchanged on failure.
+ */
+HKDFGUARD_API int hkdfguard_security_model(
+    int* out_model,
+    int* out_may_write_key_files);
+
+/*
+ * Whether hkdfguard_open_file, under this machine's security model (see
+ * hkdfguard_security_model), trusts the account or group `sid` - a SID
+ * string such as "S-1-5-32-544" - to own a key file or a folder above one,
+ * or to hold rights that could change, replace or create entries in them.
+ * Lets a tool that prepares or writes key files check a folder against the
+ * exact rule the library reads by. Windows-only.
+ *
+ * Returns HKDFGUARD_OK with *out_trusted set to 1 or 0;
+ * HKDFGUARD_ERR_INVALID_ARGUMENT for a NULL pointer or a string that isn't a
+ * SID; or HKDFGUARD_ERR_POLICY_INVALID / HKDFGUARD_ERR_WIN_GROUP_INVALID as
+ * hkdfguard_security_model. *out_trusted is left unchanged on failure.
+ */
+HKDFGUARD_API int hkdfguard_key_file_principal_trusted(
+    const char* sid,
+    int* out_trusted);
+
 /*
  * Reads a wrapped-key file (e.g. one written by hkdfguard.exe
  * wrap) and returns its WRAPPED DEK bytes in `out`, exactly as stored on
@@ -394,18 +499,36 @@ HKDFGUARD_API int hkdfguard_generate_and_wrap_dek(
  *           mid-write.
  *           The file, and every folder above it up to the drive root,
  *           must be owned by SYSTEM, BUILTIN\Administrators,
- *           TrustedInstaller or the account this process runs as, and
+ *           TrustedInstaller or - by security model, see
+ *           hkdfguard_security_model - a deployer group or a direct member
+ *           of one (production, the default) or the account this process
+ *           runs as (developer), and
  *           must grant no other account the right to change it: on the
  *           file, write, append, write attributes or extended attributes,
  *           delete, change permissions or take ownership; on a folder,
  *           delete entries in it, delete the folder itself, change its
- *           permissions or take ownership. (Creating new entries in a
- *           folder is fine - C:\ProgramData lets Users do that.)
+ *           permissions or take ownership.
+ *           Every folder below the drive root - the file's own folder and
+ *           each one above it, but not the drive root itself - must also
+ *           grant no other account the right to create entries in it
+ *           ("create files / write data" or "create folders / append
+ *           data"), as the Linux build refuses any directory writable by
+ *           group or others, sticky or not. So C:\ProgramData and
+ *           C:\Windows\Temp, which let Users create entries, and any folder
+ *           under them, are refused, and so is a folder created under
+ *           C:\ProgramData with its default, inherited permissions. The
+ *           drive root is exempt from the create rule only: a default
+ *           C:\ lets Authenticated Users create folders in it, which cannot
+ *           displace a folder already there, and the folders below it are
+ *           judged themselves. A key file directly in the drive root is
+ *           judged by the drive-root rule.
  *           Otherwise HKDFGUARD_ERR_FILE_UNTRUSTED: reading a wrapped DEK
  *           gains nothing, but anyone able to replace it, and to wrap
  *           under the service's KEK, could plant a DEK they know. A folder
  *           created directly under C:\ inherits "Authenticated Users:
- *           Modify" and fails this until its permissions are narrowed.
+ *           Modify" and fails this until its inherited permissions are
+ *           removed (icacls <folder> /inheritance:r plus explicit grants -
+ *           see docs/admin-guide.md, "Where to keep key files").
  *           Read access for other accounts is never a reason to refuse:
  *           the file is ciphertext.
  * out     - caller-owned output buffer. May be NULL only if *out_len is

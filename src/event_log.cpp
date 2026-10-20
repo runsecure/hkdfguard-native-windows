@@ -6,6 +6,7 @@
 #include <windows.h>
 #include <bcrypt.h> // BCryptHash - payload fingerprint for the wrap/unwrap events
 
+#include <atomic>
 #include <string>
 #include <vector>
 
@@ -25,6 +26,13 @@
 //                     wrap that produced it - which also makes a substituted
 //                     older payload visible, since deployment rollback is
 //                     deliberately allowed by the format itself.
+//   1005 Warning      hkdfguard_open_file trusted a key file under the
+//                     developer security model, once per process - the
+//                     caller's own files are accepted, which a production
+//                     machine must not do.
+//   1004 Warning      A KEK was retired (deleted) by hkdfguard.exe retire.
+//                     Written by the CLI, not this file - the library has no
+//                     delete - but its message lives in this DLL's table.
 //   2000 Warning      KEK_ACCESS_DENIED on any call: someone tried to use (or
 //                     create) a KEK they aren't authorized for, or tried
 //                     to provision without elevation.
@@ -64,6 +72,7 @@ namespace hkdfguard {
         constexpr DWORD kEvtKekCreatedSoftwareFallback = 1001;
         constexpr DWORD kEvtDekWrapped = 1002;
         constexpr DWORD kEvtDekUnwrapped = 1003;
+        constexpr DWORD kEvtDeveloperMode = 1005;
         constexpr DWORD kEvtAccessDenied = 2000;
         constexpr DWORD kEvtKekAclInvalid = 2002;
         constexpr DWORD kEvtIntegrityFailure = 2003;
@@ -107,6 +116,7 @@ namespace hkdfguard {
         const wchar_t *OpName(AuditOp op) noexcept {
             switch (op) {
                 case AuditOp::KekExists: return L"hkdfguard_kek_exists";
+                case AuditOp::KekFingerprint: return L"hkdfguard_kek_fingerprint";
                 case AuditOp::CreateKek: return L"hkdfguard_create_kek";
                 case AuditOp::Wrap: return L"hkdfguard_wrap_dek";
                 case AuditOp::GenerateAndWrap: return L"hkdfguard_generate_and_wrap_dek";
@@ -331,6 +341,22 @@ namespace hkdfguard {
                   L" raw bytes, or its hex or base64), so it may be a plaintext key written to disk by "
                   L"mistake. None of its contents were returned. Treat that key as exposed: find out how the "
                   L"file was written, remove it, and re-mint the DEK.");
+        } catch (...) {
+        }
+    }
+
+    void LogDeveloperModeKeyFile() noexcept {
+        static std::atomic<bool> logged{false};
+        if (logged.exchange(true)) {
+            return;
+        }
+        try {
+            Write(EVENTLOG_WARNING_TYPE, kEvtDeveloperMode,
+                  L"hkdfguard_open_file is running under the developer security model "
+                  L"(HKLM\\Software\\Policies\\HkdfGuard\\SecurityModel = 1): key files owned by the calling "
+                  L"account are trusted, so an application that can write files could persist a key file its own "
+                  L"service accepts. Remove the value (or set it to 0) on any production machine. Logged once per "
+                  L"process.");
         } catch (...) {
         }
     }

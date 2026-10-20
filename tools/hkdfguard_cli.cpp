@@ -1,14 +1,33 @@
-// CLI tool: provisions a service's machine-wide KEK, and separately wraps a
+// CLI tool: provisions a service's machine-wide KEK, separately wraps a
 // caller-supplied Data Encryption Key (DEK) under an already-provisioned
-// KEK, writing the wrapped payload to a file.
+// KEK, writing the wrapped payload to a file, and retires (deletes) a KEK
+// once nothing needs it.
 //
-// Two subcommands, strictly separated:
+// Four subcommands, strictly separated:
 //
 //   provision --service-name|-sn <name>
 //       Calls hkdfguard_create_kek, which creates the KEK if it is missing
-//       or re-verifies an existing one (properties and ACL). Never wraps a
-//       DEK, never touches a file.
+//       or re-verifies an existing one (properties and ACL), then prints
+//       its fingerprint (hkdfguard_kek_fingerprint) for the operator to
+//       record. Never wraps a DEK, never touches a file.
 //       This is the *only* subcommand that may create a KEK.
+//
+//   retire --service-name|-sn <name> (--fingerprint|-fp <hex> | --corrupt)
+//          [--provider tpm|software]
+//       Deletes the service's KEK, after the operator proves which KEK they
+//       mean by supplying its fingerprint - or, with --corrupt, only if the
+//       key under the service's name is not a P-256 ECDH key at all, so has
+//       no fingerprint. The *only* subcommand that deletes keys, and
+//       deliberately implemented here rather than in the library: the DLL's
+//       C ABI offers no delete, so no application that loads it gets a
+//       one-call wipe. Requires an elevated process. Every payload wrapped
+//       under a retired KEK is permanently unrecoverable. Logged as event
+//       1004. The macOS tool's retire, with --provider added because a
+//       Windows service can have a KEK on each of two providers.
+//
+//   status --service-name|-sn <name>
+//       Reports whether the service has a KEK, which provider holds it, and
+//       its fingerprint. Read-only: never creates or deletes a key.
 //
 //   wrap --key-file-path|-kf <path> --service-name|-sn <name> \
 //        (--dek-stdin | --dek-file <path>) [--group|-g <name>] [--force|-f]
@@ -23,9 +42,12 @@
 //       of this process, unlike a plain --dek=<value> argument would be.
 //
 // Calls into HkdfGuard.dll through its stable C ABI - hkdfguard_kek_exists,
-// hkdfguard_create_kek, and hkdfguard_wrap_dek - the same interface any
-// other-language caller uses; this tool links only against
-// include/hkdfguard.h and the hkdfguard import library, nothing from src/.
+// hkdfguard_create_kek, hkdfguard_kek_fingerprint and hkdfguard_wrap_dek -
+// the same interface any other-language caller uses; this tool links only
+// against include/hkdfguard.h and the hkdfguard import library, nothing from
+// src/. The one exception is retire/status's direct NCrypt access to the
+// KEK's persisted key (see "KEK inspection and retirement" below): the ABI
+// deliberately has no way to delete a key or address one provider's copy.
 //
 // The KEK's `service` identity is exactly --service-name's value, passed
 // straight through to the hkdfguard_* calls as `service`, and shared
@@ -68,16 +90,23 @@
 // link, and allowing one would let whoever can plant a link in the output
 // directory redirect an elevated `wrap --force` at an arbitrary file. See the
 // "output path must be a real file" section below for exactly how that is
-// enforced on open handles rather than on re-queried paths.
+// enforced on open handles rather than on re-queried paths. And the folders
+// above it must be ones hkdfguard_open_file will read from: no account but
+// SYSTEM, Administrators, TrustedInstaller and the caller may create, delete
+// or rename entries in any of them below the drive root (see "The folders a
+// key file may be read from" below) - refused before the DEK is read.
 
 #include "hkdfguard.h"
+#include "no_follow_open.h" // the path walk shared with hkdfguard_open_file - see tools/CMakeLists.txt
 
 #include <windows.h>
 #include <aclapi.h> // SetSecurityInfo - protecting the key file's DACL on its handle
 #include <bcrypt.h>
+#include <ncrypt.h> // retire/status: opening, inspecting and deleting the persisted KEK
 #include <sddl.h> // ConvertStringSidToSidA - over-broad --group check
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -89,6 +118,7 @@
 #include <vector>
 
 #pragma comment(lib, "bcrypt.lib")
+#pragma comment(lib, "ncrypt.lib")
 #pragma comment(lib, "advapi32.lib")
 
 namespace {
@@ -157,35 +187,6 @@ namespace {
         return result;
     }
 
-    // Minimal RAII wrapper for a Win32 file HANDLE - this tool's own local
-    // copy of the same idea src/handle_traits.h uses for NCrypt/BCrypt handles
-    // elsewhere in this project, kept local since this tool intentionally
-    // depends only on the public hkdfguard.h header, nothing from src/.
-    class ScopedFileHandle {
-    public:
-        explicit ScopedFileHandle(HANDLE h = INVALID_HANDLE_VALUE) : handle_(h) {
-        }
-
-        ~ScopedFileHandle() { reset(); }
-
-        ScopedFileHandle(const ScopedFileHandle &) = delete;
-
-        ScopedFileHandle &operator=(const ScopedFileHandle &) = delete;
-
-        void reset(HANDLE h = INVALID_HANDLE_VALUE) {
-            if (handle_ != INVALID_HANDLE_VALUE && handle_ != nullptr) {
-                CloseHandle(handle_);
-            }
-            handle_ = h;
-        }
-
-        HANDLE get() const { return handle_; }
-        bool valid() const { return handle_ != INVALID_HANDLE_VALUE && handle_ != nullptr; }
-
-    private:
-        HANDLE handle_;
-    };
-
     // MARK: - Argument parsing
 
     struct ProvisionArgs {
@@ -201,6 +202,23 @@ namespace {
         std::optional<std::string> dekFile; // --dek-file: read the DEK from this file instead of stdin
     };
 
+    constexpr size_t kFingerprintLen = HKDFGUARD_KEK_FINGERPRINT_LEN;
+    using Fingerprint = std::array<uint8_t, kFingerprintLen>;
+
+    // The two key storage providers a service's KEK can live on.
+    enum class KekProvider { Tpm, Software };
+
+    struct RetireArgs {
+        std::string serviceName;
+        std::optional<Fingerprint> fingerprint; // --fingerprint: a valid KEK, by its fingerprint
+        bool corrupt = false;                   // --corrupt: a key under the name that isn't a P-256 ECDH key
+        std::optional<KekProvider> provider;    // --provider: which provider's key, when both have one
+    };
+
+    struct StatusArgs {
+        std::string serviceName;
+    };
+
     enum class ParseOutcome { Run, Help };
 
     // The one usage text, printed for every help request and after every
@@ -213,13 +231,24 @@ namespace {
             L"  %ls provision --service-name|-sn <name>\n"
             L"  %ls wrap --key-file-path|-kf <path> --service-name|-sn <name> (--dek-stdin | --dek-file <path>)\n"
             L"       [--group|-g <name>] [--force|-f]\n"
+            L"  %ls retire --service-name|-sn <name> (--fingerprint|-fp <hex> | --corrupt)\n"
+            L"       [--provider tpm|software]\n"
+            L"  %ls status --service-name|-sn <name>\n"
             L"\n"
             L"provision  ensures a KEK exists for the service. Run once, at deployment time, from an\n"
-            L"           elevated prompt; this is the only command that makes the (deliberately slow)\n"
-            L"           setup calls.\n"
+            L"           elevated prompt; this is the only command that creates keys. Prints the\n"
+            L"           KEK's fingerprint -- record it.\n"
             L"wrap       wraps a DEK under the service's existing KEK and writes the payload to\n"
             L"           --key-file-path, readable by its owner only, or also by --group's\n"
             L"           members (read-only). Fails if the KEK has not been provisioned.\n"
+            L"retire     deletes the service's KEK, only if its fingerprint matches <hex> (64 hex\n"
+            L"           characters, as printed by provision). The only command that deletes keys;\n"
+            L"           needs an elevated prompt. Everything wrapped under that KEK becomes\n"
+            L"           permanently unrecoverable: migrate to a new service name first. With\n"
+            L"           --corrupt instead, deletes the key only if it is not a P-256 ECDH key at\n"
+            L"           all. --provider picks the key when both providers hold one.\n"
+            L"status     reports whether the service has a KEK, which provider holds it, and its\n"
+            L"           fingerprint. Read-only: never creates or deletes anything.\n"
             L"\n"
             L"The DEK is base64 of exactly 32 bytes, read from stdin or a file -- never\n"
             L"from a command-line argument or an environment variable, both of which are\n"
@@ -227,10 +256,24 @@ namespace {
             L"\n"
             L"Examples:\n"
             L"  %ls provision -sn svc\n"
-            L"  $dekBase64 | %ls wrap -kf C:\\ProgramData\\app\\key.bin -sn svc --dek-stdin\n"
-            L"  %ls wrap -kf C:\\ProgramData\\app\\key.bin -sn svc --dek-file C:\\ProgramData\\app\\dek.b64\n",
-            kProgramName, kProgramName, kProgramName, kProgramName, kProgramName);
+            L"  $dekBase64 | %ls wrap -kf C:\\HkdfGuardKeys\\app\\key.bin -sn svc --dek-stdin\n"
+            L"  %ls wrap -kf C:\\HkdfGuardKeys\\app\\key.bin -sn svc --dek-file C:\\Users\\me\\dek.b64\n"
+            L"\n"
+            L"Every folder above --key-file-path, up to but not including the drive root, must let\n"
+            L"no account but SYSTEM, Administrators, TrustedInstaller and the reader create, delete\n"
+            L"or rename entries in it -- so not C:\\ProgramData or C:\\Windows\\Temp. Prepare a folder\n"
+            L"of its own from an elevated prompt:\n"
+            L"  icacls C:\\HkdfGuardKeys /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F\n"
+            L"         *S-1-5-32-545:(OI)(CI)RX\n"
+            L"  %ls status -sn svc\n"
+            L"  %ls retire -sn svc -fp <fingerprint printed by provision>\n",
+            kProgramName, kProgramName, kProgramName, kProgramName, kProgramName, kProgramName, kProgramName,
+            kProgramName, kProgramName);
     }
+
+    // The subcommand list every "missing/unknown subcommand" error names -
+    // the macOS tool's wording.
+    constexpr char kSubcommandList[] = "`provision`, `wrap`, `retire` or `status`";
 
     // Stores a flag's value, refusing a second one rather than letting the
     // last win: `-kf a.key ... -kf b.key` is ambiguous about which file the
@@ -360,6 +403,120 @@ namespace {
         out.force = force;
         out.dekStdin = dekStdin;
         out.dekFile = dekFile;
+        return ParseOutcome::Run;
+    }
+
+    // Exactly 64 hex digits, either case. No separators or prefixes: the
+    // value is meant to be pasted from provision's output, and a strict
+    // format keeps a truncated paste from ever looking valid. The macOS
+    // tool's parseFingerprintHex.
+    Fingerprint ParseFingerprintHex(const std::string &text) {
+        if (text.size() != kFingerprintLen * 2) {
+            throw CliError(
+                "--fingerprint must be exactly " + std::to_string(kFingerprintLen * 2) + " hex characters, got " +
+                std::to_string(text.size()));
+        }
+        auto nibble = [](char c) -> int {
+            if (c >= '0' && c <= '9') return c - '0';
+            if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+            if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+            return -1;
+        };
+        Fingerprint bytes{};
+        for (size_t i = 0; i < kFingerprintLen; ++i) {
+            int hi = nibble(text[2 * i]);
+            int lo = nibble(text[2 * i + 1]);
+            if (hi < 0 || lo < 0) {
+                throw CliError("--fingerprint must contain only hex characters (0-9, a-f)");
+            }
+            bytes[i] = static_cast<uint8_t>((hi << 4) | lo);
+        }
+        return bytes;
+    }
+
+    // Reads a flag's value (argv[i + 1]), refusing a missing or empty one.
+    std::string FlagValue(int argc, char *argv[], int &i, const std::string &flag, const char *longName) {
+        if (i + 1 >= argc) {
+            throw CliError(flag + " requires a value");
+        }
+        std::string value = argv[++i];
+        if (value.empty()) {
+            throw CliError(std::string(longName) + " must not be empty");
+        }
+        return value;
+    }
+
+    // Same argv[2]-onward convention as ParseProvisionArgs above.
+    ParseOutcome ParseRetireArgs(int argc, char *argv[], RetireArgs &out) {
+        std::optional<std::string> serviceName;
+        std::optional<std::string> fingerprintText;
+        std::optional<std::string> providerText;
+        bool corrupt = false;
+
+        for (int i = 2; i < argc; ++i) {
+            std::string arg = argv[i];
+            if (arg == "--help" || arg == "-h") {
+                return ParseOutcome::Help;
+            } else if (arg == "--service-name" || arg == "-sn") {
+                SetOnce(serviceName, "--service-name", FlagValue(argc, argv, i, arg, "--service-name"));
+            } else if (arg == "--fingerprint" || arg == "-fp") {
+                SetOnce(fingerprintText, "--fingerprint", FlagValue(argc, argv, i, arg, "--fingerprint"));
+            } else if (arg == "--provider") {
+                SetOnce(providerText, "--provider", FlagValue(argc, argv, i, arg, "--provider"));
+            } else if (arg == "--corrupt") {
+                if (corrupt) {
+                    throw CliError("give --corrupt at most once");
+                }
+                corrupt = true;
+            } else {
+                throw CliError("unrecognized argument for `retire`: " + arg);
+            }
+        }
+
+        if (!serviceName) throw CliError("retire: missing required --service-name|-sn");
+        if (fingerprintText && corrupt) {
+            throw CliError(
+                "retire: --fingerprint and --corrupt are mutually exclusive: a KEK with a readable fingerprint is "
+                "not corrupt");
+        }
+        if (!fingerprintText && !corrupt) {
+            throw CliError(
+                "retire: missing required --fingerprint|-fp (the 64-hex-character value printed by provision), or "
+                "--corrupt for a key that is not a P-256 ECDH key");
+        }
+
+        out.serviceName = *serviceName;
+        out.corrupt = corrupt;
+        if (fingerprintText) {
+            out.fingerprint = ParseFingerprintHex(*fingerprintText);
+        }
+        if (providerText) {
+            if (*providerText == "tpm") {
+                out.provider = KekProvider::Tpm;
+            } else if (*providerText == "software") {
+                out.provider = KekProvider::Software;
+            } else {
+                throw CliError("--provider must be `tpm` or `software`, got \"" + *providerText + "\"");
+            }
+        }
+        return ParseOutcome::Run;
+    }
+
+    // Same argv[2]-onward convention as ParseProvisionArgs above.
+    ParseOutcome ParseStatusArgs(int argc, char *argv[], StatusArgs &out) {
+        std::optional<std::string> serviceName;
+        for (int i = 2; i < argc; ++i) {
+            std::string arg = argv[i];
+            if (arg == "--help" || arg == "-h") {
+                return ParseOutcome::Help;
+            } else if (arg == "--service-name" || arg == "-sn") {
+                SetOnce(serviceName, "--service-name", FlagValue(argc, argv, i, arg, "--service-name"));
+            } else {
+                throw CliError("unrecognized argument for `status`: " + arg);
+            }
+        }
+        if (!serviceName) throw CliError("status: missing required --service-name|-sn");
+        out.serviceName = *serviceName;
         return ParseOutcome::Run;
     }
 
@@ -641,8 +798,8 @@ namespace {
             case HKDFGUARD_ERR_INTERNAL_ERROR: return "an internal error occurred in HkdfGuard.dll";
             case HKDFGUARD_ERR_PROCESS_HARDENING_FAILED: return "could not harden this process against memory disclosure (crash-report heap, same-user debugging and code injection)";
             case HKDFGUARD_ERR_INVALID_SERVICE_NAME: return "service name is missing or malformed (ASCII letters, digits and '.' only, 1-128 bytes, not starting with '.', no \"..\")";
-            case HKDFGUARD_ERR_POLICY_INVALID: return "invalid key storage policy";
-            case HKDFGUARD_ERR_WIN_GROUP_INVALID: return "a KeyUseGroups policy entry is unresolvable, not a group, over-broad, or not host-local";
+            case HKDFGUARD_ERR_POLICY_INVALID: return "invalid machine policy: HKLM\\Software\\Policies\\HkdfGuard\\KeyStoragePolicy is not 0, 1 or 2, or SecurityModel is not 0 or 1";
+            case HKDFGUARD_ERR_WIN_GROUP_INVALID: return "a KeyUseGroups or DeployerGroups policy entry is unresolvable, not a group, over-broad, or not host-local (or a deployer group's members could not be read)";
             case HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH: return "wrapped payload was not produced under this service's current KEK";
             case HKDFGUARD_ERR_KEK_NOT_FOUND: return "no KEK is provisioned for this service";
             case HKDFGUARD_ERR_KEK_ACCESS_DENIED: return "this KEK exists, but this account is not authorized to use it";
@@ -654,7 +811,7 @@ namespace {
             case HKDFGUARD_ERR_FILE_TOO_LONG: return "the wrapped-key file is longer than a wrapped key";
             case HKDFGUARD_ERR_FILE_PLAINTEXT_KEY: return "the file looks like an UNWRAPPED 32-byte key (raw, or its hex or base64) - it may hold a plaintext key; treat it as exposed";
             case HKDFGUARD_ERR_FILE_MALFORMED: return "the wrapped-key file is the right size but does not hold a valid wrapped key";
-            case HKDFGUARD_ERR_FILE_UNTRUSTED: return "the wrapped-key path is, or passes through, a symbolic link, junction or other reparse point, uses an 8.3 short name, or is not on a local drive (UNC, mapped or SUBST drive, device); or the file or a folder above it is owned by, or lets, an account other than SYSTEM, Administrators, TrustedInstaller or the caller write or replace it";
+            case HKDFGUARD_ERR_FILE_UNTRUSTED: return "the wrapped-key path is, or passes through, a symbolic link, junction or other reparse point, uses an 8.3 short name, or is not on a local drive (UNC, mapped or SUBST drive, device); or the file or a folder above it is owned by, or lets, an account other than SYSTEM, Administrators, TrustedInstaller or the caller write or replace it; or a folder above it, other than the drive root, lets such an account create files or folders in it (as C:\\ProgramData and C:\\Windows\\Temp do)";
             default: return "unknown status code " + std::to_string(code);
         }
     }
@@ -708,7 +865,8 @@ namespace {
     // over-broad principal). Skipping it whenever hkdfguard_kek_exists said
     // "yes" would let a pre-planted or later-widened KEK pass provisioning
     // unchecked. hkdfguard_kek_exists only chooses the message printed.
-    void EnsureKekProvisioned(const std::string &service) {
+    // Returns true if this call created the KEK.
+    bool EnsureKekProvisioned(const std::string &service) {
         int32_t exists = 0;
         int32_t rc = hkdfguard_kek_exists(service.c_str(), &exists);
         if (rc != HKDFGUARD_OK) {
@@ -737,6 +895,34 @@ namespace {
         } else {
             fprintf(stdout, "KEK provisioned for service \"%s\"\n", service.c_str());
         }
+        return exists == 0;
+    }
+
+    std::string HexString(const uint8_t *bytes, size_t len) {
+        static const char kDigits[] = "0123456789abcdef";
+        std::string out;
+        out.reserve(len * 2);
+        for (size_t i = 0; i < len; ++i) {
+            out.push_back(kDigits[bytes[i] >> 4]);
+            out.push_back(kDigits[bytes[i] & 0x0F]);
+        }
+        return out;
+    }
+
+    std::string HexString(const Fingerprint &fp) {
+        return HexString(fp.data(), fp.size());
+    }
+
+    // The library's answer for the KEK `service` resolves to - the one a
+    // wrap would use (hkdfguard_kek_fingerprint). Returns the status code;
+    // `out` is filled only on HKDFGUARD_OK.
+    int32_t ReadKekFingerprint(const std::string &service, Fingerprint &out) {
+        int32_t len = static_cast<int32_t>(out.size());
+        int32_t rc = hkdfguard_kek_fingerprint(service.c_str(), out.data(), &len);
+        if (rc == HKDFGUARD_OK && len != static_cast<int32_t>(out.size())) {
+            return HKDFGUARD_ERR_INTERNAL_ERROR;
+        }
+        return rc;
     }
 
     // Enforces that --service-name - the exact value passed to
@@ -1044,64 +1230,36 @@ namespace {
     // to could redirect an (often elevated) `wrap --force` into overwriting
     // and deleting an arbitrary file, or a plain `wrap` into creating one
     // somewhere it never meant to (CREATE_NEW happily follows a *dangling*
-    // symlink and creates its target). So: refuse, don't tolerate. The
-    // helpers below enforce that four ways, all on handles already open
-    // (never by re-querying a path that could be swapped underneath):
+    // symlink and creates its target). And a directory symbolic link can
+    // point at \\server\share: following one would make this process connect
+    // and authenticate to that server before anything could refuse it. So:
+    // refuse, don't tolerate - and never follow a link even to find out.
     //
+    //   0. The path is walked, never resolved by name (no_follow_open.h):
+    //      the drive root, then each folder opened relative to the handle of
+    //      the one above it, each refused if it is a reparse point before
+    //      anything is opened through it, then the file relative to its
+    //      folder. Nothing reached through a link is ever opened.
     //   1. The object itself must not carry FILE_ATTRIBUTE_REPARSE_POINT -
-    //      every CreateFile in this section passes
-    //      FILE_FLAG_OPEN_REPARSE_POINT precisely so a symlink at the path
-    //      opens *as the link* and gets caught here, rather than being
-    //      silently followed.
+    //      it is opened with FILE_OPEN_REPARSE_POINT, so a link at the path
+    //      opens *as the link* and gets caught here.
     //   2. It must be a file, not a directory.
     //   3. The kernel's own resolved path for the handle
     //      (GetFinalPathNameByHandle) must equal the fully-qualified form of
-    //      what the caller typed - which is what catches a junction or
-    //      symlink in a *parent* component, where flag (1) on the leaf can't
-    //      see it. (A path using 8.3 short names is refused before this, in
-    //      FullLongPath.)
+    //      what the caller typed. After (0) the only way they can differ is
+    //      a component spelled with its 8.3 short name ("PROGRA~1"), which
+    //      is refused.
     //   4. The file must have exactly one name (no hard links), since
     //      neither (1) nor (3) can tell that a file is also reachable at
     //      another path, and overwriting it would change that file too.
     //
-    // A consequence of (3) worth knowing: a path through a SUBST drive or a
-    // mapped network drive resolves to a different canonical form and is
-    // refused too. A secrets file belongs on a real local path anyway.
+    // SUBST and mapped network drives are refused before (0), from the
+    // drive letter alone. A secrets file belongs on a real local path.
 
-    // GetLongPathName for a path that must exist; empty on failure, with
-    // GetLastError() left set for the caller.
-    std::string TryLongPathName(const std::string &path) {
-        DWORD needed = GetLongPathNameA(path.c_str(), nullptr, 0);
-        if (needed == 0) {
-            return {};
-        }
-        std::string longForm(needed, '\0');
-        DWORD written = GetLongPathNameA(path.c_str(), longForm.data(), needed);
-        if (written == 0 || written >= needed) {
-            return {};
-        }
-        longForm.resize(written);
-        return longForm;
-    }
-
-    // Fully-qualified form of `path`, as the caller spelled it - *not*
-    // resolved through any reparse point. This is the "expected" side of
-    // check (3) above.
-    //
-    // 8.3 short names ("PROGRA~1") are refused rather than expanded, here
-    // and in HkdfGuard.dll's hkdfguard_open_file alike: they are a second,
-    // auto-generated name for the same file, with a history of checks that
-    // matched one spelling but not the other. The test is exact, not a guess
-    // from "~" characters: GetLongPathName walks the path through the
-    // directory listing, and a path is refused only if that changes one of
-    // its components (ignoring case). A genuine long name such as
-    // "report~1.key" passes.
-    //
-    // GetLongPathName only works on paths that exist, and the wrapped-key
-    // file usually doesn't yet. So if the full path doesn't resolve, the
-    // parent directory (which must exist) is checked instead; the leaf of a
-    // file that doesn't exist yet has no short name to check.
-    std::string FullLongPath(const std::string &path) {
+    // Fully-qualified form of `path`, as the caller spelled it -
+    // GetFullPathName works on the text alone, so nothing is opened and no
+    // link is followed. This is the "expected" side of check (3) above.
+    std::string FullPath(const std::string &path) {
         DWORD needed = GetFullPathNameA(path.c_str(), 0, nullptr, nullptr);
         if (needed == 0) {
             throw CliError("GetFullPathName failed for " + path + ": " + FormatWin32Error(GetLastError()));
@@ -1112,45 +1270,70 @@ namespace {
             throw CliError("GetFullPathName failed for " + path + ": " + FormatWin32Error(GetLastError()));
         }
         full.resize(written);
-
-        auto refuseShortName = [&path]() {
-            throw CliError(
-                path + " uses an 8.3 short name (such as PROGRA~1); spell every folder and the file "
-                "with its full name");
-        };
-
-        std::string longForm = TryLongPathName(full);
-        if (!longForm.empty()) {
-            if (_stricmp(longForm.c_str(), full.c_str()) != 0) {
-                refuseShortName();
-            }
-            return full;
-        }
-        DWORD err = GetLastError();
-        if (err != ERROR_FILE_NOT_FOUND) {
-            throw CliError("GetLongPathName failed for " + full + ": " + FormatWin32Error(err));
-        }
-
-        size_t sep = full.find_last_of("\\/");
-        if (sep == std::string::npos || sep + 1 >= full.size()) {
-            throw CliError("cannot determine the file name in " + path);
-        }
-        std::string parent = (sep <= 2) ? full.substr(0, sep + 1) : full.substr(0, sep);
-        std::string parentLong = TryLongPathName(parent);
-        if (parentLong.empty()) {
-            throw CliError(
-                "the directory for " + path + " (" + parent + ") does not exist or cannot be resolved: " +
-                FormatWin32Error(GetLastError()));
-        }
-        if (_stricmp(parentLong.c_str(), parent.c_str()) != 0) {
-            refuseShortName();
-        }
         return full;
+    }
+
+    // This tool's paths are ANSI (argv, the A-suffixed Win32 calls); the
+    // walk is in UTF-16. Converted with the same code page CreateFileA would
+    // use, so the same names are meant.
+    std::wstring AnsiToWide(const std::string &s) {
+        if (s.empty()) return {};
+        int len = MultiByteToWideChar(CP_ACP, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
+        std::wstring wide(static_cast<size_t>(len > 0 ? len : 0), L'\0');
+        if (len > 0) MultiByteToWideChar(CP_ACP, 0, s.data(), static_cast<int>(s.size()), wide.data(), len);
+        return wide;
+    }
+
+    std::string WideToAnsi(const std::wstring &w) {
+        if (w.empty()) return {};
+        int len = WideCharToMultiByte(CP_ACP, 0, w.data(), static_cast<int>(w.size()), nullptr, 0, nullptr, nullptr);
+        std::string narrow(static_cast<size_t>(len > 0 ? len : 0), '\0');
+        if (len > 0) WideCharToMultiByte(CP_ACP, 0, w.data(), static_cast<int>(w.size()), narrow.data(), len, nullptr, nullptr);
+        return narrow;
+    }
+
+    std::string FinalPathOfHandle(HANDLE file, const std::string &path);
+    std::string TrimTrailingSeparators(std::string p);
+
+    // Check (0): opens every folder from the drive root down to the one
+    // holding `full`'s last component, never following a link (see
+    // no_follow_open.h), then refuses an 8.3 short name anywhere in those
+    // folders - check (3) on the deepest one, whose canonical path spells
+    // every folder above it. `what` names the path in messages. `full` must
+    // already have passed RequireLocalDrivePath.
+    hkdfguard_nofollow::FolderChain WalkToParent(const std::string &full, const std::string &what) {
+        hkdfguard_nofollow::FolderChain chain;
+        hkdfguard_nofollow::Error error;
+        if (!hkdfguard_nofollow::OpenFolderChain(AnsiToWide(full), chain, error)) {
+            const std::string at = WideToAnsi(error.at);
+            switch (error.failure) {
+                case hkdfguard_nofollow::Failure::ReparsePoint:
+                    throw CliError(
+                        what + " resolves through a symbolic link, junction or other reparse point at \"" + at +
+                        "\"; it must be a real local path with no links in it (nothing was opened through the link)");
+                case hkdfguard_nofollow::Failure::NotADirectory:
+                    throw CliError(what + ": \"" + at + "\" is a file, not a folder");
+                case hkdfguard_nofollow::Failure::OpenFailed:
+                    if (error.win32 == ERROR_FILE_NOT_FOUND || error.win32 == ERROR_PATH_NOT_FOUND) {
+                        throw CliError("the directory for " + what + " (" + at + ") does not exist");
+                    }
+                    throw CliError("cannot open the folder \"" + at + "\" in " + what + ": " + FormatWin32Error(error.win32));
+                default:
+                    throw CliError(what + " names an alternate data stream or has an empty folder name");
+            }
+        }
+        const std::string parent = WideToAnsi(chain.parentPath());
+        const std::string actual = TrimTrailingSeparators(FinalPathOfHandle(chain.parent(), what));
+        if (_stricmp(actual.c_str(), TrimTrailingSeparators(parent).c_str()) != 0) {
+            throw CliError(
+                what + " uses an 8.3 short name (such as PROGRA~1); spell every folder and the file with its full name");
+        }
+        return chain;
     }
 
     // The kernel's canonical DOS path for an open handle, with the "\\?\"
     // (or "\\?\UNC\") prefix GetFinalPathNameByHandle always adds stripped
-    // back off so it compares directly against FullLongPath's output. This is
+    // back off so it compares directly against FullPath's output. This is
     // the "actual" side of check (3) above - it reflects every reparse point
     // that was traversed to reach the object, which is the whole point.
     std::string FinalPathOfHandle(HANDLE file, const std::string &path) {
@@ -1197,7 +1380,7 @@ namespace {
     }
 
     // Checks (1)-(4) above against an already-open handle. `expected` is the
-    // FullLongPath form the handle is supposed to be sitting at;
+    // FullPath form the handle is supposed to be sitting at;
     // `allowDirectory` is set only for the parent-directory pre-check in
     // ValidateOutputPathIsReal, never for the wrapped-key file itself.
     void RequireRealObjectAtExpectedPath(
@@ -1229,24 +1412,26 @@ namespace {
                 "overwriting it cannot alter a file at some other path");
         }
 
+        // Reached only through the walk, so a difference here can only be an
+        // 8.3 short name in the last component.
         std::string actual = TrimTrailingSeparators(FinalPathOfHandle(file, path));
         std::string want = TrimTrailingSeparators(expected);
         if (_stricmp(actual.c_str(), want.c_str()) != 0) {
             throw CliError(
-                path + " resolves through a symbolic link, junction, SUBST or mapped drive to \"" + actual +
-                "\"; the wrapped-key path must be a real local path with no links in it");
+                path + " uses an 8.3 short name (such as PROGRA~1), resolving to \"" + actual +
+                "\"; spell every folder and the file with its full name");
         }
     }
 
     // Refuses `path` unless it names a file on a local drive: never a UNC
     // path (\\server\share\..., \\?\UNC\...), a device or \\?\ path, or a
-    // mapped network drive. Decided from the path text alone (GetFullPathName
-    // does no I/O; GetDriveType asks only the local mount manager) and before
-    // anything touches the path, so this process never connects or
-    // authenticates to a server named in it - which would hand that server
-    // the caller's NTLM credentials. A SUBST drive passes here and is caught
-    // later, where the opened handle's real path must match the spelled one.
-    // `what` names the path in the message.
+    // mapped network drive, nor a SUBST drive (whose target is another path,
+    // possibly a share). Decided from the path text and the drive letter
+    // alone (see hkdfguard_nofollow::IsLocalDrivePath - nothing is opened)
+    // and before anything touches the path, so this process never connects
+    // or authenticates to a server named in it - which would hand that
+    // server the caller's NTLM credentials. Links further down the path are
+    // the walk's job (WalkToParent). `what` names the path in the message.
     void RequireLocalDrivePath(const std::string &path, const std::string &what) {
         char fullBuf[MAX_PATH * 4];
         DWORD fullLen = GetFullPathNameA(path.c_str(), static_cast<DWORD>(sizeof(fullBuf)), fullBuf, nullptr);
@@ -1254,63 +1439,243 @@ namespace {
             throw CliError("failed to resolve " + what + ": " + FormatWin32Error(GetLastError()));
         }
         const std::string full(fullBuf, fullLen);
-        const bool driveLetter = full.size() >= 3 && std::isalpha(static_cast<unsigned char>(full[0])) &&
-                                 full[1] == ':' && full[2] == '\\';
-        if (!driveLetter || GetDriveTypeA(full.substr(0, 3).c_str()) == DRIVE_REMOTE) {
+        if (!hkdfguard_nofollow::IsLocalDrivePath(AnsiToWide(full))) {
             throw CliError(
-                what + " is not on a local drive (UNC paths, mapped network drives and devices are refused)");
+                what + " is not on a local drive (UNC paths, mapped network and SUBST drives, and devices are "
+                "refused)");
+        }
+    }
+
+    std::vector<BYTE> GetProcessUserSid();
+    std::string AccountNameOf(PSID sid);
+
+    // MARK: - The folders a key file may be read from
+    //
+    // hkdfguard_open_file refuses a key file (HKDFGUARD_ERR_FILE_UNTRUSTED)
+    // unless every folder above it - the drive root included - is owned by
+    // SYSTEM, Administrators, TrustedInstaller or the reading account and
+    // lets no other account delete, rename or take over its entries, and
+    // unless every folder below the drive root - the key file's own folder
+    // included - also lets no other account create files or folders in it
+    // (the Linux build's "no directory writable by group or others", sticky
+    // or not). The drive root is exempt from that last part only: a default
+    // C:\ lets Authenticated Users create folders, and the folders below it
+    // are judged themselves. See src/key_file.cpp, whose rule this mirrors
+    // ACE for ACE so that wrap never writes a file the library would refuse
+    // to read. (The library judges against the account *reading* the file;
+    // here "this account" is the one running wrap - the closest this tool
+    // can know.)
+    //
+    // So C:\ProgramData (Users may create entries in it), any folder under
+    // it, C:\Windows\Temp, and a folder made directly under C:\ that still
+    // inherits Authenticated Users: Modify are all refused, before the DEK
+    // is read or a provider is touched, with the fix in the message.
+
+    // Rights the library refuses to anyone untrusted, on every folder (the
+    // drive root included) and, below the drive root, also the create rights.
+    constexpr ACCESS_MASK kFolderReplaceRights = FILE_DELETE_CHILD | DELETE | WRITE_DAC | WRITE_OWNER | GENERIC_ALL;
+    constexpr ACCESS_MASK kFolderCreateRights = FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY | GENERIC_WRITE;
+
+    // Shared system folders that let every user create entries. Never the
+    // thing to fix - the key belongs somewhere else - so the message says so
+    // instead of suggesting icacls on them.
+    bool IsSharedSystemFolder(const std::string &folder) {
+        auto same = [&folder](const std::string &other) {
+            return !other.empty() && _stricmp(TrimTrailingSeparators(other).c_str(), folder.c_str()) == 0;
+        };
+        auto env = [](const char *name) {
+            char value[MAX_PATH * 2] = {};
+            DWORD len = GetEnvironmentVariableA(name, value, static_cast<DWORD>(sizeof(value)));
+            return (len > 0 && len < sizeof(value)) ? std::string(value, len) : std::string();
+        };
+        char windows[MAX_PATH + 1] = {};
+        UINT len = GetSystemWindowsDirectoryA(windows, MAX_PATH + 1);
+        const std::string windowsTemp = (len > 0 && len <= MAX_PATH) ? std::string(windows, len) + "\\Temp" : "";
+        return same(env("ProgramData")) || same(env("PUBLIC")) || same(windowsTemp);
+    }
+
+    // The fix for a folder that fails the rule, as icacls commands an
+    // administrator can paste into an elevated prompt. /inheritance:r drops
+    // every inherited ACE and /grant:r sets the three that are wanted; an
+    // ACE set on the folder itself (`explicitSid`, as "*S-1-..."; empty when
+    // the offending ACE was inherited) survives both, so it is removed first.
+    std::string KeyFolderFix(const std::string &folder, const std::string &explicitSid = std::string()) {
+        if (IsSharedSystemFolder(folder)) {
+            return "; " + folder + " is a shared system folder - do not change its permissions; keep key files in a "
+                   "folder of their own instead, for example one directly under the drive root, prepared from an "
+                   "elevated prompt with:\n"
+                   "  mkdir C:\\HkdfGuardKeys\\<app>\n"
+                   "  icacls C:\\HkdfGuardKeys /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F "
+                   "*S-1-5-32-545:(OI)(CI)RX HkdfGuardDeployers:(OI)(CI)M\n"
+                   "  icacls C:\\HkdfGuardKeys /setowner *S-1-5-32-544 /T\n"
+                   "(see \"Where to keep key files\" in docs/admin-guide.md)";
+        }
+        return "; remove every other account's rights to it, from an elevated prompt:\n" +
+               (explicitSid.empty() ? std::string()
+                                    : "  icacls \"" + folder + "\" /remove:g " + explicitSid + "\n") +
+               "  icacls \"" + folder + "\" /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F "
+               "*S-1-5-32-545:(OI)(CI)RX HkdfGuardDeployers:(OI)(CI)M\n"
+               "  icacls \"" + folder + "\" /setowner *S-1-5-32-544 /T\n"
+               "then check that `icacls \"" + folder + "\"` lists only SYSTEM, Administrators, Users (RX) and "
+               "HkdfGuardDeployers (M), and "
+               "that every folder above it passes too (see \"Where to keep key files\" in docs/admin-guide.md)";
+    }
+
+    // "*S-1-..." for icacls, or empty if the SID can't be rendered.
+    std::string IcaclsSid(PSID sid) {
+        LPSTR text = nullptr;
+        if (!ConvertSidToStringSidA(sid, &text)) {
+            return std::string();
+        }
+        std::string s = std::string("*") + text;
+        LocalFree(text);
+        return s;
+    }
+
+    // Applies the library's folder rule to every folder of a walked chain,
+    // on the handles the walk opened (so it is the folders actually
+    // traversed that are judged). `path` is --key-file-path as given. Who
+    // is trusted is the library's answer, under the machine's security
+    // model (hkdfguard_key_file_principal_trusted), not a copy of its rule:
+    // SYSTEM, Administrators and TrustedInstaller always, then the deployer
+    // groups and their members (production) or this account (developer).
+    void RequireTrustedKeyFileFolders(const hkdfguard_nofollow::FolderChain &chain, const std::string &path) {
+        int model = HKDFGUARD_SECURITY_MODEL_PRODUCTION;
+        int ignored = 0;
+        int32_t modelRc = hkdfguard_security_model(&model, &ignored);
+        if (modelRc != HKDFGUARD_OK) {
+            throw CliError("could not read the security model: " + DescribeStatus(modelRc));
+        }
+        const bool developer = model == HKDFGUARD_SECURITY_MODEL_DEVELOPER;
+        const std::string others = developer ? "this account" : "a deployer group (HkdfGuardDeployers or DeployerGroups) "
+                                                                "or a direct member of one";
+        std::vector<std::pair<std::vector<BYTE>, bool>> cache;
+        auto mayOwn = [&](PSID sid) {
+            for (const auto &entry: cache) {
+                if (EqualSid(sid, const_cast<BYTE *>(entry.first.data()))) return entry.second;
+            }
+            LPSTR text = nullptr;
+            if (!ConvertSidToStringSidA(sid, &text)) {
+                throw CliError("ConvertSidToStringSid failed: " + FormatWin32Error(GetLastError()));
+            }
+            int trusted = 0;
+            int32_t rc = hkdfguard_key_file_principal_trusted(text, &trusted);
+            LocalFree(text);
+            if (rc != HKDFGUARD_OK) {
+                throw CliError("could not check who may write key files: " + DescribeStatus(rc));
+            }
+            const auto *bytes = static_cast<const BYTE *>(sid);
+            cache.emplace_back(std::vector<BYTE>(bytes, bytes + GetLengthSid(sid)), trusted != 0);
+            return trusted != 0;
+        };
+        auto mayWrite = [&](PSID sid) {
+            return mayOwn(sid) || IsWellKnownSid(sid, WinCreatorOwnerRightsSid) ||
+                   IsWellKnownSid(sid, WinCreatorOwnerSid) || IsWellKnownSid(sid, WinCreatorGroupSid);
+        };
+        const std::string why =
+                "hkdfguard_open_file would refuse to read a key file there (HKDFGUARD_ERR_FILE_UNTRUSTED, -39): "
+                "every folder from the key file's own up to, but not including, the drive root must let no account "
+                "other than SYSTEM, Administrators, TrustedInstaller or " + others + " create, delete or "
+                "rename entries in it, or change its permissions (" + (developer ? "developer" : "production") +
+                " security model)";
+
+        for (size_t i = 0; i < chain.handles.size(); ++i) {
+            const bool driveRoot = i == 0;
+            const std::string folder = TrimTrailingSeparators(WideToAnsi(chain.paths[i]));
+            const std::string what = "--key-file-path " + path + ": " + (driveRoot ? "the drive root " : "the folder ") +
+                                     "\"" + folder + "\"";
+            PSID owner = nullptr;
+            PACL dacl = nullptr;
+            PSECURITY_DESCRIPTOR sd = nullptr;
+            DWORD rc = GetSecurityInfo(chain.handles[i].get(), SE_FILE_OBJECT,
+                                       OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION, &owner, nullptr, &dacl,
+                                       nullptr, &sd);
+            if (rc != ERROR_SUCCESS) {
+                throw CliError(what + ": its security could not be read (" + FormatWin32Error(rc) +
+                               "), so hkdfguard_open_file could not vouch for it either");
+            }
+            struct FreeSd {
+                PSECURITY_DESCRIPTOR p;
+                ~FreeSd() { LocalFree(p); }
+            } freeSd{sd};
+            const std::string fix = driveRoot ? std::string("; keep the key file on a drive whose root is not open "
+                                                            "to other accounts")
+                                              : KeyFolderFix(folder);
+            if (owner == nullptr || !mayOwn(owner)) {
+                throw CliError(what + " is owned by " + (owner ? AccountNameOf(owner) : std::string("no one")) +
+                               ", which is neither SYSTEM, Administrators, TrustedInstaller nor " + others + "; " +
+                               why + fix);
+            }
+            if (dacl == nullptr) {
+                throw CliError(what + " has no DACL, so every account has full access to it; " + why + fix);
+            }
+            const ACCESS_MASK forbidden = driveRoot ? kFolderReplaceRights : (kFolderReplaceRights | kFolderCreateRights);
+            for (DWORD a = 0; a < dacl->AceCount; ++a) {
+                void *ace = nullptr;
+                if (!GetAce(dacl, a, &ace)) {
+                    throw CliError(what + ": its ACL could not be read: " + FormatWin32Error(GetLastError()));
+                }
+                const auto *header = static_cast<const ACE_HEADER *>(ace);
+                if (header->AceFlags & INHERIT_ONLY_ACE) {
+                    continue; // applies only to what is created inside it
+                }
+                switch (header->AceType) {
+                    case ACCESS_DENIED_ACE_TYPE:
+                    case ACCESS_DENIED_OBJECT_ACE_TYPE:
+                    case ACCESS_DENIED_CALLBACK_ACE_TYPE:
+                    case ACCESS_DENIED_CALLBACK_OBJECT_ACE_TYPE:
+                        continue;
+                    case ACCESS_ALLOWED_ACE_TYPE:
+                    case ACCESS_ALLOWED_CALLBACK_ACE_TYPE: {
+                        const auto *allowed = static_cast<const ACCESS_ALLOWED_ACE *>(ace);
+                        PSID sid = const_cast<DWORD *>(&allowed->SidStart);
+                        const ACCESS_MASK granted = allowed->Mask & forbidden;
+                        if (granted == 0 || mayWrite(sid)) {
+                            continue;
+                        }
+                        const bool createOnly = (granted & ~kFolderCreateRights) == 0;
+                        const bool inherited = (header->AceFlags & INHERITED_ACE) != 0;
+                        throw CliError(what + " lets " + AccountNameOf(sid) +
+                                       (createOnly ? " create files or folders in it"
+                                                   : " delete, rename or replace its entries, or change its permissions") +
+                                       (inherited ? " (an inherited permission)" : "") + "; " + why +
+                                       (driveRoot || inherited ? fix : KeyFolderFix(folder, IcaclsSid(sid))));
+                    }
+                    default:
+                        throw CliError(what + " has an access-allowed ACE of an unexpected type; " + why + fix);
+                }
+            }
         }
     }
 
     // Fail-fast version of the checks above, run before any KEK or DEK work
     // so a bad output path is rejected without touching the key store or
-    // reading the DEK at all: the parent directory must be a real directory
-    // at its spelled location, and if something already exists at the leaf
-    // it must not be a reparse point. The authoritative checks are still the
-    // ones made on the actual write/overwrite handles later
-    // (SecureOverwriteAndRemoveIfExists / WriteWrappedKeyFile) - this is the
-    // friendly early exit, not the security boundary, since a path can
-    // always change between a pre-check and a later open.
-    void ValidateOutputPathIsReal(const std::string &path) {
-        std::string full = FullLongPath(path);
+    // reading the DEK at all: every folder down to the file's must be real
+    // (WalkToParent) and pass the library's folder rule
+    // (RequireTrustedKeyFileFolders), and if something already exists at the
+    // leaf it must pass checks (1)-(4). Returns whether something exists there. The
+    // authoritative checks are still the ones made on the actual
+    // write/overwrite handles later (SecureOverwriteAndRemoveIfExists /
+    // WriteWrappedKeyFile) - this is the friendly early exit, not the
+    // security boundary, since a path can always change between a
+    // pre-check and a later open.
+    bool ValidateOutputPathIsReal(const std::string &path) {
+        const std::string full = FullPath(path);
+        hkdfguard_nofollow::FolderChain chain = WalkToParent(full, path);
+        RequireTrustedKeyFileFolders(chain, path);
 
-        size_t sep = full.find_last_of("\\/");
-        if (sep == std::string::npos) {
-            throw CliError("cannot determine the parent directory of " + path);
+        hkdfguard_nofollow::Handle leaf;
+        DWORD err = 0;
+        if (hkdfguard_nofollow::OpenRelative(
+                chain.parent(), chain.leaf, FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_OPEN, 0, nullptr, leaf, err)) {
+            RequireRealObjectAtExpectedPath(leaf.get(), full, path, /*allowDirectory=*/false);
+            return true;
         }
-        // Keep the separator for a drive root ("C:\"), drop it otherwise.
-        std::string parent = (sep <= 2) ? full.substr(0, sep + 1) : full.substr(0, sep);
-
-        {
-            // FILE_FLAG_BACKUP_SEMANTICS is what CreateFile requires to open a
-            // *directory* handle at all; FILE_FLAG_OPEN_REPARSE_POINT so a
-            // junction opens as itself (see the section comment above).
-            ScopedFileHandle dir(CreateFile(
-                parent.c_str(), FILE_READ_ATTRIBUTES,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
-                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
-            if (!dir.valid()) {
-                throw CliError(
-                    "cannot open the directory for " + path + " (" + parent + "): " +
-                    FormatWin32Error(GetLastError()));
-            }
-            RequireRealObjectAtExpectedPath(dir.get(), parent, parent, /*allowDirectory=*/true);
-        }
-
-        {
-            // FILE_FLAG_BACKUP_SEMANTICS here too, so that if the leaf turns
-            // out to be a directory or junction it still opens and is caught
-            // by the checks, rather than failing to open and being deferred.
-            ScopedFileHandle leaf(CreateFile(
-                path.c_str(), FILE_READ_ATTRIBUTES,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
-                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
-            if (leaf.valid()) {
-                RequireRealObjectAtExpectedPath(leaf.get(), full, path, /*allowDirectory=*/false);
-            }
-            // Not existing yet is fine (that's the normal first-run case);
-            // any other open failure is left for the real write to report.
-        }
+        // Not existing yet is the normal first-run case. Anything else
+        // (access denied, in use) means something is there; the real
+        // write reports what.
+        return err != ERROR_FILE_NOT_FOUND && err != ERROR_PATH_NOT_FOUND;
     }
 
     // Marks the file behind an open handle for deletion when its last handle
@@ -1335,7 +1700,8 @@ namespace {
     // --force, an existing file is never touched at all
     // (WriteWrappedKeyFile's CREATE_NEW fails outright instead).
     //
-    // The file is opened with FILE_FLAG_OPEN_REPARSE_POINT and vetted by
+    // The file is reached by the walk (WalkToParent), opened relative to its
+    // folder without following a reparse point, and vetted by
     // RequireRealObjectAtExpectedPath before a single byte is written, and is
     // deleted through that same handle (DeleteViaHandle) rather than by
     // path - see the section comment above for why. A symlink or junction
@@ -1359,29 +1725,31 @@ namespace {
     // best-effort measure against casual recovery, not a cryptographic
     // guarantee against a determined attacker with access to the raw storage.
     void SecureOverwriteAndRemoveIfExists(const std::string &path) {
-        ScopedFileHandle file(CreateFile(
-            path.c_str(), GENERIC_WRITE | DELETE, 0 /* exclusive access for the duration of the passes */, nullptr,
-            OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
-        if (!file.valid()) {
-            DWORD err = GetLastError();
+        const std::string full = FullPath(path);
+        hkdfguard_nofollow::FolderChain chain = WalkToParent(full, path);
+        RequireTrustedKeyFileFolders(chain, path); // re-checked on these handles, before anything is destroyed
+        hkdfguard_nofollow::Handle file;
+        DWORD err = 0;
+        if (!hkdfguard_nofollow::OpenRelative(
+                chain.parent(), chain.leaf, GENERIC_WRITE | DELETE, 0 /* exclusive access for the duration of the passes */,
+                FILE_OPEN, FILE_NON_DIRECTORY_FILE, nullptr, file, err)) {
             if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND) {
                 return; // nothing to overwrite or delete
             }
             if (err == ERROR_ACCESS_DENIED || err == ERROR_SHARING_VIOLATION) {
                 // Can't write to it - skip the overwrite passes and go
                 // straight to removing it, still through a vetted handle.
-                ScopedFileHandle del(CreateFile(
-                    path.c_str(), DELETE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-                    OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
-                if (!del.valid()) {
-                    DWORD delErr = GetLastError();
+                hkdfguard_nofollow::Handle del;
+                DWORD delErr = 0;
+                if (!hkdfguard_nofollow::OpenRelative(
+                        chain.parent(), chain.leaf, DELETE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                        FILE_OPEN, FILE_NON_DIRECTORY_FILE, nullptr, del, delErr)) {
                     if (delErr == ERROR_FILE_NOT_FOUND || delErr == ERROR_PATH_NOT_FOUND) {
                         return;
                     }
                     throw CliError("failed to remove " + path + ": " + FormatWin32Error(delErr));
                 }
-                RequireRealObjectAtExpectedPath(del.get(), FullLongPath(path), path, /*allowDirectory=*/false);
+                RequireRealObjectAtExpectedPath(del.get(), full, path, /*allowDirectory=*/false);
                 DeleteViaHandle(del.get(), path);
                 return;
             }
@@ -1389,7 +1757,7 @@ namespace {
         }
 
         // Vet the handle before writing anything through it.
-        RequireRealObjectAtExpectedPath(file.get(), FullLongPath(path), path, /*allowDirectory=*/false);
+        RequireRealObjectAtExpectedPath(file.get(), full, path, /*allowDirectory=*/false);
 
         LARGE_INTEGER fileSize{};
         if (!GetFileSizeEx(file.get(), &fileSize)) {
@@ -1437,7 +1805,7 @@ namespace {
         }
 
         // Delete through the very handle that was vetted and overwritten -
-        // the file disappears when ScopedFileHandle closes it on return.
+        // the file disappears when its handle closes on return.
         DeleteViaHandle(file.get(), path);
     }
 
@@ -1449,31 +1817,33 @@ namespace {
     // inherited-from-parent-directory) permissions before being locked down
     // after the fact.
     //
-    // FILE_FLAG_OPEN_REPARSE_POINT matters even here: without it, CREATE_NEW
-    // *follows* a symlink whose target doesn't exist yet and creates that
-    // target - so an attacker-planted dangling link would turn "create my
-    // key file here" into "create a file wherever the link points." With the
-    // flag, a link at the path is seen as an existing object and CREATE_NEW
-    // fails with ERROR_FILE_EXISTS instead. The resolved-path check right
-    // after creation then catches a junction in a parent directory; on a
-    // mismatch the just-created (still empty) file is deleted through its
-    // own handle before anything is written to it.
+    // Created relative to its folder's handle from the walk (WalkToParent),
+    // so no link above it is followed. A link *at* the path is an existing
+    // name, so FILE_CREATE fails with "already exists" rather than following
+    // a dangling symlink to create its target - which would turn "create my
+    // key file here" into "create a file wherever the link points". The
+    // resolved-path check right after creation catches an 8.3 short name;
+    // on a mismatch the just-created (still empty) file is deleted through
+    // its own handle before anything is written to it.
     void WriteWrappedKeyFile(
         const std::string &path, const std::vector<uint8_t> &bytes, const KeyFileSecurity &security) {
         SECURITY_ATTRIBUTES sa = security.attributes();
-        ScopedFileHandle file(CreateFile(
-            path.c_str(), GENERIC_WRITE | DELETE | WRITE_DAC, 0, &sa, CREATE_NEW,
-            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
-        if (!file.valid()) {
-            DWORD err = GetLastError();
-            if (err == ERROR_FILE_EXISTS) {
+        const std::string full = FullPath(path);
+        hkdfguard_nofollow::FolderChain chain = WalkToParent(full, path);
+        RequireTrustedKeyFileFolders(chain, path); // re-checked on the handles the file is created through
+        hkdfguard_nofollow::Handle file;
+        DWORD err = 0;
+        if (!hkdfguard_nofollow::OpenRelative(
+                chain.parent(), chain.leaf, GENERIC_WRITE | DELETE | WRITE_DAC, 0, FILE_CREATE,
+                FILE_NON_DIRECTORY_FILE, sa.lpSecurityDescriptor, file, err)) {
+            if (err == ERROR_FILE_EXISTS || err == ERROR_ALREADY_EXISTS) {
                 throw CliError(path + " already exists; pass --force|-f to overwrite");
             }
             throw CliError("failed to open " + path + " for writing: " + FormatWin32Error(err));
         }
 
         try {
-            RequireRealObjectAtExpectedPath(file.get(), FullLongPath(path), path, /*allowDirectory=*/false);
+            RequireRealObjectAtExpectedPath(file.get(), full, path, /*allowDirectory=*/false);
         } catch (const CliError &) {
             // Nothing has been written yet; don't leave an empty file behind
             // at wherever the path actually resolved to.
@@ -1504,7 +1874,7 @@ namespace {
 
         // Write the payload and flush it to storage, so a reported success
         // survives a crash. On any failure the file is deleted through its
-        // own handle (it goes when ScopedFileHandle closes it): a failed wrap
+        // own handle (it goes when that handle closes): a failed wrap
         // never leaves an empty or truncated key file behind, for the next
         // `wrap` to call "already exists" or a service to read as malformed -
         // the same rule as the Linux tool's finish_key_file.
@@ -1655,22 +2025,25 @@ namespace {
     //   - on a local drive: never UNC, a mapped network drive or a device,
     //     decided before anything is opened, so this process never connects
     //     or authenticates to a server named in the path;
+    //   - reached by the walk (WalkToParent): no symbolic link or junction
+    //     above it is ever followed, so nothing is opened on another machine;
+    //   - a regular file, opened without following a reparse point;
     //   - no 8.3 short name anywhere in it;
-    //   - a regular file, opened without following a reparse point, and at
-    //     the spelled path: no symbolic link or junction at it or above it;
     // then RequireTrustedDekFile, then at most kMaxDekStdinLen bytes. Opened
     // with read sharing only, so nobody can change it while it's read.
     // Unlike the key file, a hard link isn't refused: nothing here writes
     // through it, and the Linux tool doesn't refuse one either.
     void ReadDekFile(const std::string &path, DekScratch &scratch) {
-        RequireLocalDrivePath(path, "--dek-file " + path);
-        const std::string expected = FullLongPath(path); // refuses 8.3 short names
+        const std::string what = "--dek-file " + path;
+        RequireLocalDrivePath(path, what);
+        const std::string expected = FullPath(path);
+        hkdfguard_nofollow::FolderChain chain = WalkToParent(expected, what);
 
-        ScopedFileHandle file(CreateFile(
-            path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-            FILE_FLAG_OPEN_REPARSE_POINT | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION, nullptr));
-        if (!file.valid()) {
-            throw CliError("failed to open --dek-file " + path + ": " + FormatWin32Error(GetLastError()));
+        hkdfguard_nofollow::Handle file;
+        DWORD err = 0;
+        if (!hkdfguard_nofollow::OpenRelative(
+                chain.parent(), chain.leaf, GENERIC_READ, FILE_SHARE_READ, FILE_OPEN, 0, nullptr, file, err)) {
+            throw CliError("failed to open " + what + ": " + FormatWin32Error(err));
         }
         if (GetFileType(file.get()) != FILE_TYPE_DISK) {
             throw CliError("--dek-file " + path + " is not a regular file");
@@ -1688,11 +2061,507 @@ namespace {
         const std::string actual = TrimTrailingSeparators(FinalPathOfHandle(file.get(), path));
         if (_stricmp(actual.c_str(), TrimTrailingSeparators(expected).c_str()) != 0) {
             throw CliError(
-                "--dek-file " + path + " resolves through a symbolic link, junction, SUBST or mapped drive to \"" +
-                actual + "\"; give its real local path");
+                what + " uses an 8.3 short name (such as PROGRA~1), resolving to \"" + actual +
+                "\"; give its full local path");
         }
         RequireTrustedDekFile(file.get(), path);
         ReadBoundedInto(file.get(), "--dek-file", scratch);
+    }
+
+    // MARK: - KEK inspection and retirement (retire and status only)
+    //
+    // The library's ABI answers for "the KEK this service resolves to under
+    // the KeyStoragePolicy", and deliberately cannot delete anything. Retire
+    // needs more than that: the exact persisted key on one specific
+    // provider, opened once, checked, and deleted through that same handle.
+    // So this section opens the key directly with NCrypt, exactly as
+    // kek_store.cpp does (machine scope, silent), and nothing here ever
+    // creates or modifies a key.
+
+    // RAII for an NCrypt provider or key handle - this tool's own copy of
+    // src/handle_traits.h's: this tool compiles nothing from src/.
+    class ScopedNCryptHandle {
+    public:
+        ScopedNCryptHandle() = default;
+        ~ScopedNCryptHandle() { reset(); }
+        ScopedNCryptHandle(const ScopedNCryptHandle &) = delete;
+        ScopedNCryptHandle &operator=(const ScopedNCryptHandle &) = delete;
+        ScopedNCryptHandle(ScopedNCryptHandle &&other) noexcept : handle_(other.release()) {
+        }
+        ScopedNCryptHandle &operator=(ScopedNCryptHandle &&other) noexcept {
+            if (this != &other) {
+                reset();
+                handle_ = other.release();
+            }
+            return *this;
+        }
+
+        void reset() {
+            if (handle_ != 0) {
+                NCryptFreeObject(handle_);
+                handle_ = 0;
+            }
+        }
+        // Forgets the handle without freeing it - for NCryptDeleteKey, which
+        // frees the handle itself, even when it fails.
+        NCRYPT_HANDLE release() {
+            NCRYPT_HANDLE h = handle_;
+            handle_ = 0;
+            return h;
+        }
+        NCRYPT_HANDLE get() const { return handle_; }
+        NCRYPT_HANDLE *put() {
+            reset();
+            return &handle_;
+        }
+
+    private:
+        NCRYPT_HANDLE handle_ = 0;
+    };
+
+    LPCWSTR NCryptProviderName(KekProvider p) {
+        return p == KekProvider::Tpm ? MS_PLATFORM_CRYPTO_PROVIDER : MS_KEY_STORAGE_PROVIDER;
+    }
+
+    const char *ProviderLabel(KekProvider p) {
+        return p == KekProvider::Tpm ? "Microsoft Platform Crypto Provider (TPM)"
+                                     : "Microsoft Software Key Storage Provider";
+    }
+
+    const char *ProviderFlag(KekProvider p) {
+        return p == KekProvider::Tpm ? "tpm" : "software";
+    }
+
+    // The persisted name of `service`'s KEK. Must equal kek_store.cpp's
+    // KeyName(service, kCurrentKeyId) - a FROZEN format there. `service` is
+    // already validated and lowercased, so the widen is exact.
+    std::wstring KekKeyName(const std::string &service) {
+        return L"hkdfguardwin_" + std::wstring(service.begin(), service.end()) + L"_v1";
+    }
+
+    std::string NCryptErrorText(SECURITY_STATUS status) {
+        char code[16];
+        snprintf(code, sizeof(code), "0x%08lX", static_cast<unsigned long>(status));
+        return FormatWin32Error(static_cast<DWORD>(status)) + " (" + code + ")";
+    }
+
+#ifndef TBS_E_TPM_NOT_FOUND
+#define TBS_E_TPM_NOT_FOUND ((SECURITY_STATUS)0x8028400FL)
+#endif
+
+    struct OpenedKek {
+        KekProvider provider;
+        ScopedNCryptHandle storage; // kept open for as long as the key handle
+        ScopedNCryptHandle key;
+    };
+
+    // Opens `service`'s KEK on `provider`, or returns nullopt when that
+    // provider definitely holds none: the key name doesn't exist there
+    // (NTE_BAD_KEYSET), or - TPM only - this machine has no usable TPM
+    // provider at all, so nothing can be stored on it. Anything else
+    // (access denied, a TPM that is busy or errors) throws: a key may well
+    // be there, and "can't tell" must never be reported as "absent".
+    std::optional<OpenedKek> OpenKekDirect(const std::string &service, KekProvider provider) {
+        OpenedKek result{provider, {}, {}};
+        SECURITY_STATUS status = NCryptOpenStorageProvider(
+            reinterpret_cast<NCRYPT_PROV_HANDLE *>(result.storage.put()), NCryptProviderName(provider), 0);
+        if (status != ERROR_SUCCESS) {
+            if (provider == KekProvider::Tpm) {
+                return std::nullopt;
+            }
+            throw CliError(
+                std::string("cannot open the ") + ProviderLabel(provider) + ": " + NCryptErrorText(status));
+        }
+
+        std::wstring name = KekKeyName(service);
+        status = NCryptOpenKey(
+            static_cast<NCRYPT_PROV_HANDLE>(result.storage.get()),
+            reinterpret_cast<NCRYPT_KEY_HANDLE *>(result.key.put()), name.c_str(), 0,
+            NCRYPT_MACHINE_KEY_FLAG | NCRYPT_SILENT_FLAG);
+        if (status == ERROR_SUCCESS) {
+            return std::optional<OpenedKek>(std::move(result));
+        }
+        if (status == NTE_BAD_KEYSET) {
+            return std::nullopt;
+        }
+        if (provider == KekProvider::Tpm && (status == TBS_E_TPM_NOT_FOUND || status == NTE_DEVICE_NOT_FOUND)) {
+            return std::nullopt;
+        }
+        if (status == NTE_PERM || status == static_cast<SECURITY_STATUS>(ERROR_ACCESS_DENIED)) {
+            throw CliError(
+                "a KEK for service \"" + service + "\" exists on the " + ProviderLabel(provider) +
+                ", but this account may not open it (run from an elevated prompt)");
+        }
+        throw CliError(
+            "cannot inspect the KEK for service \"" + service + "\" on the " + ProviderLabel(provider) + ": " +
+            NCryptErrorText(status));
+    }
+
+    // What a persisted key under a service's name turned out to be.
+    struct KeyInspection {
+        bool isP256Ecdh = false;
+        Fingerprint fingerprint{}; // valid only when isP256Ecdh
+        std::string description;   // what it is instead, when not
+    };
+
+    // Reads `key`'s algorithm group, length and public key. A P-256 ECDH key
+    // gets its fingerprint, computed exactly as the library's
+    // ComputeKekFingerprint does: SHA-256 of the raw X || Y coordinates.
+    // Anything else is reported as such - but only on a *definite* answer
+    // (the properties read fine and describe another kind of key). A query
+    // that fails throws instead, so a key that merely couldn't be read right
+    // now is never classified as corrupt and deleted for it.
+    KeyInspection InspectKey(NCRYPT_KEY_HANDLE key, const std::string &where) {
+        KeyInspection result;
+
+        wchar_t group[64] = {};
+        DWORD cb = 0;
+        SECURITY_STATUS status = NCryptGetProperty(
+            key, NCRYPT_ALGORITHM_GROUP_PROPERTY, reinterpret_cast<PBYTE>(group),
+            sizeof(group) - sizeof(wchar_t), &cb, 0);
+        if (status != ERROR_SUCCESS) {
+            throw CliError("cannot read the algorithm of " + where + ": " + NCryptErrorText(status));
+        }
+        if (wcscmp(group, NCRYPT_ECDH_ALGORITHM_GROUP) != 0) {
+            std::string narrow;
+            for (const wchar_t *c = group; *c != L'\0'; ++c) {
+                narrow.push_back(*c >= 0x20 && *c < 0x7F ? static_cast<char>(*c) : '?');
+            }
+            result.description = "a key of algorithm group " + (narrow.empty() ? std::string("(unnamed)") : narrow);
+            return result;
+        }
+
+        DWORD length = 0;
+        status = NCryptGetProperty(key, NCRYPT_LENGTH_PROPERTY, reinterpret_cast<PBYTE>(&length), sizeof(length), &cb, 0);
+        if (status != ERROR_SUCCESS) {
+            throw CliError("cannot read the key length of " + where + ": " + NCryptErrorText(status));
+        }
+        if (length != 256) {
+            result.description = "a " + std::to_string(length) + "-bit ECDH key";
+            return result;
+        }
+
+        cb = 0;
+        status = NCryptExportKey(key, 0, BCRYPT_ECCPUBLIC_BLOB, nullptr, nullptr, 0, &cb, 0);
+        std::vector<BYTE> blob;
+        if (status == ERROR_SUCCESS && cb >= sizeof(BCRYPT_ECCKEY_BLOB)) {
+            blob.resize(cb);
+            status = NCryptExportKey(key, 0, BCRYPT_ECCPUBLIC_BLOB, nullptr, blob.data(), cb, &cb, 0);
+        }
+        if (status != ERROR_SUCCESS || cb < sizeof(BCRYPT_ECCKEY_BLOB)) {
+            throw CliError(
+                "cannot export the public key of " + where + ": " +
+                (status != ERROR_SUCCESS ? NCryptErrorText(status) : std::string("short blob")));
+        }
+        const auto *header = reinterpret_cast<const BCRYPT_ECCKEY_BLOB *>(blob.data());
+        constexpr size_t kPointLen = 64;
+        if (header->dwMagic != BCRYPT_ECDH_PUBLIC_P256_MAGIC || header->cbKey != 32 ||
+            cb < sizeof(BCRYPT_ECCKEY_BLOB) + kPointLen) {
+            result.description = "a 256-bit ECDH key on a curve other than P-256";
+            return result;
+        }
+
+        NTSTATUS hs = BCryptHash(
+            BCRYPT_SHA256_ALG_HANDLE, nullptr, 0, blob.data() + sizeof(BCRYPT_ECCKEY_BLOB),
+            static_cast<ULONG>(kPointLen), result.fingerprint.data(), static_cast<ULONG>(result.fingerprint.size()));
+        if (!BCRYPT_SUCCESS(hs)) {
+            throw CliError("cannot hash the public key of " + where + ": " + FormatWin32Error(static_cast<DWORD>(hs)));
+        }
+        result.isP256Ecdh = true;
+        return result;
+    }
+
+    // Every persisted key under `service`'s name, on both providers, in that
+    // order, each opened and inspected. `only` restricts it to one.
+    struct FoundKek {
+        OpenedKek opened;
+        KeyInspection inspection;
+    };
+
+    std::vector<FoundKek> FindKeks(const std::string &service, std::optional<KekProvider> only = std::nullopt) {
+        std::vector<FoundKek> found;
+        for (KekProvider p : {KekProvider::Tpm, KekProvider::Software}) {
+            if (only && *only != p) {
+                continue;
+            }
+            std::optional<OpenedKek> opened = OpenKekDirect(service, p);
+            if (!opened) {
+                continue;
+            }
+            std::string where = std::string("the KEK for service \"") + service + "\" on the " + ProviderLabel(p);
+            KeyInspection inspection = InspectKey(static_cast<NCRYPT_KEY_HANDLE>(opened->key.get()), where);
+            found.push_back(FoundKek{std::move(*opened), std::move(inspection)});
+        }
+        return found;
+    }
+
+    std::string DescribeFound(const FoundKek &k) {
+        return std::string(ProviderFlag(k.opened.provider)) + ": " +
+               (k.inspection.isP256Ecdh ? "fingerprint " + HexString(k.inspection.fingerprint)
+                                        : k.inspection.description);
+    }
+
+    bool ProcessIsElevated() {
+        HANDLE token = nullptr;
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+            return false;
+        }
+        TOKEN_ELEVATION elevation{};
+        DWORD size = 0;
+        bool elevated = GetTokenInformation(token, TokenElevation, &elevation, sizeof(elevation), &size) &&
+                        elevation.TokenIsElevated != 0;
+        CloseHandle(token);
+        return elevated;
+    }
+
+    // Records the retirement as event 1004 (warning) under the library's
+    // event source, with this account as the event's user - the same shape
+    // as the library's own events (src/event_log.cpp). Returns false if the
+    // event could not be written; the caller says so, since a deletion
+    // nobody can later find in the log is worth an operator's attention.
+    bool LogKekRetired(const std::string &text) {
+        constexpr DWORD kEvtKekRetired = 1004; // src/event_messages.mc
+        HANDLE source = RegisterEventSourceW(nullptr, L"hkdfguard-native-windows");
+        if (source == nullptr) {
+            return false;
+        }
+        std::wstring full(text.begin(), text.end());
+        wchar_t exe[MAX_PATH] = {};
+        DWORD n = GetModuleFileNameW(nullptr, exe, MAX_PATH);
+        full += L" Process: " + std::wstring(n > 0 && n < MAX_PATH ? exe : L"(unknown)") + L" (PID " +
+                std::to_wstring(GetCurrentProcessId()) + L").";
+        LPCWSTR strings[1] = {full.c_str()};
+        std::vector<BYTE> sid;
+        try {
+            sid = GetProcessUserSid();
+        } catch (const CliError &) {
+            sid.clear();
+        }
+        BOOL ok = ReportEventW(
+            source, EVENTLOG_WARNING_TYPE, 0, kEvtKekRetired, sid.empty() ? nullptr : sid.data(), 1, 0, strings,
+            nullptr);
+        DeregisterEventSource(source);
+        return ok != FALSE;
+    }
+
+    // Lowercases an already-ValidateServiceCharset-checked name: the exact
+    // form the library stores and names its keys by.
+    std::string LowercaseService(const std::string &service) {
+        std::string out = service;
+        for (char &c : out) {
+            if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+        }
+        return out;
+    }
+
+    // MARK: - Security model
+
+    // The security model in force, and whether this account may persist key
+    // files under it (hkdfguard_security_model).
+    struct SecurityModelInfo {
+        int model = HKDFGUARD_SECURITY_MODEL_PRODUCTION;
+        bool mayWriteKeyFiles = false;
+    };
+
+    SecurityModelInfo ReadSecurityModel() {
+        int model = 0;
+        int mayWrite = 0;
+        int32_t rc = hkdfguard_security_model(&model, &mayWrite);
+        if (rc != HKDFGUARD_OK) {
+            throw CliError("could not read the security model: " + DescribeStatus(rc));
+        }
+        return SecurityModelInfo{model, mayWrite != 0};
+    }
+
+    const char *SecurityModelName(int model) {
+        return model == HKDFGUARD_SECURITY_MODEL_DEVELOPER ? "developer" : "production";
+    }
+
+    void RequireMayPersistKeyFiles() {
+        SecurityModelInfo info = ReadSecurityModel();
+        if (!info.mayWriteKeyFiles) {
+            throw CliError(
+                std::string("under the ") + SecurityModelName(info.model) +
+                " security model this account may not persist key files: only an elevated administrator or a "
+                "member of a deployer group (HkdfGuardDeployers, or a group in "
+                "HKLM\\Software\\Policies\\HkdfGuard\\DeployerGroups) may, and a key file this account wrote "
+                "would be refused by hkdfguard_open_file. Nothing was written");
+        }
+    }
+
+    // MARK: - Run: status
+
+    // Read-only. Exits 0 whenever there was a definite answer (present,
+    // absent, corrupt or unusable) and 1 when there wasn't (access denied, a
+    // provider error), so scripts can tell "no key" from "can't tell" - the
+    // macOS tool's rule.
+    void RunStatus(const StatusArgs &args) {
+        ValidateServiceCharset(args.serviceName);
+        const std::string service = LowercaseService(args.serviceName);
+        fprintf(stdout, "service: %s\n", service.c_str());
+        {
+            const SecurityModelInfo info = ReadSecurityModel();
+            fprintf(stdout, "security model: %s (this account %s persist key files)\n",
+                    SecurityModelName(info.model), info.mayWriteKeyFiles ? "may" : "may not");
+        }
+
+        int32_t exists = 0;
+        int32_t rc = hkdfguard_kek_exists(service.c_str(), &exists);
+        if (rc != HKDFGUARD_OK) {
+            throw CliError("could not determine the KEK state for service \"" + service + "\": " + DescribeStatus(rc));
+        }
+        std::vector<FoundKek> found = FindKeks(service);
+
+        if (exists == 0) {
+            fprintf(stdout, "kek: absent\n");
+        } else {
+            Fingerprint fp{};
+            rc = ReadKekFingerprint(service, fp);
+            if (rc == HKDFGUARD_ERR_PROVIDER_ERROR && !found.empty()) {
+                // A key exists under the name but fails the library's
+                // property checks, so the library won't say which one it
+                // selected. List what is there instead of guessing.
+                bool anyP256 = false;
+                for (const FoundKek &k : found) {
+                    anyP256 = anyP256 || k.inspection.isP256Ecdh;
+                }
+                if (anyP256) {
+                    fprintf(stdout, "kek: unusable (%s)\n", DescribeStatus(rc).c_str());
+                } else {
+                    fprintf(stdout, "kek: corrupt (not a P-256 ECDH key; see retire --corrupt)\n");
+                }
+                for (const FoundKek &k : found) {
+                    fprintf(stdout, "key under this name: %s\n", DescribeFound(k).c_str());
+                }
+                return;
+            }
+            if (rc != HKDFGUARD_OK) {
+                throw CliError(
+                    "a KEK exists for service \"" + service + "\" but its fingerprint could not be read: " +
+                    DescribeStatus(rc));
+            }
+
+            fprintf(stdout, "kek: present\n");
+            for (auto it = found.begin(); it != found.end(); ++it) {
+                if (it->inspection.isP256Ecdh && it->inspection.fingerprint == fp) {
+                    fprintf(stdout, "provider: %s\n", ProviderLabel(it->opened.provider));
+                    found.erase(it);
+                    break;
+                }
+            }
+            fprintf(stdout, "fingerprint: %s\n", HexString(fp).c_str());
+        }
+
+        // A key on a provider the KeyStoragePolicy doesn't select is unused
+        // today but would be picked up if the policy changed - worth seeing.
+        for (const FoundKek &k : found) {
+            fprintf(stdout, "other key under this name (not selected by the KeyStoragePolicy): %s\n",
+                    DescribeFound(k).c_str());
+        }
+    }
+
+    // MARK: - Run: retire
+
+    // Deletes `service`'s KEK on one provider, only after confirming it is
+    // the key the operator means: by fingerprint, or (--corrupt) by its not
+    // being a P-256 ECDH key at all. The key is opened once and checked, and
+    // the delete goes through that same handle, so what is deleted is
+    // exactly what was checked. (Replacing a machine key between the check
+    // and the delete takes administrator rights, which retire's caller has
+    // anyway.) Afterwards the name is re-opened on that provider to confirm
+    // the key is gone.
+    void RunRetire(const RetireArgs &args) {
+        ValidateServiceCharset(args.serviceName);
+        const std::string service = LowercaseService(args.serviceName);
+
+        // Deleting a machine-wide key needs Administrators (or
+        // HkdfGuardAdmins) rights, and retire is a security administrator's
+        // act, so it refuses up front rather than failing part-way.
+        if (!ProcessIsElevated()) {
+            throw CliError("retire must run from an elevated prompt (Run as administrator); nothing was deleted");
+        }
+
+        std::vector<FoundKek> found = FindKeks(service, args.provider);
+        if (found.empty()) {
+            throw CliError(
+                "no KEK exists for service \"" + service + "\"" +
+                (args.provider ? std::string(" on the ") + ProviderLabel(*args.provider) : std::string()) +
+                "; nothing to retire");
+        }
+        if (found.size() > 1) {
+            throw CliError(
+                "found a key for service \"" + service + "\" on both providers (" + DescribeFound(found[0]) + "; " +
+                DescribeFound(found[1]) +
+                "); refusing to choose which one to delete -- nothing was deleted. Run `" + kProgramNameNarrow +
+                " status` to see which one the KeyStoragePolicy selects, then pass --provider tpm or --provider "
+                "software");
+        }
+        FoundKek &target = found.front();
+        const KekProvider provider = target.opened.provider;
+        const std::string where = std::string("the KEK for service \"") + service + "\" on the " + ProviderLabel(provider);
+
+        if (args.fingerprint) {
+            if (!target.inspection.isP256Ecdh) {
+                throw CliError(
+                    where + " is " + target.inspection.description +
+                    ", not a P-256 ECDH key, so it has no fingerprint to confirm; if it is genuinely corrupt, "
+                    "retire it with --corrupt");
+            }
+            if (target.inspection.fingerprint != *args.fingerprint) {
+                throw CliError(
+                    "fingerprint mismatch for service \"" + service + "\": " + where + " has fingerprint " +
+                    HexString(target.inspection.fingerprint) + ", not " + HexString(*args.fingerprint) +
+                    "; nothing was deleted");
+            }
+        } else if (target.inspection.isP256Ecdh) {
+            throw CliError(
+                where + " is a valid P-256 ECDH key (fingerprint " + HexString(target.inspection.fingerprint) +
+                "), not corrupt; nothing was deleted -- retire a valid KEK with --fingerprint");
+        }
+
+        // NCryptDeleteKey frees the key handle itself, even on failure.
+        SECURITY_STATUS status =
+            NCryptDeleteKey(static_cast<NCRYPT_KEY_HANDLE>(target.opened.key.release()), 0);
+        if (status != ERROR_SUCCESS) {
+            throw CliError(
+                "deleting " + where + " failed: " + NCryptErrorText(status) + "; run `" + kProgramNameNarrow +
+                " status` to see whether it remains");
+        }
+        if (OpenKekDirect(service, provider)) {
+            throw CliError(where + " was deleted, but a key under its name is still found; investigate before relying on it being gone");
+        }
+
+        const std::string identity =
+            args.fingerprint ? "fingerprint " + HexString(*args.fingerprint)
+                             : "corrupt: " + target.inspection.description + ", not a P-256 ECDH key";
+        const bool logged = LogKekRetired(
+            "KEK retired for service '" + service + "' on the " + ProviderLabel(provider) + " (" + identity +
+            ") by " + kProgramNameNarrow + " retire. Every DEK wrapped under it is permanently unrecoverable.");
+
+        fprintf(stdout, "retired KEK for service \"%s\" (%s, %s)\n", service.c_str(), identity.c_str(),
+                ProviderLabel(provider));
+        if (args.fingerprint) {
+            fprintf(stdout, "every payload wrapped under it is now permanently unrecoverable\n");
+        }
+        if (!logged) {
+            fprintf(stderr, "warning: the retirement could not be recorded in the Application event log (event 1004)\n");
+        }
+
+        // A key on the other provider, if any, is untouched - and may be the
+        // one the service now resolves to. The deletion has already
+        // succeeded, so a failure to look is only a note, never an error.
+        try {
+            std::vector<FoundKek> remaining = FindKeks(service);
+            if (!remaining.empty()) {
+                fprintf(stdout, "note: service \"%s\" still has a key on the other provider (%s); run `%s status`\n",
+                        service.c_str(), DescribeFound(remaining.front()).c_str(), kProgramNameNarrow);
+            } else if (!args.fingerprint) {
+                fprintf(stdout, "service \"%s\" can now be provisioned again\n", service.c_str());
+            }
+        } catch (const CliError &e) {
+            fprintf(stdout, "note: could not check the other provider for a key under this name: %s\n",
+                    e.message.c_str());
+        }
     }
 
     // MARK: - Run: provision
@@ -1701,7 +2570,24 @@ namespace {
         // `service` is not secret -- it's a logical identifier, not key
         // material.
         ValidateServiceCharset(args.serviceName);
-        EnsureKekProvisioned(args.serviceName);
+        const bool created = EnsureKekProvisioned(args.serviceName);
+
+        Fingerprint fp{};
+        int32_t rc = ReadKekFingerprint(args.serviceName, fp);
+        if (rc != HKDFGUARD_OK) {
+            throw CliError(
+                "the KEK for service \"" + args.serviceName + "\" exists but its fingerprint could not be read: " +
+                DescribeStatus(rc));
+        }
+        // The macOS tool's wording. A KEK this operator didn't create could
+        // have been planted by another administrator; the fingerprint is how
+        // to tell.
+        if (created) {
+            fprintf(stdout, "fingerprint: %s -- record this; retire requires it\n", HexString(fp).c_str());
+        } else {
+            fprintf(stdout, "fingerprint: %s -- confirm it matches the one recorded when this service was provisioned\n",
+                    HexString(fp).c_str());
+        }
     }
 
     // MARK: - Run: wrap
@@ -1715,23 +2601,27 @@ namespace {
             RequireLocalDrivePath(*args.dekFile, "--dek-file " + *args.dekFile);
         }
 
-        // Fast, friendly pre-check: fail before ever touching the TPM/Software
-        // Key Storage Provider if the output path obviously already exists and
-        // --force wasn't passed. WriteWrappedKeyFile's CREATE_NEW is the actual
-        // correctness guarantee against the exists-then-create race; this is
-        // purely a fail-fast convenience on top of it.
-        if (!args.force) {
-            DWORD attrs = GetFileAttributes(args.keyFilePath.c_str());
-            if (attrs != INVALID_FILE_ATTRIBUTES) {
-                throw CliError(args.keyFilePath + " already exists; pass --force|-f to overwrite");
-            }
-        }
-
         // The output path must be a real file at a real location - no
-        // symlink, junction, or other reparse point at or above it. Checked
-        // here, before any KEK or DEK work, so a bad path is rejected cheaply;
-        // the write/overwrite code re-checks on its own handles regardless.
-        ValidateOutputPathIsReal(args.keyFilePath);
+        // symlink, junction, or other reparse point at or above it, and none
+        // followed to find out (see WalkToParent) - in folders
+        // hkdfguard_open_file would trust (RequireTrustedKeyFileFolders: no
+        // other account may create, delete or rename entries in any folder
+        // below the drive root). Checked here, before any KEK or DEK work,
+        // so a bad path is rejected cheaply; the write/overwrite code
+        // re-checks on its own handles regardless. wrap never creates a
+        // missing folder - a folder it made would inherit its parent's
+        // rights, create rights included - so the operator prepares the
+        // folder (docs/admin-guide.md) and a missing one is an error.
+        //
+        // Then a fast, friendly pre-check: fail before ever touching the
+        // TPM/Software Key Storage Provider if the output path already exists
+        // and --force wasn't passed. WriteWrappedKeyFile's FILE_CREATE is the
+        // actual correctness guarantee against the exists-then-create race;
+        // this is purely a fail-fast convenience on top of it.
+        const bool exists = ValidateOutputPathIsReal(args.keyFilePath);
+        if (exists && !args.force) {
+            throw CliError(args.keyFilePath + " already exists; pass --force|-f to overwrite");
+        }
 
         // Resolved before any TPM/Software Key Storage Provider work, so a bad
         // --group name fails fast rather than after an expensive (and, with
@@ -1785,6 +2675,18 @@ namespace {
             // survives past this point.
         }
 
+        // Wrapping in memory is open to any account with key use on the KEK;
+        // *persisting* the result is not. Under the production security
+        // model (the default) only SYSTEM, Administrators, TrustedInstaller
+        // and the deployer groups' members are trusted to have written a
+        // key file - see hkdfguard_security_model - so a file this account
+        // wrote would be refused by hkdfguard_open_file anyway. Asked of
+        // the library, which applies exactly the rule it reads files by,
+        // and checked before anything on disk is touched (--force's
+        // overwrite included). After the wrap, so that every input is
+        // still validated first.
+        RequireMayPersistKeyFiles();
+
         if (args.force) {
             SecureOverwriteAndRemoveIfExists(args.keyFilePath);
         }
@@ -1797,6 +2699,34 @@ namespace {
         fprintf(
             stdout, "wrapped key written to %s (%zu bytes, %s, service \"%s\")\n",
             args.keyFilePath.c_str(), wrapped.size(), access.c_str(), service.c_str());
+    }
+
+    // Parses and runs one subcommand. Exit codes: 0 success, 1 operational
+    // failure, 2 usage error (followed by the usage text).
+    template <typename Args, typename Parse, typename Run>
+    int Dispatch(int argc, char *argv[], Parse parse, Run run) {
+        Args args;
+        try {
+            if (parse(argc, argv, args) == ParseOutcome::Help) {
+                PrintUsage();
+                return 0;
+            }
+        } catch (const CliError &e) {
+            fprintf(stderr, "error: %s\n", e.message.c_str());
+            PrintUsage();
+            return 2;
+        }
+
+        try {
+            run(args);
+            return 0;
+        } catch (const CliError &e) {
+            fprintf(stderr, "error: %s\n", e.message.c_str());
+            return 1;
+        } catch (const std::exception &e) {
+            fprintf(stderr, "error: %hs\n", e.what());
+            return 1;
+        }
     }
 } // namespace
 
@@ -1816,7 +2746,7 @@ int main(int argc, char *argv[]) {
     }
 
     if (argc < 2) {
-        fprintf(stderr, "error: missing subcommand: expected `provision` or `wrap`\n");
+        fprintf(stderr, "error: missing subcommand: expected %s\n", kSubcommandList);
         PrintUsage();
         return 2;
     }
@@ -1828,56 +2758,19 @@ int main(int argc, char *argv[]) {
     }
 
     if (command == "provision") {
-        ProvisionArgs args;
-        try {
-            if (ParseProvisionArgs(argc, argv, args) == ParseOutcome::Help) {
-                PrintUsage();
-                return 0;
-            }
-        } catch (const CliError &e) {
-            fprintf(stderr, "error: %s\n", e.message.c_str());
-            PrintUsage();
-            return 2;
-        }
-
-        try {
-            RunProvision(args);
-            return 0;
-        } catch (const CliError &e) {
-            fprintf(stderr, "error: %s\n", e.message.c_str());
-            return 1;
-        } catch (const std::exception &e) {
-            fprintf(stderr, "error: %hs\n", e.what());
-            return 1;
-        }
+        return Dispatch<ProvisionArgs>(argc, argv, ParseProvisionArgs, RunProvision);
     }
-
     if (command == "wrap") {
-        WrapArgs args;
-        try {
-            if (ParseWrapArgs(argc, argv, args) == ParseOutcome::Help) {
-                PrintUsage();
-                return 0;
-            }
-        } catch (const CliError &e) {
-            fprintf(stderr, "error: %s\n", e.message.c_str());
-            PrintUsage();
-            return 2;
-        }
-
-        try {
-            RunWrap(args);
-            return 0;
-        } catch (const CliError &e) {
-            fprintf(stderr, "error: %s\n", e.message.c_str());
-            return 1;
-        } catch (const std::exception &e) {
-            fprintf(stderr, "error: %hs\n", e.what());
-            return 1;
-        }
+        return Dispatch<WrapArgs>(argc, argv, ParseWrapArgs, RunWrap);
+    }
+    if (command == "retire") {
+        return Dispatch<RetireArgs>(argc, argv, ParseRetireArgs, RunRetire);
+    }
+    if (command == "status") {
+        return Dispatch<StatusArgs>(argc, argv, ParseStatusArgs, RunStatus);
     }
 
-    fprintf(stderr, "error: unknown subcommand \"%s\": expected `provision` or `wrap`\n", command.c_str());
+    fprintf(stderr, "error: unknown subcommand \"%s\": expected %s\n", command.c_str(), kSubcommandList);
     PrintUsage();
     return 2;
 }
