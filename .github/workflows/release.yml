@@ -124,69 +124,42 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      # The signtool plugin for Artifact Signing. The installer is fetched
-      # from Microsoft's documented download URL and must carry a valid
-      # Microsoft Authenticode signature before it is run.
+      # The signtool plugin for Artifact Signing (Azure.CodeSigning.Dlib.dll),
+      # taken from Microsoft's NuGet package rather than the client tools
+      # MSI: the MSI copies the same files and then hung in InstallFinalize on
+      # hosted runners. signtool itself comes from the runner's Windows SDK.
       #
-      # Bounded in time and in where it looks: a hosted runner's Program
-      # Files holds hundreds of thousands of files, and an earlier version of
-      # this step searched all of it recursively for the plugin, which could
-      # run for hours. Now only the client tools' own folders are looked in.
-      - name: Install the Artifact Signing client tools
+      # Pinned by version and by the package's SHA-256, and the plugin must
+      # carry a valid Microsoft Authenticode signature. To move to a newer
+      # version, update both and check the new package's plugin the same way.
+      - name: Get the Artifact Signing plugin
         shell: powershell
-        timeout-minutes: 15
+        timeout-minutes: 10
         run: |
           $ErrorActionPreference = "Stop"
           # Windows PowerShell's progress display makes Invoke-WebRequest
           # many times slower on larger downloads.
           $ProgressPreference = "SilentlyContinue"
-          $msi = Join-Path $env:RUNNER_TEMP "ArtifactSigningClientTools.msi"
-          $log = Join-Path $env:RUNNER_TEMP "ArtifactSigningClientTools-install.log"
-          # A line before each phase, so a stall shows which one it is.
+          $version = "1.0.146"
+          $sha256 = "7761E5D8F31E54B764DA21D33CD8B0A2940E1B05526C7DFCB5E94B0431426F70"
+          $pkg = Join-Path $env:RUNNER_TEMP "microsoft.artifactsigning.client.$version.zip"
+          $dir = Join-Path $env:RUNNER_TEMP "ArtifactSigningClient"
           function Step([string]$what) { Write-Host ("[{0:HH:mm:ss}] {1}" -f (Get-Date), $what) }
-          Step "Downloading the client tools installer"
-          Invoke-WebRequest -UseBasicParsing -TimeoutSec 300 -Uri "https://download.microsoft.com/download/70ad2c3b-761f-4aa9-a9de-e7405aa2b4c1/ArtifactSigningClientTools.msi" -OutFile $msi
-          Step ("Downloaded {0:N0} bytes; checking its signature" -f (Get-Item $msi).Length)
-          $sig = Get-AuthenticodeSignature -FilePath $msi
+          Step "Downloading Microsoft.ArtifactSigning.Client $version"
+          Invoke-WebRequest -UseBasicParsing -TimeoutSec 300 -Uri "https://api.nuget.org/v3-flatcontainer/microsoft.artifactsigning.client/$version/microsoft.artifactsigning.client.$version.nupkg" -OutFile $pkg
+          $actual = (Get-FileHash -Path $pkg -Algorithm SHA256).Hash
+          if ($actual -ne $sha256) {
+            throw "Microsoft.ArtifactSigning.Client $version has SHA-256 $actual, not the pinned $sha256."
+          }
+          Step "Package matches the pinned SHA-256; extracting"
+          Expand-Archive -Path $pkg -DestinationPath $dir -Force
+          $dlib = Join-Path $dir "bin\x64\Azure.CodeSigning.Dlib.dll"
+          if (-not (Test-Path $dlib)) { throw "bin\x64\Azure.CodeSigning.Dlib.dll is missing from the package" }
+          $sig = Get-AuthenticodeSignature -FilePath $dlib
           if ($sig.Status -ne "Valid" -or $sig.SignerCertificate.Subject -notmatch "O=Microsoft Corporation") {
-            throw "The downloaded client tools installer is not validly signed by Microsoft ($($sig.Status): $($sig.SignerCertificate.Subject))."
+            throw "The Artifact Signing plugin is not validly signed by Microsoft ($($sig.Status): $($sig.SignerCertificate.Subject))."
           }
-          Step "Installing (msiexec, logging to $log)"
-          $proc = Start-Process msiexec.exe -ArgumentList @("/i", "`"$msi`"", "/quiet", "/norestart", "/l*v", "`"$log`"") -PassThru
-          # Don't wait forever: a hung install fails in 5 minutes, with its log.
-          if (-not $proc.WaitForExit(300000)) {
-            $proc.Kill()
-            if (Test-Path $log) { Get-Content $log -Tail 60 }
-            throw "client tools install did not finish within 5 minutes"
-          }
-          if ($proc.ExitCode -ne 0 -and $proc.ExitCode -ne 3010) {
-            if (Test-Path $log) { Get-Content $log -Tail 60 }
-            throw "client tools install failed (msiexec exit $($proc.ExitCode))"
-          }
-          # The installer may install per-user or per-machine. Look where it
-          # puts the plugin, then - still narrowly - inside any folder named
-          # for signing under each Microsoft folder. Never a whole-disk search.
-          Step "Installed (msiexec exit $($proc.ExitCode)); looking for the plugin"
-          $known = @(
-            (Join-Path $env:LOCALAPPDATA "Microsoft\MicrosoftArtifactSigningClientTools\Azure.CodeSigning.Dlib.dll"),
-            (Join-Path $env:ProgramFiles "Microsoft\MicrosoftArtifactSigningClientTools\Azure.CodeSigning.Dlib.dll"),
-            (Join-Path ${env:ProgramFiles(x86)} "Microsoft\MicrosoftArtifactSigningClientTools\Azure.CodeSigning.Dlib.dll")
-          )
-          $dlib = $known | Where-Object { Test-Path $_ } | Select-Object -First 1
-          if (-not $dlib) {
-            Step "Not in the known folders; searching the Microsoft folders' *Signing* subfolders"
-            $signingDirs = foreach ($base in $env:LOCALAPPDATA, $env:ProgramFiles, ${env:ProgramFiles(x86)}) {
-              Get-ChildItem -Path (Join-Path $base "Microsoft") -Directory -Filter "*Signing*" -ErrorAction SilentlyContinue
-            }
-            $dlib = $signingDirs | ForEach-Object {
-              Get-ChildItem -Path $_.FullName -Recurse -Filter Azure.CodeSigning.Dlib.dll -ErrorAction SilentlyContinue
-            } | Select-Object -First 1 -ExpandProperty FullName
-          }
-          if (-not $dlib) {
-            if (Test-Path $log) { Select-String -Path $log -Pattern "INSTALLDIR|APPDIR|TARGETDIR|Installed" | Select-Object -Last 20 }
-            throw "Azure.CodeSigning.Dlib.dll not found in the client tools' install folders"
-          }
-          Write-Host "Artifact Signing plugin: $dlib"
+          Step "Artifact Signing plugin: $dlib"
           "HKDFGUARD_SIGNING_DLIB=$dlib" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       # Same helper and metadata (scripts/signing/metadata.json) as local
