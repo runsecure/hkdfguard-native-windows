@@ -136,7 +136,7 @@ function Add-TestGroupMember([string]$Group, [string]$User) {
 function Remove-TestGroupMember([string]$Group, [string]$User) {
     ([ADSI]"WinNT://$env:COMPUTERNAME/$Group,group").Remove("WinNT://$env:COMPUTERNAME/$User,user")
 }
-function Get-GroupSid([string]$Name) {
+function Get-AccountSid([string]$Name) {
     return (New-Object System.Security.Principal.NTAccount($Name)).Translate([System.Security.Principal.SecurityIdentifier]).Value
 }
 
@@ -151,10 +151,16 @@ function Set-ProtectedAcl([string]$Path, [string]$Sddl) {
     $security.SetSecurityDescriptorSddlForm($Sddl, [System.Security.AccessControl.AccessControlSections]"Owner, Access")
     if ($aclExtensions) { $aclExtensions::SetAccessControl($info, $security) } else { $info.SetAccessControl($security) }
 }
-function Get-FileOwnerName([string]$Path) {
-    $info = New-Object System.IO.FileInfo($Path)
-    $security = if ($aclExtensions) { $aclExtensions::GetAccessControl($info) } else { $info.GetAccessControl() }
-    return $security.GetOwner([System.Security.Principal.NTAccount]).Value
+# A key file's owner SID and content hash, read as $Credential's account:
+# the CLI's key file DACL admits only its owner and the -g group, so this
+# script's own (admin) account can't open it.
+function Get-KeyFileAs($Credential, [string]$Path) {
+    $r = Invoke-As $Credential $probe @("inspect", $Path)
+    if ($r.StdOut -match "inspect=0 owner=(\S+) sha256=([0-9a-f]{64})") {
+        return [pscustomobject]@{ Owner = $Matches[1]; Sha256 = $Matches[2] }
+    }
+    Write-Host "    inspect: $($r.StdOut) $($r.StdErr)"
+    return $null
 }
 
 try {
@@ -184,8 +190,8 @@ try {
     New-Item -ItemType Directory -Path $root, $bin, $keys, $out | Out-Null
     Set-ProtectedAcl $root "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)"
     Set-ProtectedAcl $out "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"
-    $deployers = Get-GroupSid "HkdfGuardDeployers"
-    $users = Get-GroupSid "HkdfGuardUsers"
+    $deployers = Get-AccountSid "HkdfGuardDeployers"
+    $users = Get-AccountSid "HkdfGuardUsers"
     Set-ProtectedAcl $keys "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1301bf;;;$deployers)(A;OICI;0x1200a9;;;$users)"
     foreach ($file in $CliExePath, $ProbeExePath, $DllPath) { Copy-Item -LiteralPath $file -Destination $bin }
     $cli = Join-Path $bin (Split-Path -Leaf $CliExePath)
@@ -209,8 +215,8 @@ try {
     $r = Invoke-As $dep $cli @("wrap", "-kf", $keyFile, "-sn", $service, "--dek-stdin", "-g", "HkdfGuardUsers") -StdIn ([Convert]::ToBase64String($dekBytes))
     Check (($r.ExitCode -eq 0) -and (Test-Path -LiteralPath $keyFile)) "deployer: wrap persists a key file in the key folder"
     if ($r.ExitCode -ne 0) { Write-Host "    stderr: $($r.StdErr)" }
-    $owner = try { Get-FileOwnerName $keyFile } catch { $null }
-    Check ($owner -like "*\$depName") "deployer: the key file is owned by the deployer's own account (not Administrators)"
+    $before = Get-KeyFileAs $dep $keyFile
+    Check ($before -and $before.Owner -eq (Get-AccountSid "$env:COMPUTERNAME\$depName")) "deployer: the key file is owned by the deployer's own account (not Administrators)"
 
     $r = Invoke-As $dep $probe @("unwrap", $service, $keyFile)
     Check ($r.StdOut -match "open=0 unwrap=0") "deployer: may unwrap the key file it deployed"
@@ -218,12 +224,11 @@ try {
     # The next release: the deployer replaces its own key file in place with
     # `wrap --force` - which overwrites, then deletes, the old file before
     # writing the new one - not elevated, as a deployer runs it.
-    $before = [System.IO.File]::ReadAllBytes($keyFile)
     $nextDek = New-Object byte[] 32
     [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($nextDek)
     $r = Invoke-As $dep $cli @("wrap", "-kf", $keyFile, "-sn", $service, "--dek-stdin", "-g", "HkdfGuardUsers", "--force") -StdIn ([Convert]::ToBase64String($nextDek))
-    $after = if (Test-Path -LiteralPath $keyFile) { [System.IO.File]::ReadAllBytes($keyFile) } else { $null }
-    Check (($r.ExitCode -eq 0) -and $after -and -not [System.Linq.Enumerable]::SequenceEqual([byte[]]$before, [byte[]]$after)) "deployer: wrap --force replaces its own key file with the next release's"
+    $after = Get-KeyFileAs $dep $keyFile
+    Check (($r.ExitCode -eq 0) -and $before -and $after -and $after.Sha256 -ne $before.Sha256) "deployer: wrap --force replaces its own key file with the next release's"
     if ($r.ExitCode -ne 0) { Write-Host "    stderr: $($r.StdErr)" }
     $r = Invoke-As $dep $probe @("unwrap", $service, $keyFile)
     Check ($r.StdOut -match "open=0 unwrap=0") "deployer: the replaced key file reads and unwraps"

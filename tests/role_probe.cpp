@@ -15,15 +15,21 @@
 //                            <src> into <dir>\<name>, creating <dir>, as
 //                            this account: a key file it persisted itself
 //   overwrite <path>         write=<win32> - opens an existing file for writing
+//   inspect <path>           inspect=<win32> owner=<sid> sha256=<hex> - the
+//                            file's owner and content hash, as this account
+//                            (a key file's DACL may not admit the test's admin)
 #include "hkdfguard.h"
 
 #include <windows.h>
+#include <aclapi.h>
 #include <bcrypt.h>
+#include <sddl.h>
 
 #include <cstdio>
 #include <string>
 #include <vector>
 
+#pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "bcrypt.lib")
 
 namespace {
@@ -59,12 +65,55 @@ namespace {
         CloseHandle(out);
         return err;
     }
+
+    DWORD Inspect(const char *path, std::string &owner, std::string &sha256) {
+        HANDLE h = CreateFileA(path, GENERIC_READ | READ_CONTROL, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (h == INVALID_HANDLE_VALUE) return GetLastError();
+        PSID ownerSid = nullptr;
+        PSECURITY_DESCRIPTOR sd = nullptr;
+        DWORD err = GetSecurityInfo(h, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION, &ownerSid, nullptr, nullptr, nullptr, &sd);
+        if (err == ERROR_SUCCESS) {
+            char *text = nullptr;
+            if (ConvertSidToStringSidA(ownerSid, &text)) {
+                owner = text;
+                LocalFree(text);
+            } else {
+                err = GetLastError();
+            }
+            LocalFree(sd);
+        }
+        std::vector<uint8_t> bytes;
+        uint8_t chunk[4096];
+        DWORD got = 0;
+        while (err == ERROR_SUCCESS) {
+            if (!ReadFile(h, chunk, sizeof(chunk), &got, nullptr)) {
+                err = GetLastError();
+            } else if (got == 0) {
+                break;
+            } else {
+                bytes.insert(bytes.end(), chunk, chunk + got);
+            }
+        }
+        CloseHandle(h);
+        if (err != ERROR_SUCCESS) return err;
+        uint8_t digest[32] = {};
+        if (BCryptHash(BCRYPT_SHA256_ALG_HANDLE, nullptr, 0, bytes.data(), static_cast<ULONG>(bytes.size()), digest,
+                       sizeof(digest)) != 0) {
+            return ERROR_INVALID_DATA;
+        }
+        static const char hex[] = "0123456789abcdef";
+        for (uint8_t b : digest) {
+            sha256 += hex[b >> 4];
+            sha256 += hex[b & 0xf];
+        }
+        return ERROR_SUCCESS;
+    }
 } // namespace
 
 int main(int argc, char *argv[]) {
     if (argc < 2) {
         std::fprintf(stderr, "usage: role_probe model | open <path> | unwrap <service> <path> | ephemeral <service> | "
-                             "plant <src> <dir> <name> | overwrite <path>\n");
+                             "plant <src> <dir> <name> | overwrite <path> | inspect <path>\n");
         return 2;
     }
     const std::string command = argv[1];
@@ -118,6 +167,12 @@ int main(int argc, char *argv[]) {
         DWORD err = h == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
         if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
         std::printf("write=%lu\n", err);
+        return 0;
+    }
+    if (command == "inspect" && argc == 3) {
+        std::string owner, sha256;
+        DWORD err = Inspect(argv[2], owner, sha256);
+        std::printf("inspect=%lu owner=%s sha256=%s\n", err, owner.c_str(), sha256.c_str());
         return 0;
     }
     std::fprintf(stderr, "role_probe: unknown command or wrong argument count\n");
