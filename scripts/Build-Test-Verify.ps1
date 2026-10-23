@@ -64,6 +64,26 @@ if (-not $principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Adm
     exit 1
 }
 
+# ---- Run in a child process --------------------------------------------
+# The end-to-end check below loads build\HkdfGuard.dll into this process
+# through Add-Type/[DllImport], and nothing unloads it until the process
+# exits. Run in the caller's own window, a second run would then fail to
+# relink the DLL (LNK1168) and to Add-Type HkdfGuardNative again. So the
+# work runs in a child of the same PowerShell executable (same edition and
+# architecture, and the same elevated token), which exits when it's done.
+if ($env:HKDFGUARD_BTV_CHILD -ne "1") {
+    $childArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $PSCommandPath, "-Configuration", $Configuration, "-Group", $Group)
+    if ($NoCleanup) { $childArgs += "-NoCleanup" }
+    $env:HKDFGUARD_BTV_CHILD = "1"
+    try {
+        & (Get-Process -Id $PID).Path @childArgs
+        $childExit = $LASTEXITCODE
+    } finally {
+        Remove-Item Env:HKDFGUARD_BTV_CHILD -ErrorAction SilentlyContinue
+    }
+    exit $childExit
+}
+
 # ---- Locate and enter the VS Build Tools developer environment --------
 Write-Section "Locating MSVC / CMake / Ninja"
 $installerDir = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer"
