@@ -1522,6 +1522,7 @@ int main() {
     // requires for its in/out parameter.
     rc = hkdfguard_wrap_dek(kService, dek.data(), static_cast<int32_t>(dek.size()), wrapped.data(), &wrapped_len);
     Check(rc == HKDFGUARD_OK, "wrap succeeds");
+    const bool primary_wrap_ok = (rc == HKDFGUARD_OK);
     Check(wrapped_len == HKDFGUARD_WRAPPED_MAX_LEN, "wrap produces fixed-size payload");
 
     // Byte offset 1 of the wrapped payload is ProviderType (see
@@ -3802,12 +3803,19 @@ int main() {
     // ---- Cleanup. ----
     // Remove the KEKs this test run created so they don't accumulate in the
     // user's key storage across repeated runs. (CheckPolicyCreatesKek above
-    // already cleans up after itself.)
-    CleanupKek(kServiceLifecycleWide, lifecycle_wrapped[1], "lifecycle test service");
+    // already cleans up after itself.) Each KEK's provider type is read from
+    // a payload wrapped under it, so a service whose wrap failed - e.g. no
+    // KEK was ever created, as when this runs unelevated - is skipped rather
+    // than handed to DeleteKek with a ProviderType byte of 0.
+    if (lifecycle_wrap_ok) {
+        CleanupKek(kServiceLifecycleWide, lifecycle_wrapped[1], "lifecycle test service");
+    }
     if (use_groups_service_created) {
         CleanupKek(kServiceUseGroupsWide, use_groups_wrapped[1], "key-use-policy test service");
     }
-    CleanupKek(kServiceWide, provider_type, "primary test service");
+    if (primary_wrap_ok) {
+        CleanupKek(kServiceWide, provider_type, "primary test service");
+    }
     if (other_service_wrapped) {
         // wrapped_other[1] is the second service's own ProviderType byte -
         // may differ from `provider_type` above in principle, so it's read
