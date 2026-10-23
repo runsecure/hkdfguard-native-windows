@@ -317,10 +317,10 @@ use) are still granted by *name*, now restricted to local groups.
 
 ## 9. ACL enforcement and `GENERIC_READ` (design decision + verified)
 
-- The KEK's ACL is applied once, at creation, and never re-verified on open:
-  the OS enforces the DACL on every use, so an unauthorized caller gets
-  `NTE_PERM` (surfaced as `HKDFGUARD_ERR_KEK_ACCESS_DENIED`). **Design
-  decision.** A fresh key's ACL is checked for the presence of every
+- The KEK's ACL is applied at creation, and the OS enforces the DACL on every
+  use, so an unauthorized caller gets `NTE_PERM` (surfaced as
+  `HKDFGUARD_ERR_KEK_ACCESS_DENIED`). **Design decision.** A fresh key's ACL
+  is checked for the presence of every
   principal it was granted. An *existing* key found by
   `hkdfguard_create_kek` is checked against policy-independent invariants
   instead: a real (non-NULL) DACL, SYSTEM and Administrators present, and
@@ -328,10 +328,20 @@ use) are still granted by *name*, now restricted to local groups.
   or a conditional (callback) allow ACE. An object or compound allow ACE,
   which this library never writes, or an unreadable ACE fails the check
   outright rather than being skipped. Failing that returns
-  `HKDFGUARD_ERR_KEK_INVALID` and leaves the key untouched. This
-  catches a pre-planted key or one later widened to e.g. Everyone. It does
-  not catch a widening to some other specific account, and it does not run
-  on wrap or unwrap, which never re-verify the ACL. **Verified** by test
+  `HKDFGUARD_ERR_KEK_INVALID` and leaves the key untouched. The same
+  invariants are checked again on every wrap, unwrap and fingerprint
+  (`VerifyAclIfReadable` in `src/kek_store.cpp`), but only when the caller
+  can read the DACL: reading it needs `READ_CONTROL`, which key use alone
+  doesn't grant, so for an application account the provisioning-time check
+  stands, while an administrator, deployer or tool that can read it gets
+  `HKDFGUARD_ERR_KEK_INVALID` (event 2002) as soon as it uses a KEK whose ACL
+  was widened. A failure to read the DACL is not itself an error. This
+  catches a key widened to e.g. Everyone, and a pre-planted key whose DACL
+  breaks the invariants. It does not catch a widening to some other specific
+  account, and it reads only the DACL, never the key's owner: a pre-planted
+  key with an acceptable DACL passes. Planting a machine key needs elevation
+  (section 5), so that is within the trust already given to administrators.
+  **Verified** by test
   sections 25d (plain grant to Everyone) and 28 (conditional allow ACE for
   Everyone, grants to ALL SERVICES and Local account), elevated. Section 27
   covers pre-planted keys that fail property verification instead: wrong
@@ -424,8 +434,10 @@ use) are still granted by *name*, now restricted to local groups.
 
 ## 11. Things established about the build, not the crypto (verified)
 
-- The test-only override seams (`SetTestPolicyOverride`,
-  `SetTestKeyUseGroupsOverride`, `SetTestTpmProviderNameOverride`) exist
+- The test-only seams (`SetTestPolicyOverride`,
+  `SetTestKeyUseGroupsOverride`, `SetTestSecurityModelOverride`,
+  `SetTestDeployerGroupsOverride`, `SetTestTpmProviderNameOverride`,
+  `SetTestTpmFaults` and `SetTestEcdhProviderFault`) exist
   only when `HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE` is defined, which only
   `tests/CMakeLists.txt` does; a `strings` scan of the built DLL finds no
   trace of them.
@@ -466,13 +478,15 @@ use) are still granted by *name*, now restricted to local groups.
   equivalent.
 - Only one TPM vendor/firmware has been exercised (section 4); other
   Platform Crypto Provider backends may exhibit different quirks.
-- Release binaries are Authenticode-signed only when the repository has
-  the `WINDOWS_SIGNING_CERT_PFX_BASE64` and `WINDOWS_SIGNING_CERT_PASSWORD`
-  secrets; otherwise the release workflow builds them unsigned and flags
-  that with a warning. Every release does get a GitHub build provenance
-  attestation for the zip, DLL and CLI (`gh attestation verify`), which
-  needs a public repository or GitHub Enterprise Cloud. Workflow actions
-  are pinned to commit SHAs.
+- Release binaries and MSIs are Authenticode-signed through Azure Artifact
+  Signing (`scripts/ArtifactSigning.ps1`), by a release-workflow job in the
+  "release" environment that signs in to Azure over OIDC: no signing
+  certificate or password is stored in the repository. There is no unsigned
+  fallback - a release whose signing fails is not published. Every release
+  also gets a GitHub build provenance attestation for the signed files
+  (`gh attestation verify`), which needs a public repository or GitHub
+  Enterprise Cloud. Workflow actions are pinned to commit SHAs, and values a
+  tag can influence reach scripts only through environment variables.
 
 ## 13. ECDH with a computed point on the Windows providers (verified)
 

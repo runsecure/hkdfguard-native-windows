@@ -811,7 +811,7 @@ namespace {
             case HKDFGUARD_ERR_FILE_TOO_LONG: return "the wrapped-key file is longer than a wrapped key";
             case HKDFGUARD_ERR_FILE_PLAINTEXT_KEY: return "the file looks like an UNWRAPPED 32-byte key (raw, or its hex or base64) - it may hold a plaintext key; treat it as exposed";
             case HKDFGUARD_ERR_FILE_MALFORMED: return "the wrapped-key file is the right size but does not hold a valid wrapped key";
-            case HKDFGUARD_ERR_FILE_UNTRUSTED: return "the wrapped-key path is, or passes through, a symbolic link, junction or other reparse point, uses an 8.3 short name, or is not on a local drive (UNC, mapped or SUBST drive, device); or the file or a folder above it is owned by, or lets, an account other than SYSTEM, Administrators, TrustedInstaller or the caller write or replace it; or a folder above it, other than the drive root, lets such an account create files or folders in it (as C:\\ProgramData and C:\\Windows\\Temp do)";
+            case HKDFGUARD_ERR_FILE_UNTRUSTED: return "the wrapped-key path is, or passes through, a symbolic link, junction or other reparse point, uses an 8.3 short name, or is not on a local drive (UNC, mapped or SUBST drive, device); or the file or a folder above it is owned by, or lets, an untrusted account write or replace it (trusted are SYSTEM, Administrators and TrustedInstaller, plus the deployer groups and their members under the production security model, or this account under the developer model); or a folder above it, other than the drive root, lets such an account create files or folders in it (as C:\\ProgramData and C:\\Windows\\Temp do)";
             default: return "unknown status code " + std::to_string(code);
         }
     }
