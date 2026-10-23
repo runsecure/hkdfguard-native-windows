@@ -30,7 +30,9 @@ namespace hkdfguard {
     // A *missing* KeyStoragePolicy value (the registry key or value isn't
     // there at all) falls back to the documented safe default
     // (KeyStoragePolicy::PreferTpm) - that is normal, unconfigured-machine
-    // behavior, not an error.
+    // behavior, not an error. A policy key that exists but can't be opened
+    // (access denied, say) is not "missing": it returns
+    // KeyStoragePolicy::Invalid, since the policy it holds is unknown.
     //
     // A value that *is* present but isn't one of the three recognized
     // policies (wrong REG_* type, or a DWORD other than 0/1/2) returns
@@ -57,6 +59,13 @@ namespace hkdfguard {
     // long REG_SZ isn't. Anything present but unreadable, of another type,
     // or not 0/1/2 is KeyStoragePolicy::Invalid.
     KeyStoragePolicy ParseKeyStoragePolicy(bool found, bool readable, unsigned long type, unsigned long value) noexcept;
+
+    // The rule LoadEffectivePolicy applies when the policy *key* can't be
+    // opened, with no registry I/O, so it can be tested directly: only "not
+    // found" (ERROR_FILE_NOT_FOUND / ERROR_PATH_NOT_FOUND) is "never
+    // configured" and gets the PreferTpm default; any other status (e.g.
+    // ERROR_ACCESS_DENIED) is KeyStoragePolicy::Invalid.
+    KeyStoragePolicy KeyStoragePolicyForUnopenedKey(long openStatus) noexcept;
 
 // Test-only seam: makes LoadEffectivePolicy() return `policy` instead of
 // reading the registry, regardless of this machine's actual configured

@@ -966,6 +966,15 @@ int main() {
         Check(ParseKeyStoragePolicy(true, false, REG_SZ, 0) == KeyStoragePolicy::Invalid,
               "KeyStoragePolicy present but unreadable as a DWORD (a long REG_SZ): invalid, not the default");
         Check(ParseKeyStoragePolicy(true, true, REG_SZ, 1) == KeyStoragePolicy::Invalid, "KeyStoragePolicy of the wrong type: invalid");
+
+        // The policy key itself: only "not found" is unconfigured; a key that
+        // exists but can't be opened may hold RequireTpm, so it fails closed.
+        using hkdfguard::KeyStoragePolicyForUnopenedKey;
+        Check(KeyStoragePolicyForUnopenedKey(ERROR_FILE_NOT_FOUND) == KeyStoragePolicy::PreferTpm, "Policy key absent: PreferTpm");
+        Check(KeyStoragePolicyForUnopenedKey(ERROR_PATH_NOT_FOUND) == KeyStoragePolicy::PreferTpm, "Policy key's parent absent: PreferTpm");
+        Check(KeyStoragePolicyForUnopenedKey(ERROR_ACCESS_DENIED) == KeyStoragePolicy::Invalid,
+              "Policy key present but unreadable (access denied): invalid, not the default");
+        Check(KeyStoragePolicyForUnopenedKey(ERROR_BADKEY) == KeyStoragePolicy::Invalid, "Policy key failing to open any other way: invalid");
     }
 
     // ---- -2d. Which drive letters count as local: the drive letter's ----

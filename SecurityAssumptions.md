@@ -201,8 +201,11 @@ administrator.
 - A missing `KeyStoragePolicy` value means "never configured" and yields the
   default (`PreferTpm`). A value that is present but unrecognized yields
   `KeyStoragePolicy::Invalid`, and every reader fails closed with
-  `HKDFGUARD_ERR_POLICY_INVALID`. **Verified** by test
-  (`test_roundtrip.cpp` section 25b) via the test-only override.
+  `HKDFGUARD_ERR_POLICY_INVALID`. So does a policy key that exists but can't
+  be opened (`ERROR_ACCESS_DENIED` from a hardened registry ACL, say): only a
+  key that is not found counts as never configured, since an unreadable one
+  may hold `RequireTpm`. **Verified** by test (`test_roundtrip.cpp` section
+  25b) via the test-only override; the open-status rule by section -2c.
 - `KeyUseGroups` read failures of any kind yield an empty list (no
   additional principals), never an exception. Entries are trimmed; a bad
   entry fails `hkdfguard_create_kek` before any key is touched.
