@@ -450,10 +450,12 @@ namespace hkdfguard {
 
         // The key itself missing means the policy has never been
         // configured on this machine at all - that is the "missing" case
-        // the default applies to, not the "present but invalid" case
-        // ParsePolicyValue's Invalid sentinel is for.
+        // the default applies to. Any other failure to open it (access
+        // denied by a hardened registry ACL, say) leaves a policy that may
+        // well be configured - possibly RequireTpm - unread, so it fails
+        // closed rather than quietly running under PreferTpm.
         if (status != ERROR_SUCCESS) {
-            return kDefaultPolicy;
+            return KeyStoragePolicyForUnopenedKey(status);
         }
 
         DWORD value = 0;
@@ -480,6 +482,13 @@ namespace hkdfguard {
             status == ERROR_SUCCESS && size == sizeof(value),
             type,
             value);
+    }
+
+    KeyStoragePolicy KeyStoragePolicyForUnopenedKey(long openStatus) noexcept
+    {
+        return openStatus == ERROR_FILE_NOT_FOUND || openStatus == ERROR_PATH_NOT_FOUND
+            ? kDefaultPolicy
+            : KeyStoragePolicy::Invalid;
     }
 
     KeyStoragePolicy ParseKeyStoragePolicy(bool found, bool readable, unsigned long type, unsigned long value) noexcept

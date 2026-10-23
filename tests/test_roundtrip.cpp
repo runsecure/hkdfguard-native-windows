@@ -52,6 +52,41 @@ void Check(bool condition, const char* what) {
     }
 }
 
+void Skip(const char* what) {
+    std::printf("[SKIP] %s\n", what);
+}
+
+bool IsElevated() {
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return false;
+    TOKEN_ELEVATION elevation{};
+    DWORD size = 0;
+    bool elevated = GetTokenInformation(token, TokenElevation, &elevation, sizeof(elevation), &size) &&
+                    elevation.TokenIsElevated != 0;
+    CloseHandle(token);
+    return elevated;
+}
+
+// Set once at the start of main. Creating a machine-scope KEK needs
+// elevation, so without it every check that needs a KEK this run created
+// can't be carried out at all.
+bool g_elevated = false;
+
+// Check for a condition that needs a KEK this run provisioned: elevated, it
+// is an ordinary Check; not elevated, it is reported as [SKIP] whatever the
+// outcome, so an unelevated run passes with skips and any [FAIL] in it is a
+// real problem rather than the cascade from KEK creation being refused.
+void CheckNeedsElevation(bool condition, const char* what) {
+    if (g_elevated) {
+        Check(condition, what);
+    } else {
+        std::printf("[SKIP] %s (needs elevation)\n", what);
+    }
+}
+void CheckNeedsElevation(bool condition, const std::string& what) {
+    CheckNeedsElevation(condition, what.c_str());
+}
+
 // Builds a deterministic (not random) 32-byte test DEK: each byte is some
 // simple, distinct function of its index, purely so bugs that shuffle or
 // truncate bytes are easy to spot rather than every byte looking the same.
@@ -177,7 +212,7 @@ void CheckPolicyCreatesKek(
                 "[INFO] %s: create_kek failed - acceptable without real TPM/vTPM hardware on this machine: %s\n",
                 label.c_str(), e.what());
         } else {
-            Check(false, (label + ": create_kek should not fail on this policy").c_str());
+            CheckNeedsElevation(false, label + ": create_kek should not fail on this policy");
             std::printf("    (%s)\n", e.what());
         }
     }
@@ -255,24 +290,8 @@ std::wstring PickNarrowGroup() {
 }
 
 // ---- Helpers for sections 26-29 (fault injection, pre-planted keys, ACL ----
-//      entries, golden payload). Elevation-dependent checks in those
-//      sections print [SKIP] instead of failing when not elevated, so a
-//      non-elevated run only fails on real problems.
+//      entries, golden payload).
 
-void Skip(const char* what) {
-    std::printf("[SKIP] %s\n", what);
-}
-
-bool IsElevated() {
-    HANDLE token = nullptr;
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return false;
-    TOKEN_ELEVATION elevation{};
-    DWORD size = 0;
-    bool elevated = GetTokenInformation(token, TokenElevation, &elevation, sizeof(elevation), &size) &&
-                    elevation.TokenIsElevated != 0;
-    CloseHandle(token);
-    return elevated;
-}
 
 // Whether the real Platform Crypto Provider opens on this machine.
 bool HasTpmProvider() {
@@ -919,6 +938,7 @@ bool ImportGoldenKek() {
 } // namespace
 
 int main() {
+    g_elevated = IsElevated();
     std::vector<uint8_t> dek = MakeDek();
     int32_t rc;
 
@@ -966,6 +986,15 @@ int main() {
         Check(ParseKeyStoragePolicy(true, false, REG_SZ, 0) == KeyStoragePolicy::Invalid,
               "KeyStoragePolicy present but unreadable as a DWORD (a long REG_SZ): invalid, not the default");
         Check(ParseKeyStoragePolicy(true, true, REG_SZ, 1) == KeyStoragePolicy::Invalid, "KeyStoragePolicy of the wrong type: invalid");
+
+        // The policy key itself: only "not found" is unconfigured; a key that
+        // exists but can't be opened may hold RequireTpm, so it fails closed.
+        using hkdfguard::KeyStoragePolicyForUnopenedKey;
+        Check(KeyStoragePolicyForUnopenedKey(ERROR_FILE_NOT_FOUND) == KeyStoragePolicy::PreferTpm, "Policy key absent: PreferTpm");
+        Check(KeyStoragePolicyForUnopenedKey(ERROR_PATH_NOT_FOUND) == KeyStoragePolicy::PreferTpm, "Policy key's parent absent: PreferTpm");
+        Check(KeyStoragePolicyForUnopenedKey(ERROR_ACCESS_DENIED) == KeyStoragePolicy::Invalid,
+              "Policy key present but unreadable (access denied): invalid, not the default");
+        Check(KeyStoragePolicyForUnopenedKey(ERROR_BADKEY) == KeyStoragePolicy::Invalid, "Policy key failing to open any other way: invalid");
     }
 
     // ---- -2d. Which drive letters count as local: the drive letter's ----
@@ -1070,17 +1099,17 @@ int main() {
     Check(lifecycle_exists == 0, "kek_exists reports false before the KEK is created");
 
     rc = hkdfguard_create_kek(kServiceLifecycle);
-    Check(rc == HKDFGUARD_OK, "create_kek provisions a new KEK");
+    CheckNeedsElevation(rc == HKDFGUARD_OK, "create_kek provisions a new KEK");
 
     lifecycle_exists = -1;
     rc = hkdfguard_kek_exists(kServiceLifecycle, &lifecycle_exists);
     Check(rc == HKDFGUARD_OK, "kek_exists succeeds after the KEK is created");
-    Check(lifecycle_exists == 1, "kek_exists reports true after the KEK is created");
+    CheckNeedsElevation(lifecycle_exists == 1, "kek_exists reports true after the KEK is created");
 
     // create_kek is safe to call again for an already-provisioned service:
     // it verifies rather than failing or re-creating.
     rc = hkdfguard_create_kek(kServiceLifecycle);
-    Check(rc == HKDFGUARD_OK, "create_kek is idempotent for an already-provisioned service");
+    CheckNeedsElevation(rc == HKDFGUARD_OK, "create_kek is idempotent for an already-provisioned service");
 
     // wrap now succeeds, since create_kek has provisioned the KEK it needs.
     std::vector<uint8_t> lifecycle_wrapped(HKDFGUARD_WRAPPED_MAX_LEN);
@@ -1088,7 +1117,7 @@ int main() {
     rc = hkdfguard_wrap_dek(
         kServiceLifecycle, dek.data(), static_cast<int32_t>(dek.size()), lifecycle_wrapped.data(),
         &lifecycle_wrapped_len);
-    Check(rc == HKDFGUARD_OK, "wrap succeeds once create_kek has provisioned the KEK");
+    CheckNeedsElevation(rc == HKDFGUARD_OK, "wrap succeeds once create_kek has provisioned the KEK");
     const bool lifecycle_wrap_ok = (rc == HKDFGUARD_OK);
 
     // ---- 0b. wrap fails outright for a service with no KEK - wrap never ----
@@ -1473,7 +1502,7 @@ int main() {
     Check(trimmed_entry_validates, "key-use policy entry with surrounding whitespace is trimmed and validates as a real group");
 
     rc = InternalCreateKekResult(kServiceUseGroupsWide);
-    Check(rc == HKDFGUARD_OK, "create_kek accepts a real group from the key-use policy (whitespace trimmed)");
+    CheckNeedsElevation(rc == HKDFGUARD_OK, "create_kek accepts a real group from the key-use policy (whitespace trimmed)");
     if (rc != HKDFGUARD_OK) {
         // HKDFGUARD_ERR_KEK_ACCESS_DENIED (-13) here with the validation check
         // above passing means the environment couldn't provision (this
@@ -1499,7 +1528,7 @@ int main() {
     // ---- 1. Provision kService's KEK, then a basic wrap -> unwrap ----
     //         roundtrip.
     rc = hkdfguard_create_kek(kService);
-    Check(rc == HKDFGUARD_OK, "create_kek provisions kService's KEK");
+    CheckNeedsElevation(rc == HKDFGUARD_OK, "create_kek provisions kService's KEK");
 
     std::vector<uint8_t> wrapped(HKDFGUARD_WRAPPED_MAX_LEN);
     // `wrapped_len` is initialized to the buffer's actual capacity before
@@ -1512,7 +1541,8 @@ int main() {
     // variable is turned into the `int32_t*` the function signature
     // requires for its in/out parameter.
     rc = hkdfguard_wrap_dek(kService, dek.data(), static_cast<int32_t>(dek.size()), wrapped.data(), &wrapped_len);
-    Check(rc == HKDFGUARD_OK, "wrap succeeds");
+    CheckNeedsElevation(rc == HKDFGUARD_OK, "wrap succeeds");
+    const bool primary_wrap_ok = (rc == HKDFGUARD_OK);
     Check(wrapped_len == HKDFGUARD_WRAPPED_MAX_LEN, "wrap produces fixed-size payload");
 
     // Byte offset 1 of the wrapped payload is ProviderType (see
@@ -1521,19 +1551,19 @@ int main() {
     // deliberate: it's testing the actual on-the-wire output, the same
     // thing any other language's binding would see.
     uint8_t provider_type = wrapped[1];
-    Check(provider_type == 1 || provider_type == 2, "provider type is TPM(1) or Software(2)");
+    CheckNeedsElevation(provider_type == 1 || provider_type == 2, "provider type is TPM(1) or Software(2)");
     std::printf("    (provider_type = %d)\n", provider_type);
 
     std::vector<uint8_t> unwrapped(HKDFGUARD_DEK_LEN);
     int32_t unwrapped_len = static_cast<int32_t>(unwrapped.size());
     rc = hkdfguard_unwrap_dek(kService, wrapped.data(), wrapped_len, unwrapped.data(), &unwrapped_len);
-    Check(rc == HKDFGUARD_OK, "unwrap succeeds");
+    CheckNeedsElevation(rc == HKDFGUARD_OK, "unwrap succeeds");
     Check(unwrapped_len == HKDFGUARD_DEK_LEN, "unwrap produces 32-byte DEK");
     // std::memcmp (declared in <cstring>) compares raw bytes and returns 0
     // when they're identical - the standard way to check two byte buffers
     // are equal, since operator== isn't defined for raw pointers/arrays the
     // way it is for e.g. std::vector or std::string.
-    Check(std::memcmp(dek.data(), unwrapped.data(), HKDFGUARD_DEK_LEN) == 0, "unwrapped DEK matches original");
+    CheckNeedsElevation(std::memcmp(dek.data(), unwrapped.data(), HKDFGUARD_DEK_LEN) == 0, "unwrapped DEK matches original");
 
     // ---- 1b. Service names are case-insensitive: a service name that only ----
     //          differs in case from kService resolves to the exact same KEK,
@@ -1547,10 +1577,10 @@ int main() {
     int32_t mixed_case_exists = -1;
     rc = hkdfguard_kek_exists(kServiceMixedCase, &mixed_case_exists);
     Check(rc == HKDFGUARD_OK, "kek_exists succeeds for a differently-cased alias of an existing service");
-    Check(mixed_case_exists == 1, "kek_exists reports true for a differently-cased alias of an existing service");
+    CheckNeedsElevation(mixed_case_exists == 1, "kek_exists reports true for a differently-cased alias of an existing service");
 
     rc = hkdfguard_create_kek(kServiceMixedCase);
-    Check(rc == HKDFGUARD_OK, "create_kek is idempotent for a differently-cased alias of an existing service");
+    CheckNeedsElevation(rc == HKDFGUARD_OK, "create_kek is idempotent for a differently-cased alias of an existing service");
 
     // Wrap using the mixed-case alias; it must reuse kService's existing KEK
     // (same provider), not provision a second, independent one.
@@ -1559,7 +1589,7 @@ int main() {
     rc = hkdfguard_wrap_dek(
         kServiceMixedCase, dek.data(), static_cast<int32_t>(dek.size()), wrapped_mixed_case.data(),
         &wrapped_mixed_case_len);
-    Check(rc == HKDFGUARD_OK, "wrap succeeds using a differently-cased alias of an existing service");
+    CheckNeedsElevation(rc == HKDFGUARD_OK, "wrap succeeds using a differently-cased alias of an existing service");
     Check(wrapped_mixed_case[1] == provider_type, "wrap via a differently-cased alias reuses the same provider/KEK");
 
     // Unwrap that payload using the original lowercase form.
@@ -1568,8 +1598,8 @@ int main() {
     rc = hkdfguard_unwrap_dek(
         kService, wrapped_mixed_case.data(), wrapped_mixed_case_len, unwrapped_via_lowercase.data(),
         &unwrapped_via_lowercase_len);
-    Check(rc == HKDFGUARD_OK, "unwrap succeeds using the lowercase form of a payload wrapped via a mixed-case alias");
-    Check(
+    CheckNeedsElevation(rc == HKDFGUARD_OK, "unwrap succeeds using the lowercase form of a payload wrapped via a mixed-case alias");
+    CheckNeedsElevation(
         std::memcmp(dek.data(), unwrapped_via_lowercase.data(), HKDFGUARD_DEK_LEN) == 0,
         "unwrapped DEK matches original when wrap/unwrap use differently-cased service names");
 
@@ -1581,8 +1611,8 @@ int main() {
     rc = hkdfguard_unwrap_dek(
         kServiceMixedCase, wrapped.data(), wrapped_len, unwrapped_via_mixed_case.data(),
         &unwrapped_via_mixed_case_len);
-    Check(rc == HKDFGUARD_OK, "unwrap succeeds using a mixed-case alias of the service a payload was wrapped under");
-    Check(
+    CheckNeedsElevation(rc == HKDFGUARD_OK, "unwrap succeeds using a mixed-case alias of the service a payload was wrapped under");
+    CheckNeedsElevation(
         std::memcmp(dek.data(), unwrapped_via_mixed_case.data(), HKDFGUARD_DEK_LEN) == 0,
         "unwrapped DEK matches original when unwrap uses a differently-cased alias of the wrapping service");
 
@@ -1593,8 +1623,8 @@ int main() {
     std::vector<uint8_t> unwrapped_again(HKDFGUARD_DEK_LEN);
     int32_t unwrapped_again_len = static_cast<int32_t>(unwrapped_again.size());
     rc = hkdfguard_unwrap_dek(kService, wrapped.data(), wrapped_len, unwrapped_again.data(), &unwrapped_again_len);
-    Check(rc == HKDFGUARD_OK, "unwrapping the same payload a second time succeeds");
-    Check(
+    CheckNeedsElevation(rc == HKDFGUARD_OK, "unwrapping the same payload a second time succeeds");
+    CheckNeedsElevation(
         std::memcmp(dek.data(), unwrapped_again.data(), HKDFGUARD_DEK_LEN) == 0,
         "second unwrap of the same payload recovers the identical DEK");
 
@@ -1604,7 +1634,7 @@ int main() {
     std::vector<uint8_t> wrapped2(HKDFGUARD_WRAPPED_MAX_LEN);
     int32_t wrapped2_len = static_cast<int32_t>(wrapped2.size());
     rc = hkdfguard_wrap_dek(kService, dek.data(), static_cast<int32_t>(dek.size()), wrapped2.data(), &wrapped2_len);
-    Check(rc == HKDFGUARD_OK, "second wrap succeeds");
+    CheckNeedsElevation(rc == HKDFGUARD_OK, "second wrap succeeds");
     Check(wrapped2[1] == provider_type, "second wrap reuses the same provider type");
 
     // ---- 4. hkdfguard_generate_and_wrap_dek: generates its own DEK, wraps
@@ -1613,7 +1643,7 @@ int main() {
     std::vector<uint8_t> generated1(HKDFGUARD_WRAPPED_MAX_LEN);
     int32_t generated1_len = static_cast<int32_t>(generated1.size());
     rc = hkdfguard_generate_and_wrap_dek(kService, generated1.data(), &generated1_len);
-    Check(rc == HKDFGUARD_OK, "generate_and_wrap succeeds");
+    CheckNeedsElevation(rc == HKDFGUARD_OK, "generate_and_wrap succeeds");
     Check(generated1_len == HKDFGUARD_WRAPPED_MAX_LEN, "generate_and_wrap produces fixed-size payload");
     Check(generated1[1] == provider_type, "generate_and_wrap reuses the same provider type");
 
@@ -1623,7 +1653,7 @@ int main() {
     std::vector<uint8_t> generated1_unwrapped(HKDFGUARD_DEK_LEN);
     int32_t generated1_unwrapped_len = static_cast<int32_t>(generated1_unwrapped.size());
     rc = hkdfguard_unwrap_dek(kService, generated1.data(), generated1_len, generated1_unwrapped.data(), &generated1_unwrapped_len);
-    Check(rc == HKDFGUARD_OK, "unwrap of a generate_and_wrap_dek payload succeeds");
+    CheckNeedsElevation(rc == HKDFGUARD_OK, "unwrap of a generate_and_wrap_dek payload succeeds");
     Check(generated1_unwrapped_len == HKDFGUARD_DEK_LEN, "unwrap of a generate_and_wrap_dek payload produces 32-byte DEK");
 
     // A second call generates an *independent* random DEK - not the fixed
@@ -1636,12 +1666,12 @@ int main() {
     std::vector<uint8_t> generated2(HKDFGUARD_WRAPPED_MAX_LEN);
     int32_t generated2_len = static_cast<int32_t>(generated2.size());
     rc = hkdfguard_generate_and_wrap_dek(kService, generated2.data(), &generated2_len);
-    Check(rc == HKDFGUARD_OK, "second generate_and_wrap succeeds");
+    CheckNeedsElevation(rc == HKDFGUARD_OK, "second generate_and_wrap succeeds");
     std::vector<uint8_t> generated2_unwrapped(HKDFGUARD_DEK_LEN);
     int32_t generated2_unwrapped_len = static_cast<int32_t>(generated2_unwrapped.size());
     rc = hkdfguard_unwrap_dek(kService, generated2.data(), generated2_len, generated2_unwrapped.data(), &generated2_unwrapped_len);
-    Check(rc == HKDFGUARD_OK, "unwrap of the second generate_and_wrap_dek payload succeeds");
-    Check(
+    CheckNeedsElevation(rc == HKDFGUARD_OK, "unwrap of the second generate_and_wrap_dek payload succeeds");
+    CheckNeedsElevation(
         std::memcmp(generated1_unwrapped.data(), generated2_unwrapped.data(), HKDFGUARD_DEK_LEN) != 0,
         "two generate_and_wrap_dek calls produce different DEKs");
     Check(
@@ -1719,7 +1749,7 @@ int main() {
     int32_t auth_out_len = static_cast<int32_t>(out_for_auth.size());
     rc = hkdfguard_unwrap_dek(kService, corrupted.data(), static_cast<int32_t>(corrupted.size()),
                               out_for_auth.data(), &auth_out_len);
-    Check(rc == HKDFGUARD_ERR_PAYLOAD_AUTH_FAILED, "unwrap rejects corrupted ciphertext");
+    CheckNeedsElevation(rc == HKDFGUARD_ERR_PAYLOAD_AUTH_FAILED, "unwrap rejects corrupted ciphertext");
     Check(AllZero(out_for_auth.data(), out_for_auth.size()), "output buffer zeroed after auth failure");
 
     // ---- 11. Corrupted tag -> authentication failure, output zeroed. ----
@@ -1729,7 +1759,7 @@ int main() {
     int32_t tag_out_len = static_cast<int32_t>(out_for_tag.size());
     rc = hkdfguard_unwrap_dek(kService, corrupted_tag.data(), static_cast<int32_t>(corrupted_tag.size()),
                               out_for_tag.data(), &tag_out_len);
-    Check(rc == HKDFGUARD_ERR_PAYLOAD_AUTH_FAILED, "unwrap rejects corrupted tag");
+    CheckNeedsElevation(rc == HKDFGUARD_ERR_PAYLOAD_AUTH_FAILED, "unwrap rejects corrupted tag");
     Check(AllZero(out_for_tag.data(), out_for_tag.size()), "output buffer zeroed after tag failure");
 
     // ---- 11b. Corrupted KEK fingerprint -> KEK_FINGERPRINT_MISMATCH (not PAYLOAD_AUTH_FAILED), ----
@@ -1743,7 +1773,7 @@ int main() {
     rc = hkdfguard_unwrap_dek(
         kService, corrupted_fingerprint.data(), static_cast<int32_t>(corrupted_fingerprint.size()),
         out_for_fingerprint.data(), &fingerprint_out_len);
-    Check(rc == HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH, "unwrap rejects a payload whose KEK fingerprint doesn't match as KEK_FINGERPRINT_MISMATCH");
+    CheckNeedsElevation(rc == HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH, "unwrap rejects a payload whose KEK fingerprint doesn't match as KEK_FINGERPRINT_MISMATCH");
     Check(AllZero(out_for_fingerprint.data(), out_for_fingerprint.size()), "output buffer zeroed after fingerprint mismatch");
 
     // ---- 11c. Non-zero reserved bytes -> malformed, output zeroed. ----
@@ -1754,7 +1784,7 @@ int main() {
     rc = hkdfguard_unwrap_dek(
         kService, nonzero_reserved.data(), static_cast<int32_t>(nonzero_reserved.size()),
         out_for_reserved.data(), &reserved_out_len);
-    Check(rc == HKDFGUARD_ERR_PAYLOAD_MALFORMED, "unwrap rejects non-zero reserved bytes");
+    CheckNeedsElevation(rc == HKDFGUARD_ERR_PAYLOAD_MALFORMED, "unwrap rejects non-zero reserved bytes");
     Check(AllZero(out_for_reserved.data(), out_for_reserved.size()), "output buffer zeroed after reserved-bytes failure");
 
     // ---- 12. Invalid service (null / empty) is rejected on wrap. ----
@@ -1779,13 +1809,13 @@ int main() {
     //          payload wrapped under one service cannot be unwrapped under
     //          another.
     rc = hkdfguard_create_kek(kServiceOther);
-    Check(rc == HKDFGUARD_OK, "create_kek provisions kServiceOther's KEK");
+    CheckNeedsElevation(rc == HKDFGUARD_OK, "create_kek provisions kServiceOther's KEK");
 
     bool other_service_wrapped = false;
     std::vector<uint8_t> wrapped_other(HKDFGUARD_WRAPPED_MAX_LEN);
     int32_t wrapped_other_len = static_cast<int32_t>(wrapped_other.size());
     rc = hkdfguard_wrap_dek(kServiceOther, dek.data(), static_cast<int32_t>(dek.size()), wrapped_other.data(), &wrapped_other_len);
-    Check(rc == HKDFGUARD_OK, "wrap with a different service succeeds");
+    CheckNeedsElevation(rc == HKDFGUARD_OK, "wrap with a different service succeeds");
     other_service_wrapped = (rc == HKDFGUARD_OK);
 
     std::vector<uint8_t> out_wrong_service(HKDFGUARD_DEK_LEN, 0xAA);
@@ -1797,7 +1827,7 @@ int main() {
     // than failing to find a key at all (KEK_NOT_FOUND, the only other
     // correct outcome, if kServiceOther's KEK couldn't be created - e.g.
     // this process isn't elevated).
-    Check(rc == HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH || rc == HKDFGUARD_ERR_KEK_NOT_FOUND, "unwrap with the wrong service fails with KEK_FINGERPRINT_MISMATCH");
+    CheckNeedsElevation(rc == HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH || rc == HKDFGUARD_ERR_KEK_NOT_FOUND, "unwrap with the wrong service fails with KEK_FINGERPRINT_MISMATCH");
     Check(AllZero(out_wrong_service.data(), out_wrong_service.size()), "output buffer zeroed after wrong-service failure");
 
     // ---- 14. Null-pointer argument validation, wrap side. ----
@@ -1831,7 +1861,7 @@ int main() {
     const std::string service129(129, 'a');
 
     rc = hkdfguard_create_kek(service128.c_str());
-    Check(rc == HKDFGUARD_OK, "create_kek accepts a service name exactly at the 128-byte maximum");
+    CheckNeedsElevation(rc == HKDFGUARD_OK, "create_kek accepts a service name exactly at the 128-byte maximum");
     bool service128_created = (rc == HKDFGUARD_OK);
 
     std::vector<uint8_t> wrapped_128(HKDFGUARD_WRAPPED_MAX_LEN);
@@ -1962,7 +1992,7 @@ int main() {
     rc = hkdfguard_unwrap_dek(
         kService, corrupted_provider.data(), static_cast<int32_t>(corrupted_provider.size()),
         out_for_provider.data(), &provider_out_len);
-    Check(rc == HKDFGUARD_ERR_PAYLOAD_MALFORMED, "unwrap rejects an unrecognized provider type byte");
+    CheckNeedsElevation(rc == HKDFGUARD_ERR_PAYLOAD_MALFORMED, "unwrap rejects an unrecognized provider type byte");
     Check(AllZero(out_for_provider.data(), out_for_provider.size()), "output buffer zeroed after unrecognized-provider-type failure");
 
     // ---- 23b. A KeyId other than kCurrentKeyId is rejected as malformed. ----
@@ -1978,7 +2008,7 @@ int main() {
     rc = hkdfguard_unwrap_dek(
         kService, corrupted_key_id.data(), static_cast<int32_t>(corrupted_key_id.size()),
         out_for_key_id.data(), &key_id_out_len);
-    Check(rc == HKDFGUARD_ERR_PAYLOAD_MALFORMED, "unwrap rejects a KeyId other than kCurrentKeyId");
+    CheckNeedsElevation(rc == HKDFGUARD_ERR_PAYLOAD_MALFORMED, "unwrap rejects a KeyId other than kCurrentKeyId");
     Check(AllZero(out_for_key_id.data(), out_for_key_id.size()), "output buffer zeroed after unrecognized-KeyId failure");
 
     // ---- 24. Null-pointer argument validation, generate_and_wrap_dek. ----
@@ -2158,7 +2188,7 @@ int main() {
                                          IndependentAuthenticated(provider, salt, kek_pub), key);
             genuine_key.assign(key.data(), key.data() + key.size());
         });
-        Check(setup == HKDFGUARD_OK, "test setup: read the KEK's public key and derive a genuine wrapping key");
+        CheckNeedsElevation(setup == HKDFGUARD_OK, "test setup: read the KEK's public key and derive a genuine wrapping key");
 
         if (setup == HKDFGUARD_OK) {
             std::vector<uint8_t> nonce(hkdfguard::kNonceLen, 0x5A);
@@ -2205,7 +2235,7 @@ int main() {
     rc = hkdfguard_unwrap_dek(
         kService, tampered_salt_payload.data(), static_cast<int32_t>(tampered_salt_payload.size()),
         out_for_salt.data(), &salt_out_len);
-    Check(rc == HKDFGUARD_ERR_PAYLOAD_AUTH_FAILED, "unwrap rejects a payload whose salt was changed (PAYLOAD_AUTH_FAILED)");
+    CheckNeedsElevation(rc == HKDFGUARD_ERR_PAYLOAD_AUTH_FAILED, "unwrap rejects a payload whose salt was changed (PAYLOAD_AUTH_FAILED)");
     Check(AllZero(out_for_salt.data(), out_for_salt.size()), "output buffer zeroed after a changed-salt failure");
 
     // Every wrap draws a fresh salt.
@@ -2213,7 +2243,7 @@ int main() {
         std::vector<uint8_t> again(HKDFGUARD_WRAPPED_MAX_LEN);
         int32_t again_len = static_cast<int32_t>(again.size());
         rc = hkdfguard_wrap_dek(kService, dek.data(), static_cast<int32_t>(dek.size()), again.data(), &again_len);
-        Check(rc == HKDFGUARD_OK &&
+        CheckNeedsElevation(rc == HKDFGUARD_OK &&
                   std::memcmp(again.data() + hkdfguard::kSaltOffset, wrapped.data() + hkdfguard::kSaltOffset,
                               hkdfguard::kSaltLen) != 0,
               "two wraps of the same DEK use different salts");
@@ -3398,8 +3428,7 @@ int main() {
     Check(no_tpm_exists_is_false, "PreferTpm with no TPM: KekExists falls through to software and reports false (not PROVIDER_ERROR)");
 
     // The create/exists/open/delete sequence needs elevation like every other
-    // KEK creation in this suite; without it, this reports a failure that is
-    // part of the known non-elevated cascade.
+    // KEK creation in this suite; without it, it is reported as skipped.
     try {
         hkdfguard::CreateKek(kServiceNoTpmWide);
         Check(true, "PreferTpm with no TPM: create_kek falls back to the software provider");
@@ -3408,7 +3437,7 @@ int main() {
         Check(kek.provider_type == hkdfguard::kProviderTypeSoftware, "PreferTpm with no TPM: the KEK actually opened is software-backed");
         hkdfguard::DeleteKek(kServiceNoTpmWide, hkdfguard::kProviderTypeSoftware, hkdfguard::kCurrentKeyId);
     } catch (const std::exception &e) {
-        Check(false, "PreferTpm with no TPM: create/exists/open/delete sequence should succeed (elevated)");
+        CheckNeedsElevation(false, "PreferTpm with no TPM: create/exists/open/delete sequence should succeed");
         std::printf("    (%s)\n", e.what());
     }
 
@@ -3432,8 +3461,8 @@ int main() {
     //           this check, create_kek accepted any existing key under the
     //           service's name as "already provisioned" without looking at
     //           who it admits. SoftwareOnly keeps this off the TPM so it's
-    //           deterministic; elevated-only (KEK creation), so it's part of
-    //           the known cascade when not elevated.
+    //           deterministic; elevated-only (KEK creation), so it's skipped
+    //           when not elevated.
     constexpr const wchar_t* kServiceAclWidenedWide = L"hkdfguardwin.test.aclwidened";
     hkdfguard::SetTestPolicyOverride(hkdfguard::KeyStoragePolicy::SoftwareOnly);
     bool acl_widened_created = false;
@@ -3514,7 +3543,7 @@ int main() {
                 "a KEK rejected for its ACL is left in place, not deleted");
         }
     } catch (const std::exception &e) {
-        Check(false, "widened-ACL scenario: KEK setup should succeed (elevated)");
+        CheckNeedsElevation(false, "widened-ACL scenario: KEK setup should succeed");
         std::printf("    (%s)\n", e.what());
     }
     if (acl_widened_created) {
@@ -3793,12 +3822,19 @@ int main() {
     // ---- Cleanup. ----
     // Remove the KEKs this test run created so they don't accumulate in the
     // user's key storage across repeated runs. (CheckPolicyCreatesKek above
-    // already cleans up after itself.)
-    CleanupKek(kServiceLifecycleWide, lifecycle_wrapped[1], "lifecycle test service");
+    // already cleans up after itself.) Each KEK's provider type is read from
+    // a payload wrapped under it, so a service whose wrap failed - e.g. no
+    // KEK was ever created, as when this runs unelevated - is skipped rather
+    // than handed to DeleteKek with a ProviderType byte of 0.
+    if (lifecycle_wrap_ok) {
+        CleanupKek(kServiceLifecycleWide, lifecycle_wrapped[1], "lifecycle test service");
+    }
     if (use_groups_service_created) {
         CleanupKek(kServiceUseGroupsWide, use_groups_wrapped[1], "key-use-policy test service");
     }
-    CleanupKek(kServiceWide, provider_type, "primary test service");
+    if (primary_wrap_ok) {
+        CleanupKek(kServiceWide, provider_type, "primary test service");
+    }
     if (other_service_wrapped) {
         // wrapped_other[1] is the second service's own ProviderType byte -
         // may differ from `provider_type` above in principle, so it's read
