@@ -114,4 +114,21 @@ namespace hkdfguard {
             SecureZeroMemory(p, len);
         }
     }
+
+    // SecureBuffer's guarantee for memory this project doesn't hold as a
+    // SecureBuffer - a run-time-sized heap buffer, say: zeroes `len` bytes at
+    // `p` when the guard goes out of scope, on every exit path, an exception
+    // included. The memory must outlive the guard, so declare the guard after
+    // whatever owns it. Not copyable, for the same reason SecureBuffer isn't.
+    class ScopedSecureZero {
+    public:
+        ScopedSecureZero(void *p, size_t len) noexcept : p_(p), len_(len) {}
+        ScopedSecureZero(const ScopedSecureZero &) = delete;
+        ScopedSecureZero &operator=(const ScopedSecureZero &) = delete;
+        ~ScopedSecureZero() { SecureZero(p_, len_); }
+
+    private:
+        void *p_;
+        size_t len_;
+    };
 } // namespace hkdfguard

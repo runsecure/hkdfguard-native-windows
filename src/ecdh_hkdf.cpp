@@ -194,6 +194,13 @@ namespace hkdfguard {
             // provided" default (see the comment on HkdfSha512 below for why that's
             // equivalent).
             std::vector<uint8_t> hash_object(hash_object_len);
+            // CNG keeps the HMAC's state - derived from `key`, which is the ECDH
+            // secret or the PRK - in this buffer. The guard wipes it on every
+            // way out of this function, a failed CNG call's exception included.
+            // Declared after the vector it wipes and before `hash`, so it runs
+            // after BCryptDestroyHash has released the object and before the
+            // vector frees the memory.
+            ScopedSecureZero wipe_hash_object(hash_object.data(), hash_object.size());
             ScopedBCryptHash hash;
             status = BCryptCreateHash(
                 alg.get(), hash.put(), hash_object.data(), hash_object_len,
@@ -215,17 +222,12 @@ namespace hkdfguard {
             // Finalizes the computation and writes the 64-byte HMAC-SHA512 result
             // into `out`.
             status = BCryptFinishHash(hash.get(), out, 64, 0);
-            // The scratch buffer CNG used internally (which, depending on the key
-            // this HMAC was computed with, may retain sensitive intermediate state)
-            // is wiped immediately after FinishHash, *before* even checking
-            // whether that call succeeded - so it's zeroed unconditionally on every
-            // path out of this function, success or failure alike.
-            SecureZero(hash_object.data(), hash_object.size());
             if (!BCRYPT_SUCCESS(status)) {
                 throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO_ERROR, "BCryptFinishHash failed");
             }
-            // `alg` and `hash` (both RAII handles) are closed automatically here as
-            // the function returns.
+            // On return - or on any throw above - `hash` is destroyed, then
+            // `wipe_hash_object` zeroes CNG's scratch buffer, then the vector
+            // and `alg` are released, in reverse order of declaration.
         }
 
         // HKDF-SHA512 (RFC 5869), specialized for a 32-byte output: since the
