@@ -22,6 +22,9 @@ target_include_directories(hkdfguard-cli PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../
 # target is hkdfguard-cli and only its output file is renamed.
 set_target_properties(hkdfguard-cli PROPERTIES OUTPUT_NAME "hkdfguard")
 
+# The same version resource as the DLL (see the root CMakeLists.txt).
+hkdfguard_add_version_resource(hkdfguard-cli "HkdfGuard provisioning tool" "hkdfguard.exe" VFT_APP)
+
 # Same hardening as the DLL (see hkdfguard_apply_hardening in the root
 # CMakeLists.txt): this tool runs elevated and handles the plaintext DEK.
 hkdfguard_apply_hardening(hkdfguard-cli)

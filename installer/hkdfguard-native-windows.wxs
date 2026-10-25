@@ -43,7 +43,8 @@
       that KEK's ACL (ACLs are applied only at creation) - installing this
       MSI before running `provision` takes care of that.
     - Major upgrades remove the previous version first
-      (Schedule="afterInstallInitialize"); bump -Version for every release.
+      (Schedule="afterInstallInitialize"); bump the project() VERSION in
+      CMakeLists.txt for every release (Build-Msi.ps1 takes it from there).
       A service with the DLL loaded holds it open, so stop such services
       before upgrading, or Windows Installer will ask to close them or
       schedule a reboot.
@@ -51,7 +52,7 @@
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
 
   <Package
-      Name="hkdfguard-native-windows"
+      Name="HkdfGuard for Windows"
       Manufacturer="$(Manufacturer)"
       Version="$(ProductVersion)"
       UpgradeCode="77210BC5-3A24-48F2-8266-5642DA27ACC6"

@@ -1,0 +1,35 @@
+// Version resource for HkdfGuard.dll and hkdfguard.exe, filled in by CMake
+// (hkdfguard_add_version_resource in the root CMakeLists.txt) from the
+// project() version - the one place the release version is set. It sits
+// inside the Authenticode-signed image, so the SDK loaders can read the
+// version of the file they verified and refuse one older than they accept.
+
+#include <winver.h>
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION    @PROJECT_VERSION_MAJOR@,@PROJECT_VERSION_MINOR@,@PROJECT_VERSION_PATCH@,0
+ PRODUCTVERSION @PROJECT_VERSION_MAJOR@,@PROJECT_VERSION_MINOR@,@PROJECT_VERSION_PATCH@,0
+ FILEFLAGSMASK  VS_FFI_FILEFLAGSMASK
+ FILEFLAGS      0
+ FILEOS         VOS_NT_WINDOWS32
+ FILETYPE       @HKDFGUARD_FILE_TYPE@
+ FILESUBTYPE    VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName",      "@HKDFGUARD_COMPANY_NAME@"
+            VALUE "FileDescription",  "@HKDFGUARD_FILE_DESCRIPTION@"
+            VALUE "FileVersion",      "@PROJECT_VERSION@"
+            VALUE "InternalName",     "@HKDFGUARD_ORIGINAL_FILENAME@"
+            VALUE "OriginalFilename", "@HKDFGUARD_ORIGINAL_FILENAME@"
+            VALUE "ProductName",      "@HKDFGUARD_PRODUCT_NAME@"
+            VALUE "ProductVersion",   "@PROJECT_VERSION@"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

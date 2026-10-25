@@ -578,7 +578,7 @@ older version over a newer one is blocked.
 msiexec /x hkdfguard-native-windows-0.9.0-win-x64.msi /qn /l*v uninstall.log
 ```
 
-You can also uninstall from **Settings → Apps**. Uninstalling removes the files, the
+You can also uninstall **HkdfGuard for Windows** from **Settings → Apps**. Uninstalling removes the files, the
 `InstallPath` value and the event source registration. It deliberately keeps:
 
 - **All KEKs.** Deleting a KEK destroys every DEK wrapped under it. To remove one on

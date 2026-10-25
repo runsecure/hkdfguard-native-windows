@@ -31,7 +31,10 @@
 .PARAMETER Version
     MSI ProductVersion, major.minor.build (major and minor at most 255, build
     at most 65535). Must increase for every release, or the major upgrade
-    will not replace the installed version. Default: 0.9.0.
+    will not replace the installed version. Default, and the only value
+    accepted: the project() VERSION in CMakeLists.txt, which is also stamped
+    into the binaries' version resources - so the MSI can't disagree with
+    the files it installs.
 
 .PARAMETER Manufacturer
     Manufacturer shown in Apps & Features. Default: HkdfGuard.
@@ -58,7 +61,7 @@ param(
     [ValidateSet("x64", "ARM64")]
     [string]$Arch = "x64",
     [ValidatePattern('^\d{1,3}\.\d{1,3}\.\d{1,5}$')]
-    [string]$Version = "0.9.0",
+    [string]$Version,
     [string]$Manufacturer = "HkdfGuard",
     [switch]$Sign,
     [string]$SigningMetadata,
@@ -69,6 +72,17 @@ param(
 $ErrorActionPreference = "Stop"
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $RepoRoot
+
+$cmakeLists = Get-Content -Raw (Join-Path $RepoRoot "CMakeLists.txt")
+if ($cmakeLists -notmatch 'project\(hkdfguard-native-windows\s+VERSION\s+(\d+\.\d+\.\d+)') {
+    throw "Could not read the project() VERSION from CMakeLists.txt."
+}
+$ProjectVersion = $Matches[1]
+if (-not $Version) {
+    $Version = $ProjectVersion
+} elseif ($Version -ne $ProjectVersion) {
+    throw "-Version $Version is not the project() VERSION in CMakeLists.txt ($ProjectVersion), which is what the binaries carry. Change it there instead."
+}
 
 $parts = $Version.Split('.') | ForEach-Object { [int]$_ }
 if ($parts[0] -gt 255 -or $parts[1] -gt 255 -or $parts[2] -gt 65535) {

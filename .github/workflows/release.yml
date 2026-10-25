@@ -102,7 +102,8 @@ jobs:
           path: dist/win-arm64
 
       # The MSI ProductVersion is the tag without its "v"; it must fit MSI's
-      # major.minor.build limits.
+      # major.minor.build limits, and equal the project() VERSION in
+      # CMakeLists.txt, which the binaries' version resources carry.
       - name: Determine the release version
         id: version
         shell: powershell
@@ -116,7 +117,11 @@ jobs:
               [int]$Matches[1] -gt 255 -or [int]$Matches[2] -gt 255 -or [int]$Matches[3] -gt 65535) {
             throw "Tag '$tag' is not vMAJOR.MINOR.BUILD within MSI limits (major, minor <= 255; build <= 65535)."
           }
-          "version=$($tag.Substring(1))" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          $version = $tag.Substring(1)
+          if ((Get-Content -Raw CMakeLists.txt) -notmatch 'project\(hkdfguard-native-windows\s+VERSION\s+(\d+\.\d+\.\d+)' -or $Matches[1] -ne $version) {
+            throw "Tag '$tag' does not match the project() VERSION in CMakeLists.txt; bump that version and tag the commit that carries it."
+          }
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
       # Federated (OIDC) sign-in: GitHub's short-lived token is exchanged for
       # an Azure token for AZURE_CLIENT_ID - no stored Azure secret. Leaves

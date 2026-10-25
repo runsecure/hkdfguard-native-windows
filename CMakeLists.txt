@@ -1,8 +1,16 @@
 # Minimum CMake version this project's syntax requires.
 cmake_minimum_required(VERSION 3.20)
-# Declares the project name and that it's a C++ project (as opposed to C,
-# which CMake also supports enabling separately).
-project(hkdfguard-native-windows CXX)
+# Declares the project name, its release version, and that it's a C++
+# project (as opposed to C, which CMake also supports enabling separately).
+# VERSION is the single source of the release version: it is stamped into
+# HkdfGuard.dll's and hkdfguard.exe's version resources (src/version.rc.in),
+# Build-Msi.ps1 reads it as the MSI's default ProductVersion, and the release
+# workflow refuses a tag that doesn't match it. Bump it for every release.
+project(hkdfguard-native-windows VERSION 0.9.0 LANGUAGES CXX)
+
+# The ProductName and CompanyName in both binaries' version resources.
+set(HKDFGUARD_PRODUCT_NAME "HkdfGuard for Windows")
+set(HKDFGUARD_COMPANY_NAME "HkdfGuard")
 
 # This library depends on Windows-only APIs (CNG/NCrypt), so fail loudly and
 # immediately rather than producing confusing compiler errors later if
@@ -83,6 +91,24 @@ if(MSVC)
     # resource compiler find it in the mc output directory.
     target_include_directories(hkdfguard PRIVATE ${HKDFGUARD_MC_OUT})
 endif()
+
+# Adds a version resource (src/version.rc.in) to target: the project()
+# version as its file and product version, HKDFGUARD_PRODUCT_NAME, and the
+# given description, original file name and file type (VFT_DLL / VFT_APP).
+# MSVC builds only, like the message table above. Defined here so
+# tools/CMakeLists.txt can use it for hkdfguard.exe.
+function(hkdfguard_add_version_resource target description original_filename file_type)
+    if(NOT MSVC)
+        return()
+    endif()
+    set(HKDFGUARD_FILE_DESCRIPTION "${description}")
+    set(HKDFGUARD_ORIGINAL_FILENAME "${original_filename}")
+    set(HKDFGUARD_FILE_TYPE "${file_type}")
+    configure_file(${PROJECT_SOURCE_DIR}/src/version.rc.in ${CMAKE_CURRENT_BINARY_DIR}/${target}_version.rc @ONLY)
+    target_sources(${target} PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/${target}_version.rc)
+endfunction()
+
+hkdfguard_add_version_resource(hkdfguard "HkdfGuard native KMS library" "HkdfGuard.dll" VFT_DLL)
 
 # Names the actual output files HkdfGuard.dll and its companion
 # HkdfGuard.lib import library - no version in the name, as on Linux

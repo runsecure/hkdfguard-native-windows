@@ -26,8 +26,9 @@
     Also build the signed MSI installer for each architecture.
 
 .PARAMETER Version
-    MSI ProductVersion (major.minor.build). Required with -Msi; must be
-    higher than any version already deployed, or the upgrade won't replace it.
+    MSI ProductVersion (major.minor.build). Default, and the only value
+    accepted: the project() VERSION in CMakeLists.txt, which the binaries
+    carry (see Build-Msi.ps1). Bump that for each release.
 
 .PARAMETER SigningMetadata
     Artifact Signing metadata JSON. Default: scripts\signing\metadata.json.
@@ -38,7 +39,7 @@
 
 .EXAMPLE
     scripts\build-dist-signed.bat
-    scripts\build-dist-signed.bat -Msi -Version 0.9.0
+    scripts\build-dist-signed.bat -Msi
     powershell -File scripts\Build-Dist-Signed.ps1 -Arch x64
 #>
 param(
@@ -62,7 +63,10 @@ function Write-Section($title) {
 function Write-Ok($msg) { Write-Host "[OK]   $msg" -ForegroundColor Green }
 
 if ($Msi -and -not $Version) {
-    throw "-Msi needs -Version (major.minor.build), higher than any version already deployed."
+    if ((Get-Content -Raw (Join-Path $RepoRoot "CMakeLists.txt")) -notmatch 'project\(hkdfguard-native-windows\s+VERSION\s+(\d+\.\d+\.\d+)') {
+        throw "Could not read the project() VERSION from CMakeLists.txt."
+    }
+    $Version = $Matches[1]
 }
 $archs = if ($Arch -eq "All") { @("x64", "ARM64") } else { @($Arch) }
 
