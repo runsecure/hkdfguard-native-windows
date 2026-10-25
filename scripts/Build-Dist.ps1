@@ -60,8 +60,9 @@
     (or the HKDFGUARD_SIGNING_METADATA environment variable).
 
 .PARAMETER SigningDlib
-    Path to the x64 Azure.CodeSigning.Dlib.dll. Default: the Artifact Signing
-    client tools' install location (or HKDFGUARD_SIGNING_DLIB).
+    Path to a Microsoft-signed x64 Azure.CodeSigning.Dlib.dll. Default:
+    HKDFGUARD_SIGNING_DLIB, else the pinned NuGet plugin ArtifactSigning.ps1
+    fetches and verifies.
 #>
 param(
     [ValidateSet("x64", "ARM64")]

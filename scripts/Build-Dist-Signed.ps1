@@ -34,8 +34,8 @@
     Artifact Signing metadata JSON. Default: scripts\signing\metadata.json.
 
 .PARAMETER SigningDlib
-    Path to the x64 Azure.CodeSigning.Dlib.dll. Default: the Artifact Signing
-    client tools' install location.
+    Path to a Microsoft-signed x64 Azure.CodeSigning.Dlib.dll. Default: the
+    pinned NuGet plugin ArtifactSigning.ps1 fetches and verifies.
 
 .EXAMPLE
     scripts\build-dist-signed.bat

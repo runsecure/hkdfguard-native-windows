@@ -140,7 +140,9 @@ jobs:
       #
       # Pinned by version and by the package's SHA-256, and the plugin must
       # carry a valid Microsoft Authenticode signature. To move to a newer
-      # version, update both and check the new package's plugin the same way.
+      # version, update both and check the new package's plugin the same way
+      # - and update the same pins (plus the plugin's own SHA-256) in
+      # scripts/ArtifactSigning.ps1, which local signing uses.
       - name: Get the Artifact Signing plugin
         shell: powershell
         timeout-minutes: 10

@@ -249,7 +249,7 @@ namespace hkdfguard {
                     key,
                     NCRYPT_ALGORITHM_GROUP_PROPERTY,
                     reinterpret_cast<PBYTE>(algorithmGroup),
-                    sizeof(algorithmGroup),
+                    sizeof(algorithmGroup) - sizeof(wchar_t), // keep a terminator
                     &cbResult,
                     0);
 

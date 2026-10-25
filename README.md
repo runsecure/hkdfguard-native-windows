@@ -761,9 +761,13 @@ through `scripts\ArtifactSigning.ps1`. The signing machine needs:
 
 - The Windows SDK's signtool, version 10.0.22621 or later. The scripts pick the newest x64
   copy automatically.
-- The Artifact Signing client tools, which provide the signtool plugin:
-  `winget install -e --id Microsoft.Azure.ArtifactSigningClientTools`. They need .NET 8 or
-  later.
+- .NET 8 or later, for the signtool plugin. The scripts fetch the plugin themselves on first
+  use: Microsoft's `Microsoft.ArtifactSigning.Client` NuGet package, pinned by version and
+  SHA-256 (the same package the release workflow uses), cached in
+  `%LOCALAPPDATA%\HkdfGuard\signing`. Every run re-checks the cached plugin's hash and its
+  Microsoft signature. The winget client tools aren't used: their installer ships the
+  plugin unsigned. A plugin named with `-SigningDlib` or `HKDFGUARD_SIGNING_DLIB` must be
+  Microsoft-signed.
 - `scripts\signing\metadata.json`, which names the account's regional endpoint, the
   account and the certificate profile. It holds no secrets. The endpoint must match the
   account's region, or signing fails with a 403.
