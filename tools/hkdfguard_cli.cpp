@@ -95,14 +95,16 @@
 #include <aclapi.h> // SetSecurityInfo - protecting the key file's DACL on its handle
 #include <bcrypt.h>
 #include <ncrypt.h> // retire/status: opening, inspecting and deleting the persisted KEK
-#include <sddl.h> // ConvertStringSidToSidA - over-broad --group check
+#include <sddl.h> // ConvertStringSidToSidW - over-broad --group check
+#include <io.h> // _get_osfhandle: whether stdout/stderr is a console (Print)
 
 #include <algorithm>
 #include <array>
+#include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring> // _stricmp
+#include <cstring>
 #include <exception>
 #include <cctype>
 #include <optional>
@@ -118,6 +120,16 @@ namespace {
     // Narrow twin of kProgramName, for the tool's narrow (std::string)
     // error/hint text; only PrintUsage is wide.
     constexpr char kProgramNameNarrow[] = "hkdfguard";
+
+    // Text in this tool is UTF-8 inside (what the library's ABI takes) and
+    // UTF-16 at every Win32 call; these convert between the two, and Print*
+    // write output. Defined with the path code below.
+    std::wstring Utf8ToWide(const std::string &s);
+    std::string WideToUtf8(const std::wstring &w);
+    bool EqualsIgnoreCase(const std::string &a, const std::string &b);
+    void Print(FILE *stream, const std::string &utf8);
+    void Printf(FILE *stream, const char *format, ...);
+    void PrintfW(FILE *stream, const wchar_t *format, ...);
     constexpr size_t kDekLen = 32;
     // Starting capacity for the wrapped payload; WrapDek retries once at the
     // library-reported size on HKDFGUARD_ERR_BUFFER_TOO_SMALL, so this is a
@@ -140,22 +152,22 @@ namespace {
     // Renders a Win32 error code (from GetLastError(), or an NTSTATUS cast to
     // DWORD for a BCrypt failure) as a human-readable string.
     std::string FormatWin32Error(DWORD code) {
-        LPSTR buf = nullptr;
+        LPWSTR buf = nullptr;
 
-        DWORD len = FormatMessageA(
+        DWORD len = FormatMessageW(
             FORMAT_MESSAGE_ALLOCATE_BUFFER |
             FORMAT_MESSAGE_FROM_SYSTEM |
             FORMAT_MESSAGE_IGNORE_INSERTS,
             nullptr,
             code,
             MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
-            reinterpret_cast<LPSTR>(&buf),
+            reinterpret_cast<LPWSTR>(&buf),
             0,
             nullptr);
 
         std::string result =
                 (len > 0 && buf != nullptr)
-                    ? std::string(buf, len)
+                    ? WideToUtf8(std::wstring(buf, len))
                     : "(unknown error)";
 
         if (buf != nullptr) {
@@ -208,7 +220,7 @@ namespace {
     // The one usage text, printed for every help request and after every
     // usage error.
     void PrintUsage() {
-        fwprintf(
+        PrintfW(
             stderr,
             L"Usage:\n"
             L"  %ls provision --service-name|-sn <name>\n"
@@ -272,7 +284,7 @@ namespace {
     // Throws CliError on any parse failure; returns ParseOutcome::Help if
     // --help/-h was seen (in which case `out` is left unpopulated - the caller
     // must check the return value before using `out`). Starts at argv[2] -
-    // argv[1] is the subcommand name, already consumed by main() to dispatch
+    // argv[1] is the subcommand name, already consumed by wmain() to dispatch
     // here.
     ParseOutcome ParseProvisionArgs(int argc, char *argv[], ProvisionArgs &out) {
         std::optional<std::string> serviceName;
@@ -552,7 +564,7 @@ namespace {
             }
             locked_ = VirtualLock(base_, kSize) != FALSE;
             if (!locked_) {
-                fprintf(stderr,
+                Printf(stderr,
                         "warning: could not lock the DEK's buffer into memory (VirtualLock: %s); it could be "
                         "written to the page file\n",
                         FormatWin32Error(GetLastError()).c_str());
@@ -863,9 +875,9 @@ namespace {
         }
 
         if (exists != 0) {
-            fprintf(stdout, "KEK already provisioned for service \"%s\"; verified, nothing to do\n", service.c_str());
+            Printf(stdout, "KEK already provisioned for service \"%s\"; verified, nothing to do\n", service.c_str());
         } else {
-            fprintf(stdout, "KEK provisioned for service \"%s\"\n", service.c_str());
+            Printf(stdout, "KEK provisioned for service \"%s\"\n", service.c_str());
         }
         return exists == 0;
     }
@@ -1026,7 +1038,7 @@ namespace {
         }
         for (const char *sidString: kOverBroadGroupSidStrings) {
             PSID known = nullptr;
-            if (!ConvertStringSidToSidA(sidString, &known)) {
+            if (!ConvertStringSidToSidW(Utf8ToWide(sidString).c_str(), &known)) {
                 throw CliError("ConvertStringSidToSid failed: " + FormatWin32Error(GetLastError()));
             }
             const bool match = EqualSid(sid, known) != FALSE;
@@ -1047,13 +1059,13 @@ namespace {
             return false;
         }
         for (const char *fixed: {"BUILTIN", "NT AUTHORITY", "NT SERVICE"}) {
-            if (_stricmp(domain.c_str(), fixed) == 0) {
+            if (EqualsIgnoreCase(domain, fixed)) {
                 return true;
             }
         }
-        char computer[MAX_COMPUTERNAME_LENGTH + 1] = {};
+        wchar_t computer[MAX_COMPUTERNAME_LENGTH + 1] = {};
         DWORD size = MAX_COMPUTERNAME_LENGTH + 1;
-        return GetComputerNameA(computer, &size) && _stricmp(domain.c_str(), computer) == 0;
+        return GetComputerNameW(computer, &size) && EqualsIgnoreCase(domain, WideToUtf8(computer));
     }
 
     // Resolves `groupName` (a group on this host, e.g. "App_1234" or
@@ -1071,17 +1083,19 @@ namespace {
         // First call: size query. LookupAccountNameW returns FALSE here even
         // on the expected path (buffers too small); the real signal is that
         // sidSize/domainSize come back non-zero.
-        LookupAccountName(nullptr, groupName.c_str(), nullptr, &sidSize, nullptr, &domainSize, &sidType);
+        const std::wstring wideName = Utf8ToWide(groupName);
+        LookupAccountNameW(nullptr, wideName.c_str(), nullptr, &sidSize, nullptr, &domainSize, &sidType);
         if (sidSize == 0) {
             throw CliError("--group \"" + groupName + "\" could not be resolved: " + FormatWin32Error(GetLastError()));
         }
         std::vector<BYTE> sid(sidSize);
-        std::string domain(domainSize, '\0');
-        if (!LookupAccountName(
-            nullptr, groupName.c_str(), sid.data(), &sidSize, domain.data(), &domainSize, &sidType)) {
+        std::wstring wideDomain(domainSize, L'\0');
+        if (!LookupAccountNameW(
+            nullptr, wideName.c_str(), sid.data(), &sidSize, wideDomain.data(), &domainSize, &sidType)) {
             throw CliError("--group \"" + groupName + "\" could not be resolved: " + FormatWin32Error(GetLastError()));
         }
-        domain.resize(domainSize); // on success, the length without the NUL
+        wideDomain.resize(domainSize); // on success, the length without the NUL
+        const std::string domain = WideToUtf8(wideDomain);
         if (sidType != SidTypeGroup && sidType != SidTypeAlias && sidType != SidTypeWellKnownGroup) {
             throw CliError("--group \"" + groupName + "\" does not name a group account");
         }
@@ -1233,36 +1247,110 @@ namespace {
     // GetFullPathName works on the text alone, so nothing is opened and no
     // link is followed. This is the "expected" side of check (3) above.
     std::string FullPath(const std::string &path) {
-        DWORD needed = GetFullPathNameA(path.c_str(), 0, nullptr, nullptr);
+        const std::wstring wide = Utf8ToWide(path);
+        DWORD needed = GetFullPathNameW(wide.c_str(), 0, nullptr, nullptr);
         if (needed == 0) {
             throw CliError("GetFullPathName failed for " + path + ": " + FormatWin32Error(GetLastError()));
         }
-        std::string full(needed, '\0');
-        DWORD written = GetFullPathNameA(path.c_str(), needed, full.data(), nullptr);
+        std::wstring full(needed, L'\0');
+        DWORD written = GetFullPathNameW(wide.c_str(), needed, full.data(), nullptr);
         if (written == 0 || written >= needed) {
             throw CliError("GetFullPathName failed for " + path + ": " + FormatWin32Error(GetLastError()));
         }
         full.resize(written);
-        return full;
+        return WideToUtf8(full);
     }
 
-    // This tool's paths are ANSI (argv, the A-suffixed Win32 calls); the
-    // walk is in UTF-16. Converted with the same code page CreateFileA would
-    // use, so the same names are meant.
-    std::wstring AnsiToWide(const std::string &s) {
+    // Arguments arrive as UTF-16 (wmain) and are held as UTF-8, the encoding
+    // the library's ABI takes; every Win32 call is the W form, through these
+    // two conversions. Both are exact for well-formed text - nothing is
+    // best-fit mapped to a look-alike character - so the library sees the
+    // service name and paths exactly as they were typed.
+    std::wstring Utf8ToWide(const std::string &s) {
         if (s.empty()) return {};
-        int len = MultiByteToWideChar(CP_ACP, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
-        std::wstring wide(static_cast<size_t>(len > 0 ? len : 0), L'\0');
-        if (len > 0) MultiByteToWideChar(CP_ACP, 0, s.data(), static_cast<int>(s.size()), wide.data(), len);
+        const int len = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.data(), static_cast<int>(s.size()), nullptr, 0);
+        if (len <= 0) {
+            throw CliError("text is not valid UTF-8: " + FormatWin32Error(GetLastError()));
+        }
+        std::wstring wide(static_cast<size_t>(len), L'\0');
+        MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.data(), static_cast<int>(s.size()), wide.data(), len);
         return wide;
     }
 
-    std::string WideToAnsi(const std::wstring &w) {
+    // Win32 text (final paths, account names, error messages) to UTF-8. A
+    // lone surrogate, which NTFS permits in a name, becomes U+FFFD; such text
+    // is only ever shown, never turned back into a path.
+    std::string WideToUtf8(const std::wstring &w) {
         if (w.empty()) return {};
-        int len = WideCharToMultiByte(CP_ACP, 0, w.data(), static_cast<int>(w.size()), nullptr, 0, nullptr, nullptr);
-        std::string narrow(static_cast<size_t>(len > 0 ? len : 0), '\0');
-        if (len > 0) WideCharToMultiByte(CP_ACP, 0, w.data(), static_cast<int>(w.size()), narrow.data(), len, nullptr, nullptr);
-        return narrow;
+        const int len = WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), nullptr, 0, nullptr, nullptr);
+        std::string utf8(static_cast<size_t>(len > 0 ? len : 0), '\0');
+        if (len > 0) WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), utf8.data(), len, nullptr, nullptr);
+        return utf8;
+    }
+
+    // Case-insensitive comparison the way the file system compares names:
+    // ordinal and culture-independent, so "É" matches "é" (as it does on
+    // disk) while no two distinct characters are folded together.
+    bool EqualsIgnoreCase(const std::string &a, const std::string &b) {
+        const std::wstring wa = Utf8ToWide(a);
+        const std::wstring wb = Utf8ToWide(b);
+        return CompareStringOrdinal(wa.c_str(), static_cast<int>(wa.size()), wb.c_str(), static_cast<int>(wb.size()),
+                                    TRUE) == CSTR_EQUAL;
+    }
+
+    // Output: on a console the text is written as UTF-16 (WriteConsoleW), so
+    // it reads correctly whatever the console's code page; redirected to a
+    // file or pipe it is UTF-8 bytes.
+    void Print(FILE *stream, const std::string &utf8) {
+        fflush(stream);
+        HANDLE console = reinterpret_cast<HANDLE>(_get_osfhandle(_fileno(stream)));
+        DWORD mode = 0;
+        if (console != INVALID_HANDLE_VALUE && GetConsoleMode(console, &mode)) {
+            // Not Utf8ToWide: output must never throw, so an invalid byte
+            // (none is expected) becomes U+FFFD instead of an error.
+            const int len = MultiByteToWideChar(CP_UTF8, 0, utf8.data(), static_cast<int>(utf8.size()), nullptr, 0);
+            std::wstring wide(static_cast<size_t>(len > 0 ? len : 0), L'\0');
+            if (len > 0) MultiByteToWideChar(CP_UTF8, 0, utf8.data(), static_cast<int>(utf8.size()), wide.data(), len);
+            size_t done = 0;
+            while (done < wide.size()) {
+                DWORD written = 0;
+                if (!WriteConsoleW(console, wide.data() + done, static_cast<DWORD>(wide.size() - done), &written,
+                                   nullptr) ||
+                    written == 0) {
+                    break;
+                }
+                done += written;
+            }
+            return;
+        }
+        fwrite(utf8.data(), 1, utf8.size(), stream);
+        fflush(stream);
+    }
+
+    void Printf(FILE *stream, const char *format, ...) {
+        va_list args;
+        va_start(args, format);
+        va_list sizing;
+        va_copy(sizing, args);
+        const int len = vsnprintf(nullptr, 0, format, sizing);
+        va_end(sizing);
+        std::vector<char> buffer(static_cast<size_t>(len > 0 ? len : 0) + 1, '\0');
+        if (len > 0) vsnprintf(buffer.data(), buffer.size(), format, args);
+        va_end(args);
+        Print(stream, std::string(buffer.data(), static_cast<size_t>(len > 0 ? len : 0)));
+    }
+
+    void PrintfW(FILE *stream, const wchar_t *format, ...) {
+        va_list args;
+        va_start(args, format);
+        va_list sizing;
+        va_copy(sizing, args);
+        const int len = _vscwprintf(format, sizing);
+        va_end(sizing);
+        std::vector<wchar_t> buffer(static_cast<size_t>(len > 0 ? len : 0) + 1, L'\0');
+        if (len > 0) vswprintf(buffer.data(), buffer.size(), format, args);
+        va_end(args);
+        Print(stream, WideToUtf8(std::wstring(buffer.data(), static_cast<size_t>(len > 0 ? len : 0))));
     }
 
     std::string FinalPathOfHandle(HANDLE file, const std::string &path);
@@ -1277,8 +1365,8 @@ namespace {
     hkdfguard_nofollow::FolderChain WalkToParent(const std::string &full, const std::string &what) {
         hkdfguard_nofollow::FolderChain chain;
         hkdfguard_nofollow::Error error;
-        if (!hkdfguard_nofollow::OpenFolderChain(AnsiToWide(full), chain, error)) {
-            const std::string at = WideToAnsi(error.at);
+        if (!hkdfguard_nofollow::OpenFolderChain(Utf8ToWide(full), chain, error)) {
+            const std::string at = WideToUtf8(error.at);
             switch (error.failure) {
                 case hkdfguard_nofollow::Failure::NotLocalDrive:
                     throw CliError(
@@ -1299,9 +1387,9 @@ namespace {
                     throw CliError(what + " names an alternate data stream or has an empty folder name");
             }
         }
-        const std::string parent = WideToAnsi(chain.parentPath());
+        const std::string parent = WideToUtf8(chain.parentPath());
         const std::string actual = TrimTrailingSeparators(FinalPathOfHandle(chain.parent(), what));
-        if (_stricmp(actual.c_str(), TrimTrailingSeparators(parent).c_str()) != 0) {
+        if (!EqualsIgnoreCase(actual, TrimTrailingSeparators(parent))) {
             throw CliError(
                 what + " uses an 8.3 short name (such as PROGRA~1); spell every folder and the file with its full name");
         }
@@ -1314,30 +1402,29 @@ namespace {
     // the "actual" side of check (3) above - it reflects every reparse point
     // that was traversed to reach the object, which is the whole point.
     std::string FinalPathOfHandle(HANDLE file, const std::string &path) {
-        // Sized by retrying rather than by trusting the size query: the ANSI
-        // variant's "buffer too small" return has been observed to *exclude*
-        // the terminator (the documented contract says include), so a buffer
-        // of exactly that size is always one short. Growing to whatever the
-        // call last reported, plus one, and retrying converges either way.
+        // Sized by retrying rather than by trusting the size query alone:
+        // growing to whatever the call last reported, plus one, converges
+        // whether or not that count included the terminator.
         const DWORD flags = FILE_NAME_NORMALIZED | VOLUME_NAME_DOS;
-        std::string final(MAX_PATH, '\0');
+        std::wstring wide(MAX_PATH, L'\0');
         DWORD written = 0;
         for (int attempt = 0; attempt < 4; ++attempt) {
-            written = GetFinalPathNameByHandleA(file, final.data(), static_cast<DWORD>(final.size()), flags);
+            written = GetFinalPathNameByHandleW(file, wide.data(), static_cast<DWORD>(wide.size()), flags);
             if (written == 0) {
                 throw CliError(
                     "GetFinalPathNameByHandle failed for " + path + ": " + FormatWin32Error(GetLastError()));
             }
-            if (written < final.size()) {
+            if (written < wide.size()) {
                 break;
             }
-            final.assign(static_cast<size_t>(written) + 1, '\0');
+            wide.assign(static_cast<size_t>(written) + 1, L'\0');
         }
-        if (written >= final.size()) {
+        if (written >= wide.size()) {
             throw CliError("GetFinalPathNameByHandle could not size its result for " + path);
         }
-        final.resize(written);
+        wide.resize(written);
 
+        std::string final = WideToUtf8(wide);
         if (final.rfind("\\\\?\\UNC\\", 0) == 0) {
             final = "\\\\" + final.substr(8);
         } else if (final.rfind("\\\\?\\", 0) == 0) {
@@ -1393,7 +1480,7 @@ namespace {
         // 8.3 short name in the last component.
         std::string actual = TrimTrailingSeparators(FinalPathOfHandle(file, path));
         std::string want = TrimTrailingSeparators(expected);
-        if (_stricmp(actual.c_str(), want.c_str()) != 0) {
+        if (!EqualsIgnoreCase(actual, want)) {
             throw CliError(
                 path + " uses an 8.3 short name (such as PROGRA~1), resolving to \"" + actual +
                 "\"; spell every folder and the file with its full name");
@@ -1416,7 +1503,7 @@ namespace {
             throw CliError("failed to resolve " + what + ": " + FormatWin32Error(GetLastError()));
         }
         const std::string full(fullBuf, fullLen);
-        if (!hkdfguard_nofollow::IsLocalDrivePath(AnsiToWide(full))) {
+        if (!hkdfguard_nofollow::IsLocalDrivePath(Utf8ToWide(full))) {
             throw CliError(
                 what + " is not on a local drive (UNC paths, mapped network and SUBST drives, and devices are "
                 "refused)");
@@ -1457,17 +1544,17 @@ namespace {
     // instead of suggesting icacls on them.
     bool IsSharedSystemFolder(const std::string &folder) {
         auto same = [&folder](const std::string &other) {
-            return !other.empty() && _stricmp(TrimTrailingSeparators(other).c_str(), folder.c_str()) == 0;
+            return !other.empty() && EqualsIgnoreCase(TrimTrailingSeparators(other), folder);
         };
-        auto env = [](const char *name) {
-            char value[MAX_PATH * 2] = {};
-            DWORD len = GetEnvironmentVariableA(name, value, static_cast<DWORD>(sizeof(value)));
-            return (len > 0 && len < sizeof(value)) ? std::string(value, len) : std::string();
+        auto env = [](const wchar_t *name) {
+            wchar_t value[MAX_PATH * 2] = {};
+            DWORD len = GetEnvironmentVariableW(name, value, static_cast<DWORD>(std::size(value)));
+            return (len > 0 && len < std::size(value)) ? WideToUtf8(std::wstring(value, len)) : std::string();
         };
-        char windows[MAX_PATH + 1] = {};
-        UINT len = GetSystemWindowsDirectoryA(windows, MAX_PATH + 1);
-        const std::string windowsTemp = (len > 0 && len <= MAX_PATH) ? std::string(windows, len) + "\\Temp" : "";
-        return same(env("ProgramData")) || same(env("PUBLIC")) || same(windowsTemp);
+        wchar_t windows[MAX_PATH + 1] = {};
+        UINT len = GetSystemWindowsDirectoryW(windows, MAX_PATH + 1);
+        const std::string windowsTemp = (len > 0 && len <= MAX_PATH) ? WideToUtf8(std::wstring(windows, len)) + "\\Temp" : "";
+        return same(env(L"ProgramData")) || same(env(L"PUBLIC")) || same(windowsTemp);
     }
 
     // The fix for a folder that fails the rule, as icacls commands an
@@ -1499,11 +1586,11 @@ namespace {
 
     // "*S-1-..." for icacls, or empty if the SID can't be rendered.
     std::string IcaclsSid(PSID sid) {
-        LPSTR text = nullptr;
-        if (!ConvertSidToStringSidA(sid, &text)) {
+        LPWSTR text = nullptr;
+        if (!ConvertSidToStringSidW(sid, &text)) {
             return std::string();
         }
-        std::string s = std::string("*") + text;
+        std::string s = "*" + WideToUtf8(text);
         LocalFree(text);
         return s;
     }
@@ -1557,7 +1644,7 @@ namespace {
 
         for (size_t i = 0; i < chain.handles.size(); ++i) {
             const bool driveRoot = i == 0;
-            const std::string folder = TrimTrailingSeparators(WideToAnsi(chain.paths[i]));
+            const std::string folder = TrimTrailingSeparators(WideToUtf8(chain.paths[i]));
             const std::string what = "--key-file-path " + path + ": " + (driveRoot ? "the drive root " : "the folder ") +
                                      "\"" + folder + "\"";
             PSID owner = nullptr;
@@ -1901,15 +1988,15 @@ namespace {
     // An account's name for an error message ("DOMAIN\\name"), or its SID
     // string when it can't be resolved.
     std::string AccountNameOf(PSID sid) {
-        char name[256], domain[256];
-        DWORD nameLen = sizeof(name), domainLen = sizeof(domain);
+        wchar_t name[256], domain[256];
+        DWORD nameLen = static_cast<DWORD>(std::size(name)), domainLen = static_cast<DWORD>(std::size(domain));
         SID_NAME_USE use;
-        if (LookupAccountSidA(nullptr, sid, name, &nameLen, domain, &domainLen, &use)) {
-            return domainLen > 0 ? std::string(domain) + "\\" + name : std::string(name);
+        if (LookupAccountSidW(nullptr, sid, name, &nameLen, domain, &domainLen, &use)) {
+            return domainLen > 0 ? WideToUtf8(domain) + "\\" + WideToUtf8(name) : WideToUtf8(name);
         }
-        LPSTR text = nullptr;
-        if (ConvertSidToStringSidA(sid, &text)) {
-            std::string s(text);
+        LPWSTR text = nullptr;
+        if (ConvertSidToStringSidW(sid, &text)) {
+            std::string s = WideToUtf8(text);
             LocalFree(text);
             return s;
         }
@@ -2027,7 +2114,7 @@ namespace {
             throw CliError("--dek-file " + path + " is not a regular file");
         }
         const std::string actual = TrimTrailingSeparators(FinalPathOfHandle(file.get(), path));
-        if (_stricmp(actual.c_str(), TrimTrailingSeparators(expected).c_str()) != 0) {
+        if (!EqualsIgnoreCase(actual, TrimTrailingSeparators(expected))) {
             throw CliError(
                 what + " uses an 8.3 short name (such as PROGRA~1), resolving to \"" + actual +
                 "\"; give its full local path");
@@ -2104,7 +2191,7 @@ namespace {
     // KeyName(service, kCurrentKeyId) - a FROZEN format there. `service` is
     // already validated and lowercased, so the widen is exact.
     std::wstring KekKeyName(const std::string &service) {
-        return L"hkdfguardwin_" + std::wstring(service.begin(), service.end()) + L"_v1";
+        return L"hkdfguardwin_" + Utf8ToWide(service) + L"_v1";
     }
 
     std::string NCryptErrorText(SECURITY_STATUS status) {
@@ -2293,7 +2380,7 @@ namespace {
         if (source == nullptr) {
             return false;
         }
-        std::wstring full(text.begin(), text.end());
+        std::wstring full = Utf8ToWide(text);
         wchar_t exe[MAX_PATH] = {};
         DWORD n = GetModuleFileNameW(nullptr, exe, MAX_PATH);
         full += L" Process: " + std::wstring(n > 0 && n < MAX_PATH ? exe : L"(unknown)") + L" (PID " +
@@ -2365,10 +2452,10 @@ namespace {
     void RunStatus(const StatusArgs &args) {
         ValidateServiceCharset(args.serviceName);
         const std::string service = LowercaseService(args.serviceName);
-        fprintf(stdout, "service: %s\n", service.c_str());
+        Printf(stdout, "service: %s\n", service.c_str());
         {
             const SecurityModelInfo info = ReadSecurityModel();
-            fprintf(stdout, "security model: %s (this account %s persist key files)\n",
+            Printf(stdout, "security model: %s (this account %s persist key files)\n",
                     SecurityModelName(info.model), info.mayWriteKeyFiles ? "may" : "may not");
         }
 
@@ -2380,7 +2467,7 @@ namespace {
         std::vector<FoundKek> found = FindKeks(service);
 
         if (exists == 0) {
-            fprintf(stdout, "kek: absent\n");
+            Printf(stdout, "kek: absent\n");
         } else {
             Fingerprint fp{};
             rc = ReadKekFingerprint(service, fp);
@@ -2393,12 +2480,12 @@ namespace {
                     anyP256 = anyP256 || k.inspection.isP256Ecdh;
                 }
                 if (anyP256) {
-                    fprintf(stdout, "kek: unusable (%s)\n", DescribeStatus(rc).c_str());
+                    Printf(stdout, "kek: unusable (%s)\n", DescribeStatus(rc).c_str());
                 } else {
-                    fprintf(stdout, "kek: corrupt (not a P-256 ECDH key; see retire --corrupt)\n");
+                    Printf(stdout, "kek: corrupt (not a P-256 ECDH key; see retire --corrupt)\n");
                 }
                 for (const FoundKek &k : found) {
-                    fprintf(stdout, "key under this name: %s\n", DescribeFound(k).c_str());
+                    Printf(stdout, "key under this name: %s\n", DescribeFound(k).c_str());
                 }
                 return;
             }
@@ -2408,21 +2495,21 @@ namespace {
                     DescribeStatus(rc));
             }
 
-            fprintf(stdout, "kek: present\n");
+            Printf(stdout, "kek: present\n");
             for (auto it = found.begin(); it != found.end(); ++it) {
                 if (it->inspection.isP256Ecdh && it->inspection.fingerprint == fp) {
-                    fprintf(stdout, "provider: %s\n", ProviderLabel(it->opened.provider));
+                    Printf(stdout, "provider: %s\n", ProviderLabel(it->opened.provider));
                     found.erase(it);
                     break;
                 }
             }
-            fprintf(stdout, "fingerprint: %s\n", HexString(fp).c_str());
+            Printf(stdout, "fingerprint: %s\n", HexString(fp).c_str());
         }
 
         // A key on a provider the KeyStoragePolicy doesn't select is unused
         // today but would be picked up if the policy changed - worth seeing.
         for (const FoundKek &k : found) {
-            fprintf(stdout, "other key under this name (not selected by the KeyStoragePolicy): %s\n",
+            Printf(stdout, "other key under this name (not selected by the KeyStoragePolicy): %s\n",
                     DescribeFound(k).c_str());
         }
     }
@@ -2505,7 +2592,7 @@ namespace {
             "KEK retired for service '" + service + "' on the " + ProviderLabel(provider) + " (" + identity +
             ") by " + kProgramNameNarrow + " retire. Every DEK wrapped under it is permanently unrecoverable.");
         if (!logged) {
-            fprintf(stderr, "warning: the retirement could not be recorded in the Application event log (event 1004)\n");
+            Printf(stderr, "warning: the retirement could not be recorded in the Application event log (event 1004)\n");
         }
 
         // Then confirm it's gone, by reopening the name on that provider.
@@ -2513,10 +2600,10 @@ namespace {
             throw CliError(where + " was deleted, but a key under its name is still found; investigate before relying on it being gone");
         }
 
-        fprintf(stdout, "retired KEK for service \"%s\" (%s, %s)\n", service.c_str(), identity.c_str(),
+        Printf(stdout, "retired KEK for service \"%s\" (%s, %s)\n", service.c_str(), identity.c_str(),
                 ProviderLabel(provider));
         if (args.fingerprint) {
-            fprintf(stdout, "every payload wrapped under it is now permanently unrecoverable\n");
+            Printf(stdout, "every payload wrapped under it is now permanently unrecoverable\n");
         }
 
         // A key on the other provider, if any, is untouched - and may be the
@@ -2525,13 +2612,13 @@ namespace {
         try {
             std::vector<FoundKek> remaining = FindKeks(service);
             if (!remaining.empty()) {
-                fprintf(stdout, "note: service \"%s\" still has a key on the other provider (%s); run `%s status`\n",
+                Printf(stdout, "note: service \"%s\" still has a key on the other provider (%s); run `%s status`\n",
                         service.c_str(), DescribeFound(remaining.front()).c_str(), kProgramNameNarrow);
             } else if (!args.fingerprint) {
-                fprintf(stdout, "service \"%s\" can now be provisioned again\n", service.c_str());
+                Printf(stdout, "service \"%s\" can now be provisioned again\n", service.c_str());
             }
         } catch (const CliError &e) {
-            fprintf(stdout, "note: could not check the other provider for a key under this name: %s\n",
+            Printf(stdout, "note: could not check the other provider for a key under this name: %s\n",
                     e.message.c_str());
         }
     }
@@ -2552,9 +2639,9 @@ namespace {
         // A KEK this operator didn't create could have been planted by
         // another administrator; the fingerprint is how to tell.
         if (created) {
-            fprintf(stdout, "fingerprint: %s -- record this; retire requires it\n", HexString(fp).c_str());
+            Printf(stdout, "fingerprint: %s -- record this; retire requires it\n", HexString(fp).c_str());
         } else {
-            fprintf(stdout, "fingerprint: %s -- confirm it matches the one recorded when this service was provisioned\n",
+            Printf(stdout, "fingerprint: %s -- confirm it matches the one recorded when this service was provisioned\n",
                     HexString(fp).c_str());
         }
     }
@@ -2652,7 +2739,7 @@ namespace {
 
         const std::string access =
                 args.groupName ? "owner read/write + " + *args.groupName + " read-only" : std::string("owner read/write");
-        fprintf(
+        Printf(
             stdout, "wrapped key written to %s (%zu bytes, %s, service \"%s\")\n",
             args.keyFilePath.c_str(), wrapped.size(), access.c_str(), service.c_str());
     }
@@ -2668,7 +2755,7 @@ namespace {
                 return 0;
             }
         } catch (const CliError &e) {
-            fprintf(stderr, "error: %s\n", e.message.c_str());
+            Printf(stderr, "error: %s\n", e.message.c_str());
             PrintUsage();
             return 2;
         }
@@ -2677,16 +2764,16 @@ namespace {
             run(args);
             return 0;
         } catch (const CliError &e) {
-            fprintf(stderr, "error: %s\n", e.message.c_str());
+            Printf(stderr, "error: %s\n", e.message.c_str());
             return 1;
         } catch (const std::exception &e) {
-            fprintf(stderr, "error: %hs\n", e.what());
+            Printf(stderr, "error: %hs\n", e.what());
             return 1;
         }
     }
 } // namespace
 
-int main(int argc, char *argv[]) {
+int wmain(int argc, wchar_t *wargv[]) {
     // Before anything is read: this process holds a plaintext DEK, so it
     // must not be dumpable, debuggable or injectable by other processes of
     // the same user - including through threads the key storage provider
@@ -2696,13 +2783,35 @@ int main(int argc, char *argv[]) {
     {
         int rc = hkdfguard_harden_process_with_flags(HKDFGUARD_HARDEN_REQUIRE_PROTECTED_SIGNATURE);
         if (rc != HKDFGUARD_OK) {
-            fprintf(stderr, "error: %s; refusing to handle key material\n", DescribeStatus(rc).c_str());
+            Printf(stderr, "error: %s; refusing to handle key material\n", DescribeStatus(rc).c_str());
             return 1;
         }
     }
 
+    // The arguments as UTF-8, the encoding the rest of the tool and the
+    // library's ABI work in. The conversion is exact or it fails: a lone
+    // surrogate has no UTF-8 form, and a best-fit substitute would mean
+    // acting on a different name than the one typed.
+    std::vector<std::string> utf8Args;
+    for (int i = 0; i < argc; ++i) {
+        const int len = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wargv[i], -1, nullptr, 0, nullptr, nullptr);
+        if (len <= 0) {
+            Printf(stderr, "error: argument %d is not valid Unicode text\n", i);
+            return 2;
+        }
+        std::string arg(static_cast<size_t>(len), '\0');
+        WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wargv[i], -1, arg.data(), len, nullptr, nullptr);
+        arg.resize(static_cast<size_t>(len) - 1); // without the terminator
+        utf8Args.push_back(std::move(arg));
+    }
+    std::vector<char *> argv;
+    for (std::string &arg : utf8Args) {
+        argv.push_back(arg.data());
+    }
+    argv.push_back(nullptr);
+
     if (argc < 2) {
-        fprintf(stderr, "error: missing subcommand: expected %s\n", kSubcommandList);
+        Printf(stderr, "error: missing subcommand: expected %s\n", kSubcommandList);
         PrintUsage();
         return 2;
     }
@@ -2714,19 +2823,19 @@ int main(int argc, char *argv[]) {
     }
 
     if (command == "provision") {
-        return Dispatch<ProvisionArgs>(argc, argv, ParseProvisionArgs, RunProvision);
+        return Dispatch<ProvisionArgs>(argc, argv.data(), ParseProvisionArgs, RunProvision);
     }
     if (command == "wrap") {
-        return Dispatch<WrapArgs>(argc, argv, ParseWrapArgs, RunWrap);
+        return Dispatch<WrapArgs>(argc, argv.data(), ParseWrapArgs, RunWrap);
     }
     if (command == "retire") {
-        return Dispatch<RetireArgs>(argc, argv, ParseRetireArgs, RunRetire);
+        return Dispatch<RetireArgs>(argc, argv.data(), ParseRetireArgs, RunRetire);
     }
     if (command == "status") {
-        return Dispatch<StatusArgs>(argc, argv, ParseStatusArgs, RunStatus);
+        return Dispatch<StatusArgs>(argc, argv.data(), ParseStatusArgs, RunStatus);
     }
 
-    fprintf(stderr, "error: unknown subcommand \"%s\": expected %s\n", command.c_str(), kSubcommandList);
+    Printf(stderr, "error: unknown subcommand \"%s\": expected %s\n", command.c_str(), kSubcommandList);
     PrintUsage();
     return 2;
 }
