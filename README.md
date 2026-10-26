@@ -266,7 +266,11 @@ Arguments are taken as the Unicode text they were typed as and handed to the lib
 UTF-8, with no code-page conversion in between: a path, service name or group name with
 characters outside the system code page is used exactly, never best-fit mapped to a
 look-alike (`ā` is not `a`). Output is written as Unicode on a console, whatever its code
-page, and as UTF-8 when redirected to a file or pipe.
+page, and as UTF-8 when redirected to a file or pipe. For the same reason `--key-file-path`
+and `--dek-file` refuse any name Windows would rewrite or redirect: a folder or file name
+ending in a dot or space (Windows drops it), a reserved device name such as `CON`, `NUL`,
+`COM1` or `LPT1`, with or without an extension (Windows programs open the device instead),
+and a path ending in a separator.
 
 `tools/hkdfguard_cli.cpp` builds `hkdfguard.exe`, a thin
 wrapper around the ABI above with four subcommands: `provision`, `wrap`, `status` and
