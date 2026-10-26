@@ -79,7 +79,7 @@ namespace {
             }
         } floor{entered + std::chrono::milliseconds(floor_ms)};
 
-        const unsigned long count = g_setup_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+        const unsigned long count = g_setup_calls.fetch_add(1) + 1;
         if (count == kSetupCallsWarnAt + 1) {
             LogSetupCallsExceeded(kSetupCallsWarnAt, floor_ms);
         }

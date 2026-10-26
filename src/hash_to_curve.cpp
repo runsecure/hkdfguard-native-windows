@@ -4,23 +4,23 @@
 #include <windows.h>
 #include <bcrypt.h>
 #include <cstring>
+#include <vector>
 
-// Point decompression - finding Y from X - is the one piece of P-256
-// arithmetic CNG doesn't expose, so it is done here with a minimal
-// arithmetic modulo p. It aims to be obviously correct rather than fast:
-// field elements are four 64-bit limbs, and multiplication is
+// RFC 9380 hash-to-curve (P256_XMD:SHA-256_SSWU_RO_). CNG has no
+// hash-to-curve, and no field arithmetic either, so this is done here with a
+// minimal arithmetic modulo p. It aims to be obviously correct rather than
+// fast: field elements are four 64-bit limbs, and multiplication is
 // double-and-add over modular addition, so nothing beyond add/subtract with
-// carry is needed. One point costs about a millisecond - small beside the
-// TPM agreement it feeds. Every point produced is also checked by the
+// carry is needed. Each step follows the RFC's text, not its optimized
+// straight-line versions. One point costs about 8 ms (x64 Release) - mostly
+// its six modular exponentiations, and about the cost of the TPM agreement
+// it feeds. Every point produced is also checked by the
 // caller through BCryptImportKeyPair (ecdh_hkdf.cpp), so an arithmetic
 // mistake here fails closed, and tests/test_roundtrip.cpp pins the output
-// against reference vectors.
+// against the RFC's own test vectors (Appendix J.1.1).
 
 namespace hkdfguard {
     namespace {
-        constexpr char kDomain[] = "HkdfGuard-P256-payload-ECDH-point-v1:";
-        constexpr int kMaxAttempts = 255; // counters 0..254
-
         // A field element mod p: little-endian 64-bit limbs, v[0] least significant.
         struct Fe {
             uint64_t v[4];
@@ -121,18 +121,6 @@ namespace hkdfguard {
             return r;
         }
 
-        Fe FromBigEndian(const uint8_t in[32]) {
-            Fe r;
-            for (int limb = 0; limb < 4; ++limb) {
-                uint64_t w = 0;
-                for (int k = 0; k < 8; ++k) {
-                    w = (w << 8) | in[(3 - limb) * 8 + k];
-                }
-                r.v[limb] = w;
-            }
-            return r;
-        }
-
         void ToBigEndian(const Fe &a, uint8_t out[32]) {
             for (int limb = 0; limb < 4; ++limb) {
                 for (int k = 0; k < 8; ++k) {
@@ -141,54 +129,185 @@ namespace hkdfguard {
             }
         }
 
-        // (p + 1) / 4: since p = 3 (mod 4), y = rhs^((p+1)/4) is a square root
-        // of rhs whenever one exists. Computed from kP, not written out, so
-        // there is one fewer constant to get wrong.
-        Fe SqrtExponent() {
-            Fe one = {{1, 0, 0, 0}}, e;
-            AddRaw(e, kP, one); // p + 1 < 2^256: no carry
+        constexpr Fe kZero = {{0, 0, 0, 0}};
+        constexpr Fe kOne = {{1, 0, 0, 0}};
+
+        Fe Small(uint64_t v) {
+            return {{v, 0, 0, 0}};
+        }
+
+        Fe Neg(const Fe &a) {
+            return SubMod(kZero, a);
+        }
+
+        // a^-1 mod p as a^(p-2) (Fermat). This is RFC 9380's inv0: 0 maps to 0.
+        Fe Inv(const Fe &a) {
+            Fe e;
+            SubRaw(e, kP, Small(2));
+            return PowMod(a, e);
+        }
+
+        // The curve's right-hand side, x^3 + a*x + b, with a = -3.
+        Fe CurveRhs(const Fe &x) {
+            const Fe a = Neg(Small(3));
+            return AddMod(AddMod(MulMod(MulMod(x, x), x), MulMod(a, x)), kB);
+        }
+
+        // Sets `root` to a square root of `a` and returns true if `a` is a
+        // square mod p (0 included); returns false otherwise. Since
+        // p = 3 (mod 4), a^((p+1)/4) is a root whenever one exists. The
+        // exponent is computed from kP, not written out, so there is one
+        // fewer constant to get wrong.
+        bool Sqrt(const Fe &a, Fe &root) {
+            Fe e;
+            AddRaw(e, kP, kOne); // p + 1 < 2^256: no carry
             for (int i = 0; i < 4; ++i) { // shift right by 2
                 e.v[i] = (e.v[i] >> 2) | (i < 3 ? e.v[i + 1] << 62 : 0);
             }
-            return e;
+            root = PowMod(a, e);
+            return Equal(MulMod(root, root), a);
         }
-    } // namespace
 
-    void PayloadEcdhPoint(const uint8_t salt[kSaltLen], uint8_t point_out[kPublicPointLen]) {
-        constexpr size_t domain_len = sizeof(kDomain) - 1; // exclude NUL
-        uint8_t input[domain_len + kSaltLen + 1];
-        memcpy(input, kDomain, domain_len);
-        memcpy(input + domain_len, salt, kSaltLen);
+        // A big-endian integer of any length, reduced mod p by Horner's rule,
+        // one byte at a time (r = 256*r + byte), so every intermediate value
+        // stays below p.
+        Fe ReduceBigEndian(const uint8_t *in, size_t len) {
+            Fe r = kZero;
+            for (size_t i = 0; i < len; ++i) {
+                for (int k = 0; k < 8; ++k) {
+                    r = AddMod(r, r);
+                }
+                r = AddMod(r, Small(in[i]));
+            }
+            return r;
+        }
 
-        const Fe exponent = SqrtExponent();
-        for (int counter = 0; counter < kMaxAttempts; ++counter) {
-            input[domain_len + kSaltLen] = static_cast<uint8_t>(counter);
-            uint8_t x_bytes[32];
-            NTSTATUS status = BCryptHash(BCRYPT_SHA256_ALG_HANDLE, nullptr, 0, input, sizeof(input), x_bytes, 32);
+        void Sha256(std::vector<uint8_t> &in, uint8_t out[32]) {
+            NTSTATUS status = BCryptHash(BCRYPT_SHA256_ALG_HANDLE, nullptr, 0, in.data(),
+                                         static_cast<ULONG>(in.size()), out, 32);
             if (!BCRYPT_SUCCESS(status)) {
                 throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO_ERROR, "SHA-256 for hash-to-curve failed");
             }
-
-            Fe x = FromBigEndian(x_bytes);
-            if (GreaterOrEqual(x, kP)) {
-                continue; // not a field element
-            }
-            // rhs = x^3 - 3x + b
-            Fe x3 = MulMod(MulMod(x, x), x);
-            Fe three_x = AddMod(AddMod(x, x), x);
-            Fe rhs = AddMod(SubMod(x3, three_x), kB);
-
-            Fe y = PowMod(rhs, exponent);
-            if (!Equal(MulMod(y, y), rhs)) {
-                continue; // rhs is not a square: no point has this X
-            }
-            if ((y.v[0] & 1) != 0) {
-                SubRaw(y, kP, y); // the even root: p - y (y is odd, so nonzero)
-            }
-            ToBigEndian(x, point_out);
-            ToBigEndian(y, point_out + 32);
-            return;
         }
-        throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO_ERROR, "no P-256 point found for this payload salt");
+
+        // hash_to_field's output: count = 2 elements of L = 48 bytes each
+        // (L = ceil((ceil(log2(p)) + k) / 8) for security level k = 128).
+        constexpr size_t kFieldBytes = 48;
+        constexpr size_t kUniformBytes = 2 * kFieldBytes;
+
+        // RFC 9380 section 5.3.1, expand_message_xmd with SHA-256
+        // (b_in_bytes = 32, s_in_bytes = 64), for len_in_bytes = 96, so
+        // ell = 3:
+        //
+        //   DST_prime = DST || I2OSP(len(DST), 1)
+        //   b_0 = H(Z_pad(64) || msg || I2OSP(96, 2) || I2OSP(0, 1) || DST_prime)
+        //   b_1 = H(b_0 || I2OSP(1, 1) || DST_prime)
+        //   b_i = H(strxor(b_0, b_(i-1)) || I2OSP(i, 1) || DST_prime)
+        //   uniform_bytes = b_1 || b_2 || b_3
+        void ExpandMessageXmd(const uint8_t *msg, size_t msg_len, const char *dst, size_t dst_len,
+                              uint8_t out[kUniformBytes]) {
+            if (dst_len > 255) {
+                throw HkdfGuardError(HKDFGUARD_ERR_INTERNAL_ERROR, "hash-to-curve DST longer than 255 bytes");
+            }
+            std::vector<uint8_t> dst_prime(dst, dst + dst_len);
+            dst_prime.push_back(static_cast<uint8_t>(dst_len));
+
+            std::vector<uint8_t> input(64, 0); // Z_pad
+            input.insert(input.end(), msg, msg + msg_len);
+            input.push_back(0);
+            input.push_back(static_cast<uint8_t>(kUniformBytes)); // I2OSP(96, 2)
+            input.push_back(0);                                   // I2OSP(0, 1)
+            input.insert(input.end(), dst_prime.begin(), dst_prime.end());
+            uint8_t b0[32];
+            Sha256(input, b0);
+
+            uint8_t b_prev[32] = {};
+            for (uint8_t i = 1; i <= kUniformBytes / 32; ++i) {
+                input.clear();
+                for (int k = 0; k < 32; ++k) {
+                    input.push_back(i == 1 ? b0[k] : static_cast<uint8_t>(b0[k] ^ b_prev[k]));
+                }
+                input.push_back(i);
+                input.insert(input.end(), dst_prime.begin(), dst_prime.end());
+                Sha256(input, b_prev);
+                memcpy(out + (i - 1) * 32, b_prev, 32);
+            }
+        }
+
+        // RFC 9380 section 6.6.2, the simplified SWU map, with A = -3,
+        // B = b and Z = -10 (section 8.2):
+        //
+        //   tv1 = inv0(Z^2 * u^4 + Z * u^2)
+        //   x1  = (-B / A) * (1 + tv1);  if tv1 == 0, x1 = B / (Z * A)
+        //   gx1 = x1^3 + A * x1 + B
+        //   x2  = Z * u^2 * x1
+        //   (x, y) = (x1, sqrt(gx1)) if gx1 is square, else (x2, sqrt(gx2))
+        //   if sgn0(u) != sgn0(y), y = -y
+        //
+        // sgn0 on this prime field is the low bit.
+        void MapToCurveSswu(const Fe &u, Fe &x, Fe &y) {
+            const Fe a = Neg(Small(3)), z = Neg(Small(10));
+            static const Fe minus_b_over_a = MulMod(Neg(kB), Inv(Neg(Small(3)))); // computed once
+            const Fe z_u2 = MulMod(z, MulMod(u, u));
+            const Fe tv1 = Inv(AddMod(MulMod(z_u2, z_u2), z_u2));
+            Fe x1;
+            if (Equal(tv1, kZero)) {
+                x1 = MulMod(kB, Inv(MulMod(z, a)));
+            } else {
+                x1 = MulMod(minus_b_over_a, AddMod(kOne, tv1));
+            }
+            if (Sqrt(CurveRhs(x1), y)) {
+                x = x1;
+            } else {
+                x = MulMod(z_u2, x1);
+                if (!Sqrt(CurveRhs(x), y)) {
+                    // The map guarantees one of gx1, gx2 is a square.
+                    throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO_ERROR, "simplified SWU found no square");
+                }
+            }
+            if ((u.v[0] & 1) != (y.v[0] & 1)) {
+                y = Neg(y);
+            }
+        }
+
+        // (x0, y0) + (x1, y1) in affine coordinates. Neither input is the
+        // point at infinity (the SWU map never outputs it); a sum that is
+        // the point at infinity is refused. P-256 has no point with y = 0
+        // (its order is odd), so doubling never divides by zero.
+        void AddPoints(const Fe &x0, const Fe &y0, const Fe &x1, const Fe &y1, Fe &x, Fe &y) {
+            Fe lambda;
+            if (!Equal(x0, x1)) {
+                lambda = MulMod(SubMod(y1, y0), Inv(SubMod(x1, x0)));
+            } else if (Equal(y0, y1)) {
+                // Doubling: (3 * x0^2 + a) / (2 * y0), a = -3.
+                const Fe x0_sq = MulMod(x0, x0);
+                lambda = MulMod(SubMod(AddMod(AddMod(x0_sq, x0_sq), x0_sq), Small(3)), Inv(AddMod(y0, y0)));
+            } else {
+                throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO_ERROR, "hash-to-curve sum is the point at infinity");
+            }
+            x = SubMod(SubMod(MulMod(lambda, lambda), x0), x1);
+            y = SubMod(MulMod(lambda, SubMod(x0, x)), y0);
+        }
+    } // namespace
+
+    void HashToCurveP256(const uint8_t *msg, size_t msg_len, const char *dst, size_t dst_len,
+                         uint8_t point_out[kPublicPointLen]) {
+        // hash_to_field: u_i = OS2IP(uniform_bytes[48*i .. 48*i + 47]) mod p.
+        uint8_t uniform[kUniformBytes];
+        ExpandMessageXmd(msg, msg_len, dst, dst_len, uniform);
+        const Fe u0 = ReduceBigEndian(uniform, kFieldBytes);
+        const Fe u1 = ReduceBigEndian(uniform + kFieldBytes, kFieldBytes);
+
+        Fe q0x, q0y, q1x, q1y, x, y;
+        MapToCurveSswu(u0, q0x, q0y);
+        MapToCurveSswu(u1, q1x, q1y);
+        AddPoints(q0x, q0y, q1x, q1y, x, y); // clear_cofactor: h_eff = 1
+        ToBigEndian(x, point_out);
+        ToBigEndian(y, point_out + 32);
+    }
+
+    void PayloadEcdhPoint(const uint8_t salt[kSaltLen], uint8_t point_out[kPublicPointLen]) {
+        HashToCurveP256(salt, kSaltLen, kPayloadEcdhPointDst, sizeof(kPayloadEcdhPointDst) - 1, point_out);
     }
 } // namespace hkdfguard
+

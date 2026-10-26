@@ -453,7 +453,7 @@ for what it means). There is no `unwrap` subcommand - unwrapping is DLL-only; se
 
 ## Building
 
-Requires CMake 3.20+, a Windows 10/11 SDK, and an MSVC C++17 toolchain (Visual Studio
+Requires CMake 3.20+, a Windows 10/11 SDK, and an MSVC C++20 toolchain (Visual Studio
 2022 Build Tools with the "Desktop development with C++" workload, or equivalent).
 
 **Recommended: `scripts\run-build-test-verify.bat`.** Double-click it, or run it from
@@ -689,8 +689,8 @@ It is read on every setup call.
 
 - **Crypto**: ECDH (P-256) between the KEK's private key and a point hashed from a
   random per-payload salt, then HKDF-SHA512 and AES-256-GCM. Each wrap draws a 32-byte
-  salt and hashes it to a P-256 point `H(salt)` (`src/hash_to_curve.cpp`: SHA-256
-  try-and-increment, pinned by fixed test vectors). The shared
+  salt and hashes it to a P-256 point `H(salt)` (`src/hash_to_curve.cpp`: RFC 9380
+  `P256_XMD:SHA-256_SSWU_RO_`, checked against the RFC's test vectors). The shared
   secret `Z = ECDH(KEK private key, H(salt))` is computed by `NCryptSecretAgreement` on the
   KEK's own provider - inside the TPM for a Platform Crypto Provider KEK - for wrap and
   unwrap alike, taken out raw (`BCRYPT_KDF_RAW_SECRET`) and reversed to big-endian, then

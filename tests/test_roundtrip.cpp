@@ -6,7 +6,7 @@
 #include "kek_store.h"  // CreateKek/KekExists/OpenKekForWrap/DeleteKek - internal helpers, used directly below
 #include "policy.h"     // SetTestPolicyOverride - internal test-only seam, used directly below
 #include "ecdh_hkdf.h"  // IsValidP256Point, DeriveWrappingKey - the point gate and the derivation, tested directly below
-#include "hash_to_curve.h" // PayloadEcdhPoint - checked against the Linux implementation's vectors below
+#include "hash_to_curve.h" // HashToCurveP256, PayloadEcdhPoint - checked against RFC 9380's vectors below
 #include "key_file.h"   // ReadWrappedKeyFile - hkdfguard_open_file's implementation, called directly in section 24c
 #include "errors.h"     // HkdfGuardError - caught by PointGateResult and CodeOf below to read error codes
 #include "key_acl.h"    // ValidateKeyUseGroups - vets the key-use policy list without touching any key
@@ -663,12 +663,15 @@ constexpr char kGoldenKekX[] = "a55c04e4b2113126f3ea5244034decd0c0c9f55cd25d2e03
 constexpr char kGoldenKekY[] = "4ab897ae67c14350a0213b0a67d416472aa053a16992018ac4d874dc8529569d";
 constexpr char kGoldenKekD[] = "9639379738995d1017b34a6398b444cf9cd0c82acb0dc0cd5d40c91b513f4e90";
 constexpr char kGoldenSalt[] = "4242424242424242424242424242424242424242424242424242424242424242";
-// H(kGoldenSalt): produced by the Linux implementation's payload_ecdh_point,
-// not by this project's hash_to_curve.cpp, so the golden payload pins this
-// library to the documented hash-to-curve as well as the rest of the
-// construction.
-constexpr char kGoldenPointX[] = "23705f112056934aef2059c9c3ffa610ccb2f070d266d4ffa06210d37e9a0de5";
-constexpr char kGoldenPointY[] = "df412b76994469fb7c27385e2d8f389f3da716076c79a19bb57249c9755f032a";
+// H(kGoldenSalt): RFC 9380 P256_XMD:SHA-256_SSWU_RO_ under the payload DST,
+// produced by tests/reference/golden_reference.py (Python integers, checked
+// there against RFC 9380's own vectors), not by this project's
+// hash_to_curve.cpp - so the golden payload pins this library to the
+// documented hash-to-curve as well as the rest of the construction.
+constexpr char kGoldenPointX[] = "5cf9efd2880814da095afdd42a79a9a3c91b484c8e7a1665990ba1dafdd61f21";
+constexpr char kGoldenPointY[] = "f4e49b3f6b0089f567293e36fa31274d96e18d589ed2ac5c7ff867fe6a4bee34";
+// The golden payload's wrapping key, from the same reference script.
+constexpr char kGoldenWrappingKey[] = "25f4ecee8784cca9b5f11280d4b4d62fa179381be5bef51d274c57ae7cd866f1";
 constexpr char kGoldenNonce[] = "977bcd31c21caffe32bc3f6a";
 constexpr char kGoldenService[] = "hkdfguardwin.test.golden";
 constexpr wchar_t kGoldenServiceWide[] = L"hkdfguardwin.test.golden";
@@ -676,15 +679,15 @@ constexpr wchar_t kGoldenServiceWide[] = L"hkdfguardwin.test.golden";
 // The golden WrappedDekV1 payload: MakeDek() wrapped under the golden KEK
 // for kGoldenService, with the golden salt and nonce, under the documented
 // key derivation (HKDF info = "hkdfguard-wrap-v1:" || u16le(len) ||
-// service || header || fingerprint; AAD = header || fingerprint). Computed
-// outside this project, and its wrapping key (4de2f10c...) matches the
-// Linux implementation's derive_wrapping_key. Frozen: if a code change
+// service || header || fingerprint; AAD = header || fingerprint). Its
+// wrapping key is kGoldenWrappingKey, and its AES-256-GCM seal was
+// recomputed separately with .NET's AesGcm. Frozen: if a code change
 // makes this stop unwrapping, that change breaks every payload already
 // deployed - fix the change, never this constant.
 constexpr char kGoldenPayloadHex[] =
     "010200000100000042424242424242424242424242424242424242424242424242424242"
-    "42424242977bcd31c21caffe32bc3f6a83bd5956cb4af147e9f9bdbe2efedd0eefc55ddb"
-    "904810deb11b40870b9e29a493df5ddf8a065fb584ff823e1a107a0938d1ef5a8d210826"
+    "42424242977bcd31c21caffe32bc3f6abcfaf3413a2e6addf1f0f990c2336e0e2d419b20"
+    "fd814c39601a0b457c829572e0067cd393ca56b6b43f196b1d7bad6438d1ef5a8d210826"
     "eeabdd24b8676833717a7ecedb999ae3b9b3012a0d4353c4";
 
 // BCRYPT_ECCPRIVATE_BLOB for a P-256 ECDH key from hex X, Y, d.
@@ -730,8 +733,8 @@ std::vector<uint8_t> IndependentAuthenticated(uint8_t providerType, const std::v
 }
 
 // The wrapping key, derived from the *documented* construction written
-// independently of src/ (no library function is called) - the Linux
-// build's, byte for byte: Z = ECDH(KEK d, point) as big-endian X ->
+// independently of src/ (no library function is called): Z = ECDH(KEK d,
+// point) as big-endian X ->
 // HKDF-SHA512 (RFC 5869, salt = the payload salt, info =
 // "hkdfguard-wrap-v1:" || u16le(len(service)) || service || header ||
 // fingerprint) -> first 32 bytes. Shared by the golden payload and the
@@ -779,7 +782,7 @@ bool IndependentWrappingKey(const std::vector<uint8_t>& salt, const std::vector<
         return false;
     }
     // BCRYPT_KDF_RAW_SECRET is little-endian; the construction uses the
-    // conventional big-endian X coordinate (as the Linux implementation does).
+    // conventional big-endian X coordinate.
     std::reverse(z.begin(), z.end());
 
     const std::vector<uint8_t> authenticated = IndependentAuthenticated(providerType, salt, kekPub);
@@ -2021,38 +2024,57 @@ int main() {
     }
 
     // ---- 24b. The ECDH construction: Z = ECDH(KEK private key, H(salt)). ----
-    //          First the pieces with no KEK - hash-to-curve against the
-    //          Linux implementation, and the point gate - then, against the
+    //          First the pieces with no KEK - hash-to-curve against RFC
+    //          9380's vectors, and the point gate - then, against the
     //          real KEK, that a payload can't be forged from the public key.
     {
-        // Reference points from the Linux implementation's
-        // payload_ecdh_point for three fixed salts; this library must hash
-        // each salt to exactly these points.
-        std::vector<uint8_t> sequential(hkdfguard::kSaltLen);
-        for (size_t i = 0; i < sequential.size(); ++i) sequential[i] = static_cast<uint8_t>(i);
-        struct LinuxVector {
-            std::vector<uint8_t> salt;
+        // RFC 9380 Appendix J.1.1 (P256_XMD:SHA-256_SSWU_RO_): every
+        // message must hash to exactly the RFC's point under the RFC's DST.
+        struct RfcVector {
+            std::string msg;
             const char* x;
             const char* y;
         };
-        const LinuxVector vectors[] = {
-            {std::vector<uint8_t>(hkdfguard::kSaltLen, 0x00),
-             "c68960c82e7e3d5395da61ee0f2024fb5e9ec0e45e2f104e33c65cca87c93620",
-             "ef42f3f44d5c434e04ef8d0ffb90b23b4a7d7517d32f65e0c645c610bb370982"},
-            {std::vector<uint8_t>(hkdfguard::kSaltLen, 0x42),
-             "23705f112056934aef2059c9c3ffa610ccb2f070d266d4ffa06210d37e9a0de5",
-             "df412b76994469fb7c27385e2d8f389f3da716076c79a19bb57249c9755f032a"},
-            {sequential,
-             "074508261589a2c703bcb88966769c27f980a528de99cd3dc92d93d3de8fa2a6",
-             "06260ec7bdd3a303f376430f01bdb5aafba4d1b6688f550077279977b1c9de88"},
+        const char rfcDst[] = "QUUX-V01-CS02-with-P256_XMD:SHA-256_SSWU_RO_";
+        const RfcVector vectors[] = {
+            {"",
+             "2c15230b26dbc6fc9a37051158c95b79656e17a1a920b11394ca91c44247d3e4",
+             "8a7a74985cc5c776cdfe4b1f19884970453912e9d31528c060be9ab5c43e8415"},
+            {"abc",
+             "0bb8b87485551aa43ed54f009230450b492fead5f1cc91658775dac4a3388a0f",
+             "5c41b3d0731a27a7b14bc0bf0ccded2d8751f83493404c84a88e71ffd424212e"},
+            {"abcdef0123456789",
+             "65038ac8f2b1def042a5df0b33b1f4eca6bff7cb0f9c6c1526811864e544ed80",
+             "cad44d40a656e7aff4002a8de287abc8ae0482b5ae825822bb870d6df9b56ca3"},
+            {"q128_" + std::string(128, 'q'),
+             "4be61ee205094282ba8a2042bcb48d88dfbb609301c49aa8b078533dc65a0b5d",
+             "98f8df449a072c4721d241a3b1236d3caccba603f916ca680f4539d2bfb3c29e"},
+            {"a512_" + std::string(512, 'a'),
+             "457ae2981f70ca85d8e24c308b14db22f3e3862c5ea0f652ca38b5e49cd64bc5",
+             "ecb9f0eadc9aeed232dabc53235368c1394c78de05dd96893eefa62b0f4757dc"},
         };
-        for (const LinuxVector& v : vectors) {
+        for (const RfcVector& v : vectors) {
             std::vector<uint8_t> expected = FromHex(v.x), expectedY = FromHex(v.y);
             expected.insert(expected.end(), expectedY.begin(), expectedY.end());
             std::vector<uint8_t> point(hkdfguard::kPublicPointLen);
-            int32_t code = CodeOf([&] { hkdfguard::PayloadEcdhPoint(v.salt.data(), point.data()); });
+            int32_t code = CodeOf([&] {
+                hkdfguard::HashToCurveP256(reinterpret_cast<const uint8_t*>(v.msg.data()), v.msg.size(), rfcDst,
+                                           sizeof(rfcDst) - 1, point.data());
+            });
             Check(code == HKDFGUARD_OK && point == expected,
-                  ("hash-to-curve matches the Linux implementation for salt " + ToHex(v.salt).substr(0, 8) + "...").c_str());
+                  ("hash-to-curve matches RFC 9380 J.1.1 for msg \"" + v.msg.substr(0, 8) + "\"").c_str());
+        }
+
+        // The payload's own DST: the golden salt hashes to the reference
+        // script's H(kGoldenSalt).
+        {
+            std::vector<uint8_t> salt = FromHex(kGoldenSalt);
+            std::vector<uint8_t> expected = FromHex(kGoldenPointX), expectedY = FromHex(kGoldenPointY);
+            expected.insert(expected.end(), expectedY.begin(), expectedY.end());
+            std::vector<uint8_t> point(hkdfguard::kPublicPointLen);
+            int32_t code = CodeOf([&] { hkdfguard::PayloadEcdhPoint(salt.data(), point.data()); });
+            Check(code == HKDFGUARD_OK && point == expected,
+                  "hash-to-curve: the golden salt hashes to the reference H(salt) under the payload DST");
         }
 
         // Any salt maps to a valid P-256 point, and different salts to
@@ -2741,11 +2763,13 @@ int main() {
             Check(r.rc == HKDFGUARD_OK && r.out == wrapped, "open_file accepts a \\\\?\\-prefixed path");
 
             wchar_t saved_cwd[MAX_PATH + 1] = {};
-            GetCurrentDirectoryW(MAX_PATH + 1, saved_cwd);
-            if (SetCurrentDirectoryW(dir.c_str())) {
+            const DWORD cwd_len = GetCurrentDirectoryW(MAX_PATH + 1, saved_cwd);
+            if (cwd_len == 0 || cwd_len > MAX_PATH) {
+                Check(false, "test setup: save the current directory");
+            } else if (SetCurrentDirectoryW(dir.c_str())) {
                 r = open("good.key");
                 Check(r.rc == HKDFGUARD_OK && r.out == wrapped, "open_file resolves a relative path against the current directory");
-                SetCurrentDirectoryW(saved_cwd);
+                Check(SetCurrentDirectoryW(saved_cwd) != FALSE, "test setup: restore the current directory");
             } else {
                 Check(false, "test setup: change into the scratch folder");
             }
@@ -3699,8 +3723,8 @@ int main() {
             // KEK imported as an unnamed, in-memory Software KSP key (nothing
             // persisted, no machine key store), run through this test's
             // compiled copy of DeriveWrappingKey over the golden payload's own
-            // authenticated bytes. It must give the wrapping key the Linux
-            // crate's derive_wrapping_key gives for the same inputs.
+            // authenticated bytes. It must give the reference script's
+            // wrapping key (kGoldenWrappingKey).
             {
                 std::vector<uint8_t> derived;
                 int32_t derive_rc = CodeOf([&] {
@@ -3719,12 +3743,11 @@ int main() {
                     hkdfguard::DeriveWrappingKey(prov.get(), key.get(), kGoldenService, authenticated, wrapping_key);
                     derived.assign(wrapping_key.data(), wrapping_key.data() + wrapping_key.size());
                 });
-                Check(derive_rc == HKDFGUARD_OK &&
-                          ToHex(derived) == "4de2f10c9aa73b64effbf994f5051f928b6902bc21b2ea43afd09a20447ac47e",
-                      "golden payload: the library's DeriveWrappingKey gives the Linux derivation's wrapping key");
+                Check(derive_rc == HKDFGUARD_OK && ToHex(derived) == kGoldenWrappingKey,
+                      "golden payload: the library's DeriveWrappingKey gives the reference wrapping key");
                 if (derive_rc != HKDFGUARD_OK || derived.empty()) {
                     std::printf("    (derivation returned %d)\n", derive_rc);
-                } else if (ToHex(derived) != "4de2f10c9aa73b64effbf994f5051f928b6902bc21b2ea43afd09a20447ac47e") {
+                } else if (ToHex(derived) != kGoldenWrappingKey) {
                     std::printf("    (derived %s)\n", ToHex(derived).c_str());
                 }
             }

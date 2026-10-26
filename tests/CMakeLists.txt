@@ -10,8 +10,8 @@ add_executable(test_roundtrip
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/policy.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/key_acl.cpp
     # ecdh_hkdf.cpp + hash_to_curve.cpp: so the test can call
-    # IsValidP256Point and PayloadEcdhPoint directly (hand-built points and
-    # the Linux implementation's hash-to-curve vectors) without a KEK, and DeriveWrappingKey
+    # IsValidP256Point, HashToCurveP256 and PayloadEcdhPoint directly
+    # (hand-built points and RFC 9380's hash-to-curve vectors) without a KEK, and DeriveWrappingKey
     # with the test-only provider fault enabled.
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/ecdh_hkdf.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/hash_to_curve.cpp

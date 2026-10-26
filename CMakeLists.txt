@@ -15,7 +15,7 @@ if(NOT WIN32)
     message(FATAL_ERROR "hkdfguard-native-windows is Windows-only (requires CNG/NCrypt).")
 endif()
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Only the functions marked HKDFGUARD_API (dllexport) in hkdfguard.h are
 # exported, keeping the ABI surface minimal and deliberate.

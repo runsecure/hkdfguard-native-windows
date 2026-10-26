@@ -16,6 +16,7 @@
 
 #include <windows.h>
 #include <aclapi.h> // GetSecurityInfo
+#include <bit>     // std::bit_cast - LARGE_INTEGER to LONGLONG
 #include <cstring>
 #include <string>
 #include <vector>
@@ -117,10 +118,10 @@ namespace hkdfguard {
         // extended prefix stripped so it compares against ExpectedFullPath.
         // Sized by retrying: grows to whatever the call last reported, plus one.
         std::wstring FinalPathOfHandle(HANDLE file) {
-            std::wstring final(MAX_PATH, L'\0');
+            std::wstring final_path(MAX_PATH, L'\0');
             for (int attempt = 0; attempt < 4; ++attempt) {
                 DWORD written = GetFinalPathNameByHandleW(
-                    file, final.data(), static_cast<DWORD>(final.size()), FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+                    file, final_path.data(), static_cast<DWORD>(final_path.size()), FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
                 if (written == 0) {
                     // ERROR_PATH_NOT_FOUND here means the file's volume has no
                     // drive letter - reachable only through a volume mount point.
@@ -128,11 +129,11 @@ namespace hkdfguard {
                         GetLastError() == ERROR_PATH_NOT_FOUND ? HKDFGUARD_ERR_FILE_UNTRUSTED : HKDFGUARD_ERR_FILE_IO,
                         "GetFinalPathNameByHandle failed");
                 }
-                if (written < final.size()) {
-                    final.resize(written);
-                    return StripExtendedPrefix(final);
+                if (written < final_path.size()) {
+                    final_path.resize(written);
+                    return StripExtendedPrefix(final_path);
                 }
-                final.assign(static_cast<size_t>(written) + 1, L'\0');
+                final_path.assign(static_cast<size_t>(written) + 1, L'\0');
             }
             throw HkdfGuardError(HKDFGUARD_ERR_FILE_IO, "GetFinalPathNameByHandle could not size its result");
         }
@@ -722,21 +723,22 @@ namespace hkdfguard {
         // memory. A file too short to be a payload but short enough to be a
         // DEK written as text (hex or base64) is read into a wiped buffer to
         // tell which; its bytes are never copied to the caller.
-        LARGE_INTEGER size{};
-        if (!GetFileSizeEx(file, &size)) {
+        LARGE_INTEGER size_field{};
+        if (!GetFileSizeEx(file, &size_field)) {
             throw HkdfGuardError(HKDFGUARD_ERR_FILE_IO, "GetFileSizeEx failed");
         }
-        if (size.QuadPart == HKDFGUARD_DEK_LEN) {
+        const auto size = std::bit_cast<LONGLONG>(size_field); // the whole union, not one member
+        if (size == HKDFGUARD_DEK_LEN) {
             throw HkdfGuardError(HKDFGUARD_ERR_FILE_PLAINTEXT_KEY, "file is the size of a plaintext DEK");
         }
-        if (size.QuadPart < static_cast<LONGLONG>(kTotalLen)) {
-            if (size.QuadPart <= static_cast<LONGLONG>(kMaxPlaintextTextLen) &&
+        if (size < static_cast<LONGLONG>(kTotalLen)) {
+            if (size <= static_cast<LONGLONG>(kMaxPlaintextTextLen) &&
                 SmallFileLooksLikePlaintextDek(file)) {
                 throw HkdfGuardError(HKDFGUARD_ERR_FILE_PLAINTEXT_KEY, "file holds a DEK written as hex or base64");
             }
             throw HkdfGuardError(HKDFGUARD_ERR_FILE_TOO_SHORT, "file is shorter than a wrapped payload");
         }
-        if (size.QuadPart > static_cast<LONGLONG>(kTotalLen)) {
+        if (size > static_cast<LONGLONG>(kTotalLen)) {
             throw HkdfGuardError(HKDFGUARD_ERR_FILE_TOO_LONG, "file is longer than a wrapped payload");
         }
 
