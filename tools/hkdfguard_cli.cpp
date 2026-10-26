@@ -420,7 +420,7 @@ namespace {
             int hi = nibble(text[2 * i]);
             int lo = nibble(text[2 * i + 1]);
             if (hi < 0 || lo < 0) {
-                throw CliError("--fingerprint must contain only hex characters (0-9, a-f)");
+                throw CliError("--fingerprint must contain only hex characters (0-9, a-f, A-F)");
             }
             bytes[i] = static_cast<uint8_t>((hi << 4) | lo);
         }
@@ -1484,6 +1484,61 @@ namespace {
             throw CliError(
                 path + " uses an 8.3 short name (such as PROGRA~1), resolving to \"" + actual +
                 "\"; spell every folder and the file with its full name");
+        }
+    }
+
+    // Refuses a path that Win32 would quietly rewrite or redirect, so the
+    // file opened is the one typed. In every folder and the file name:
+    //   - a trailing '.' or space, which Win32 path handling strips
+    //     ("key.bin." would be written as "key.bin");
+    //   - a reserved device name (CON, PRN, AUX, NUL, COM0-9, LPT0-9, the
+    //     superscript-digit COM/LPT forms, CONIN$, CONOUT$), with or without
+    //     an extension, since Win32 programs open the device rather than a
+    //     file of that name.
+    // And the path must not end in a separator: it has to name a file.
+    // `.` and `..` components, a drive ("C:") and the "?" of a \\?\ prefix
+    // are left for the other checks.
+    void RequireExactPathNames(const std::string &path, const std::string &what) {
+        if (!path.empty() && (path.back() == '\\' || path.back() == '/')) {
+            throw CliError(what + " ends in a path separator; give the path of a file");
+        }
+        static const char *const kReserved[] = {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"};
+        size_t start = 0;
+        while (start <= path.size()) {
+            size_t end = path.find_first_of("\\/", start);
+            if (end == std::string::npos) end = path.size();
+            const std::string part = path.substr(start, end - start);
+            start = end + 1;
+            const bool drive = part.size() == 2 && part[1] == ':';
+            if (part.empty() || part == "." || part == ".." || part == "?" || drive) {
+                continue;
+            }
+            if (part.back() == '.' || part.back() == ' ') {
+                throw CliError(what + ": \"" + part + "\" ends in a " + (part.back() == '.' ? "dot" : "space") +
+                               ", which Windows drops from the name; remove it");
+            }
+            // The device name is the part before the first dot, without
+            // trailing spaces: "nul.txt" and "COM1 .key" are devices too.
+            std::string stem = part.substr(0, part.find('.'));
+            while (!stem.empty() && stem.back() == ' ') stem.pop_back();
+            bool reserved = false;
+            for (const char *name : kReserved) {
+                reserved = reserved || EqualsIgnoreCase(stem, name);
+            }
+            const std::wstring wide = Utf8ToWide(stem);
+            if (wide.size() == 4) {
+                const std::wstring prefix = wide.substr(0, 3);
+                const wchar_t digit = wide[3];
+                const bool comOrLpt = CompareStringOrdinal(prefix.c_str(), 3, L"COM", 3, TRUE) == CSTR_EQUAL ||
+                                      CompareStringOrdinal(prefix.c_str(), 3, L"LPT", 3, TRUE) == CSTR_EQUAL;
+                const bool deviceDigit = (digit >= L'0' && digit <= L'9') || digit == L'\x00B9' ||
+                                         digit == L'\x00B2' || digit == L'\x00B3';
+                reserved = reserved || (comOrLpt && deviceDigit);
+            }
+            if (reserved) {
+                throw CliError(what + ": \"" + part + "\" is a reserved Windows device name; Windows programs would "
+                               "open the device rather than a file, so choose another name");
+            }
         }
     }
 
@@ -2651,7 +2706,12 @@ namespace {
     void RunWrap(WrapArgs &args) {
         // First, before anything touches a path: a UNC or mapped-drive path
         // would make this process connect to the server it names. The same
-        // rule as hkdfguard_open_file.
+        // rule as hkdfguard_open_file. Before even that, the names
+        // themselves: the path is used exactly as typed or not at all.
+        RequireExactPathNames(args.keyFilePath, "--key-file-path " + args.keyFilePath);
+        if (args.dekFile) {
+            RequireExactPathNames(*args.dekFile, "--dek-file " + *args.dekFile);
+        }
         RequireLocalDrivePath(args.keyFilePath, args.keyFilePath);
         if (args.dekFile) {
             RequireLocalDrivePath(*args.dekFile, "--dek-file " + *args.dekFile);

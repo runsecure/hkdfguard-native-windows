@@ -270,6 +270,41 @@ try {
         Check ($r.StdErr -match [regex]::Escape('"' + $case.Name + '"')) "status: the rejected name is echoed exactly as typed ($($case.What))"
     }
 
+    # ---- 3e. Paths are used exactly as typed: a name Win32 would rewrite ----
+    #          (a trailing dot or space is dropped) or redirect (a reserved
+    #          device name opens the device), or a path ending in a
+    #          separator, is refused before anything is opened - for the key
+    #          file, a folder above it, and --dek-file alike.
+    $exactService = "hkdfguardexact" + [Guid]::NewGuid().ToString("N")
+    $exactCases = @(
+        @{ Leaf = "dot.key."; Pattern = "ends in a dot"; What = "a trailing dot" },
+        @{ Leaf = "space.key "; Pattern = "ends in a space"; What = "a trailing space" },
+        @{ Leaf = "CON"; Pattern = "reserved Windows device name"; What = "CON" },
+        @{ Leaf = "com1.key"; Pattern = "reserved Windows device name"; What = "COM1 with an extension, lowercase" },
+        @{ Leaf = "NUL .key"; Pattern = "reserved Windows device name"; What = "NUL with a space before the extension" },
+        @{ Leaf = "LPT" + [char]0x00B9 + ".key"; Pattern = "reserved Windows device name"; What = "LPT with a superscript digit" },
+        @{ Leaf = "CONOUT$"; Pattern = "reserved Windows device name"; What = "CONOUT$" },
+        @{ Leaf = "folder.\x.key"; Pattern = "ends in a dot"; What = "a folder with a trailing dot" },
+        @{ Leaf = "aux\x.key"; Pattern = "reserved Windows device name"; What = "a folder named AUX" },
+        @{ Leaf = "trail\"; Pattern = "ends in a path separator"; What = "a trailing separator" })
+    foreach ($case in $exactCases) {
+        $path = Join-Path $workDir $case.Leaf
+        $before = @(Get-ChildItem -LiteralPath $workDir -Force | ForEach-Object Name)
+        $r = Invoke-Cli @("wrap", "--key-file-path", $path, "--service-name", $exactService, "--dek-stdin") -StdIn $validB64
+        $after = @(Get-ChildItem -LiteralPath $workDir -Force | ForEach-Object Name)
+        Check (($r.ExitCode -eq 1) -and ($r.StdErr -match [regex]::Escape($case.Pattern))) "wrap: a key-file path with $($case.What) is refused, naming the reason"
+        Check ($after.Count -eq $before.Count) "wrap: a key-file path with $($case.What) creates nothing"
+    }
+    $r = Invoke-Cli @("wrap", "--key-file-path", (Join-Path $workDir "exact.key"), "--service-name", $exactService, "--dek-file", (Join-Path $workDir "dek.b64."))
+    Check (($r.ExitCode -eq 1) -and ($r.StdErr -match "--dek-file .*ends in a dot")) "wrap: a --dek-file path with a trailing dot is refused the same way"
+    $r = Invoke-Cli @("wrap", "--key-file-path", (Join-Path $workDir "exact.key"), "--service-name", $exactService, "--dek-file", (Join-Path $workDir "NUL"))
+    Check (($r.ExitCode -eq 1) -and ($r.StdErr -match "--dek-file .*reserved Windows device name")) "wrap: a --dek-file named NUL is refused as a device name"
+    # Names that only resemble a device or carry a dot elsewhere are ordinary.
+    foreach ($leaf in @("CONSOLE.key", "com10.key", "lpt.key", "nul_backup.key", ".key", "a.b.key")) {
+        $r = Invoke-Cli @("wrap", "--key-file-path", (Join-Path $workDir $leaf), "--service-name", $exactService, "--dek-stdin") -StdIn $validB64
+        Check ($r.StdErr -notmatch "reserved Windows device name|ends in a (dot|space)|ends in a path separator") "wrap: `"$leaf`" is an ordinary name and passes the name check"
+    }
+
     if (-not $developerModel) {
         Write-Host "[SKIP] the wrap scenarios: production security model and not elevated - this account's own key folders aren't trusted, and SecurityModel can't be set for the run"
         if ($failures -eq 0) { exit 0 } else { exit 1 }
