@@ -1,26 +1,35 @@
 #pragma once
 
 #include "wire_format.h" // kSaltLen, kPublicPointLen
+#include <cstddef>
 #include <cstdint>
 
 namespace hkdfguard {
+    // The domain separation tag for hashing a payload's salt to a point.
+    // Cryptographic input: changing it changes every H(salt), and the
+    // golden-payload test (tests/test_roundtrip.cpp section 29) fails.
+    constexpr char kPayloadEcdhPointDst[] = "HkdfGuard-payload-ECDH-point-V01-CS01-with-P256_XMD:SHA-256_SSWU_RO_";
+
+    // RFC 9380 hash_to_curve with the suite P256_XMD:SHA-256_SSWU_RO_:
+    // expand_message_xmd (SHA-256) to two field elements, the simplified
+    // SWU map applied to each, and their sum (P-256 has cofactor 1, so
+    // clear_cofactor is the identity). `dst` is `dst_len` bytes, at most 255.
+    //
+    // Writes the point as raw X || Y (64 bytes, big-endian coordinates) into
+    // `point_out`. Not constant-time, and need not be for its one caller:
+    // the salt is public. Throws HkdfGuardError(HKDFGUARD_ERR_CRYPTO_ERROR)
+    // if SHA-256 fails, or if the two mapped points cancel (probability
+    // about 2^-256).
+    void HashToCurveP256(const uint8_t *msg, size_t msg_len, const char *dst, size_t dst_len,
+                         uint8_t point_out[kPublicPointLen]);
+
     // Hashes a payload's salt to a P-256 point H(salt), per the documented
     // HkdfGuard construction:
     //
-    //   for counter = 0, 1, ..., 254:
-    //       X = SHA-256("HkdfGuard-P256-payload-ECDH-point-v1:" || salt || counter)
-    //       if X < p and X^3 - 3X + b is a square mod p:
-    //           return (X, the even square root Y)     // SEC1 prefix 0x02
+    //   H(salt) = HashToCurveP256(salt, kPayloadEcdhPointDst)
     //
     // Nobody knows the discrete logarithm of a hash output, which is what
     // makes Z = ECDH(KEK private key, H(salt)) computable only by the KEK's
-    // holder (see wire_format.h). P-256 has cofactor 1, so every point found
-    // is in the prime-order group. About half of all X candidates work, so
-    // all 255 failing has probability 2^-255.
-    //
-    // Writes the point as raw X || Y (64 bytes, big-endian coordinates) into
-    // `point_out`. Not constant-time, and need not be: the salt is public.
-    // Throws HkdfGuardError(HKDFGUARD_ERR_CRYPTO_ERROR) if SHA-256 fails or no
-    // candidate is found.
+    // holder (see wire_format.h).
     void PayloadEcdhPoint(const uint8_t salt[kSaltLen], uint8_t point_out[kPublicPointLen]);
 } // namespace hkdfguard

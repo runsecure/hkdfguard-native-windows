@@ -88,7 +88,9 @@ setup if that point were off the curve. P-256 has cofactor 1, so an
 on-curve check is sufficient.
 
 **How it holds now.** The point is no longer taken from the payload at all:
-it is `H(salt)`, computed by `src/hash_to_curve.cpp` from the salt, and
+it is `H(salt)`, computed by `src/hash_to_curve.cpp` from the salt with
+RFC 9380 hash-to-curve (`P256_XMD:SHA-256_SSWU_RO_`, DST
+`HkdfGuard-payload-ECDH-point-V01-CS01-with-P256_XMD:SHA-256_SSWU_RO_`), and
 lies on the curve by construction - the payload's only input to it is 32
 bytes of salt, which have no invalid value. As defense in depth, every
 `H(salt)` still goes through `IsValidP256Point` (`src/ecdh_hkdf.cpp`)
@@ -102,7 +104,8 @@ with valid keys, all-zero and all-0xFF coordinates, random coordinates,
 single-bit mutations of valid keys, and 100 fuzzed valid keys: every valid
 point imported, every malformed point was rejected. `tests/test_roundtrip.cpp`
 re-checks the gate on every run (valid, all-zero, all-0xFF, single-bit
-mutations of X and Y) and checks 32 random salts all hash to valid,
+mutations of X and Y), checks the hash-to-curve against every RFC 9380
+Appendix J.1.1 vector, and checks 32 random salts all hash to valid,
 distinct points. Underneath, the providers refuse bad points themselves
 (section 13): the Software KSP and the Platform Crypto Provider both reject
 off-curve, (0,0), out-of-range and all-0xFF points at `NCryptImportKey`,
@@ -112,14 +115,11 @@ and the PCP does so in software before the TPM.
 ## 3. Raw ECDH secret byte order (verified)
 
 **Claim.** The shared secret fed to HKDF is the shared point's X coordinate,
-**big-endian** - the same bytes the Linux implementation (RustCrypto's
-`raw_secret_bytes`) feeds HKDF.
+**big-endian**, the conventional encoding of a field element (SEC 1).
 
 **Why it matters.** `BCRYPT_KDF_RAW_SECRET` returns the secret
 **little-endian** (byte-reversed X). Feeding it as-is would derive a
-different key from the Linux construction for the same inputs. (The
-construction is what is shared; the authenticated bytes it is fed are
-Windows-specific - see section 10.)
+different key from the documented construction for the same inputs.
 
 **Verified how.** The proof of concept behind section 13 compared
 `NCryptDeriveKey(BCRYPT_KDF_RAW_SECRET)` against an independent
@@ -132,8 +132,10 @@ unwrap agreeing on byte order - no longer arises.
 
 **The construction is pinned.** Section 29 of `tests/test_roundtrip.cpp`
 rebuilds a frozen golden payload from the documented construction,
-independently of `src/` - with `H(salt)` taken from the Linux crate's own
-output, not this project's hash-to-curve - and checks the shipped DLL
+independently of `src/` - with `H(salt)` taken from
+`tests/reference/golden_reference.py` (an RFC 9380 implementation in Python
+integers, checked there against the RFC's vectors), not this project's
+hash-to-curve - and checks the shipped DLL
 unwraps it to a known DEK. Any change to the hash-to-curve, the IKM byte
 order, the HKDF salt, hash or info string, the AAD, or the wire layout fails
 that test while ordinary round trips still pass.
@@ -396,17 +398,11 @@ use) are still granted by *name*, now restricted to local groups.
   key, raw X||Y)`, where the header is payload bytes 0..39 (`Version`,
   `ProviderType`, `Reserved`, `KeyId`, `Salt`). They are the AES-256-GCM
   AAD, **and** they end HKDF's info: `"hkdfguard-wrap-v1:" ||
-  u16le(len(service)) || normalized service || authenticated bytes`. This
-  is the Linux build's construction (`derive_wrapping_key`,
-  `Payload::authenticated_bytes`), adopted so both builds share one KDF and
-  one AAD rule. What is shared is the construction, not the bytes it is fed:
-  the payload layout, the authenticated bytes and the fingerprint encoding
-  are Windows-specific. Linux's payload has a variable-length key ID and
-  its authenticated bytes include the nonce; here the `KeyId` is a fixed
-  u32le and the nonce is left out (below); and this build fingerprints raw
-  `X||Y` where Linux and macOS hash `0x04||X||Y`. So the same KEK and DEK
-  give different payloads on the two platforms - cross-platform payload
-  parity is not a goal (`src/wire_format.h`).
+  u16le(len(service)) || normalized service || authenticated bytes`. The
+  payload layout, the authenticated bytes and the fingerprint encoding are
+  this build's own: the `KeyId` is a fixed u32le, the nonce is left out
+  (below), and the fingerprint hashes raw `X||Y` with no `0x04` prefix.
+  Cross-platform payload parity is not a goal (`src/wire_format.h`).
   Every field a parser reads or routes on, the KEK, and the service are
   therefore bound into the wrapping key itself, not only checked by the
   tag. AES-GCM doesn't commit to its key, but here a payload's context
@@ -420,14 +416,17 @@ use) are still granted by *name*, now restricted to local groups.
   - The golden-payload test (section 29 of `tests/test_roundtrip.cpp`)
     reproduces the frozen payload from an implementation of the spec written
     in the test, independent of `src/`.
-  - The frozen value was computed separately with .NET's `HKDF` and `AesGcm`.
-  - Its wrapping key (`4de2f10c...`) is what the Linux crate's own
-    `derive_wrapping_key` returns for the same Z, salt, service and
-    authenticated bytes.
+  - Its wrapping key (`25f4ecee...`) is what
+    `tests/reference/golden_reference.py` derives with Python's own
+    integers, `hashlib` and `hmac` for the same KEK, salt, service and
+    authenticated bytes: RFC 9380 `H(salt)`, `Z = x(d·H(salt))`, then
+    HKDF-SHA512.
+  - Its AES-256-GCM seal under that key was recomputed separately with
+    .NET's `AesGcm`.
 
   The library's `DeriveWrappingKey` is checked against that key without
   elevation, on the golden KEK imported as an in-memory Software KSP key.
-  Elevated (2026-10-16), the shipped DLL also unwraps the frozen payload to
+  Elevated (2026-10-26), the shipped DLL also unwraps the frozen payload to
   the known DEK, with the golden KEK imported as a Software KSP machine
   key.
   The fingerprint also travels in the payload and is
@@ -534,9 +533,10 @@ keys and, elevated, machine keys:
   both providers).
 - Independent maths (Software KSP, exportable test key): `d·H(salt)`
   computed with `System.Numerics.BigInteger` matched the provider for two
-  salts and three KDFs. The hash-to-curve re-implementation matched the
-  Linux implementation's `payload_ecdh_point` on the RustCrypto p256 0.14
-  crate for three salts.
+  salts and three KDFs. (This proof of concept predates the move to RFC
+  9380 hash-to-curve; what it shows about the agreement does not depend on
+  how the point was derived. The hash-to-curve itself is checked against
+  RFC 9380's vectors - section 2.)
 - The private key stays in the TPM: exporting the PCP key's private blob is
   refused (`0x8009000A`), as is changing its export policy; the provider
   reports `NCRYPT_IMPL_HARDWARE_FLAG`; one agreement takes ~8.9 ms on the
