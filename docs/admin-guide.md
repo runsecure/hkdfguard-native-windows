@@ -296,7 +296,7 @@ path helpers do this: some keep short names (PowerShell's `Resolve-Path`, for on
   SYSTEM, Administrators, TrustedInstaller or - under the production model - a deployer
   group or a direct member of one (under the developer model: the account the application
   runs as), and no other account may write the file or delete, rename, re-permission or
-  take ownership of it or of any of those folders; and
+  take ownership of it or those folders; and
 - every folder **below the drive root** - the key file's own folder and each folder above
   it - lets no other account **create** files or folders in it ("Create files / write
   data" or "Create folders / append data"). This is the Windows form of the Linux build's
