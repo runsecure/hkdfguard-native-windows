@@ -1,49 +1,38 @@
-# Minimum CMake version this project's syntax requires.
 cmake_minimum_required(VERSION 3.20)
-# Declares the project name and that it's a C++ project (as opposed to C,
-# which CMake also supports enabling separately).
-project(hkdfguard-native-windows CXX)
+# VERSION is the single source of the release version: it is stamped into
+# HkdfGuard.dll's and hkdfguard.exe's version resources (src/version.rc.in),
+# Build-Msi.ps1 reads it as the MSI's default ProductVersion, and the release
+# workflow refuses a tag that doesn't match it. Bump it for every release.
+project(hkdfguard-native-windows VERSION 0.9.0 LANGUAGES CXX)
 
-# This library depends on Windows-only APIs (CNG/NCrypt), so fail loudly and
-# immediately rather than producing confusing compiler errors later if
-# someone tries to configure it on Linux/macOS.
+# The ProductName and CompanyName in both binaries' version resources.
+set(HKDFGUARD_PRODUCT_NAME "HkdfGuard for Windows")
+set(HKDFGUARD_COMPANY_NAME "HkdfGuard")
+
+# The library depends on Windows-only APIs (CNG/NCrypt); fail at configure
+# time rather than with confusing compiler errors.
 if(NOT WIN32)
     message(FATAL_ERROR "hkdfguard-native-windows is Windows-only (requires CNG/NCrypt).")
 endif()
 
-# Require C++17 (the language standard used throughout src/, e.g. inline
-# variables, structured bindings availability, etc.) and refuse to silently
-# fall back to an older standard if the compiler doesn't support it.
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-# Only the two functions explicitly marked HKDFGUARD_API (dllexport) in
-# hkdfguard.h should be exported from the DLL - this turns off CMake's
-# option to auto-export every symbol, which would defeat the point of
-# hand-picking a minimal, stable ABI surface.
+# Only the functions marked HKDFGUARD_API (dllexport) in hkdfguard.h are
+# exported, keeping the ABI surface minimal and deliberate.
 set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS OFF)
 
-# Statically link the MSVC/UCRT runtime (/MT, /MTd for Debug) into every
-# binary this project produces, instead of the CMake/MSVC default of
-# dynamically linking it (/MD, /MDd). Without this, HkdfGuard.dll and
-# hkdfguard.exe depend on MSVCP140.dll/VCRUNTIME140*.dll/the
-# api-ms-win-crt-*.dll forwarders at load time, none of which ship with a
-# bare Windows install - a machine without the Visual C++ Redistributable
-# (or Visual Studio itself) installed fails to load them. Statically linking
-# instead makes both fully self-contained: nothing beyond the OS itself is
-# required on a target machine. Must be set before any target is declared
-# below (it configures a global default new targets pick up); relies on
-# CMake policy CMP0091 defaulting to NEW, which it does automatically here
-# since cmake_minimum_required's version (3.20) is well past 3.15, the
-# version that introduced it.
+# Statically link the MSVC/UCRT runtime (/MT, /MTd for Debug) instead of the
+# default /MD. Dynamically linked, both binaries would need MSVCP140.dll,
+# VCRUNTIME140*.dll and the api-ms-win-crt-*.dll forwarders, which a bare
+# Windows install lacks without the Visual C++ Redistributable; statically
+# linked they need nothing beyond the OS. Must be set before any target is
+# declared; relies on policy CMP0091 being NEW (implied by the 3.20
+# minimum).
 if(MSVC)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
-# Declares the "hkdfguard" build target: a SHARED library (a .dll on
-# Windows, plus a companion .lib "import library" other code links against
-# to call into it), built from exactly these five .cpp files. Each .cpp's
-# own #include of its matching .h pulls the rest of the source tree in as
-# needed - CMake itself doesn't need to know about the .h files here.
+# The library: HkdfGuard.dll plus its HkdfGuard.lib import library.
 add_library(hkdfguard SHARED
     src/hkdfguard.cpp
     src/wire_format.cpp
@@ -59,13 +48,11 @@ add_library(hkdfguard SHARED
 )
 
 # Event log message table: mc.exe (Windows SDK) compiles
-# src/event_messages.mc into a resource script, which is linked into the
-# DLL so the DLL itself can be registered (by the MSI) as the
-# "hkdfguard-native-windows" event source's EventMessageFile. Without a
-# message table Event Viewer still records every event, but renders it with
-# a "description cannot be found" preamble. MSVC builds only - other
-# toolchains (e.g. a MinGW dev build) simply skip the resource; the logging
-# code itself doesn't depend on it.
+# src/event_messages.mc into a resource linked into the DLL, so the MSI can
+# register the DLL as the "hkdfguard-native-windows" event source's
+# EventMessageFile. Without it Event Viewer still records every event, but
+# with a "description cannot be found" preamble. MSVC builds only; other
+# toolchains skip the resource, and the logging code doesn't depend on it.
 if(MSVC)
     enable_language(RC)
     find_program(HKDFGUARD_MC_EXE NAMES mc REQUIRED)
@@ -84,45 +71,47 @@ if(MSVC)
     target_include_directories(hkdfguard PRIVATE ${HKDFGUARD_MC_OUT})
 endif()
 
-# Names the actual output files HkdfGuard.dll and its companion
-# HkdfGuard.lib import library - no version in the name, as on Linux
-# (libhkdfguard.so): the wrap format is identified by the payload's
-# version byte, not by the library. (The event log source and the MSI's product
-# name, hkdfguard-native-windows, are separate identifiers - see
-# installer/.) Only
-# changes what lands on disk - the CMake target itself is still named
-# "hkdfguard" everywhere else in this file and in tests/CMakeLists.txt
-# (e.g. target_link_libraries, $<TARGET_FILE_DIR:hkdfguard>), so nothing
-# else needs to change when this name does.
+# Adds a version resource (src/version.rc.in) to target: the project()
+# version as its file and product version, HKDFGUARD_PRODUCT_NAME, and the
+# given description, original file name and file type (VFT_DLL / VFT_APP).
+# MSVC builds only, like the message table above. Defined here so
+# tools/CMakeLists.txt can use it for hkdfguard.exe.
+function(hkdfguard_add_version_resource target description original_filename file_type)
+    if(NOT MSVC)
+        return()
+    endif()
+    set(HKDFGUARD_FILE_DESCRIPTION "${description}")
+    set(HKDFGUARD_ORIGINAL_FILENAME "${original_filename}")
+    set(HKDFGUARD_FILE_TYPE "${file_type}")
+    configure_file(${PROJECT_SOURCE_DIR}/src/version.rc.in ${CMAKE_CURRENT_BINARY_DIR}/${target}_version.rc @ONLY)
+    target_sources(${target} PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/${target}_version.rc)
+endfunction()
+
+hkdfguard_add_version_resource(hkdfguard "HkdfGuard native KMS library" "HkdfGuard.dll" VFT_DLL)
+
+# Output files are HkdfGuard.dll / HkdfGuard.lib, with no version in the
+# name: the wrap format is identified by the payload's version byte, not by
+# the library. (The event log source and the MSI's product name,
+# hkdfguard-native-windows, are separate identifiers - see installer/.) The
+# CMake target itself stays "hkdfguard".
 set_target_properties(hkdfguard PROPERTIES OUTPUT_NAME "HkdfGuard")
 
-# PRIVATE compile definitions apply only while compiling hkdfguard's own
-# .cpp files, not to anything that later links against it. HKDFGUARD_EXPORTS
-# is exactly the macro hkdfguard.h checks to choose dllexport over
-# dllimport (see that file's comment) - this is the one and only place it
-# gets defined. UNICODE/_UNICODE steer the small number of Windows headers
-# that have separate ANSI/wide-character APIs toward their wide (UTF-16)
-# versions, matching the std::wstring-based key names used in kek_store.cpp.
+# HKDFGUARD_EXPORTS makes hkdfguard.h choose dllexport over dllimport; this
+# is the only place it is defined. UNICODE/_UNICODE select the wide (UTF-16)
+# Windows APIs, matching the std::wstring key names in kek_store.cpp.
 target_compile_definitions(hkdfguard PRIVATE HKDFGUARD_EXPORTS UNICODE _UNICODE)
-# PUBLIC include dirs are inherited by anything that links against this
-# target (like the test_roundtrip executable in tests/) - here, that's
-# include/, so consumers can #include "hkdfguard.h". PRIVATE include dirs
-# (src/) are only visible while building HkdfGuard.dll's own sources, kept
-# private since e.g. wire_format.h's byte-offset constants are internal
-# implementation detail, not part of the public ABI contract.
+# include/ (the public header) is inherited by consumers such as the tests;
+# src/ stays private, since its headers are implementation detail, not ABI.
 target_include_directories(hkdfguard
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
-# The two Windows system libraries providing every NCrypt*/BCrypt* function
-# called throughout src/, plus wer.lib for process_hardening.cpp's
-# WerSetFlags.
+# Windows system libraries: NCrypt/BCrypt for the cryptography, wer.lib for
+# process_hardening.cpp's WerSetFlags, plus ntdll and netapi32.
 target_link_libraries(hkdfguard PRIVATE ncrypt.lib bcrypt.lib wer.lib ntdll.lib netapi32.lib)
 
-# MSVC-specific hardening flags, applied only when compiling with MSVC (as
-# opposed to some other compiler CMake might be configured to use). Defined
-# once as a function so the DLL and the CLI (tools/CMakeLists.txt) always get
-# the identical set. The linker's own defaults (/DYNAMICBASE,
+# MSVC hardening flags, defined once as a function so the DLL and the CLI
+# (tools/CMakeLists.txt) always get the identical set. The linker's own defaults (/DYNAMICBASE,
 # /HIGHENTROPYVA, /NXCOMPAT - ASLR and DEP) are left on and not repeated.
 #
 #   /W4               High warning level (catches e.g. signed/unsigned mixups).
@@ -162,7 +151,7 @@ if(MSVC)
     #
     # HKDFGUARD_REQUIRE_SPECTRE_LIBS turns the "absent" case from a warning
     # into a configure failure. Off by default so a developer machine without
-    # the component can still build; the release workflow turns it on (via
+    # the component can still build; CI and release builds turn it on (via
     # the environment variable of the same name, which seeds the option's
     # default) so a release can never quietly ship an unmitigated runtime.
     if("$ENV{HKDFGUARD_REQUIRE_SPECTRE_LIBS}" STREQUAL "1")
@@ -214,13 +203,9 @@ endfunction()
 
 hkdfguard_apply_hardening(hkdfguard)
 
-# tools/CMakeLists.txt declares hkdfguard-cli, the standalone CLI
-# utility that wraps a DEK and writes it to a file - see that file for why
-# it's a separate add_subdirectory rather than folded into this one.
+# tools/: hkdfguard-cli (hkdfguard.exe), the command-line tool.
 add_subdirectory(tools)
 
-# Turns on CTest support (the `ctest` command used in README.md) and pulls
-# in tests/CMakeLists.txt, which declares the test_roundtrip executable and
-# registers it as a test.
+# tests/: the test_roundtrip executable and the CTest registrations.
 enable_testing()
 add_subdirectory(tests)

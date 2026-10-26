@@ -221,8 +221,8 @@ namespace hkdfguard {
             HardenToken(user, strictDefault);
         }
 
-        // 2. The process. Kept: terminate (as on Linux, the same user can
-        // still kill a hardened process), query (plain and limited - tools
+        // 2. The process. Kept: terminate (the same user can still kill a
+        // hardened process), query (plain and limited - tools
         // and runtimes that open their own process by ID for information
         // keep working) and synchronize (waiting for exit). Gone: VM read,
         // write and operation, create thread, duplicate handle, set

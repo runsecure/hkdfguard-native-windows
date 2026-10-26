@@ -1,11 +1,9 @@
 @echo off
-rem Runs Build-Dist.ps1 next to this file: clean-builds the Release
-rem configuration and stages HkdfGuard.dll and
-rem hkdfguard.exe into dist\win-x64. Unlike
-rem run-build-test-verify.bat, this does not need to run elevated - building
-rem Release doesn't touch the machine-wide KEK, only actually wrapping a DEK
-rem does. Pass -Sign to Authenticode-sign the staged binaries through Azure
-rem Artifact Signing; build-dist-signed.bat builds both architectures, signed.
+rem Runs Build-Dist.ps1 next to this file: clean-builds Release and stages
+rem HkdfGuard.dll and hkdfguard.exe into dist\win-x64. Needs no elevation:
+rem building doesn't touch the machine-wide KEK. Pass -Sign to
+rem Authenticode-sign the staged binaries through Azure Artifact Signing;
+rem build-dist-signed.bat builds both architectures, signed.
 
 setlocal
 set "SCRIPT_DIR=%~dp0"

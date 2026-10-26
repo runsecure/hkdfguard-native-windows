@@ -6,16 +6,8 @@ namespace hkdfguard {
 
     namespace {
 
-        // Administratively-managed policy location.
-        //
-        // Intended to be deployable via:
-        //
-        //   Group Policy Preferences
-        //   Intune
-        //   DSC
-        //   SCCM
-        //   Manual registry configuration
-        //
+        // Administratively managed policy location, deployable via Group
+        // Policy Preferences, Intune, DSC, SCCM or manual registry edits.
         constexpr wchar_t kPolicyKey[] =
             L"Software\\Policies\\HkdfGuard";
 
@@ -45,19 +37,14 @@ namespace hkdfguard {
         constexpr wchar_t kDeployerGroupsValue[] =
             L"DeployerGroups";
 
-        // Security-focused default.
-        //
-        // Existing behavior today is:
-        //   TPM if available
-        //   otherwise software provider
-        //
+        // Default when no policy is configured: the TPM if available,
+        // otherwise the software provider.
         constexpr KeyStoragePolicy kDefaultPolicy =
             KeyStoragePolicy::PreferTpm;
 
 #if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
-        // See SetTestPolicyOverride/LoadEffectivePolicy in policy.h. Empty by
-        // default, so a test binary that never calls SetTestPolicyOverride
-        // still falls through to the real registry read below.
+        // See SetTestPolicyOverride in policy.h. Empty by default, so a test
+        // binary that never sets it still reads the registry.
         std::optional<KeyStoragePolicy> g_testPolicyOverride;
 
         // Same, for LoadKeyUseGroupsPolicy.
@@ -100,11 +87,7 @@ namespace hkdfguard {
 
         // Maps a raw REG_DWORD value to a KeyStoragePolicy, or
         // KeyStoragePolicy::Invalid if it isn't one of the three recognized
-        // values - see policy.h's comment on LoadEffectivePolicy for why
-        // that's returned rather than silently substituting the default.
-        // Pulled out of LoadEffectivePolicy as its own pure function (no
-        // registry I/O) so the value-to-policy mapping itself is a small,
-        // obviously-correct piece independent of how the DWORD was obtained.
+        // values (see LoadEffectivePolicy in policy.h for why).
         KeyStoragePolicy ParsePolicyValue(DWORD value) noexcept
         {
             switch (value)
@@ -144,15 +127,12 @@ namespace hkdfguard {
 
             HKEY key = nullptr;
 
-            // KEY_WOW64_64KEY: makes this read the "real" 64-bit view of HKLM
-            // regardless of whether this process itself is 32- or 64-bit, so a
-            // 32-bit and a 64-bit HkdfGuard.dll on the same machine are
-            // guaranteed to see the identical policy rather than one of them
-            // silently reading a WOW64-redirected Software\WOW6432Node copy.
-            // (Software\Policies specifically is documented by Microsoft as
-            // excluded from WOW64 registry redirection in the first place, so
-            // this is defense in depth against relying on that exclusion,
-            // rather than a fix for an observed divergence.)
+            // KEY_WOW64_64KEY: read the 64-bit view of HKLM whether this
+            // process is 32- or 64-bit, so 32-bit and 64-bit HkdfGuard.dll on
+            // one machine see the same policy, never a WOW6432Node copy.
+            // Software\Policies is documented as excluded from WOW64
+            // redirection; the flag is defense in depth against relying on
+            // that.
             if (RegOpenKeyExW(
                     HKEY_LOCAL_MACHINE,
                     kPolicyKey,
@@ -269,8 +249,7 @@ namespace hkdfguard {
 #endif
         HKEY key = nullptr;
 
-        // KEY_WOW64_64KEY - see LoadGroupListValue's comment on the
-        // identical flag on its own RegOpenKeyExW call.
+        // KEY_WOW64_64KEY: see LoadGroupListValue.
         if (RegOpenKeyExW(
                 HKEY_LOCAL_MACHINE,
                 kPolicyKey,
@@ -332,8 +311,7 @@ namespace hkdfguard {
     {
         HKEY key = nullptr;
 
-        // KEY_WOW64_64KEY - see LoadGroupListValue's comment on the
-        // identical flag on its own RegOpenKeyExW call.
+        // KEY_WOW64_64KEY: see LoadGroupListValue.
         if (RegOpenKeyExW(
                 HKEY_LOCAL_MACHINE,
                 kPolicyKey,
@@ -371,8 +349,7 @@ namespace hkdfguard {
     unsigned long ParseSetupMinDelayMs(bool found, unsigned long type, unsigned long value) noexcept
     {
         // Only a REG_DWORD within range is honored. Anything else keeps the
-        // default, as a Linux policy file that is present but invalid
-        // does: a typo must neither remove the floor nor turn application
+        // default: a typo must neither remove the floor nor turn application
         // startup into a long hang.
         if (found && type == REG_DWORD && value <= kMaxSetupMinDelayMs)
         {
@@ -385,8 +362,7 @@ namespace hkdfguard {
     {
         HKEY key = nullptr;
 
-        // KEY_WOW64_64KEY - see LoadGroupListValue's comment on the
-        // identical flag on its own RegOpenKeyExW call.
+        // KEY_WOW64_64KEY: see LoadGroupListValue.
         if (RegOpenKeyExW(
                 HKEY_LOCAL_MACHINE,
                 kPolicyKey,
@@ -439,8 +415,7 @@ namespace hkdfguard {
 
         HKEY key = nullptr;
 
-        // KEY_WOW64_64KEY - see LoadGroupListValue's comment on the
-        // identical flag on its own RegOpenKeyExW call.
+        // KEY_WOW64_64KEY: see LoadGroupListValue.
         LONG status = RegOpenKeyExW(
             HKEY_LOCAL_MACHINE,
             kPolicyKey,
@@ -448,12 +423,11 @@ namespace hkdfguard {
             KEY_QUERY_VALUE | KEY_WOW64_64KEY,
             &key);
 
-        // The key itself missing means the policy has never been
-        // configured on this machine at all - that is the "missing" case
-        // the default applies to. Any other failure to open it (access
-        // denied by a hardened registry ACL, say) leaves a policy that may
-        // well be configured - possibly RequireTpm - unread, so it fails
-        // closed rather than quietly running under PreferTpm.
+        // A missing key means the policy was never configured, so the
+        // default applies. Any other failure to open it (access denied by a
+        // hardened registry ACL, say) leaves a possibly configured policy -
+        // maybe RequireTpm - unread, so it fails closed rather than running
+        // under PreferTpm.
         if (status != ERROR_SUCCESS) {
             return KeyStoragePolicyForUnopenedKey(status);
         }
@@ -472,11 +446,10 @@ namespace hkdfguard {
 
         RegCloseKey(key);
 
-        // Same reasoning: only the *value* missing under an existing key is
-        // still "never configured". Any other failure - a REG_QWORD or a
-        // long REG_SZ doesn't fit a DWORD (ERROR_MORE_DATA) - is a value
-        // that was set to *something*, so it's the "present but invalid"
-        // case, never the default.
+        // Likewise only a missing *value* is "never configured". Any other
+        // failure - e.g. a REG_QWORD or long REG_SZ that doesn't fit a DWORD
+        // (ERROR_MORE_DATA) - is a value set to *something*, so it is
+        // "present but invalid", never the default.
         return ParseKeyStoragePolicy(
             status != ERROR_FILE_NOT_FOUND,
             status == ERROR_SUCCESS && size == sizeof(value),

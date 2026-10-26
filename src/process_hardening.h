@@ -1,8 +1,7 @@
 #pragma once
 
 namespace hkdfguard {
-    // Hardens the calling process against memory disclosure - the Windows
-    // counterpart of the Linux build's RLIMIT_CORE / PR_SET_DUMPABLE (see
+    // Hardens the calling process against memory disclosure (see
     // hkdfguard_harden_process in hkdfguard.h for the contract):
     //
     //   1. WerSetFlags(WER_FAULT_REPORTING_FLAG_NOHEAP): Windows Error

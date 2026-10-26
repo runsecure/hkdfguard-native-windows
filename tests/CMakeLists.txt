@@ -1,13 +1,8 @@
 # test_roundtrip exercises the public DLL ABI (HkdfGuard.dll) for wrap/unwrap,
-# and additionally compiles kek_store.cpp/wire_format.cpp directly so it can
-# call the internal DeleteKek() helper to remove any KEKs it creates once the
-# test finishes - those helpers are not part of the public C ABI.
-#
-# Compiling kek_store.cpp/wire_format.cpp a second time here (they're also
-# compiled once already as part of the hkdfguard DLL target in the parent
-# CMakeLists.txt) is intentional and harmless: each ends up in a separate
-# binary (HkdfGuard.dll vs. test_roundtrip.exe), so there's no linker
-# conflict from the same function existing in both.
+# and also compiles some of src/ directly so it can call internal helpers
+# such as DeleteKek() to remove the KEKs it creates. Those sources are
+# compiled into the DLL too; each copy lives in a separate binary, so there
+# is no linker conflict.
 add_executable(test_roundtrip
     test_roundtrip.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/kek_store.cpp
@@ -15,67 +10,45 @@ add_executable(test_roundtrip
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/policy.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/key_acl.cpp
     # ecdh_hkdf.cpp + hash_to_curve.cpp: so the test can call
-    # IsValidP256Point and PayloadEcdhPoint directly (hand-built points, and
-    # the Linux implementation's hash-to-curve vectors) without a KEK, and
-    # DeriveWrappingKey with the test-only provider fault enabled.
+    # IsValidP256Point and PayloadEcdhPoint directly (hand-built points and
+    # the Linux implementation's hash-to-curve vectors) without a KEK, and DeriveWrappingKey
+    # with the test-only provider fault enabled.
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/ecdh_hkdf.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/hash_to_curve.cpp
-    # event_log.cpp: kek_store.cpp's CreateKek logs KEK creation, so this
-    # test's own compiled copy of kek_store.cpp needs it too.
+    # event_log.cpp: the test's copy of kek_store.cpp logs KEK creation.
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/event_log.cpp
     # key_file.cpp: so the test can call ReadWrappedKeyFile (hkdfguard_open_file's
     # implementation) directly.
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/key_file.cpp
 )
-# Links against hkdfguard (the DLL's import library, for the public ABI
-# calls) plus the two raw Windows crypto libraries directly (needed because
-# this executable now also compiles kek_store.cpp itself, which calls
-# NCrypt*/BCrypt* functions of its own).
+# The DLL's import library for the public ABI calls, plus the Windows
+# libraries the directly compiled src/ files call into.
 target_link_libraries(test_roundtrip PRIVATE hkdfguard ncrypt.lib bcrypt.lib ntdll.lib netapi32.lib)
 target_include_directories(test_roundtrip PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../include
     ${CMAKE_CURRENT_SOURCE_DIR}/../src
 )
-# Enables policy.h/.cpp's SetTestPolicyOverride seam (see policy.h) in this
-# target's own compiled copy of policy.cpp only. The hkdfguard DLL target in
-# the parent CMakeLists.txt never defines this macro, so its own separate
-# compiled copy of policy.cpp has no such function, and no override state,
-# at all - the seam does not exist in shipped release code.
+# Enables policy.h's SetTestPolicyOverride seam in this target's copy of
+# policy.cpp only. The DLL target never defines this macro, so the seam does
+# not exist in shipped code.
 target_compile_definitions(test_roundtrip PRIVATE HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
 
-# Registers test_roundtrip.exe as a CTest test named "roundtrip" - what
-# `ctest` (see README.md) actually runs.
 add_test(NAME roundtrip COMMAND test_roundtrip)
-# Windows only searches a fixed set of locations for a DLL an .exe depends
-# on, and the directory containing HkdfGuard.dll (the build output directory
-# for that target) isn't necessarily one of them when ctest launches
-# test_roundtrip.exe directly. This prepends that directory onto PATH for
-# just this one test's process, so the OS loader can find HkdfGuard.dll at
-# startup. $<TARGET_FILE_DIR:hkdfguard> is a CMake "generator expression" -
-# evaluated at build-configuration time to the real output path, whatever it
-# ends up being for the chosen build type/generator.
+# HkdfGuard.dll's output directory goes on the front of PATH for each test
+# process so the loader finds the DLL.
 #
-# ENVIRONMENT is a CMake *list*, so every unescaped ';' in its value starts
-# a new list entry. Windows PATH is itself ';'-separated, so splicing
-# $ENV{PATH} in raw would leave the test with PATH set to the DLL directory
-# alone (everything after the first ';' becoming bogus separate entries) -
-# no System32, so the CLI test could not even find cmd.exe. Escaping each
-# ';' keeps the whole value as one PATH entry.
+# ENVIRONMENT is a CMake list, so every unescaped ';' starts a new entry.
+# PATH is itself ';'-separated; spliced in raw, the test's PATH would be the
+# DLL directory alone - no System32, not even cmd.exe. Escaping each ';'
+# keeps the whole value as one PATH entry.
 string(REPLACE ";" "\\;" HKDFGUARD_TEST_PATH "$ENV{PATH}")
 set_tests_properties(roundtrip PROPERTIES
     ENVIRONMENT "PATH=$<TARGET_FILE_DIR:hkdfguard>\\;${HKDFGUARD_TEST_PATH}"
 )
 
-# test_cli.ps1 exercises hkdfguard.exe's own argument parsing,
-# validation, and file-handling behavior - none of which test_roundtrip
-# covers, since that only calls into HkdfGuard.dll directly and never spawns
-# the CLI. Registered as an ordinary ctest test whose "command" happens to be
-# powershell.exe running a script, the same way any other test executable
-# would be; $<TARGET_FILE:hkdfguard-cli> resolves to the CLI's real
-# built path (whatever it ends up being for the chosen generator/config),
-# passed as that script's -CliExePath argument. hkdfguard.exe
-# needs HkdfGuard.dll to be findable too (same reason as roundtrip/
-# direct_aead above), so this test gets the identical PATH treatment.
+# test_cli.ps1 exercises hkdfguard.exe's argument parsing, validation and
+# file handling, which test_roundtrip (DLL calls only) doesn't cover. It
+# gets the built CLI's path as -CliExePath and the same PATH as roundtrip.
 add_test(
     NAME cli
     COMMAND powershell.exe -NoProfile -ExecutionPolicy Bypass

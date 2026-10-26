@@ -31,11 +31,10 @@ param(
     [Parameter(Mandatory = $true)][string]$DllPath
 )
 
-# This script uses no PowerShell module - not LocalAccounts (Get-LocalGroup
-# and friends) nor Security (Get-Acl / Set-Acl). A Windows PowerShell that
-# ctest starts from a PowerShell 7 session can fail to load either, even when
-# imported by full path. Accounts and groups go through ADSI (WinNT://) and
-# file permissions through .NET's ACL API, both always present.
+# No PowerShell module is used - neither LocalAccounts nor Security
+# (Get-Acl / Set-Acl): Windows PowerShell started by ctest from a PowerShell
+# 7 session can fail to load either, even by full path. Accounts and groups
+# go through ADSI (WinNT://) and file permissions through .NET's ACL API.
 
 $ErrorActionPreference = "Stop"
 $failures = 0
@@ -262,8 +261,8 @@ try {
     Check ($r.StdOut -match "open=-39") "application: hkdfguard_open_file refuses the key file it persisted itself (FILE_UNTRUSTED)"
     if ($r.StdOut -notmatch "open=-39") { Write-Host "    $($r.StdOut) $($r.StdErr)" }
 
-    # Membership is read when the file is opened: no longer a deployer, the
-    # deployer's files are no longer trusted.
+    # Membership is read when the file is opened: once its author leaves
+    # HkdfGuardDeployers, the author's files aren't trusted.
     Remove-TestGroupMember "HkdfGuardDeployers" $depName
     $r = Invoke-As $app $probe @("open", $keyFile)
     Check ($r.StdOut -match "open=-39") "application: once its author leaves HkdfGuardDeployers, the key file is refused"

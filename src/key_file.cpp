@@ -157,10 +157,7 @@ namespace hkdfguard {
         // Rights on a folder that let a principal create new entries in it:
         // "create files / write data" (FILE_ADD_FILE), "create folders /
         // append data" (FILE_ADD_SUBDIRECTORY), and GENERIC_WRITE, which
-        // maps to both. The Windows counterpart of a directory's write bit
-        // for group or others, which the Linux build refuses whether or not
-        // the directory is sticky (/tmp-style). Refused on the key file's
-        // own folder and every folder above it - except the drive root (see
+        // maps to both. Refused on the key file's own folder and every folder above it - except the drive root (see
         // kDriveRootRights) - so C:\ProgramData and C:\Windows\Temp, which
         // let Users create entries, and a folder that inherited that from
         // them, are refused.
@@ -231,8 +228,7 @@ namespace hkdfguard {
         //     ResolveDeployerPrincipals. The account this process runs as is
         //     trusted only if it is such a member, so an application runner
         //     can't persist a key file its own service would accept.
-        //   Developer: the account this process runs as - the counterpart of
-        //     the Linux build's "root or this process's user".
+        //   Developer: the account this process runs as.
         //
         // OWNER RIGHTS is accepted in an ACE because it means "whoever owns
         // this", and the owner is checked separately. CREATOR OWNER and
@@ -241,7 +237,7 @@ namespace hkdfguard {
         class TrustedPrincipals {
         public:
             // Reads the security model (and, for Production, the deployer
-            // groups) now. Throws HkdfGuardError(HKDFGUARD_ERR_POLICY_INVALID)
+            // groups) at construction. Throws HkdfGuardError(HKDFGUARD_ERR_POLICY_INVALID)
             // for an invalid SecurityModel value, and
             // HKDFGUARD_ERR_WIN_GROUP_INVALID for a bad DeployerGroups entry.
             TrustedPrincipals() : model_(LoadSecurityModel()) {
@@ -396,8 +392,7 @@ namespace hkdfguard {
         // drive root - the key file's own folder included - must grant
         // nobody else kFolderRights: no one else may rename a file of their
         // choosing over the key, move the key's folder out of the way and
-        // one of their own into its place, or even create entries there
-        // (the Linux build's "no directory writable by group or others").
+        // one of their own into its place, or even create entries there.
         // The drive root itself (chain.handles[0]) is held to
         // kDriveRootRights only: a trusted owner, and no one else may
         // rename or delete what is directly beneath it, but creating new
@@ -422,16 +417,15 @@ namespace hkdfguard {
         // MARK: Plaintext keys written as text
 
         // Longest text form of a DEK recognised, surrounding whitespace
-        // included - the same limit as the Linux build. Every length up to
-        // it is below a payload's, so no payload can be mistaken for one.
+        // included. Every length up to it is below a payload's, so no
+        // payload can be mistaken for one.
         constexpr size_t kMaxPlaintextTextLen = 96;
         static_assert(kMaxPlaintextTextLen < kTotalLen && HKDFGUARD_DEK_LEN < kTotalLen,
                       "plaintext detection must never be able to refuse a real payload");
 
         // Branch-free byte classification for LooksLikePlaintextDek. Every
         // helper returns 0 or 1 and is straight-line arithmetic on uint32_t,
-        // with no data-dependent branch or table lookup. The Linux build's
-        // `ct` module, step for step.
+        // with no data-dependent branch or table lookup.
 
         // 1 if a == b, else 0 (inputs below 2^31).
         uint32_t CtEq(uint32_t a, uint32_t b) {
@@ -449,7 +443,7 @@ namespace hkdfguard {
             return b ^ ((a ^ b) & (0u - cond));
         }
 
-        // What Rust's trim_ascii removes: space, tab, LF, form feed, CR.
+        // ASCII whitespace: space, tab, LF, form feed, CR.
         uint32_t CtIsWhitespace(uint32_t c) {
             return CtEq(c, ' ') | CtEq(c, '\t') | CtEq(c, '\n') | CtEq(c, '\f') | CtEq(c, '\r');
         }
@@ -479,7 +473,7 @@ namespace hkdfguard {
         // recognising them is what turns "wrong file" into "this key is
         // exposed".
         //
-        // Constant-time in the contents, as on Linux and macOS: the only
+        // Constant-time in the contents: the only
         // branches are on the length, which the file's size already gives
         // away. Every byte is visited twice (once to find the text between
         // the surrounding whitespace, once to test it against all three
@@ -488,8 +482,7 @@ namespace hkdfguard {
         // first non-matching byte sits. Nothing is decoded, so the key is
         // never reassembled. Base64 is 43 characters, or 44 ending in '=',
         // all in one alphabet, whose last character's 2 unused bits are
-        // zero - what the Rust base64 crate's decoders the Linux build is
-        // tested against accept as 32 bytes.
+        // zero - the canonical encoding of 32 bytes.
         bool LooksLikePlaintextDek(const uint8_t *bytes, size_t len) {
             if (len == HKDFGUARD_DEK_LEN) {
                 return true;
@@ -695,8 +688,8 @@ namespace hkdfguard {
         }
         // And the file's own name. Short names are refused rather than
         // accepted: they are a second, auto-generated name for the same file,
-        // with a history of checks that matched one spelling but not the
-        // other. Case-insensitive, like the file system.
+        // and a check that matches one spelling can miss the other.
+        // Case-insensitive, like the file system.
         std::wstring actual = FinalPathOfHandle(file);
         if (CompareStringOrdinal(actual.c_str(), -1, expected.c_str(), -1, TRUE) != CSTR_EQUAL) {
             throw HkdfGuardError(HKDFGUARD_ERR_FILE_UNTRUSTED, "path uses an 8.3 short name");
@@ -708,15 +701,15 @@ namespace hkdfguard {
         // and can also wrap under the service's KEK could plant a DEK they
         // know, and unwrap would accept it as genuine. So the file and every
         // folder above it must be owned by SYSTEM, Administrators,
-        // TrustedInstaller or this account, and grant nobody else write,
-        // delete or ownership rights - nor, on the folders below the drive
-        // root, the right to create entries (see kFileWriteRights,
-        // kFolderRights and kDriveRootRights) - the Linux build's owner and
-        // mode checks, in ACL form. Checked on the open handle, after the path checks
-        // above, so it's the file actually read that is judged. (The OS
-        // refusing the open itself was HKDFGUARD_ERR_FILE_ACCESS_DENIED,
-        // above.) Who counts as trusted depends on the security model - see
-        // TrustedPrincipals; developer mode is announced in the event log.
+        // TrustedInstaller or a principal the security model trusts, and
+        // grant nobody else write, delete or ownership rights - nor, on the
+        // folders below the drive root, the right to create entries (see
+        // kFileWriteRights, kFolderRights and kDriveRootRights). Checked on
+        // the open handle, after the path checks above, so it's the file
+        // actually read that is judged. (The OS refusing the open itself is
+        // reported as HKDFGUARD_ERR_FILE_ACCESS_DENIED, above.) Who counts
+        // as trusted depends on the security model - see TrustedPrincipals;
+        // developer mode is announced in the event log.
         TrustedPrincipals trusted;
         if (trusted.model() == SecurityModel::Developer) {
             LogDeveloperModeKeyFile();
@@ -781,9 +774,9 @@ namespace hkdfguard {
         // unknown version, HKDFGUARD_ERR_PAYLOAD_MALFORMED for everything
         // else). Here they are re-thrown as HKDFGUARD_ERR_FILE_MALFORMED:
         // what this call reports is a verdict on the *file* - it is the
-        // right size but doesn't hold a valid wrapped key - which is also how
-        // the Linux and macOS builds of this ABI report a malformed key file,
-        // unknown version included.
+        // right size but doesn't hold a valid wrapped key - the same code
+        // other platforms' builds of this ABI report for a malformed key
+        // file, unknown version included.
         try {
             ParseWrappedDek(out, static_cast<int32_t>(kTotalLen));
         } catch (const HkdfGuardError &e) {

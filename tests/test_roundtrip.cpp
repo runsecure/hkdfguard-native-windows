@@ -1,10 +1,7 @@
-// This is a small hand-rolled test program, not built on a testing
-// framework like GoogleTest - it's a plain `main()` that runs a sequence of
-// checks and reports pass/fail for each, then exits 0 (success, the
-// standard "everything's fine" exit code a shell/CI system checks) or 1
-// (failure) depending on whether anything failed. CMake's `ctest` (see
-// tests/CMakeLists.txt) just runs this .exe and treats exit code 0 as a
-// passing test.
+// Hand-rolled test program (no test framework): main() runs a sequence of
+// checks, reports pass/fail for each, and exits 0 if all passed, 1
+// otherwise. ctest (see tests/CMakeLists.txt) runs this .exe and treats
+// exit code 0 as a pass.
 #include "hkdfguard.h"  // the public ABI under test
 #include "kek_store.h"  // CreateKek/KekExists/OpenKekForWrap/DeleteKek - internal helpers, used directly below
 #include "policy.h"     // SetTestPolicyOverride - internal test-only seam, used directly below
@@ -16,10 +13,12 @@
 #include "no_follow_open.h" // IsLocalDrivePath / IsLocalVolumeDeviceTarget - section -2d
 
 #include <aclapi.h>  // SetEntriesInAclW - section 25d widens an existing KEK's ACL
+#include <psapi.h>   // GetProcessMemoryInfo - section 30's leak probe
 #include <lm.h>      // NetLocalGroupAdd/AddMembers - section 24e makes this account a deployer
 #include <winioctl.h> // FSCTL_SET_REPARSE_POINT - section 24c plants a junction
 #include <sddl.h>    // ConvertStringSecurityDescriptorToSecurityDescriptorW - section 28
 #include <algorithm> // std::equal - section 24c
+#include <atomic>    // std::atomic - section 30's thread probe
 #include <chrono>    // steady_clock - section 0c2 times the setup floor
 #include <thread>    // std::thread - section 0c2 checks setup calls are serialized
 #include <cstdio>
@@ -28,21 +27,13 @@
 #include <vector>
 #include <string>
 
-// Anonymous namespace: everything in this block is private to this one
-// file (see aes_gcm.cpp for the fuller explanation of what this construct
-// does) - not that it matters much in a standalone test .exe with no other
-// translation units to collide with, but it's the same convention used
-// throughout the rest of the project.
 namespace {
 
-// A running count of failed checks, incremented by Check() below and read
-// back in main() to decide the process's final exit code.
+// Count of failed checks; main() uses it to pick the exit code.
 int g_failures = 0;
 
-// The test harness's one primitive: print PASS or FAIL for a labeled
-// condition, and keep count of failures. `const char* what` is a
-// human-readable label describing what's being checked, printed alongside
-// the result.
+// The harness's one primitive: print PASS or FAIL for a labeled condition
+// and count failures.
 void Check(bool condition, const char* what) {
     if (condition) {
         std::printf("[PASS] %s\n", what);
@@ -87,12 +78,9 @@ void CheckNeedsElevation(bool condition, const std::string& what) {
     CheckNeedsElevation(condition, what.c_str());
 }
 
-// Builds a deterministic (not random) 32-byte test DEK: each byte is some
-// simple, distinct function of its index, purely so bugs that shuffle or
-// truncate bytes are easy to spot rather than every byte looking the same.
-// Returned as a `std::vector<uint8_t>` - a plain (non-secure) dynamic byte
-// buffer is fine here since this is test data, not a real secret to
-// protect.
+// Builds a deterministic 32-byte test DEK: each byte is a distinct function
+// of its index, so bugs that shuffle or truncate bytes are easy to spot.
+// A plain (non-secure) buffer is fine for test data.
 std::vector<uint8_t> MakeDek() {
     std::vector<uint8_t> dek(HKDFGUARD_DEK_LEN);
     for (int i = 0; i < HKDFGUARD_DEK_LEN; ++i) {
@@ -101,9 +89,8 @@ std::vector<uint8_t> MakeDek() {
     return dek;
 }
 
-// Used to verify the "output buffer zeroed on failure" requirement: scans
-// `len` bytes starting at `buf` and returns true only if every single one
-// is 0.
+// Checks the "output buffer zeroed on failure" requirement: true only if
+// all `len` bytes of `buf` are 0.
 bool AllZero(const uint8_t* buf, size_t len) {
     for (size_t i = 0; i < len; ++i) {
         if (buf[i] != 0) return false;
@@ -111,13 +98,9 @@ bool AllZero(const uint8_t* buf, size_t len) {
     return true;
 }
 
-// Two distinct service names used across the checks below, each in both
-// its UTF-8 form (`char`, passed to the public ABI functions) and wide
-// form (`wchar_t`, passed to the internal DeleteKek for cleanup - see
-// kek_store.h). Because both are plain ASCII text, the UTF-8 bytes and the
-// UTF-16 code units happen to correspond 1:1 character-for-character, so
-// writing out both literals by hand here (rather than converting one from
-// the other at runtime) is a safe shortcut for test code specifically.
+// Two distinct service names, each as UTF-8 (for the public ABI) and wide
+// (for the internal DeleteKek - see kek_store.h). Both are plain ASCII, so
+// the two literals correspond 1:1.
 //
 // Only alphanumeric characters and '.' are used - hkdfguard.cpp's
 // IsValidServiceChar rejects everything else, including '-' (see check 17
@@ -145,20 +128,11 @@ constexpr wchar_t kServiceUseGroupsWide[] = L"hkdfguardwin.test.usegroups";
 // only that provider is queried.
 void CleanupKek(const wchar_t* service_wide, uint8_t provider_type, const char* label) {
     try {
-        // `std::wstring(service_wide)` constructs a std::wstring by copying
-        // from the `const wchar_t*` literal - DeleteKek's parameter type is
-        // `const std::wstring&` (see kek_store.h), so this conversion has
-        // to happen somewhere, and it's simplest to do it right here at the
-        // one call site rather than changing DeleteKek's signature just for
-        // this test.
         hkdfguard::DeleteKek(std::wstring(service_wide), provider_type, hkdfguard::kCurrentKeyId);
         std::printf("[INFO] cleaned up KEK for %s\n", label);
     } catch (const std::exception& e) {
-        // Cleanup failing doesn't fail the test itself (it's not what this
-        // test is checking) - it's just surfaced as a warning so it's
-        // visible in the test log if something about deletion is broken.
-        // `e.what()` retrieves the message HkdfGuardError's constructor
-        // stored via std::runtime_error - see errors.h.
+        // A cleanup failure isn't what this test checks, so it is only
+        // logged as a warning.
         std::printf("[WARN] failed to clean up KEK for %s: %s\n", label, e.what());
     }
 }
@@ -166,12 +140,10 @@ void CleanupKek(const wchar_t* service_wide, uint8_t provider_type, const char* 
 // Forces LoadEffectivePolicy() to return `policy` for the duration of this
 // call (via the test-only SetTestPolicyOverride seam - see policy.h), then
 // exercises CreateKek/KekExists/OpenKekForWrap directly against the
-// internal kek_store API - the same internal API CleanupKek's DeleteKek
-// call above uses, bypassing HkdfGuard.dll entirely - so this test can
-// cover all three KeyStoragePolicy branches deterministically, regardless
-// of this machine's actual registry policy or TPM/vTPM availability.
-// Cleans up whatever it creates before returning, and always clears the
-// override on the way out.
+// internal kek_store API, bypassing HkdfGuard.dll, so all three
+// KeyStoragePolicy branches are covered regardless of this machine's
+// registry policy or TPM/vTPM availability. Cleans up whatever it creates
+// and always clears the override on the way out.
 //
 // `tpmMayBeUnavailable` accepts CreateKek throwing as a legitimate outcome
 // rather than a test failure: RequireTpm's documented contract is "use the
@@ -691,10 +663,10 @@ constexpr char kGoldenKekX[] = "a55c04e4b2113126f3ea5244034decd0c0c9f55cd25d2e03
 constexpr char kGoldenKekY[] = "4ab897ae67c14350a0213b0a67d416472aa053a16992018ac4d874dc8529569d";
 constexpr char kGoldenKekD[] = "9639379738995d1017b34a6398b444cf9cd0c82acb0dc0cd5d40c91b513f4e90";
 constexpr char kGoldenSalt[] = "4242424242424242424242424242424242424242424242424242424242424242";
-// H(kGoldenSalt): produced by the Linux implementation's payload_ecdh_point
-// on the RustCrypto p256 0.14 crate - NOT by this project's
-// hash_to_curve.cpp - so the golden payload pins Windows to the Linux
-// hash-to-curve as well as to the rest of the construction.
+// H(kGoldenSalt): produced by the Linux implementation's payload_ecdh_point,
+// not by this project's hash_to_curve.cpp, so the golden payload pins this
+// library to the documented hash-to-curve as well as the rest of the
+// construction.
 constexpr char kGoldenPointX[] = "23705f112056934aef2059c9c3ffa610ccb2f070d266d4ffa06210d37e9a0de5";
 constexpr char kGoldenPointY[] = "df412b76994469fb7c27385e2d8f389f3da716076c79a19bb57249c9755f032a";
 constexpr char kGoldenNonce[] = "977bcd31c21caffe32bc3f6a";
@@ -702,14 +674,13 @@ constexpr char kGoldenService[] = "hkdfguardwin.test.golden";
 constexpr wchar_t kGoldenServiceWide[] = L"hkdfguardwin.test.golden";
 
 // The golden WrappedDekV1 payload: MakeDek() wrapped under the golden KEK
-// for kGoldenService, with the golden salt and nonce, under the Linux
-// build's key derivation (HKDF info = "hkdfguard-wrap-v1:" || u16le(len) ||
+// for kGoldenService, with the golden salt and nonce, under the documented
+// key derivation (HKDF info = "hkdfguard-wrap-v1:" || u16le(len) ||
 // service || header || fingerprint; AAD = header || fingerprint). Computed
-// outside this project with .NET's HKDF and AesGcm, and its wrapping key
-// (4de2f10c...) confirmed by the Linux crate's own derive_wrapping_key.
-// Frozen from the first release on: if a code change makes this stop
-// unwrapping, that change breaks every payload already deployed - fix the
-// change, never this constant.
+// outside this project, and its wrapping key (4de2f10c...) matches the
+// Linux implementation's derive_wrapping_key. Frozen: if a code change
+// makes this stop unwrapping, that change breaks every payload already
+// deployed - fix the change, never this constant.
 constexpr char kGoldenPayloadHex[] =
     "010200000100000042424242424242424242424242424242424242424242424242424242"
     "42424242977bcd31c21caffe32bc3f6a83bd5956cb4af147e9f9bdbe2efedd0eefc55ddb"
@@ -768,7 +739,7 @@ std::vector<uint8_t> IndependentAuthenticated(uint8_t providerType, const std::v
 // `kekD` (the KEK's private scalar) this is the genuine derivation, Z =
 // ECDH(d, point). Without it - `kekD` null - Z is instead ECDH(e, KEK
 // public) for a fresh random e: exactly what someone holding only the KEK's
-// public key can compute, as the earlier ECIES construction allowed.
+// public key can compute.
 bool IndependentWrappingKey(const std::vector<uint8_t>& salt, const std::vector<uint8_t>& point,
                             const std::vector<uint8_t>& kekPub, const std::vector<uint8_t>* kekD,
                             const char* service, uint8_t providerType, std::vector<uint8_t>& aesKey) {
@@ -1033,8 +1004,8 @@ int main() {
         } else {
             const std::wstring device = std::wstring(1, letter) + L":";
             const std::wstring path = device + L"\\hkdfguard\\key.bin";
-            // "\Device\MUP\..." passed the old check, which matched
-            // "\Device\" but looked for "\Device\Mup" case-sensitively.
+            // "\Device\MUP\..." must be refused: the "\Device\Mup" match is
+            // case-insensitive.
             if (DefineDosDeviceW(DDD_RAW_TARGET_PATH, device.c_str(), L"\\Device\\MUP\\localhost\\c$")) {
                 Check(!hkdfguard_nofollow::IsLocalDrivePath(path),
                       "a drive letter redefined to \\Device\\MUP\\... is not a local drive");
@@ -1531,25 +1502,18 @@ int main() {
     CheckNeedsElevation(rc == HKDFGUARD_OK, "create_kek provisions kService's KEK");
 
     std::vector<uint8_t> wrapped(HKDFGUARD_WRAPPED_MAX_LEN);
-    // `wrapped_len` is initialized to the buffer's actual capacity before
-    // the call - this is the "in" half of the in/out `out_len` parameter
-    // (see hkdfguard.h); hkdfguard_wrap_dek reads this to know how much
-    // room it has, then overwrites it with the real output length.
+    // In/out `out_len` (see hkdfguard.h): the buffer's capacity going in,
+    // the real output length coming back.
     int32_t wrapped_len = static_cast<int32_t>(wrapped.size());
 
-    // `&wrapped_len` - the address-of operator - is how a plain local
-    // variable is turned into the `int32_t*` the function signature
-    // requires for its in/out parameter.
     rc = hkdfguard_wrap_dek(kService, dek.data(), static_cast<int32_t>(dek.size()), wrapped.data(), &wrapped_len);
     CheckNeedsElevation(rc == HKDFGUARD_OK, "wrap succeeds");
     const bool primary_wrap_ok = (rc == HKDFGUARD_OK);
     Check(wrapped_len == HKDFGUARD_WRAPPED_MAX_LEN, "wrap produces fixed-size payload");
 
     // Byte offset 1 of the wrapped payload is ProviderType (see
-    // wire_format.h's layout table) - reading it directly out of the
-    // wrapped bytes like this, rather than through any library function, is
-    // deliberate: it's testing the actual on-the-wire output, the same
-    // thing any other language's binding would see.
+    // wire_format.h's layout table), read straight from the bytes so the
+    // check is on the actual wire output.
     uint8_t provider_type = wrapped[1];
     CheckNeedsElevation(provider_type == 1 || provider_type == 2, "provider type is TPM(1) or Software(2)");
     std::printf("    (provider_type = %d)\n", provider_type);
@@ -1559,10 +1523,6 @@ int main() {
     rc = hkdfguard_unwrap_dek(kService, wrapped.data(), wrapped_len, unwrapped.data(), &unwrapped_len);
     CheckNeedsElevation(rc == HKDFGUARD_OK, "unwrap succeeds");
     Check(unwrapped_len == HKDFGUARD_DEK_LEN, "unwrap produces 32-byte DEK");
-    // std::memcmp (declared in <cstring>) compares raw bytes and returns 0
-    // when they're identical - the standard way to check two byte buffers
-    // are equal, since operator== isn't defined for raw pointers/arrays the
-    // way it is for e.g. std::vector or std::string.
     CheckNeedsElevation(std::memcmp(dek.data(), unwrapped.data(), HKDFGUARD_DEK_LEN) == 0, "unwrapped DEK matches original");
 
     // ---- 1b. Service names are case-insensitive: a service name that only ----
@@ -1715,17 +1675,10 @@ int main() {
     Check(tiny_out_len == HKDFGUARD_DEK_LEN, "unwrap reports the required size through out_len on BUFFER_TOO_SMALL");
 
     // ---- 9. Malformed payload (truncated). ----
-    // `std::vector<uint8_t> truncated(wrapped.begin(), wrapped.begin() +
-    // wrapped_len - 1)` builds a *new* vector from a range of `wrapped`'s
-    // elements - here, every element except the last one - using the
-    // "iterator pair" constructor: `.begin()` is an iterator (a
-    // pointer-like object) to the first element, and `.begin() + N` one
-    // pointing N elements later; the constructor copies everything from the
-    // first iterator up to (but not including) the second.
+    // Every byte of the payload but the last.
     std::vector<uint8_t> truncated(wrapped.begin(), wrapped.begin() + wrapped_len - 1);
-    // Pre-filled with 0xAA (not 0) specifically so the AllZero() check below
-    // is actually testing something - if the buffer already started at all
-    // zeros, seeing zeros afterward wouldn't prove the library did anything.
+    // Pre-filled with 0xAA (not 0) so the AllZero() check below proves the
+    // library zeroed it.
     std::vector<uint8_t> out_for_malformed(HKDFGUARD_DEK_LEN, 0xAA);
     int32_t malformed_out_len = static_cast<int32_t>(out_for_malformed.size());
     rc = hkdfguard_unwrap_dek(kService, truncated.data(), static_cast<int32_t>(truncated.size()),
@@ -1734,16 +1687,10 @@ int main() {
     Check(AllZero(out_for_malformed.data(), out_for_malformed.size()), "output buffer zeroed after malformed payload");
 
     // ---- 10. Corrupted ciphertext -> authentication failure, output zeroed. ----
-    // `std::vector<uint8_t> corrupted = wrapped;` copies the whole vector
-    // (std::vector's copy constructor, unlike SecureBuffer's, is not
-    // deleted - it's perfectly fine to copy plain wrapped-payload bytes,
-    // which aren't secret).
     std::vector<uint8_t> corrupted = wrapped;
-    // `^= 0xFF` flips every bit of that one byte (XOR-assignment) -
-    // guaranteed to change its value no matter what it was, corrupting one
-    // byte in the middle of the ciphertext region. Computed from
-    // wire_format.h's offsets, never written as a number, so a layout
-    // change can't silently move it into a different field.
+    // Flip every bit of one byte in the middle of the ciphertext. The
+    // position comes from wire_format.h's offsets, never a literal, so a
+    // layout change can't silently move it into a different field.
     corrupted[hkdfguard::kCiphertextOffset + hkdfguard::kCiphertextLen / 2] ^= 0xFF; // inside the ciphertext region
     std::vector<uint8_t> out_for_auth(HKDFGUARD_DEK_LEN, 0xAA);
     int32_t auth_out_len = static_cast<int32_t>(out_for_auth.size());
@@ -1767,7 +1714,7 @@ int main() {
     //           KEK before any ECDH/decryption, so a payload that doesn't
     //           belong to this KEK is distinguishable from a tampered one.
     std::vector<uint8_t> corrupted_fingerprint = wrapped;
-    corrupted_fingerprint[wrapped_len - 1] ^= 0xFF; // the payload's very last byte is now fingerprint, not tag
+    corrupted_fingerprint[wrapped_len - 1] ^= 0xFF; // the payload's last byte is in the fingerprint
     std::vector<uint8_t> out_for_fingerprint(HKDFGUARD_DEK_LEN, 0xAA);
     int32_t fingerprint_out_len = static_cast<int32_t>(out_for_fingerprint.size());
     rc = hkdfguard_unwrap_dek(
@@ -1791,17 +1738,14 @@ int main() {
     // Both a null service (the null-pointer check) and an empty (but
     // non-null) one (the length check) are reported by hkdfguard.cpp's
     // ValidateAndConvertService as HKDFGUARD_ERR_INVALID_SERVICE_NAME, not
-    // the generic HKDFGUARD_ERR_INVALID_ARGUMENT - matching the Linux and
-    // macOS builds of this ABI. See check 17 below for the charset check
-    // that same function applies.
+    // the generic HKDFGUARD_ERR_INVALID_ARGUMENT. See check 17 below for the
+    // charset check that same function applies.
     int32_t null_service_out_len = static_cast<int32_t>(scratch.size());
     rc = hkdfguard_wrap_dek(nullptr, dek.data(), static_cast<int32_t>(dek.size()), scratch.data(), &null_service_out_len);
     Check(rc == HKDFGUARD_ERR_INVALID_SERVICE_NAME, "wrap rejects null service");
 
     int32_t empty_service_out_len = static_cast<int32_t>(scratch.size());
-    // `""` is a valid, non-null pointer to a single '\0' byte - a distinct
-    // case from `nullptr` above, and this checks the length-based rejection
-    // rather than the null-pointer rejection.
+    // Non-null but empty: exercises the length check, not the null check.
     rc = hkdfguard_wrap_dek("", dek.data(), static_cast<int32_t>(dek.size()), scratch.data(), &empty_service_out_len);
     Check(rc == HKDFGUARD_ERR_INVALID_SERVICE_NAME, "wrap rejects empty service");
 
@@ -1884,8 +1828,8 @@ int main() {
     //          UTF-8. hkdfguard.cpp's IsValidServiceChar charset check runs
     //          before the separate UTF-8-decoding step, and rejects any byte
     //          outside ASCII alphanumeric/'.', so both this check and check
-    //          18 below are, today, exercising that same charset rejection
-    //          rather than the UTF-8-specific one.
+    //          18 below exercise that charset rejection rather than the
+    //          UTF-8-specific one.
     // 0x80 alone is a bare UTF-8 continuation byte with no preceding lead
     // byte - never valid at that position in any well-formed UTF-8 string,
     // and also simply not an allowed service-name character either way.
@@ -1910,10 +1854,9 @@ int main() {
     Check(rc == HKDFGUARD_ERR_INVALID_SERVICE_NAME, "wrap rejects a well-formed but non-ASCII UTF-8 service name");
 
     // ---- 18b. Dot rules: no leading '.', no "..". ----
-    // The same list the Linux library's tests reject. Validation runs before
-    // any KEK is opened, so none of this needs elevation. A single trailing
-    // '.' stays legal, as on Linux: kek_exists must answer for it (OK, not
-    // INVALID_SERVICE_NAME).
+    // Validation runs before any KEK is opened, so none of this needs
+    // elevation. A single trailing '.' is legal: kek_exists must answer for
+    // it (OK, not INVALID_SERVICE_NAME).
     for (const char *bad : {".", "..", "...", ".hidden", ".com.example", "..parent", "com..example",
                             "com.example..", "a...b"}) {
         const std::string label = std::string(" \"") + bad + "\"";
@@ -1952,10 +1895,8 @@ int main() {
     Check(rc == HKDFGUARD_ERR_INVALID_ARGUMENT, "unwrap rejects null wrapped");
 
     // ---- 20. Invalid service (null / empty) is rejected on the unwrap side too. ----
-    // Check 12 above only checked this for wrap; unwrap validates `service`
-    // through the exact same ValidateAndConvertService helper, but that's an
-    // implementation detail this test shouldn't assume - each public entry
-    // point gets its own check.
+    // Unwrap shares wrap's ValidateAndConvertService (check 12), but each
+    // public entry point gets its own check rather than assuming that.
     null_unwrap_out_len = static_cast<int32_t>(unwrapped.size());
     rc = hkdfguard_unwrap_dek(nullptr, wrapped.data(), wrapped_len, unwrapped.data(), &null_unwrap_out_len);
     Check(rc == HKDFGUARD_ERR_INVALID_SERVICE_NAME, "unwrap rejects null service");
@@ -1964,8 +1905,8 @@ int main() {
     rc = hkdfguard_unwrap_dek("", wrapped.data(), wrapped_len, unwrapped.data(), &null_unwrap_out_len);
     Check(rc == HKDFGUARD_ERR_INVALID_SERVICE_NAME, "unwrap rejects empty service");
 
-    // ---- 21. Negative wrapped_len is an argument error, as on Linux - not ----
-    //          treated as an enormous unsigned length. (ParseWrappedDek also
+    // ---- 21. Negative wrapped_len is an argument error - not treated as ----
+    //          an enormous unsigned length. (ParseWrappedDek also
     //          checks the sign before casting to size_t, see wire_format.cpp.)
     null_unwrap_out_len = static_cast<int32_t>(unwrapped.size());
     rc = hkdfguard_unwrap_dek(kService, wrapped.data(), -1, unwrapped.data(), &null_unwrap_out_len);
@@ -2019,7 +1960,7 @@ int main() {
     rc = hkdfguard_generate_and_wrap_dek(kService, gen_scratch.data(), nullptr);
     Check(rc == HKDFGUARD_ERR_INVALID_ARGUMENT, "generate_and_wrap rejects null out_len");
 
-    // ---- 24a. The buffer contract, as on Linux. ----
+    // ---- 24a. The buffer contract. ----
     // A size probe (NULL out, *out_len 0) is answered with the size to
     // allocate, before any provider is reached or file opened: kServiceNoKek
     // has no KEK and the open_file path doesn't exist, so reaching either
@@ -2084,9 +2025,9 @@ int main() {
     //          Linux implementation, and the point gate - then, against the
     //          real KEK, that a payload can't be forged from the public key.
     {
-        // Points produced by the Linux implementation's payload_ecdh_point on
-        // the RustCrypto p256 0.14 crate (hkdfguard-native-linux), for three
-        // fixed salts. Windows must hash every salt to exactly these points.
+        // Reference points from the Linux implementation's
+        // payload_ecdh_point for three fixed salts; this library must hash
+        // each salt to exactly these points.
         std::vector<uint8_t> sequential(hkdfguard::kSaltLen);
         for (size_t i = 0; i < sequential.size(); ++i) sequential[i] = static_cast<uint8_t>(i);
         struct LinuxVector {
@@ -2158,8 +2099,8 @@ int main() {
     }
 
     // Forgery. The KEK's public key is readable by any account allowed to
-    // use the KEK. Under the earlier ECIES construction that was enough to
-    // build a payload unwrap accepted; now Z needs the private key. Built
+    // use the KEK, so it must not be enough to build a payload unwrap
+    // accepts: Z needs the private key. Built
     // here entirely outside the library: a payload sealed with the right
     // wrapping key must unwrap (proving the independent sealing is correct),
     // and one sealed with a key derived from the public key alone must not.
@@ -2273,7 +2214,16 @@ int main() {
         DWORD temp_long_len = GetLongPathNameW(temp, temp_long, MAX_PATH + 1);
         const std::wstring own = std::wstring((temp_long_len > 0 && temp_long_len <= MAX_PATH) ? temp_long : temp) +
                                  L"hkdfguard-production-" + std::to_wstring(GetCurrentProcessId()) + L".key";
-        if (WriteTestFile(own, wrapped)) {
+        // Production trusts deployer-group members' files, so when this
+        // account is a deployer its own file is correctly accepted.
+        int32_t me_trusted = -1;
+        const bool me_is_deployer =
+            hkdfguard_key_file_principal_trusted(ToUtf8(CurrentUserSidString()).c_str(), &me_trusted) == HKDFGUARD_OK &&
+            me_trusted == 1;
+        if (me_is_deployer) {
+            Skip("open_file: under the production model, a key file this account wrote itself is refused "
+                 "(this account is in a deployer group, which production trusts)");
+        } else if (WriteTestFile(own, wrapped)) {
             std::vector<uint8_t> out(HKDFGUARD_WRAPPED_MAX_LEN);
             int32_t len = static_cast<int32_t>(out.size());
             Check(hkdfguard_open_file(ToUtf8(own).c_str(), out.data(), &len) == HKDFGUARD_ERR_FILE_UNTRUSTED,
@@ -2355,8 +2305,7 @@ int main() {
                       "a 4096-byte file is too long");
 
         // A DEK written as text is a plaintext key too, whatever the
-        // surrounding whitespace - the same forms the Linux build refuses.
-        // The DEK starts FB EF BE FF FF FF so its standard and URL-safe
+        // surrounding whitespace. The DEK starts FB EF BE FF FF FF so its standard and URL-safe
         // encodings really differ ("++++////" vs "----____").
         {
             std::vector<uint8_t> text_dek = {0xFB, 0xEF, 0xBE, 0xFF, 0xFF, 0xFF};
@@ -2435,8 +2384,7 @@ int main() {
                           "a file in a folder Everyone may delete or rename is untrusted");
             // Create rights alone - "create files / write data" or "create
             // folders / append data" - for Users, Authenticated Users or
-            // Everyone: refused, like a group- or world-writable directory
-            // on Linux, sticky or not.
+            // Everyone: refused.
             struct CreateGrant {
                 const wchar_t* sid;
                 const wchar_t* mask;
@@ -3130,8 +3078,8 @@ int main() {
             if (got != c.want) std::printf("    (CheckKeyFileSecurity returned %d)\n", got);
         }
 
-        // The production model: this account is no longer trusted for
-        // being the caller; the deployer groups are. BUILTIN\Performance
+        // The production model: this account isn't trusted for being the
+        // caller; the deployer groups are. BUILTIN\Performance
         // Log Users (S-1-5-32-559) stands in for a deployer group: a real,
         // host-local, not over-broad group. This account is a member of
         // neither it nor HkdfGuardDeployers on a test machine; if it is, the
@@ -3200,8 +3148,7 @@ int main() {
         Check(!plain(b64 + "="), "detector: an extra '=' is not a DEK");
         Check(!plain("\v" + b64), "detector: vertical tab is not trimmed (as Rust's trim_ascii)");
         Check(plain(std::string(HKDFGUARD_DEK_LEN, '\0')), "detector: any 32 raw bytes");
-        // The constant-time rewrite: the same answers as the Linux build's
-        // edge-case test (the_detector_s_edge_cases_match_the_windows_build).
+        // Further edge cases: trimming, empty input, alphabets, hex.
         Check(plain("\f" + b64 + "\f"), "detector: form feed is trimmed");
         Check(!plain(""), "detector: empty is not a DEK");
         Check(!plain(std::string(50, ' ')), "detector: only whitespace is not a DEK");
@@ -3329,15 +3276,11 @@ int main() {
     //          a test-only override so this doesn't depend on this
     //          machine's real registry policy setting or TPM/vTPM
     //          availability (see policy.h's SetTestPolicyOverride and
-    //          CheckPolicyCreatesKek above). Every check above this point
-    //          already exercises the real, registry-reading
-    //          LoadEffectivePolicy() inside HkdfGuard.dll on every wrap/
-    //          unwrap/create_kek call - HkdfGuard.dll never calls
-    //          SetTestPolicyOverride itself, and the override lives in a
-    //          separate copy of policy.cpp's state compiled directly into
-    //          this .exe (see tests/CMakeLists.txt), so it has no way to
-    //          affect the DLL even if it wanted to. This section is the
-    //          only place that test-only override is exercised.
+    //          CheckPolicyCreatesKek above). The checks above exercise the
+    //          real, registry-reading LoadEffectivePolicy() inside
+    //          HkdfGuard.dll; the override lives in a separate copy of
+    //          policy.cpp's state compiled into this .exe (see
+    //          tests/CMakeLists.txt), so it cannot affect the DLL.
     CheckPolicyCreatesKek(
         hkdfguard::KeyStoragePolicy::SoftwareOnly,
         L"hkdfguardwin.test.policy.softwareonly",
@@ -3358,21 +3301,13 @@ int main() {
 
     // ---- 25b. An invalid KeyStoragePolicy value fails closed with ----
     //           HKDFGUARD_ERR_POLICY_INVALID, rather than being silently
-    //           treated as PreferTpm. KeyStoragePolicy::Invalid is exactly
-    //           what policy.cpp's ParsePolicyValue returns for a REG_DWORD
-    //           value that isn't 0/1/2, or what LoadEffectivePolicy returns
-    //           for a value of the wrong registry type - see policy.h's
-    //           comment on why that's a deliberate fail-closed choice
-    //           rather than a default substitution. Forced via the same
-    //           test-only override as section 25 above, so this needs
-    //           neither a real bad registry value nor elevation:
-    //           KekExists/CreateKek/OpenKekForWrap all read policy and
-    //           react to it immediately, before ever calling into NCrypt.
-    //           (OpenKekForUnwrap has the identical `if (policy ==
-    //           KeyStoragePolicy::Invalid) throw ...` guard - see
-    //           kek_store.cpp - but only reaches it after successfully
-    //           opening a real key, so exercising it here would need a
-    //           provisioned KEK; not duplicated as a separate check.)
+    //           treated as PreferTpm (see policy.h for why this fails
+    //           closed). Forced via the same test-only override as section
+    //           25, so this needs neither a real bad registry value nor
+    //           elevation: KekExists/CreateKek/OpenKekForWrap read policy
+    //           before calling into NCrypt. (OpenKekForUnwrap has the same
+    //           guard - see kek_store.cpp - but only after opening a real
+    //           key, so it isn't checked separately here.)
     hkdfguard::SetTestPolicyOverride(hkdfguard::KeyStoragePolicy::Invalid);
 
     bool kek_exists_rejects_invalid_policy = false;
@@ -3406,12 +3341,10 @@ int main() {
     //           at one no provider is registered under (see kek_store.h's
     //           SetTestTpmProviderNameOverride - a test-only seam, absent
     //           from HkdfGuard.dll), so this is deterministic on hardware
-    //           that does have a TPM. Guards against the regression where
-    //           KekExists threw HKDFGUARD_ERR_PROVIDER_ERROR here while CreateKek
-    //           and OpenKekForWrap on the same host happily fell back -
-    //           which made hkdfguard_kek_exists, and so the CLI's
-    //           `provision`, fail on exactly the hosts the fallback is for.
-    //           The RequireTpm half checks the opposite contract: with no
+    //           that does have a TPM. KekExists must fall back just as
+    //           CreateKek and OpenKekForWrap do, or hkdfguard_kek_exists (and
+    //           so the CLI's `provision`) would fail on exactly the hosts the
+    //           fallback is for. The RequireTpm half checks the opposite contract: with no
     //           TPM, "exists?" must fail closed with PROVIDER_ERROR rather than
     //           answer from the software provider.
     constexpr const wchar_t* kServiceNoTpmWide = L"hkdfguardwin.test.policy.notpm";
@@ -3457,10 +3390,10 @@ int main() {
     // ---- 25d. Re-provisioning a KEK whose ACL has been widened since ----
     //           creation (or that was pre-planted with a wide ACL) fails
     //           with HKDFGUARD_ERR_KEK_INVALID, and the key is left
-    //           exactly where it was - never deleted or replaced. Before
-    //           this check, create_kek accepted any existing key under the
-    //           service's name as "already provisioned" without looking at
-    //           who it admits. SoftwareOnly keeps this off the TPM so it's
+    //           exactly where it was - never deleted or replaced. An
+    //           existing key under the service's name only counts as
+    //           "already provisioned" if its ACL admits no one it shouldn't.
+    //           SoftwareOnly keeps this off the TPM so it's
     //           deterministic; elevated-only (KEK creation), so it's skipped
     //           when not elevated.
     constexpr const wchar_t* kServiceAclWidenedWide = L"hkdfguardwin.test.aclwidened";
@@ -3470,8 +3403,8 @@ int main() {
         hkdfguard::CreateKek(kServiceAclWidenedWide);
         acl_widened_created = true;
 
-        // Re-provisioning an untouched KEK is still fine (baseline for the
-        // check below - the new ACL check must not reject our own keys).
+        // Baseline: re-provisioning an untouched KEK succeeds - the ACL
+        // check must not reject our own keys.
         Check(
             InternalCreateKekResult(kServiceAclWidenedWide) == HKDFGUARD_OK,
             "create_kek accepts its own, unmodified existing KEK");
@@ -3565,9 +3498,9 @@ int main() {
         hkdfguard::SetTestPolicyOverride(hkdfguard::KeyStoragePolicy::PreferTpm);
 
         // 26a. A TPM that errors while being probed (here: not ready) may
-        //      have a KEK behind it, so nothing may fall back. Before the
-        //      fix, KekExists answered "false" from software, wrap opened
-        //      the software provider, and create made a software KEK.
+        //      have a KEK behind it, so nothing may fall back: KekExists must
+        //      not answer "false" from software, wrap must not open the
+        //      software provider, and create must not make a software KEK.
         //      The fault is injected at NCryptOpenKey, which is only reached
         //      once the TPM provider itself has opened. Without one (e.g. a
         //      hosted CI runner), opening the provider fails first - which is
@@ -3690,7 +3623,7 @@ int main() {
 
     // ---- 28. Re-provisioning refuses an existing KEK whose ACL grants an ----
     //          over-broad principal through a conditional (callback) allow
-    //          ACE, or grants one of the broad groups added to the denylist.
+    //          ACE, or grants one of the broad groups on the denylist.
     //          Complements 25d, which covers a plain grant to Everyone.
     {
         constexpr const wchar_t* kServiceAclEntries = L"hkdfguardwin.test.aclentries";
@@ -3816,6 +3749,348 @@ int main() {
             } else {
                 Skip("golden payload: the shipped DLL unwraps the frozen payload (needs elevation)");
             }
+        }
+    }
+
+    // ---- 30. ABI contract sweep: the buffer and argument contracts of ----
+    //          every exported function, checked exhaustively where the input
+    //          is small enough to allow it (every byte of a payload, every
+    //          output capacity), with canaries past each buffer, plus a leak
+    //          probe and a thread probe. Expected codes are the header's.
+    {
+        // Every status this build may return, per include/hkdfguard.h. Any
+        // other value - or one the header says is never returned on Windows
+        // - is a contract break, however the call was abused.
+        auto documented = [](int32_t code) {
+            static const int32_t kCodes[] = {
+                HKDFGUARD_OK, HKDFGUARD_ERR_INVALID_ARGUMENT, HKDFGUARD_ERR_BUFFER_TOO_SMALL,
+                HKDFGUARD_ERR_PROVIDER_ERROR, HKDFGUARD_ERR_CRYPTO_ERROR, HKDFGUARD_ERR_INTERNAL_ERROR,
+                HKDFGUARD_ERR_INVALID_SERVICE_NAME, HKDFGUARD_ERR_POLICY_INVALID, HKDFGUARD_ERR_PAYLOAD_MALFORMED,
+                HKDFGUARD_ERR_PAYLOAD_AUTH_FAILED, HKDFGUARD_ERR_PAYLOAD_UNSUPPORTED,
+                HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH, HKDFGUARD_ERR_KEK_NOT_FOUND, HKDFGUARD_ERR_KEK_ACCESS_DENIED,
+                HKDFGUARD_ERR_KEK_INVALID, HKDFGUARD_ERR_PROCESS_HARDENING_FAILED, HKDFGUARD_ERR_FILE_NOT_FOUND,
+                HKDFGUARD_ERR_FILE_ACCESS_DENIED, HKDFGUARD_ERR_FILE_IO, HKDFGUARD_ERR_FILE_TOO_SHORT,
+                HKDFGUARD_ERR_FILE_TOO_LONG, HKDFGUARD_ERR_FILE_PLAINTEXT_KEY, HKDFGUARD_ERR_FILE_MALFORMED,
+                HKDFGUARD_ERR_FILE_UNTRUSTED, HKDFGUARD_ERR_WIN_GROUP_INVALID};
+            for (int32_t c : kCodes) {
+                if (c == code) return true;
+            }
+            return false;
+        };
+        static constexpr uint8_t kCanary = 0xA5;
+        static constexpr size_t kPad = 64;
+        // A buffer of `cap` usable bytes followed by kPad canary bytes: a
+        // write past the stated capacity shows up as a damaged canary.
+        auto canary_buffer = [&](size_t cap) { return std::vector<uint8_t>(cap + kPad, kCanary); };
+        auto canary_intact = [&](const std::vector<uint8_t>& buf, size_t cap) {
+            return std::all_of(buf.begin() + static_cast<std::ptrdiff_t>(cap), buf.end(),
+                               [](uint8_t b) { return b == kCanary; });
+        };
+
+        // A payload that parses - version, provider type, reserved bytes and
+        // KeyId all valid - for a service that has no KEK, so every call on
+        // it gets exactly as far as the KEK lookup.
+        std::vector<uint8_t> synthetic(HKDFGUARD_WRAPPED_MAX_LEN);
+        for (size_t i = 0; i < synthetic.size(); ++i) synthetic[i] = static_cast<uint8_t>((i * 37 + 11) & 0xFF);
+        synthetic[0] = hkdfguard::kFormatVersion1;
+        synthetic[1] = hkdfguard::kProviderTypeSoftware;
+        synthetic[2] = synthetic[3] = 0;
+        const uint32_t key_id = hkdfguard::kCurrentKeyId;
+        std::memcpy(&synthetic[4], &key_id, sizeof(key_id));
+        {
+            auto out = canary_buffer(HKDFGUARD_DEK_LEN);
+            int32_t len = HKDFGUARD_DEK_LEN;
+            int32_t r = hkdfguard_unwrap_dek(kServiceNoKek, synthetic.data(), HKDFGUARD_WRAPPED_MAX_LEN, out.data(), &len);
+            Check(r == HKDFGUARD_ERR_KEK_NOT_FOUND, "sweep setup: the synthetic payload parses and reaches the KEK lookup");
+        }
+
+        // 30a. Every single-bit mutation of every payload byte, through
+        //      unwrap: the field's documented code comes back, the output is
+        //      zeroed, out_len is untouched and nothing is written past it.
+        //      Header bytes are refused by the parser; everything after them
+        //      parses, so (with no KEK) the lookup fails next.
+        {
+            int bad_code = 0, not_zeroed = 0, outlen_moved = 0, overran = 0, undocumented = 0;
+            size_t first_bad = SIZE_MAX;
+            int32_t first_bad_rc = 0;
+            for (size_t off = 0; off < HKDFGUARD_WRAPPED_MAX_LEN; ++off) {
+                for (uint8_t mask : {uint8_t{0x01}, uint8_t{0x80}}) {
+                    std::vector<uint8_t> mutated = synthetic;
+                    mutated[off] ^= mask;
+                    const int32_t expected = off == 0   ? HKDFGUARD_ERR_PAYLOAD_UNSUPPORTED
+                                             : off < 8  ? HKDFGUARD_ERR_PAYLOAD_MALFORMED
+                                                        : HKDFGUARD_ERR_KEK_NOT_FOUND;
+                    auto out = canary_buffer(HKDFGUARD_DEK_LEN);
+                    int32_t len = HKDFGUARD_DEK_LEN;
+                    const int32_t r = hkdfguard_unwrap_dek(kServiceNoKek, mutated.data(), HKDFGUARD_WRAPPED_MAX_LEN,
+                                                           out.data(), &len);
+                    if (!documented(r)) ++undocumented;
+                    if (r != expected) {
+                        if (++bad_code == 1) { first_bad = off; first_bad_rc = r; }
+                    }
+                    if (!AllZero(out.data(), HKDFGUARD_DEK_LEN)) ++not_zeroed;
+                    if (len != HKDFGUARD_DEK_LEN) ++outlen_moved;
+                    if (!canary_intact(out, HKDFGUARD_DEK_LEN)) ++overran;
+                }
+            }
+            Check(bad_code == 0, "unwrap: every single-bit mutation of every payload byte (264 cases) gets its field's documented code");
+            if (bad_code) std::printf("    (%d mismatches; first at offset %zu returned %d)\n", bad_code, first_bad, first_bad_rc);
+            Check(undocumented == 0, "unwrap: no mutation produced an undocumented status code");
+            Check(not_zeroed == 0, "unwrap: the output buffer is zeroed after every one of those failures");
+            Check(outlen_moved == 0, "unwrap: out_len is left unchanged by every one of those failures");
+            Check(overran == 0, "unwrap: nothing is written past the stated output capacity in any of them");
+        }
+
+        // The same sweep on a real payload under a real KEK: past the
+        // header, the salt, nonce, ciphertext and tag fail authentication,
+        // and the fingerprint bytes are caught before any decryption.
+        if (primary_wrap_ok) {
+            int bad_code = 0, not_zeroed = 0;
+            size_t first_bad = SIZE_MAX;
+            int32_t first_bad_rc = 0;
+            for (size_t off = 0; off < HKDFGUARD_WRAPPED_MAX_LEN; ++off) {
+                std::vector<uint8_t> mutated = wrapped;
+                mutated[off] ^= 0x01;
+                const int32_t expected = off == 0     ? HKDFGUARD_ERR_PAYLOAD_UNSUPPORTED
+                                         : off < 8    ? HKDFGUARD_ERR_PAYLOAD_MALFORMED
+                                         : off < 100  ? HKDFGUARD_ERR_PAYLOAD_AUTH_FAILED
+                                                      : HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH;
+                auto out = canary_buffer(HKDFGUARD_DEK_LEN);
+                int32_t len = HKDFGUARD_DEK_LEN;
+                const int32_t r = hkdfguard_unwrap_dek(kService, mutated.data(), HKDFGUARD_WRAPPED_MAX_LEN, out.data(), &len);
+                if (r != expected) {
+                    if (++bad_code == 1) { first_bad = off; first_bad_rc = r; }
+                }
+                if (!AllZero(out.data(), HKDFGUARD_DEK_LEN)) ++not_zeroed;
+            }
+            Check(bad_code == 0, "unwrap: on a real payload, every byte's mutation fails with its field's code (unsupported / malformed / auth failed / fingerprint mismatch)");
+            if (bad_code) std::printf("    (%d mismatches; first at offset %zu returned %d)\n", bad_code, first_bad, first_bad_rc);
+            Check(not_zeroed == 0, "unwrap: no plaintext is left behind after any of those failures");
+        } else {
+            Skip("unwrap: the real-payload mutation sweep (needs elevation)");
+        }
+
+        // 30b. A wrapped_len that lies about a real 132-byte buffer: refused
+        //      as malformed from the length alone, so nothing past the buffer
+        //      is read (INT32_MAX would fault if it were).
+        {
+            int bad = 0;
+            for (int32_t lie : {int32_t{0}, int32_t{1}, int32_t{HKDFGUARD_WRAPPED_MAX_LEN - 1},
+                                int32_t{HKDFGUARD_WRAPPED_MAX_LEN + 1}, INT32_MAX}) {
+                auto out = canary_buffer(HKDFGUARD_DEK_LEN);
+                int32_t len = HKDFGUARD_DEK_LEN;
+                const int32_t r = hkdfguard_unwrap_dek(kServiceNoKek, synthetic.data(), lie, out.data(), &len);
+                if (r != HKDFGUARD_ERR_PAYLOAD_MALFORMED || !AllZero(out.data(), HKDFGUARD_DEK_LEN) || len != HKDFGUARD_DEK_LEN ||
+                    !canary_intact(out, HKDFGUARD_DEK_LEN)) {
+                    ++bad;
+                    std::printf("    (wrapped_len %d: returned %d)\n", lie, r);
+                }
+            }
+            Check(bad == 0, "unwrap: wrapped_len of 0, 1, 131, 133 and INT32_MAX are each refused as malformed without reading past the buffer");
+        }
+
+        // 30c. out_len is untouched, nothing is written past the capacity,
+        //      and (unwrap, open_file) the output is zeroed, on a failure
+        //      that is not BUFFER_TOO_SMALL - here an invalid service name or
+        //      a missing file - for each of the five buffer functions, at
+        //      capacities from exact to generous.
+        {
+            const std::string too_long(129, 'a');
+            int bad = 0;
+            for (size_t cap : {size_t{32}, size_t{132}, size_t{133}, size_t{4096}}) {
+                auto out = canary_buffer(cap);
+                int32_t len = static_cast<int32_t>(cap);
+                int32_t r = hkdfguard_kek_fingerprint(too_long.c_str(), out.data(), &len);
+                if (r != HKDFGUARD_ERR_INVALID_SERVICE_NAME || len != static_cast<int32_t>(cap) || !canary_intact(out, cap)) ++bad;
+
+                out = canary_buffer(cap); len = static_cast<int32_t>(cap);
+                r = hkdfguard_wrap_dek(too_long.c_str(), dek.data(), HKDFGUARD_DEK_LEN, out.data(), &len);
+                if (r != HKDFGUARD_ERR_INVALID_SERVICE_NAME || len != static_cast<int32_t>(cap) || !canary_intact(out, cap)) ++bad;
+
+                out = canary_buffer(cap); len = static_cast<int32_t>(cap);
+                r = hkdfguard_generate_and_wrap_dek(too_long.c_str(), out.data(), &len);
+                if (r != HKDFGUARD_ERR_INVALID_SERVICE_NAME || len != static_cast<int32_t>(cap) || !canary_intact(out, cap)) ++bad;
+
+                out = canary_buffer(cap); len = static_cast<int32_t>(cap);
+                r = hkdfguard_unwrap_dek(too_long.c_str(), synthetic.data(), HKDFGUARD_WRAPPED_MAX_LEN, out.data(), &len);
+                if (r != HKDFGUARD_ERR_INVALID_SERVICE_NAME || len != static_cast<int32_t>(cap) || !canary_intact(out, cap) ||
+                    !AllZero(out.data(), cap)) ++bad;
+
+                out = canary_buffer(cap); len = static_cast<int32_t>(cap);
+                r = hkdfguard_open_file("C:\\hkdfguard-no-such-dir\\absent.key", out.data(), &len);
+                const bool open_ok = cap >= HKDFGUARD_WRAPPED_MAX_LEN
+                                         ? (r == HKDFGUARD_ERR_FILE_NOT_FOUND && len == static_cast<int32_t>(cap) && AllZero(out.data(), cap))
+                                         : (r == HKDFGUARD_ERR_BUFFER_TOO_SMALL && len == HKDFGUARD_WRAPPED_MAX_LEN);
+                if (!open_ok || !canary_intact(out, cap)) ++bad;
+            }
+            Check(bad == 0, "every buffer function: on a non-size failure, out_len is untouched and nothing is written past the capacity (unwrap/open_file also zero the output), at four capacities");
+            if (bad) std::printf("    (%d of 20 calls broke the contract)\n", bad);
+        }
+
+        // 30d. The service-name rule, identically through every entry point
+        //      that takes one.
+        {
+            const std::string too_long(129, 'a');
+            const char* const names[] = {nullptr, "", too_long.c_str(), "caf\xC3\xA9", ".a", "a..b", "a-b", "a b", "a/b", "\t"};
+            int bad = 0;
+            for (const char* name : names) {
+                int32_t exists = -1, len;
+                auto out = canary_buffer(HKDFGUARD_WRAPPED_MAX_LEN);
+                if (hkdfguard_kek_exists(name, &exists) != HKDFGUARD_ERR_INVALID_SERVICE_NAME || exists != -1) ++bad;
+                len = HKDFGUARD_KEK_FINGERPRINT_LEN;
+                if (hkdfguard_kek_fingerprint(name, out.data(), &len) != HKDFGUARD_ERR_INVALID_SERVICE_NAME) ++bad;
+                if (hkdfguard_create_kek(name) != HKDFGUARD_ERR_INVALID_SERVICE_NAME) ++bad;
+                len = HKDFGUARD_WRAPPED_MAX_LEN;
+                if (hkdfguard_wrap_dek(name, dek.data(), HKDFGUARD_DEK_LEN, out.data(), &len) != HKDFGUARD_ERR_INVALID_SERVICE_NAME) ++bad;
+                len = HKDFGUARD_DEK_LEN;
+                if (hkdfguard_unwrap_dek(name, synthetic.data(), HKDFGUARD_WRAPPED_MAX_LEN, out.data(), &len) != HKDFGUARD_ERR_INVALID_SERVICE_NAME) ++bad;
+                len = HKDFGUARD_WRAPPED_MAX_LEN;
+                if (hkdfguard_generate_and_wrap_dek(name, out.data(), &len) != HKDFGUARD_ERR_INVALID_SERVICE_NAME) ++bad;
+                if (!canary_intact(out, HKDFGUARD_WRAPPED_MAX_LEN)) ++bad;
+            }
+            Check(bad == 0, "service names: null, empty, 129 bytes, non-ASCII, dot rules and separators are refused identically by all six entry points (60 calls)");
+            if (bad) std::printf("    (%d calls broke the rule)\n", bad);
+        }
+
+        // 30e. SID strings through key_file_principal_trusted: well-formed
+        //      ones answer, everything else is an argument error, and the
+        //      answer slot is untouched on failure.
+        {
+            const std::string long_sid = "S-1-5-21-" + std::string(10000, '1');
+            std::string sixteen = "S-1-5";
+            for (int i = 0; i < 15; ++i) sixteen += "-1"; // 16 sub-authorities: one over the maximum
+            const char* const sids[] = {"", "S", "S-", "S-1", "S-1-", "S-1-5-", "*S-1-5-32-544", "s-1-5-32-544",
+                                        "S-1-5-32-544 ", " S-1-5-32-544", "S-1-5-32-544\n", "S-1-5-32-544x",
+                                        "S-1-5-4294967296", "S-1-5--1", "S-1-5-32-544-", "S-1-0x5-32-544",
+                                        "BUILTIN\\Administrators", "Everyone", "\xFF\xFE", long_sid.c_str(), sixteen.c_str()};
+            int bad = 0;
+            for (const char* sid : sids) {
+                int32_t trusted = -7;
+                const int32_t r = hkdfguard_key_file_principal_trusted(sid, &trusted);
+                const bool ok = (r == HKDFGUARD_OK && (trusted == 0 || trusted == 1)) ||
+                                (r == HKDFGUARD_ERR_INVALID_ARGUMENT && trusted == -7) ||
+                                ((r == HKDFGUARD_ERR_POLICY_INVALID || r == HKDFGUARD_ERR_WIN_GROUP_INVALID) && trusted == -7);
+                if (!ok) {
+                    ++bad;
+                    std::printf("    (sid \"%.40s\": returned %d, trusted %d)\n", sid, r, trusted);
+                }
+            }
+            Check(bad == 0, "key_file_principal_trusted: 21 malformed and borderline SID strings each get OK with 0/1 or an argument error with the answer untouched");
+        }
+
+        // 30f. Leak probe: a few thousand failing and succeeding calls that
+        //      never reach a provider, plus a handful that do, must not
+        //      accumulate handles or private memory.
+        {
+            wchar_t temp[MAX_PATH + 1] = {};
+            GetTempPathW(MAX_PATH + 1, temp);
+            const std::wstring dir = std::wstring(temp) + L"hkdfguard-abi-" + std::to_wstring(GetCurrentProcessId());
+            CreateDirectoryW(dir.c_str(), nullptr);
+            const std::wstring malformed_path = dir + L"\\malformed.key";
+            std::vector<uint8_t> malformed = synthetic;
+            malformed[2] = 1; // reserved byte: FILE_MALFORMED, after the size check, with the bytes read
+            const bool have_file = WriteTestFile(malformed_path, malformed);
+            const std::string malformed_utf8 = ToUtf8(malformed_path);
+
+            auto one_round = [&](size_t i) {
+                auto out = canary_buffer(HKDFGUARD_WRAPPED_MAX_LEN);
+                int32_t len = HKDFGUARD_WRAPPED_MAX_LEN;
+                if (have_file) hkdfguard_open_file(malformed_utf8.c_str(), out.data(), &len);
+                std::vector<uint8_t> mutated = synthetic;
+                mutated[8 + (i % 124)] ^= 0x01;
+                len = HKDFGUARD_DEK_LEN;
+                hkdfguard_unwrap_dek(kServiceNoKek, mutated.data(), HKDFGUARD_WRAPPED_MAX_LEN, out.data(), &len);
+                int32_t v = 0;
+                hkdfguard_key_file_principal_trusted("S-1-1-0", &v);
+                int32_t m = 0, w = 0;
+                hkdfguard_security_model(&m, &w);
+                hkdfguard_kek_exists("a..b", &v);
+            };
+            auto handles = []() { DWORD n = 0; GetProcessHandleCount(GetCurrentProcess(), &n); return n; };
+            auto private_bytes = []() {
+                PROCESS_MEMORY_COUNTERS_EX pmc{};
+                pmc.cb = sizeof(pmc);
+                GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof(pmc));
+                return pmc.PrivateUsage;
+            };
+            // Two equal phases after a warm-up: first-use allocation shows
+            // up in the first phase only, a leak grows both phases alike.
+            for (size_t i = 0; i < 50; ++i) one_round(i);
+            const DWORD handles_before = handles();
+            const SIZE_T bytes_before = private_bytes();
+            for (size_t i = 0; i < 1500; ++i) one_round(i);
+            const DWORD handles_mid = handles();
+            const SIZE_T bytes_mid = private_bytes();
+            for (size_t i = 0; i < 1500; ++i) one_round(i);
+            const SIZE_T bytes_after = private_bytes();
+            for (size_t i = 0; i < 1500; ++i) one_round(i);
+            const DWORD handles_after = handles();
+            const SIZE_T bytes_last = private_bytes();
+            auto grew = [](SIZE_T from, SIZE_T to) { return to > from ? to - from : 0; };
+            const SIZE_T grew_first = grew(bytes_before, bytes_mid);
+            const SIZE_T grew_second = grew(bytes_mid, bytes_after);
+            const SIZE_T grew_third = grew(bytes_after, bytes_last);
+            Check(handles_after <= handles_before + 8, "leak probe: 4500 rounds of failing ABI calls leave the handle count where it was");
+            Check(grew_third <= (512u << 10), "leak probe: the last 1500 rounds grow private memory by under 512 KB (no per-call leak)");
+            std::printf("    (handles %lu -> %lu -> %lu; private bytes grew %zu KB, %zu KB, then %zu KB)\n", handles_before,
+                        handles_mid, handles_after, static_cast<size_t>(grew_first >> 10),
+                        static_cast<size_t>(grew_second >> 10), static_cast<size_t>(grew_third >> 10));
+
+            // 30g. Thread probe: the same calls from eight threads at once;
+            //      every status must still be a documented one.
+            {
+                std::atomic<int> undocumented{0};
+                std::atomic<int> overran{0};
+                std::vector<std::thread> threads;
+                for (int t = 0; t < 8; ++t) {
+                    threads.emplace_back([&, t]() {
+                        for (int i = 0; i < 100; ++i) {
+                            auto out = canary_buffer(HKDFGUARD_WRAPPED_MAX_LEN);
+                            int32_t len = HKDFGUARD_WRAPPED_MAX_LEN;
+                            if (have_file && !documented(hkdfguard_open_file(malformed_utf8.c_str(), out.data(), &len))) ++undocumented;
+                            std::vector<uint8_t> mutated = synthetic;
+                            mutated[static_cast<size_t>(8 + ((i * 8 + t) % 124))] ^= 0x01;
+                            len = HKDFGUARD_DEK_LEN;
+                            if (!documented(hkdfguard_unwrap_dek(kServiceNoKek, mutated.data(), HKDFGUARD_WRAPPED_MAX_LEN, out.data(), &len))) ++undocumented;
+                            int32_t v = 0;
+                            if (!documented(hkdfguard_key_file_principal_trusted("S-1-5-32-544", &v))) ++undocumented;
+                            int32_t m = 0, w = 0;
+                            if (!documented(hkdfguard_security_model(&m, &w))) ++undocumented;
+                            if (!canary_intact(out, HKDFGUARD_WRAPPED_MAX_LEN)) ++overran;
+                        }
+                    });
+                }
+                for (auto& th : threads) th.join();
+                Check(undocumented == 0 && overran == 0, "thread probe: 8 threads x 100 rounds of concurrent ABI calls all return documented codes and stay inside their buffers");
+            }
+
+            // With a KEK: concurrent wrap/unwrap round trips must each
+            // recover the DEK they wrapped.
+            if (primary_wrap_ok) {
+                std::atomic<int> wrong{0};
+                std::vector<std::thread> threads;
+                for (int t = 0; t < 4; ++t) {
+                    threads.emplace_back([&, t]() {
+                        std::vector<uint8_t> my_dek(HKDFGUARD_DEK_LEN);
+                        for (size_t i = 0; i < my_dek.size(); ++i) my_dek[i] = static_cast<uint8_t>(i * 7 + t);
+                        for (int i = 0; i < 25; ++i) {
+                            std::vector<uint8_t> w(HKDFGUARD_WRAPPED_MAX_LEN);
+                            int32_t wl = HKDFGUARD_WRAPPED_MAX_LEN;
+                            if (hkdfguard_wrap_dek(kService, my_dek.data(), HKDFGUARD_DEK_LEN, w.data(), &wl) != HKDFGUARD_OK) { ++wrong; continue; }
+                            std::vector<uint8_t> back(HKDFGUARD_DEK_LEN);
+                            int32_t bl = HKDFGUARD_DEK_LEN;
+                            if (hkdfguard_unwrap_dek(kService, w.data(), wl, back.data(), &bl) != HKDFGUARD_OK || back != my_dek) ++wrong;
+                        }
+                    });
+                }
+                for (auto& th : threads) th.join();
+                Check(wrong == 0, "thread probe: 4 threads x 25 concurrent wrap/unwrap round trips each recover their own DEK");
+            } else {
+                Skip("thread probe: concurrent wrap/unwrap round trips (needs elevation)");
+            }
+
+            DeleteFileW(malformed_path.c_str());
+            RemoveDirectoryW(dir.c_str());
         }
     }
 

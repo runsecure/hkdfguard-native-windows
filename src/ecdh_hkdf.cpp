@@ -11,44 +11,37 @@
 #define BCRYPT_KDF_RAW_SECRET L"TRUNCATE"
 #endif
 
-// Design note: the wrapping key is derived from Z = ECDH(KEK private key,
-// H(salt)), where H(salt) is the payload's salt hashed to a P-256 point
-// (hash_to_curve.h) - the construction this project's Linux implementation
-// uses. Wrap and unwrap run the *same* code (DeriveWrappingKey below) with
-// the same salt, so they derive the same key by construction, and both
-// need the KEK's private key: knowing only the KEK's public key no longer
-// lets anyone build a payload that unwraps (it did under the earlier
-// ephemeral-key/ECIES construction this replaced before the first release).
+// The wrapping key is derived from Z = ECDH(KEK private key, H(salt)), where
+// H(salt) is the payload's salt hashed to a P-256 point (hash_to_curve.h).
+// Wrap and unwrap run the same code (DeriveWrappingKey below) with the same
+// salt, so they derive the same key, and both need the KEK's private key:
+// knowing only the KEK's public key does not let anyone build a payload
+// that unwraps.
 //
 // The ECDH runs as NCryptSecretAgreement on the KEK's own provider - inside
 // the TPM for a Platform Crypto Provider KEK - and the shared secret is
 // taken out raw via BCRYPT_KDF_RAW_SECRET ("TRUNCATE"), then fed to the
-// single, self-contained HKDF-SHA512 (RFC 5869) implementation below.
-// NCryptDeriveKey has no HKDF of its own. BCRYPT_KDF_RAW_SECRET returns the
-// shared point's X coordinate little-endian; it is reversed to the
-// conventional big-endian form before HKDF, which is what the Linux
-// implementation (RustCrypto's raw_secret_bytes) feeds HKDF too.
+// HKDF-SHA512 (RFC 5869) implementation below, since NCryptDeriveKey has no
+// HKDF of its own. BCRYPT_KDF_RAW_SECRET returns the shared point's X
+// coordinate little-endian; it is reversed to the conventional big-endian
+// form before HKDF.
 
 namespace hkdfguard {
-    // Anonymous namespace = internal linkage = "private to this file"; see
-    // aes_gcm.cpp's comment on the same construct for the full explanation.
     namespace {
-        // Fixed prefix of the HKDF "info" parameter, for *domain separation*:
-        // it ties the derived wrapping key to this exact protocol, so the
-        // derivation can never collide with some unrelated use of the same
-        // ECDH inputs. The same string as the Linux build's HKDF_INFO_PREFIX;
-        // its "v1" is the wrap protocol's version, matching the payload's
-        // version byte. Cryptographic input: changing it changes every
-        // wrapping key, and the golden-payload test (tests/test_roundtrip.cpp
-        // section 29) fails.
+        // Fixed prefix of the HKDF "info" parameter, for domain separation:
+        // it ties the derived wrapping key to this protocol, so the
+        // derivation cannot collide with an unrelated use of the same ECDH
+        // inputs. Its "v1" is the wrap protocol's version, matching the
+        // payload's version byte. Cryptographic input: changing it changes
+        // every wrapping key, and the golden-payload test
+        // (tests/test_roundtrip.cpp section 29) fails.
         constexpr char kHkdfInfoPrefix[] = "hkdfguard-wrap-v1:";
         constexpr size_t kSharedSecretLen = 32; // P-256 ECDH shared secret (X-coordinate)
 
         // HKDF info = prefix || u16le(len(service)) || service ||
-        // authenticated (header || KEK fingerprint) - the Linux build's
-        // derive_wrapping_key, byte for byte. The length prefix keeps the
-        // concatenation unambiguous. Not secret - all of it is public - so a
-        // plain vector rather than a SecureBuffer.
+        // authenticated (header || KEK fingerprint; see ecdh_hkdf.h). The
+        // length prefix keeps the concatenation unambiguous. All of it is
+        // public, so a plain vector rather than a SecureBuffer.
         std::vector<uint8_t> BuildHkdfInfo(const std::string &service, const std::vector<uint8_t> &authenticated) {
             constexpr size_t prefix_len = sizeof(kHkdfInfoPrefix) - 1; // exclude NUL
             if (service.size() > 0xFFFF) {
@@ -68,51 +61,34 @@ namespace hkdfguard {
         // public key is always permitted, independent of the key's export policy)
         // as raw X||Y bytes.
         void ExportNCryptEccPublicKey(NCRYPT_KEY_HANDLE key, uint8_t out[kPublicPointLen]) {
-            // Windows' "ask for the size first, then ask again with a big-enough
-            // buffer" pattern, used throughout Win32/CNG: the first call passes a
-            // null output pointer and 0 length, and the API responds by writing the
-            // *required* size into `cb` (via the `&cb` out-parameter) instead of
-            // actually exporting anything.
+            // Size query: a null output buffer makes NCryptExportKey report
+            // the required size in `cb`.
             DWORD cb = 0;
             SECURITY_STATUS status = NCryptExportKey(key, 0, BCRYPT_ECCPUBLIC_BLOB, nullptr, nullptr, 0, &cb, 0);
-            // SECURITY_STATUS is NCrypt's equivalent of BCrypt's NTSTATUS -
-            // ERROR_SUCCESS (0) means success, anything else is a specific failure
-            // code. `sizeof(BCRYPT_ECCKEY_BLOB)` is the fixed-size header every ECC
-            // key blob starts with (see below); if the reported size isn't even
-            // big enough to hold that header, something is already wrong.
+            // A size that can't even hold the BCRYPT_ECCKEY_BLOB header is
+            // already wrong.
             if (status != ERROR_SUCCESS || cb <= sizeof(BCRYPT_ECCKEY_BLOB)) {
                 throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO_ERROR, "NCryptExportKey (size query) failed");
             }
 
-            // Second call: now that we know the required size, allocate a
-            // right-sized buffer and ask NCrypt to actually fill it in.
             std::vector<uint8_t> blob(cb);
             status = NCryptExportKey(key, 0, BCRYPT_ECCPUBLIC_BLOB, nullptr, blob.data(), cb, &cb, 0);
             if (status != ERROR_SUCCESS) {
                 throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO_ERROR, "NCryptExportKey failed");
             }
 
-            // A BCRYPT_ECCPUBLIC_BLOB is a small fixed header (BCRYPT_ECCKEY_BLOB:
-            // a magic number identifying the curve, plus the key size in bytes)
-            // immediately followed by the raw X and Y coordinates back-to-back.
-            // `reinterpret_cast<const BCRYPT_ECCKEY_BLOB*>(blob.data())` treats the
-            // first bytes of the buffer *as if* they were a BCRYPT_ECCKEY_BLOB
-            // struct laid directly over that memory - this only works because CNG
-            // guarantees that's exactly the byte layout it wrote there.
+            // A BCRYPT_ECCPUBLIC_BLOB is a BCRYPT_ECCKEY_BLOB header (curve
+            // magic, coordinate size in bytes) followed by X || Y.
             const auto *header = reinterpret_cast<const BCRYPT_ECCKEY_BLOB *>(blob.data());
-            // Sanity-check this is really a P-256 ECDH key (the P-256 magic, not
-            // the generic magic another 256-bit curve would export with, and
-            // 32-byte coordinates) with enough bytes - as actually written by
-            // the second call, `cb` - for the header plus both coordinates (64
-            // total, == kPublicPointLen) before trusting the memory layout any
-            // further. kek_store.cpp's VerifyCurve applies the same rule when
-            // the KEK is opened.
+            // Require a P-256 ECDH key (the P-256 magic, not the generic magic
+            // another 256-bit curve would export with, and 32-byte
+            // coordinates) and enough bytes written (`cb`) for the header plus
+            // X || Y before trusting the layout. kek_store.cpp's VerifyCurve
+            // applies the same rule when the KEK is opened.
             if (header->dwMagic != BCRYPT_ECDH_PUBLIC_P256_MAGIC || header->cbKey != 32 ||
                 cb < sizeof(BCRYPT_ECCKEY_BLOB) + kPublicPointLen) {
                 throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO_ERROR, "unexpected ECC public key blob format");
             }
-            // Copy just the X||Y coordinate bytes (skipping the header) out into
-            // the caller's fixed 64-byte buffer.
             memcpy(out, blob.data() + sizeof(BCRYPT_ECCKEY_BLOB), kPublicPointLen);
         }
 
@@ -120,12 +96,10 @@ namespace hkdfguard {
         // Imports raw P-256 public key bytes (X||Y) as a software BCrypt key -
         // used only as a point validator (see IsValidP256Point).
         ScopedBCryptKey ImportBCryptEccPublicKey(BCRYPT_ALG_HANDLE ecdh_alg, const uint8_t pub[kPublicPointLen]) {
-            // Build a BCRYPT_ECCPUBLIC_BLOB (header + X||Y bytes) in memory so
-            // BCryptImportKeyPair can parse it back into a real key object.
             std::vector<uint8_t> blob(sizeof(BCRYPT_ECCKEY_BLOB) + kPublicPointLen);
             auto *header = reinterpret_cast<BCRYPT_ECCKEY_BLOB *>(blob.data());
-            header->dwMagic = BCRYPT_ECDH_PUBLIC_P256_MAGIC; // identifies "ECDH, P-256, public key"
-            header->cbKey = 32; // each coordinate is 32 bytes
+            header->dwMagic = BCRYPT_ECDH_PUBLIC_P256_MAGIC;
+            header->cbKey = 32; // bytes per coordinate
             memcpy(blob.data() + sizeof(BCRYPT_ECCKEY_BLOB), pub, kPublicPointLen);
 
             ScopedBCryptKey key;
@@ -156,15 +130,10 @@ namespace hkdfguard {
         }
 
         // Computes HMAC-SHA512(key, data) -> a 64-byte output. `key`/`key_len` may
-        // be null/0 (used for the HKDF-Extract step with an empty salt).
-        //
-        // `uint8_t out[64]` here is, like the array parameters seen in other
-        // headers, really just a `uint8_t*` - the literal "64" is documentation,
-        // not an enforced size (see wire_format.h's note on this same notation).
+        // be null/0 (HMAC with an empty key).
         void HmacSha512(const uint8_t *key, size_t key_len, const uint8_t *data, size_t data_len, uint8_t out[64]) {
-            // Opens CNG's SHA-512 implementation, but with the
-            // BCRYPT_ALG_HANDLE_HMAC_FLAG flag - this is what makes it compute
-            // *keyed* HMAC-SHA512 rather than plain unkeyed SHA-512.
+            // BCRYPT_ALG_HANDLE_HMAC_FLAG makes the SHA-512 provider compute
+            // keyed HMAC-SHA512.
             ScopedBCryptAlg alg;
             NTSTATUS status = BCryptOpenAlgorithmProvider(
                 alg.put(), BCRYPT_SHA512_ALGORITHM, nullptr, BCRYPT_ALG_HANDLE_HMAC_FLAG);
@@ -172,12 +141,8 @@ namespace hkdfguard {
                 throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO_ERROR, "open HMAC-SHA512 provider failed");
             }
 
-            // CNG hash/HMAC operations need a caller-supplied scratch buffer
-            // ("hash object") to hold their internal working state, whose required
-            // size varies by algorithm/provider - so, another instance of Windows'
-            // "ask for the size, then allocate that much" pattern: BCryptGetProperty
-            // here queries BCRYPT_OBJECT_LENGTH, the size CNG needs for that
-            // scratch buffer, writing it into `hash_object_len`.
+            // CNG needs a caller-supplied "hash object" buffer for the HMAC's
+            // working state; BCRYPT_OBJECT_LENGTH gives its size.
             DWORD hash_object_len = 0, cb_result = 0;
             status = BCryptGetProperty(
                 alg.get(), BCRYPT_OBJECT_LENGTH,
@@ -186,13 +151,8 @@ namespace hkdfguard {
                 throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO_ERROR, "query HMAC object length failed");
             }
 
-            // Allocate that scratch buffer, and create the actual hash/HMAC object.
-            // Passing `key`/`key_len` here (CNG's `pbSecret`/`cbSecret` parameters)
-            // is what seeds this as an *HMAC* keyed with `key`, rather than a plain
-            // hash - when `key` is null/key_len is 0 (the HKDF-Extract call below),
-            // this becomes HMAC with an empty key, per RFC 5869's "no salt
-            // provided" default (see the comment on HkdfSha512 below for why that's
-            // equivalent).
+            // `key`/`key_len` (CNG's pbSecret/cbSecret) is the HMAC key; a
+            // null/0 key gives HMAC with an empty key.
             std::vector<uint8_t> hash_object(hash_object_len);
             // CNG keeps the HMAC's state - derived from `key`, which is the ECDH
             // secret or the PRK - in this buffer. The guard wipes it on every
@@ -209,18 +169,12 @@ namespace hkdfguard {
                 throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO_ERROR, "BCryptCreateHash(HMAC) failed");
             }
 
-            // Feeds `data` into the hash/HMAC's running state. CNG's hashing API is
-            // split into Create -> HashData (possibly called more than once, to
-            // feed data in chunks) -> FinishHash; this project always has all its
-            // input available at once, so HashData is only ever called the one
-            // time here.
+            // All input is available at once, so a single HashData call.
             status = BCryptHashData(hash.get(), const_cast<PUCHAR>(data), static_cast<ULONG>(data_len), 0);
             if (!BCRYPT_SUCCESS(status)) {
                 throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO_ERROR, "BCryptHashData failed");
             }
 
-            // Finalizes the computation and writes the 64-byte HMAC-SHA512 result
-            // into `out`.
             status = BCryptFinishHash(hash.get(), out, 64, 0);
             if (!BCRYPT_SUCCESS(status)) {
                 throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO_ERROR, "BCryptFinishHash failed");
@@ -241,11 +195,9 @@ namespace hkdfguard {
             memcpy(t1_input.data(), info.data(), info.size());
             t1_input[info.size()] = 0x01;
 
-            // `prk` and `t1` - the HKDF-Extract output and the full HKDF-Expand
-            // output, both key material derived from the ECDH shared secret -
-            // are scoped to exactly the statements that need them, so their
-            // destructors (SecureZeroMemory, see secure_buffer.h) wipe them the
-            // instant this block ends.
+            // `prk` and `t1` (key material derived from the ECDH shared
+            // secret) are scoped to this block so their destructors wipe them
+            // as soon as the output is copied out.
             {
                 // HKDF-Extract: PRK = HMAC-SHA512(salt, IKM).
                 SecureBuffer<64> prk;
@@ -254,7 +206,7 @@ namespace hkdfguard {
                 SecureBuffer<64> t1;
                 HmacSha512(prk.data(), prk.size(), t1_input.data(), t1_input.size(), t1.data());
                 memcpy(okm_out.data(), t1.data(), okm_out.size());
-            } // <- prk's and t1's destructors (zeroing them) run here, right now.
+            } // prk and t1 wiped here
 
             // Public bytes plus a counter: wiped only as defense in depth.
             SecureZero(t1_input.data(), t1_input.size());
@@ -303,8 +255,8 @@ namespace hkdfguard {
         uint8_t kek_pub[kPublicPointLen];
         ExportNCryptEccPublicKey(kek_key, kek_pub);
 
-        // Plain (unkeyed) SHA-256 via CNG - the same Create/HashData/Finish
-        // sequence HmacSha512 above uses, minus the HMAC flag and key.
+        // Plain SHA-256: the same sequence as HmacSha512, without the HMAC
+        // flag and key.
         ScopedBCryptAlg alg;
         NTSTATUS status = BCryptOpenAlgorithmProvider(alg.put(), BCRYPT_SHA256_ALGORITHM, nullptr, 0);
         if (!BCRYPT_SUCCESS(status)) {
@@ -335,8 +287,7 @@ namespace hkdfguard {
         if (!BCRYPT_SUCCESS(status)) {
             throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO_ERROR, "BCryptFinishHash(SHA-256) failed");
         }
-        // Nothing here is secret (a public key and its public hash), so no
-        // zeroing is needed beyond the RAII handles closing themselves.
+        // Nothing here is secret (a public key and its hash), so no zeroing.
     }
 
     void DeriveWrappingKey(
@@ -397,7 +348,7 @@ namespace hkdfguard {
         // Raw Z, little-endian from CNG, reversed into big-endian X.
         SecureBuffer<kSharedSecretLen> z_little_endian;
         ExtractRawSecretFromNCrypt(secret.get(), z_little_endian);
-        secret.reset(); // shared secret is highly sensitive; destroy immediately once extracted
+        secret.reset(); // release the shared secret as soon as it is extracted
         SecureBuffer<kSharedSecretLen> z;
         for (size_t i = 0; i < kSharedSecretLen; ++i) {
             z.data()[i] = z_little_endian.data()[kSharedSecretLen - 1 - i];

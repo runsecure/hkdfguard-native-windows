@@ -1,14 +1,7 @@
-# hkdfguard-cli (built as hkdfguard.exe): a standalone command-line utility that wraps a
-# caller-supplied DEK and writes it to a file, using HkdfGuard.dll purely
+# hkdfguard-cli (built as hkdfguard.exe): the command-line tool that wraps a
+# caller-supplied DEK and writes it to a file, using HkdfGuard.dll only
 # through its public C ABI (include/hkdfguard.h) - deliberately not linked
-# against anything in src/, matching this project's macOS and Linux
-# equivalents (which also only ever go through their platform's public C
-# ABI, never an internal shortcut).
-#
-# Linking against the "hkdfguard" CMake target (not its renamed output
-# file - see the root CMakeLists.txt's OUTPUT_NAME comment) transitively
-# brings along its PUBLIC include/ directory, so no separate
-# target_include_directories call is needed here for hkdfguard.h.
+# against anything in src/. The hkdfguard target supplies include/.
 add_executable(hkdfguard-cli hkdfguard_cli.cpp)
 target_link_libraries(hkdfguard-cli PRIVATE hkdfguard bcrypt.lib ncrypt.lib advapi32.lib ntdll.lib)
 # The one header shared from src/: no_follow_open.h, header-only and
@@ -21,6 +14,9 @@ target_include_directories(hkdfguard-cli PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../
 # "hkdfguard" is already the DLL's target (output HkdfGuard.dll), so the
 # target is hkdfguard-cli and only its output file is renamed.
 set_target_properties(hkdfguard-cli PROPERTIES OUTPUT_NAME "hkdfguard")
+
+# The same version resource as the DLL (see the root CMakeLists.txt).
+hkdfguard_add_version_resource(hkdfguard-cli "HkdfGuard provisioning tool" "hkdfguard.exe" VFT_APP)
 
 # Same hardening as the DLL (see hkdfguard_apply_hardening in the root
 # CMakeLists.txt): this tool runs elevated and handles the plaintext DEK.

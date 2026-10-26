@@ -262,6 +262,16 @@ with other processes. Window hooks into a GUI process stay outside it.
 
 ## Command-line tool
 
+Arguments are taken as the Unicode text they were typed as and handed to the library as
+UTF-8, with no code-page conversion in between: a path, service name or group name with
+characters outside the system code page is used exactly, never best-fit mapped to a
+look-alike (`ā` is not `a`). Output is written as Unicode on a console, whatever its code
+page, and as UTF-8 when redirected to a file or pipe. For the same reason `--key-file-path`
+and `--dek-file` refuse any name Windows would rewrite or redirect: a folder or file name
+ending in a dot or space (Windows drops it), a reserved device name such as `CON`, `NUL`,
+`COM1` or `LPT1`, with or without an extension (Windows programs open the device instead),
+and a path ending in a separator.
+
 `tools/hkdfguard_cli.cpp` builds `hkdfguard.exe`, a thin
 wrapper around the ABI above with four subcommands: `provision`, `wrap`, `status` and
 `retire`.
@@ -712,9 +722,10 @@ It is read on every setup call.
   over-broad principal such as Everyone (`HKDFGUARD_ERR_KEK_INVALID` otherwise; the
   key is left untouched). Wrap, unwrap and `hkdfguard_kek_fingerprint` apply the same
   check whenever the calling account can read the KEK's ACL, so a KEK widened after
-  provisioning is refused as soon as an administrator or deployer uses it; an
-  application account with key use alone can't read the ACL, and for it the
-  provisioning-time check stands. `hkdfguard_wrap_dek` and `hkdfguard_unwrap_dek` only ever *open*
+  provisioning is refused as soon as an administrator or deployer uses it. Key use
+  is granted as `GENERIC_READ`, which normally includes reading the ACL, so an
+  application account will likely get the check too (untested); if it can't read
+  the ACL, the provisioning-time check stands for it. `hkdfguard_wrap_dek` and `hkdfguard_unwrap_dek` only ever *open*
   an existing KEK, never create one; unwrap opens the exact provider/key recorded in the
   payload. Every create/open/delete call passes `NCRYPT_MACHINE_KEY_FLAG` (and
   `NCRYPT_SILENT_FLAG`, so a key with an unexpected UI-requiring protection policy fails
@@ -761,9 +772,13 @@ through `scripts\ArtifactSigning.ps1`. The signing machine needs:
 
 - The Windows SDK's signtool, version 10.0.22621 or later. The scripts pick the newest x64
   copy automatically.
-- The Artifact Signing client tools, which provide the signtool plugin:
-  `winget install -e --id Microsoft.Azure.ArtifactSigningClientTools`. They need .NET 8 or
-  later.
+- .NET 8 or later, for the signtool plugin. The scripts fetch the plugin themselves on first
+  use: Microsoft's `Microsoft.ArtifactSigning.Client` NuGet package, pinned by version and
+  SHA-256 (the same package the release workflow uses), cached in
+  `%LOCALAPPDATA%\HkdfGuard\signing`. Every run re-checks the cached plugin's hash and its
+  Microsoft signature. The winget client tools aren't used: their installer ships the
+  plugin unsigned. A plugin named with `-SigningDlib` or `HKDFGUARD_SIGNING_DLIB` must be
+  Microsoft-signed.
 - `scripts\signing\metadata.json`, which names the account's regional endpoint, the
   account and the certificate profile. It holds no secrets. The endpoint must match the
   account's region, or signing fails with a 403.

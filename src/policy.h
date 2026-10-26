@@ -12,43 +12,34 @@ namespace hkdfguard {
         RequireTpm  = 1,
         SoftwareOnly = 2,
 
-        // Sentinel: the registry value was present but is not one of the
-        // three values above (wrong type, or an unrecognized DWORD).
-        // Deliberately NOT a silent alias for PreferTpm - see
-        // LoadEffectivePolicy's comment on why. Every caller that reads a
-        // KeyStoragePolicy either switches on all three real values with a
-        // trailing "invalid policy" throw after the switch (KekExists,
-        // CreateKek, OpenKekForWrap), or checks for this sentinel directly
-        // (OpenKekForUnwrap) - both fail closed with
-        // HKDFGUARD_ERR_POLICY_INVALID the moment this value appears.
+        // Sentinel: the registry value is present but not one of the three
+        // values above (wrong type, or an unrecognized DWORD). Not an alias
+        // for PreferTpm - see LoadEffectivePolicy. Callers fail closed with
+        // HKDFGUARD_ERR_POLICY_INVALID: KekExists, CreateKek and
+        // OpenKekForWrap throw after a switch over the three real values;
+        // OpenKekForUnwrap checks for this sentinel directly.
         Invalid = 0xFFFFFFFFu,
     };
 
-    // Returns the machine-wide effective policy.
-    // Never throws.
+    // Returns the machine-wide effective policy. Never throws.
     //
-    // A *missing* KeyStoragePolicy value (the registry key or value isn't
-    // there at all) falls back to the documented safe default
-    // (KeyStoragePolicy::PreferTpm) - that is normal, unconfigured-machine
+    // A *missing* KeyStoragePolicy value (key or value absent) means the
+    // default, KeyStoragePolicy::PreferTpm - normal unconfigured-machine
     // behavior, not an error. A policy key that exists but can't be opened
     // (access denied, say) is not "missing": it returns
     // KeyStoragePolicy::Invalid, since the policy it holds is unknown.
     //
     // A value that *is* present but isn't one of the three recognized
-    // policies (wrong REG_* type, or a DWORD other than 0/1/2) returns
-    // KeyStoragePolicy::Invalid instead of silently falling back to a
-    // default. This is a deliberate fail-closed choice: an admin who typed
-    // (or a deployment tool that wrote) an unrecognized value most likely
-    // intended a *specific* policy - possibly RequireTpm, the strictest one
-    // - and silently substituting PreferTpm would mean a typo can quietly
-    // weaken protection instead of being surfaced as the configuration
-    // error it is. Every caller of this function turns
-    // KeyStoragePolicy::Invalid into HKDFGUARD_ERR_POLICY_INVALID.
+    // policies (wrong REG_* type, or a DWORD other than 0/1/2) also returns
+    // KeyStoragePolicy::Invalid. This fails closed: whoever wrote an
+    // unrecognized value most likely meant a *specific* policy - possibly
+    // RequireTpm - and substituting PreferTpm would let a typo quietly
+    // weaken protection instead of surfacing as a configuration error.
+    // Every caller turns KeyStoragePolicy::Invalid into
+    // HKDFGUARD_ERR_POLICY_INVALID.
     //
-    // Reads the real registry value (see policy.cpp). When this translation
-    // unit is built with HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE defined, a
-    // test policy override - see SetTestPolicyOverride below - is checked
-    // first; in a normal (non-test) build that macro is never defined, so
+    // In a build with HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE defined, the
+    // override set by SetTestPolicyOverride is checked first; otherwise
     // this always reads the registry.
     KeyStoragePolicy LoadEffectivePolicy() noexcept;
 
@@ -68,18 +59,14 @@ namespace hkdfguard {
     KeyStoragePolicy KeyStoragePolicyForUnopenedKey(long openStatus) noexcept;
 
 // Test-only seam: makes LoadEffectivePolicy() return `policy` instead of
-// reading the registry, regardless of this machine's actual configured
-// policy - lets tests exercise all three KeyStoragePolicy branches
-// deterministically. Pass std::nullopt to clear the override and resume
-// reading the real registry value.
+// reading the registry, so tests can exercise every KeyStoragePolicy
+// branch deterministically. std::nullopt clears the override.
 //
-// Compiled in only when HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE is defined -
-// tests/CMakeLists.txt defines it for test_roundtrip's own copy of this
-// file only. HkdfGuard.dll's own build (the top-level CMakeLists.txt) never
-// defines it, so this function - and the override state it would control -
-// does not exist at all in the shipped DLL; there is no runtime flag or
-// code path in release code that could ever activate it. Not thread-safe,
-// by design: a single-threaded test process is the only intended caller.
+// Compiled in only when HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE is defined,
+// which tests/CMakeLists.txt does for test_roundtrip's own copy of this
+// file. HkdfGuard.dll's build never defines it, so neither this function
+// nor its state exists in the shipped DLL. Not thread-safe: a
+// single-threaded test process is the only intended caller.
 #if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
     void SetTestPolicyOverride(std::optional<KeyStoragePolicy> policy) noexcept;
 #endif
@@ -116,16 +103,13 @@ namespace hkdfguard {
     bool ParseAuditUnwrapSuccess(bool found, unsigned long type, unsigned long value) noexcept;
 
     // The floor on every hkdfguard_create_kek / hkdfguard_kek_exists call's
-    // wall-clock time when policy doesn't set one, and the most it may set -
-    // the same numbers as the Linux build's DEFAULT_SETUP_MIN_DELAY_MS and
-    // MAX_SETUP_MIN_DELAY_MS.
+    // wall-clock time when policy doesn't set one, and the most it may set.
     inline constexpr unsigned long kDefaultSetupMinDelayMs = 1000;
     inline constexpr unsigned long kMaxSetupMinDelayMs = 60000;
 
     // The setup-call floor in milliseconds, from the REG_DWORD value
-    // HKLM\Software\Policies\HkdfGuard\SetupMinDelayMs - the counterpart of
-    // the Linux policy file's startup_behavior.setup_min_delay_ms. Read on
-    // every setup call. Never throws.
+    // HKLM\Software\Policies\HkdfGuard\SetupMinDelayMs. Read on every setup
+    // call. Never throws.
     //
     // Missing: kDefaultSetupMinDelayMs. A REG_DWORD from 0 to
     // kMaxSetupMinDelayMs is used as is (0 disables the floor). Anything
@@ -137,9 +121,9 @@ namespace hkdfguard {
     // registry I/O, so it can be tested directly.
     unsigned long ParseSetupMinDelayMs(bool found, unsigned long type, unsigned long value) noexcept;
 
-    // Test-only seam for LoadKeyUseGroupsPolicy(), with exactly the same
-    // scope and caveats as SetTestPolicyOverride above: compiled in only
-    // for test binaries, absent from HkdfGuard.dll. std::nullopt clears it.
+    // Test-only seam for LoadKeyUseGroupsPolicy(), with the same scope and
+    // caveats as SetTestPolicyOverride: absent from HkdfGuard.dll.
+    // std::nullopt clears it.
 #if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
     void SetTestKeyUseGroupsOverride(std::optional<std::vector<std::wstring>> groups);
 #endif

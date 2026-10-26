@@ -15,9 +15,11 @@
     What the signing machine needs (see README.md, "Signing"):
       - Windows SDK signtool.exe 10.0.22621 or newer (x64). The 20348 SDK's
         signtool is not supported by the plugin.
-      - The Artifact Signing client tools (winget install -e --id
-        Microsoft.Azure.ArtifactSigningClientTools), which install the x64
-        plugin under %LOCALAPPDATA%\Microsoft\MicrosoftArtifactSigningClientTools.
+      - The x64 signtool plugin. Fetched automatically on first use from
+        Microsoft's NuGet package (Microsoft.ArtifactSigning.Client, pinned by
+        version and SHA-256, the same one CI uses) into
+        %LOCALAPPDATA%\HkdfGuard\signing, and checked against its pinned
+        hash and Microsoft's signature on every run.
       - .NET 8 or newer (the plugin rolls forward to newer major versions).
       - A metadata JSON file naming the account endpoint, account and
         certificate profile - scripts\signing\metadata.json by default.
@@ -57,15 +59,77 @@ function Get-ArtifactSigningSignTool {
     return $candidates[0].FullName
 }
 
-# The x64 Artifact Signing plugin (Azure.CodeSigning.Dlib.dll). Must match
-# signtool's architecture, which is x64 here.
+# The signtool plugin, from Microsoft's NuGet package - the same one the
+# release workflow uses (keep the two pins in step with
+# .github/workflows/release.yml). Not the winget client tools: that
+# installer ships the plugin unsigned, so nothing could tell it from a
+# replacement planted in the user-writable folder it lives in. The plugin
+# runs inside signtool with the signer's Azure sign-in and chooses the digest
+# that gets signed, so it is verified on every run, not just when fetched.
+$script:ArtifactSigningClientVersion = "1.0.146"
+$script:ArtifactSigningClientSha256 = "7761E5D8F31E54B764DA21D33CD8B0A2940E1B05526C7DFCB5E94B0431426F70" # the .nupkg
+$script:ArtifactSigningDlibSha256 = "123FA0C50341777D8E5B1414DF52F39A1F2C7AB4A9F716ABF6310069A6CB8A19"   # bin\x64\Azure.CodeSigning.Dlib.dll in it
+
+# Refuses a plugin without a valid Authenticode signature from Microsoft.
+function Assert-ArtifactSigningDlibSignature {
+    param([Parameter(Mandatory)][string]$Path)
+    $sig = Get-AuthenticodeSignature -FilePath $Path
+    if ($sig.Status -ne "Valid" -or $sig.SignerCertificate.Subject -notmatch "(^|, )O=Microsoft Corporation(,|$)") {
+        throw "The Artifact Signing plugin $Path is not validly signed by Microsoft ($($sig.Status): $($sig.SignerCertificate.Subject)); refusing to sign with it."
+    }
+}
+
+# The pinned NuGet package's x64 plugin, downloaded into a per-user cache on
+# first use. Every call re-checks the cached plugin's SHA-256 and signature,
+# so a cache someone has since changed is refused rather than used.
+function Get-PinnedArtifactSigningDlib {
+    $version = $script:ArtifactSigningClientVersion
+    $cache = Join-Path $env:LOCALAPPDATA "HkdfGuard\signing\microsoft.artifactsigning.client.$version"
+    $dlib = Join-Path $cache "bin\x64\Azure.CodeSigning.Dlib.dll"
+    if (-not (Test-Path $dlib)) {
+        $parent = Split-Path -Parent $cache
+        New-Item -ItemType Directory -Force -Path $parent | Out-Null
+        $pkg = Join-Path $parent "microsoft.artifactsigning.client.$version.zip" # .zip: Expand-Archive insists on it
+        $staging = "$cache.partial"
+        Write-Host "Downloading Microsoft.ArtifactSigning.Client $version (the signtool plugin) into $parent"
+        $savedProgress = $ProgressPreference
+        $ProgressPreference = "SilentlyContinue" # Windows PowerShell's progress bar slows Invoke-WebRequest badly
+        try {
+            Invoke-WebRequest -UseBasicParsing -TimeoutSec 300 -OutFile $pkg `
+                -Uri "https://api.nuget.org/v3-flatcontainer/microsoft.artifactsigning.client/$version/microsoft.artifactsigning.client.$version.nupkg"
+        } finally {
+            $ProgressPreference = $savedProgress
+        }
+        $actual = (Get-FileHash -Path $pkg -Algorithm SHA256).Hash
+        if ($actual -ne $script:ArtifactSigningClientSha256) {
+            Remove-Item -Force $pkg
+            throw "Microsoft.ArtifactSigning.Client $version has SHA-256 $actual, not the pinned $($script:ArtifactSigningClientSha256)."
+        }
+        if (Test-Path $staging) { Remove-Item -Recurse -Force $staging }
+        Expand-Archive -Path $pkg -DestinationPath $staging
+        Remove-Item -Force $pkg
+        Rename-Item -Path $staging -NewName (Split-Path -Leaf $cache) # only a complete extraction becomes the cache
+    }
+    $actual = (Get-FileHash -Path $dlib -Algorithm SHA256).Hash
+    if ($actual -ne $script:ArtifactSigningDlibSha256) {
+        throw "The cached Artifact Signing plugin $dlib has SHA-256 $actual, not the pinned $($script:ArtifactSigningDlibSha256). Delete $cache to download it again."
+    }
+    Assert-ArtifactSigningDlibSignature -Path $dlib
+    return $dlib
+}
+
+# The x64 Artifact Signing plugin (Azure.CodeSigning.Dlib.dll): the pinned
+# NuGet copy by default, or one given by parameter / HKDFGUARD_SIGNING_DLIB,
+# which must also carry Microsoft's signature. Must match signtool's
+# architecture, which is x64 here.
 function Get-ArtifactSigningDlib {
     param([string]$Path)
     if (-not $Path) { $Path = $env:HKDFGUARD_SIGNING_DLIB }
-    if (-not $Path) { $Path = Join-Path $env:LOCALAPPDATA "Microsoft\MicrosoftArtifactSigningClientTools\Azure.CodeSigning.Dlib.dll" }
+    if (-not $Path) { return Get-PinnedArtifactSigningDlib }
     if (-not (Test-Path $Path)) {
-        throw "Artifact Signing plugin not found at $Path. Install the client tools: winget install -e --id Microsoft.Azure.ArtifactSigningClientTools"
+        throw "Artifact Signing plugin not found at $Path."
     }
+    Assert-ArtifactSigningDlibSignature -Path (Resolve-Path $Path).Path
     $bytes = [IO.File]::ReadAllBytes((Resolve-Path $Path).Path)
     $peOffset = [BitConverter]::ToInt32($bytes, 0x3C)
     $machine = [BitConverter]::ToUInt16($bytes, $peOffset + 4)

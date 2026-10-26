@@ -150,14 +150,12 @@ $chainService = "hkdfguardcontainerchain"
 # files") tells deployments to: inherited permissions removed, then full
 # control for SYSTEM and Administrators and read for Users, owned by
 # Administrators. hkdfguard_open_file refuses a file if any folder above it,
-# below the drive root, lets another account create, delete or rename
-# entries, and both $work and C:\ProgramData fail that by design: $work is
-# under D:\a on the hosted runners and is C:\work in the containers, and a
-# new folder at a drive root inherits "Authenticated Users: Modify"; and
-# C:\ProgramData lets Users create files and folders, so no key file
-# anywhere under it is trusted. (The drive root itself may let others
-# create folders.) test_roundtrip's own open_file checks pass because they
-# use %TEMP%, inside the user profile.
+# below the drive root (which itself may let others create folders), lets
+# another account create, delete or rename entries. $work fails that: it is
+# under D:\a on the hosted runners and C:\work in the containers, and a new
+# folder at a drive root inherits "Authenticated Users: Modify". So does
+# C:\ProgramData, which lets Users create files and folders. test_roundtrip's
+# own open_file checks pass because they use %TEMP%, inside the user profile.
 $keyDir = Join-Path $env:SystemDrive "\hkdfguard-container-chain"
 Remove-Item -Recurse -Force $keyDir -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Path $keyDir | Out-Null
@@ -203,15 +201,14 @@ Copy-Item -LiteralPath $keyFile -Destination $defaultKey
 $plainFile = Join-Path $keyDir "plain.key"
 [IO.File]::WriteAllBytes($plainFile, (New-Object byte[] 32))
 
-# The P/Invoke calls run in a CHILD PowerShell process, never in this one:
-# a DLL loaded into a process stays loaded until that process exits, so
-# loading the installed HkdfGuard.dll here would hold it in use through
-# the uninstall below - and on a machine with an interactive session (the
-# hosted CI runners), Windows Installer's Restart Manager then shuts down
-# the application holding it: this script. The child exits, and unloads
-# the DLL, before the uninstall starts. It prints one "RESULT|1|..." or
-# "RESULT|0|..." line per check, which are recorded here as ordinary checks.
-# The DEK goes to the child on stdin, never on its command line.
+# The P/Invoke calls run in a CHILD PowerShell process: a loaded DLL stays
+# loaded until its process exits, so loading HkdfGuard.dll here would hold it
+# in use through the uninstall below, and on a machine with an interactive
+# session (the hosted CI runners) Windows Installer's Restart Manager would
+# shut down the process holding it - this script. The child unloads the DLL
+# by exiting before the uninstall starts. It prints one "RESULT|1|..." or
+# "RESULT|0|..." line per check, recorded here as ordinary checks. The DEK
+# goes to the child on stdin, never on its command line.
 $probe = Join-Path $work "chain-probe.ps1"
 Set-Content -Path $probe -Encoding ascii -Value @'
 param([string]$Dll, [string]$KeyFile, [string]$PlainFile, [string]$DefaultKeyFile, [string]$Service)

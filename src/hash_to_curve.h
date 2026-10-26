@@ -4,9 +4,8 @@
 #include <cstdint>
 
 namespace hkdfguard {
-    // Hashes a payload's salt to a P-256 point H(salt), exactly as this
-    // project's Linux implementation does (hkdfguard-native-linux,
-    // src/crypto.rs, payload_ecdh_point):
+    // Hashes a payload's salt to a P-256 point H(salt), per the documented
+    // HkdfGuard construction:
     //
     //   for counter = 0, 1, ..., 254:
     //       X = SHA-256("HkdfGuard-P256-payload-ECDH-point-v1:" || salt || counter)

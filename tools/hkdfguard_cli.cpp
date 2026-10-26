@@ -22,8 +22,8 @@
 //       C ABI offers no delete, so no application that loads it gets a
 //       one-call wipe. Requires an elevated process. Every payload wrapped
 //       under a retired KEK is permanently unrecoverable. Logged as event
-//       1004. The macOS tool's retire, with --provider added because a
-//       Windows service can have a KEK on each of two providers.
+//       1004. --provider exists because a Windows service can have a KEK on
+//       each of two providers.
 //
 //   status --service-name|-sn <name>
 //       Reports whether the service has a KEK, which provider holds it, and
@@ -35,27 +35,24 @@
 //       writes the wrapped payload to <path>. Never provisions a KEK - if
 //       none exists yet for this service, this fails with KEK_NOT_FOUND and
 //       a hint to run "provision" first. The DEK (32 raw bytes,
-//       base64-encoded) is read from stdin rather than a command-line
-//       argument, specifically so it never appears in this process's argv -
-//       and is therefore not visible to other processes on the same host
-//       via a command-line/process listing (e.g. a WMI query) for the life
-//       of this process, unlike a plain --dek=<value> argument would be.
+//       base64-encoded) is read from stdin or a file, never from argv, so it
+//       is not visible to other processes via a command-line/process listing
+//       (e.g. a WMI query).
 //
 // Calls into HkdfGuard.dll through its stable C ABI - hkdfguard_kek_exists,
-// hkdfguard_create_kek, hkdfguard_kek_fingerprint and hkdfguard_wrap_dek -
-// the same interface any other-language caller uses; this tool links only
+// hkdfguard_create_kek, hkdfguard_kek_fingerprint and hkdfguard_wrap_dek;
+// this tool links only
 // against include/hkdfguard.h and the hkdfguard import library, nothing from
 // src/. The one exception is retire/status's direct NCrypt access to the
 // KEK's persisted key (see "KEK inspection and retirement" below): the ABI
 // deliberately has no way to delete a key or address one provider's copy.
 //
 // The KEK's `service` identity is exactly --service-name's value, passed
-// straight through to the hkdfguard_* calls as `service`, and shared
-// between the two subcommands - "provision" and "wrap" for the same
-// service name operate on the same KEK. The KEK itself is meant to be
+// straight through to the hkdfguard_* calls, so every subcommand given the
+// same service name operates on the same KEK. The KEK is meant to be
 // long-lived: DEKs are re-minted every release under the same service
-// name, and if a genuinely new KEK is ever wanted, the service name is
-// simply versioned (e.g. "myapp.v2") - there is no in-place key rotation.
+// name, and a new KEK is obtained by versioning the service name (e.g.
+// "myapp.v2") - there is no in-place key rotation.
 // Creating a KEK (provision, the first run for a given service name) needs
 // an elevated process; wrapping against an existing one (wrap) does not,
 // subject to the key's ACL.
@@ -63,25 +60,20 @@
 // The wrapped payload is written to <key-file-path> with an explicit,
 // non-inherited DACL: the calling account (the process token's owner SID -
 // Administrators when run elevated) gets read+write and no one else is
-// granted anything - the Windows analog of the Linux tool's POSIX 0600.
-// With --group, that group also gets read-only: the analog of the Linux
-// tool's --group, mode 0640 (owner rw, one group r, no one else). Set
-// atomically at file-creation time via CreateFileW's own
-// security-attributes parameter, not applied after the fact. --group is a
-// "wrap"-only concept:
-// it governs the wrapped-key *file's* ACL, not the KEK's - which principals
-// may use the KEK is a separate, machine-level registry policy
-// (KeyUseGroups; see include/hkdfguard.h), not something either subcommand
-// accepts on the command line.
+// granted anything (in POSIX terms, 0600). With --group, that group also
+// gets read-only (0640). The DACL is set atomically at file-creation time
+// via CreateFileW's security-attributes parameter, not applied after the
+// fact. --group governs only the wrapped-key *file's* ACL, not the KEK's:
+// which principals may use the KEK is a machine-level registry policy
+// (KeyUseGroups; see include/hkdfguard.h), not a command-line option.
 //
 // With --force against a pre-existing file, that file's old contents are
 // securely overwritten in place (8 alternating all-zero/random passes,
 // each flushed before the next starts) and deleted before the new file is
 // created - see SecureOverwriteAndRemoveIfExists/WriteWrappedKeyFile below
-// for the exact sequence and its one intentional fallback, matching this
-// project's macOS implementation pass-for-pass. Only ever runs when
-// --force is passed; without it, an existing file is never touched at all
-// (WriteWrappedKeyFile's plain CREATE_NEW fails outright instead).
+// for the exact sequence and its one intentional fallback. Without --force,
+// an existing file is never touched (WriteWrappedKeyFile's FILE_CREATE fails
+// instead).
 //
 // The wrapped-key path must be a real file reached through real directories:
 // a symbolic link, junction, or other reparse point at the path or anywhere
@@ -89,8 +81,8 @@
 // --force. There is no legitimate reason for a secrets file to live behind a
 // link, and allowing one would let whoever can plant a link in the output
 // directory redirect an elevated `wrap --force` at an arbitrary file. See the
-// "output path must be a real file" section below for exactly how that is
-// enforced on open handles rather than on re-queried paths. And the folders
+// "output path must be a real file" section below for how that is enforced
+// on open handles rather than on re-queried paths. The folders
 // above it must be ones hkdfguard_open_file will read from: no account but
 // SYSTEM, Administrators, TrustedInstaller and the caller may create, delete
 // or rename entries in any of them below the drive root (see "The folders a
@@ -103,14 +95,16 @@
 #include <aclapi.h> // SetSecurityInfo - protecting the key file's DACL on its handle
 #include <bcrypt.h>
 #include <ncrypt.h> // retire/status: opening, inspecting and deleting the persisted KEK
-#include <sddl.h> // ConvertStringSidToSidA - over-broad --group check
+#include <sddl.h> // ConvertStringSidToSidW - over-broad --group check
+#include <io.h> // _get_osfhandle: whether stdout/stderr is a console (Print)
 
 #include <algorithm>
 #include <array>
+#include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring> // _stricmp
+#include <cstring>
 #include <exception>
 #include <cctype>
 #include <optional>
@@ -123,28 +117,31 @@
 
 namespace {
     constexpr wchar_t kProgramName[] = L"hkdfguard";
-    // Narrow-string twin of kProgramName, for use in narrow (std::string)
-    // error/hint text - everything in this tool that isn't a PrintUsage-style
-    // fwprintf is narrow, matching the non-UNICODE Win32 API variants and
-    // std::string this tool uses throughout.
+    // Narrow twin of kProgramName, for the tool's narrow (std::string)
+    // error/hint text; only PrintUsage is wide.
     constexpr char kProgramNameNarrow[] = "hkdfguard";
+
+    // Text in this tool is UTF-8 inside (what the library's ABI takes) and
+    // UTF-16 at every Win32 call; these convert between the two, and Print*
+    // write output. Defined with the path code below.
+    std::wstring Utf8ToWide(const std::string &s);
+    std::string WideToUtf8(const std::wstring &w);
+    bool EqualsIgnoreCase(const std::string &a, const std::string &b);
+    void Print(FILE *stream, const std::string &utf8);
+    void Printf(FILE *stream, const char *format, ...);
+    void PrintfW(FILE *stream, const wchar_t *format, ...);
     constexpr size_t kDekLen = 32;
-    // Generous starting capacity for the wrapped payload - retried once at the
-    // library-reported size on HKDFGUARD_ERR_BUFFER_TOO_SMALL, so this only
-    // needs to be a reasonable common case, not an absolute upper bound.
-    // Matches the macOS/Linux tools' own initial-capacity constant.
+    // Starting capacity for the wrapped payload; WrapDek retries once at the
+    // library-reported size on HKDFGUARD_ERR_BUFFER_TOO_SMALL, so this is a
+    // common case, not an upper bound.
     constexpr int32_t kInitialWrappedCapacity = 512;
-    // Number of secure-overwrite passes SecureOverwriteAndRemoveIfExists below
-    // performs on a pre-existing file before deleting it, alternating an
-    // all-zero pass and a random-bytes pass, four times each.
+    // Secure-overwrite passes on a pre-existing file before deletion:
+    // all-zero and random-bytes, alternating, four times each.
     constexpr size_t kSecureOverwritePassCount = 8;
 
-    // This tool's own operational-error type - deliberately not reusing the
-    // DLL's internal HkdfGuardError (src/errors.h), since this tool depends
-    // only on the public C ABI (include/hkdfguard.h) and the import library,
-    // nothing from src/. Carries a narrow std::string message, matching the
-    // narrow (non-UNICODE) Win32 API variants and std::string arguments this
-    // tool uses throughout - so every fprintf of it must use %s, never %ls.
+    // This tool's operational-error type. Not the DLL's HkdfGuardError
+    // (src/errors.h): this tool depends only on the public C ABI. The message
+    // is narrow, so every fprintf of it uses %s, never %ls.
     struct CliError {
         std::string message;
 
@@ -152,26 +149,25 @@ namespace {
         }
     };
 
-    // Renders a Win32 error code (as returned by GetLastError(), or an NTSTATUS
-    // cast to DWORD for a BCrypt failure) as a human-readable string, the
-    // standard documented FormatMessageW idiom.
+    // Renders a Win32 error code (from GetLastError(), or an NTSTATUS cast to
+    // DWORD for a BCrypt failure) as a human-readable string.
     std::string FormatWin32Error(DWORD code) {
-        LPSTR buf = nullptr;
+        LPWSTR buf = nullptr;
 
-        DWORD len = FormatMessageA(
+        DWORD len = FormatMessageW(
             FORMAT_MESSAGE_ALLOCATE_BUFFER |
             FORMAT_MESSAGE_FROM_SYSTEM |
             FORMAT_MESSAGE_IGNORE_INSERTS,
             nullptr,
             code,
             MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
-            reinterpret_cast<LPSTR>(&buf),
+            reinterpret_cast<LPWSTR>(&buf),
             0,
             nullptr);
 
         std::string result =
                 (len > 0 && buf != nullptr)
-                    ? std::string(buf, len)
+                    ? WideToUtf8(std::wstring(buf, len))
                     : "(unknown error)";
 
         if (buf != nullptr) {
@@ -222,10 +218,9 @@ namespace {
     enum class ParseOutcome { Run, Help };
 
     // The one usage text, printed for every help request and after every
-    // usage error - the Linux tool's, line for line, with this platform's
-    // paths and examples.
+    // usage error.
     void PrintUsage() {
-        fwprintf(
+        PrintfW(
             stderr,
             L"Usage:\n"
             L"  %ls provision --service-name|-sn <name>\n"
@@ -271,15 +266,14 @@ namespace {
             kProgramName, kProgramName);
     }
 
-    // The subcommand list every "missing/unknown subcommand" error names -
-    // the macOS tool's wording.
+    // The subcommand list every "missing/unknown subcommand" error names.
     constexpr char kSubcommandList[] = "`provision`, `wrap`, `retire` or `status`";
 
     // Stores a flag's value, refusing a second one rather than letting the
     // last win: `-kf a.key ... -kf b.key` is ambiguous about which file the
     // operator meant, and silently picking one is how the wrong key file gets
     // written or the wrong service's KEK gets used. `flag` is the flag's long
-    // name. The Linux tool's set_once.
+    // name.
     void SetOnce(std::optional<std::string> &slot, const char *flag, const std::string &value) {
         if (slot) {
             throw CliError(std::string("give ") + flag + " at most once");
@@ -290,7 +284,7 @@ namespace {
     // Throws CliError on any parse failure; returns ParseOutcome::Help if
     // --help/-h was seen (in which case `out` is left unpopulated - the caller
     // must check the return value before using `out`). Starts at argv[2] -
-    // argv[1] is the subcommand name, already consumed by main() to dispatch
+    // argv[1] is the subcommand name, already consumed by wmain() to dispatch
     // here.
     ParseOutcome ParseProvisionArgs(int argc, char *argv[], ProvisionArgs &out) {
         std::optional<std::string> serviceName;
@@ -408,8 +402,7 @@ namespace {
 
     // Exactly 64 hex digits, either case. No separators or prefixes: the
     // value is meant to be pasted from provision's output, and a strict
-    // format keeps a truncated paste from ever looking valid. The macOS
-    // tool's parseFingerprintHex.
+    // format keeps a truncated paste from ever looking valid.
     Fingerprint ParseFingerprintHex(const std::string &text) {
         if (text.size() != kFingerprintLen * 2) {
             throw CliError(
@@ -427,7 +420,7 @@ namespace {
             int hi = nibble(text[2 * i]);
             int lo = nibble(text[2 * i + 1]);
             if (hi < 0 || lo < 0) {
-                throw CliError("--fingerprint must contain only hex characters (0-9, a-f)");
+                throw CliError("--fingerprint must contain only hex characters (0-9, a-f, A-F)");
             }
             bytes[i] = static_cast<uint8_t>((hi << 4) | lo);
         }
@@ -522,25 +515,24 @@ namespace {
 
     // MARK: - The DEK's one buffer
 
-    // Upper bound on how much stdin "wrap --dek-stdin" will accept - the
-    // Linux tool's MAX_DEK_INPUT_LEN. A 32-byte DEK is 44 base64 characters;
+    // Upper bound on how much DEK input "wrap" will accept. A 32-byte DEK is
+    // 44 base64 characters;
     // 64 leaves room for a UTF-8 byte-order mark and a trailing CRLF, and
     // nothing longer can be a valid DEK under the rules DecodeDek applies.
     constexpr size_t kMaxDekStdinLen = 64;
 
-    // Any DEK input that isn't strict, padded, standard base64 - the Linux
-    // tool's wording. Deliberately fixed: it names no character, offset or
-    // bit pattern, so a mistyped DEK never puts part of itself into a log.
+    // Any DEK input that isn't strict, padded, standard base64. Deliberately
+    // fixed: it names no character, offset or bit pattern, so a mistyped DEK
+    // never puts part of itself into a log.
     constexpr char kInvalidBase64DekMessage[] =
             "the DEK input is not valid base64 (standard alphabet, padded, at most one trailing newline)";
 
-    // Refusing to read the DEK from an interactive console - the Linux
-    // tool's wording, with this tool's own example.
+    // Refusing to read the DEK from an interactive console.
     constexpr char kTerminalDekMessage[] =
             "refusing to read the DEK from an interactive terminal, where it would be echoed and kept in the "
             "scrollback; pipe it in instead, e.g. $dekBase64 | hkdfguard.exe wrap ... --dek-stdin";
 
-    // Refusing UTF-16 input - the Linux tool's wording.
+    // Refusing UTF-16 input.
     constexpr char kUtf16DekMessage[] =
             "the DEK input is UTF-16 encoded; send it as ASCII or UTF-8 base64 text "
             "(in PowerShell, set [Console]::OutputEncoding or $OutputEncoding to UTF-8)";
@@ -549,15 +541,14 @@ namespace {
     // from stdin, and the bytes that decodes to - lives in one fixed
     // allocation, never grown or moved, wiped before it's freed. It is
     // locked into RAM with VirtualLock, so the DEK is never written to the
-    // page file: the Linux CLI's DekScratch, with VirtualLock for mlock. Two
-    // pages, well inside the default minimum working set VirtualLock draws
-    // on. One allocation, not one per buffer, for the same reason as on
-    // Linux: locks work on whole pages.
+    // page file. Two pages, well inside the default minimum working set
+    // VirtualLock draws on. One allocation, not one per buffer, because locks
+    // work on whole pages.
     //
-    // This covers the CLI's own copies. Windows has no counterpart of
-    // Linux's mlockall, so the library's transient copies (on its stack,
-    // while it wraps) are not locked; process hardening (see main) still
-    // keeps them out of crash dumps and away from same-user processes.
+    // This covers the CLI's own copies. Windows has no process-wide memory
+    // lock, so the library's transient copies (on its stack, while it wraps)
+    // are not locked; process hardening (see main) still keeps them out of
+    // crash dumps and away from same-user processes.
     class DekScratch {
     public:
         // One byte more than accepted, so over-long input is detected
@@ -573,7 +564,7 @@ namespace {
             }
             locked_ = VirtualLock(base_, kSize) != FALSE;
             if (!locked_) {
-                fprintf(stderr,
+                Printf(stderr,
                         "warning: could not lock the DEK's buffer into memory (VirtualLock: %s); it could be "
                         "written to the page file\n",
                         FormatWin32Error(GetLastError()).c_str());
@@ -609,15 +600,11 @@ namespace {
         bool locked_ = false;
     };
 
-    // Reads all of stdin (expected to be base64 text for the DEK) into
-    // `scratch`. Used only by "wrap --dek-stdin", specifically so the DEK
-    // never appears in this process's argv - see this file's header comment.
-    // ReadFile on the stdin handle, not the C runtime's fread: the CRT keeps
-    // its own buffer for a FILE stream, which would hold a copy of the DEK
-    // text this code could neither lock nor wipe.
     // Reads at most kMaxDekStdinLen bytes from `in` into scratch's text
-    // buffer, refusing more. `what` names the source in errors, as the Linux
-    // tool's read_bounded does ("the DEK on stdin", "--dek-file").
+    // buffer, refusing more. `what` names the source in errors ("the DEK on
+    // stdin", "--dek-file"). Uses ReadFile, not the C runtime's fread: the
+    // CRT keeps its own buffer for a FILE stream, which would hold a copy of
+    // the DEK text this code could neither lock nor wipe.
     void ReadBoundedInto(HANDLE in, const std::string &what, DekScratch &scratch) {
         for (;;) {
             DWORD got = 0;
@@ -645,7 +632,7 @@ namespace {
                     " bytes; expected base64 of a 32-byte DEK");
             }
         }
-        // Empty input is reported by DecodeDek, as on Linux.
+        // Empty input is reported by DecodeDek.
     }
 
     void ReadDekBase64FromStdin(DekScratch &scratch) {
@@ -675,10 +662,10 @@ namespace {
 
     // The 6-bit value of a standard-alphabet base64 character, or -1 - in
     // constant time: no branch and no table lookup depends on `c`, which is
-    // a character of the secret DEK text. The same arithmetic as RustCrypto's
-    // base64ct (which the Linux tool uses) and libsodium: start at -1 and,
-    // for each range, add a correction masked to apply only when `c` is in
-    // it. Every term is computed for every character.
+    // a character of the secret DEK text. The same arithmetic as base64ct and
+    // libsodium: start at -1 and, for each range, add a correction masked to
+    // apply only when `c` is in it. Every term is computed for every
+    // character.
     inline int32_t Base64ValueCt(uint8_t c) {
         const int32_t ch = c;
         int32_t value = -1;
@@ -690,8 +677,7 @@ namespace {
         return value;
     }
 
-    // Decodes scratch's base64 text into its decoded bytes, by the Linux
-    // tool's rules exactly, so the same input is accepted or refused on both:
+    // Decodes scratch's base64 text into its decoded bytes, by these rules:
     //
     //   - A leading UTF-8 byte-order mark (EF BB BF) is skipped: some
     //     PowerShell and .NET configurations prepend one when piping text to
@@ -703,10 +689,10 @@ namespace {
     //   - Then strict standard base64 (RFC 4648 section 4, the `+/` alphabet)
     //     with canonical padding: a length that's a multiple of 4, `=` only
     //     as the last one or two characters, and the unused bits before the
-    //     padding zero - what base64ct, which the Linux tool uses, accepts.
+    //     padding zero.
     //
-    // Constant time with respect to the secret text, as base64ct is on
-    // Linux: every character goes through Base64ValueCt, problems are
+    // Constant time with respect to the secret text: every character goes
+    // through Base64ValueCt, problems are
     // collected into one flag rather than reported where they're found, and
     // the flag is checked once, after the whole input has been processed.
     // Only public facts decide anything earlier: the length, where the
@@ -817,8 +803,7 @@ namespace {
     }
 
     // Calls hkdfguard_wrap_dek, retrying once at the library-reported required
-    // size if the initial buffer was too small - same pattern as the
-    // macOS/Linux tools' own wrap helper. Never provisions a KEK - a missing
+    // size if the initial buffer was too small. Never provisions a KEK - a missing
     // KEK surfaces as HKDFGUARD_ERR_KEK_NOT_FOUND, with a hint pointing at
     // this tool's "provision" subcommand.
     std::vector<uint8_t> WrapDek(const std::string &service, const BYTE *dek, size_t dekLen) {
@@ -836,8 +821,8 @@ namespace {
         }
 
         if (rc != HKDFGUARD_OK) {
-            // The Linux tool's wording for the one failure an operator is most
-            // likely to hit, with the command that fixes it.
+            // The failure an operator is most likely to hit, with the
+            // command that fixes it.
             if (rc == HKDFGUARD_ERR_KEK_NOT_FOUND) {
                 throw CliError(
                     "no KEK is provisioned for service \"" + service + "\"; run `" + kProgramNameNarrow +
@@ -889,11 +874,10 @@ namespace {
             throw CliError(message);
         }
 
-        // The Linux tool's wording.
         if (exists != 0) {
-            fprintf(stdout, "KEK already provisioned for service \"%s\"; verified, nothing to do\n", service.c_str());
+            Printf(stdout, "KEK already provisioned for service \"%s\"; verified, nothing to do\n", service.c_str());
         } else {
-            fprintf(stdout, "KEK provisioned for service \"%s\"\n", service.c_str());
+            Printf(stdout, "KEK provisioned for service \"%s\"\n", service.c_str());
         }
         return exists == 0;
     }
@@ -927,8 +911,8 @@ namespace {
 
     // Enforces that --service-name - the exact value passed to
     // the hkdfguard_* calls as `service` - contains only ASCII alphanumeric
-    // characters or '.', does not start with '.', and does not contain "..",
-    // matching this project's macOS/Linux tools. The library enforces the
+    // characters or '.', does not start with '.', and does not contain "..".
+    // The library enforces the
     // same rules; checking here first gives the operator a specific message.
     void ValidateServiceCharset(const std::string &service) {
         constexpr size_t kMaxServiceLen = 128; // the ABI's limit
@@ -954,8 +938,7 @@ namespace {
 
     // Fetches the current process token's owner SID (TokenOwner) - the SID
     // Windows itself documents as "the default owner for objects this process
-    // creates" - as an owned buffer (copied out of the token info block, which
-    // is about to be freed).
+    // creates" - copied out of the token info block.
     std::vector<BYTE> GetProcessOwnerSid() {
         HANDLE hToken = nullptr;
         if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) {
@@ -992,8 +975,7 @@ namespace {
     // rollback note in README.md - or copy the file elsewhere. The same set
     // the DLL refuses as a KEK key-use group (src/key_acl.cpp's
     // kOverBroadSids/kOverBroadSidStrings), duplicated here because this tool
-    // deliberately depends only on the public C ABI, nothing from src/. Keep
-    // the two lists in sync.
+    // depends only on the public C ABI. Keep the two lists in sync.
     constexpr WELL_KNOWN_SID_TYPE kOverBroadGroupSids[] = {
         WinNullSid,
         WinWorldSid, // Everyone
@@ -1056,7 +1038,7 @@ namespace {
         }
         for (const char *sidString: kOverBroadGroupSidStrings) {
             PSID known = nullptr;
-            if (!ConvertStringSidToSidA(sidString, &known)) {
+            if (!ConvertStringSidToSidW(Utf8ToWide(sidString).c_str(), &known)) {
                 throw CliError("ConvertStringSidToSid failed: " + FormatWin32Error(GetLastError()));
             }
             const bool match = EqualSid(sid, known) != FALSE;
@@ -1077,13 +1059,13 @@ namespace {
             return false;
         }
         for (const char *fixed: {"BUILTIN", "NT AUTHORITY", "NT SERVICE"}) {
-            if (_stricmp(domain.c_str(), fixed) == 0) {
+            if (EqualsIgnoreCase(domain, fixed)) {
                 return true;
             }
         }
-        char computer[MAX_COMPUTERNAME_LENGTH + 1] = {};
+        wchar_t computer[MAX_COMPUTERNAME_LENGTH + 1] = {};
         DWORD size = MAX_COMPUTERNAME_LENGTH + 1;
-        return GetComputerNameA(computer, &size) && _stricmp(domain.c_str(), computer) == 0;
+        return GetComputerNameW(computer, &size) && EqualsIgnoreCase(domain, WideToUtf8(computer));
     }
 
     // Resolves `groupName` (a group on this host, e.g. "App_1234" or
@@ -1101,17 +1083,19 @@ namespace {
         // First call: size query. LookupAccountNameW returns FALSE here even
         // on the expected path (buffers too small); the real signal is that
         // sidSize/domainSize come back non-zero.
-        LookupAccountName(nullptr, groupName.c_str(), nullptr, &sidSize, nullptr, &domainSize, &sidType);
+        const std::wstring wideName = Utf8ToWide(groupName);
+        LookupAccountNameW(nullptr, wideName.c_str(), nullptr, &sidSize, nullptr, &domainSize, &sidType);
         if (sidSize == 0) {
             throw CliError("--group \"" + groupName + "\" could not be resolved: " + FormatWin32Error(GetLastError()));
         }
         std::vector<BYTE> sid(sidSize);
-        std::string domain(domainSize, '\0');
-        if (!LookupAccountName(
-            nullptr, groupName.c_str(), sid.data(), &sidSize, domain.data(), &domainSize, &sidType)) {
+        std::wstring wideDomain(domainSize, L'\0');
+        if (!LookupAccountNameW(
+            nullptr, wideName.c_str(), sid.data(), &sidSize, wideDomain.data(), &domainSize, &sidType)) {
             throw CliError("--group \"" + groupName + "\" could not be resolved: " + FormatWin32Error(GetLastError()));
         }
-        domain.resize(domainSize); // on success, the length without the NUL
+        wideDomain.resize(domainSize); // on success, the length without the NUL
+        const std::string domain = WideToUtf8(wideDomain);
         if (sidType != SidTypeGroup && sidType != SidTypeAlias && sidType != SidTypeWellKnownGroup) {
             throw CliError("--group \"" + groupName + "\" does not name a group account");
         }
@@ -1138,10 +1122,7 @@ namespace {
 
     // Owns every buffer a security descriptor granting "owner read/write,
     // optionally one group read-only, no one else, no inherited ACEs" needs
-    // to stay alive for as long as it's in use - a self-contained bundle
-    // rather than several out-parameters the caller would otherwise have to
-    // keep in sync by hand. The Windows analog of the Linux tool's POSIX 0600
-    // (no group) and 0640 (with --group: owner rw, one group r, no one else).
+    // while it is in use (in POSIX terms, 0600, or 0640 with --group).
     class KeyFileSecurity {
     public:
         KeyFileSecurity(std::vector<BYTE> ownerSid, std::optional<std::vector<BYTE>> groupSid)
@@ -1152,9 +1133,8 @@ namespace {
             DWORD aclSize = static_cast<DWORD>(
                 sizeof(ACL) + (sizeof(ACCESS_ALLOWED_ACE) - sizeof(DWORD)) + GetLengthSid(owner) +
                 (group ? (sizeof(ACCESS_ALLOWED_ACE) - sizeof(DWORD)) + GetLengthSid(group) : 0));
-            // ACL buffers must be DWORD-aligned, per Windows' own documented
-            // requirement; round up rather than trust the sum above to already
-            // land on a boundary.
+            // ACL buffers must be DWORD-aligned; round up rather than trust
+            // the sum above to land on a boundary.
             aclSize = (aclSize + 7) & ~static_cast<DWORD>(7);
 
             aclBuf_.resize(aclSize);
@@ -1184,21 +1164,18 @@ namespace {
             if (!SetSecurityDescriptorDacl(&sd_, TRUE, acl, FALSE)) {
                 throw CliError("SetSecurityDescriptorDacl failed: " + FormatWin32Error(GetLastError()));
             }
-            // Blocks this DACL from being merged with any inherited ACEs from
-            // the parent directory - without this, a permissive parent-folder
-            // ACL could silently widen access beyond the ACEs just set.
+            // Blocks inherited ACEs from the parent directory, which could
+            // otherwise widen access beyond the ACEs just set.
             if (!SetSecurityDescriptorControl(&sd_, SE_DACL_PROTECTED, SE_DACL_PROTECTED)) {
                 throw CliError("SetSecurityDescriptorControl failed: " + FormatWin32Error(GetLastError()));
             }
         }
 
-        // Valid only for as long as this object is alive - the returned
-        // SECURITY_ATTRIBUTES' lpSecurityDescriptor points at this object's own
-        // sd_ member, which in turn points into ownerSid_/groupSid_/aclBuf_,
-        // all owned together right here.
         // The DACL itself, for re-applying it as protected on the open file.
         PACL Dacl() const { return reinterpret_cast<PACL>(const_cast<BYTE *>(aclBuf_.data())); }
 
+        // Valid only while this object is alive: lpSecurityDescriptor points
+        // at sd_, which points into ownerSid_/groupSid_/aclBuf_.
         SECURITY_ATTRIBUTES attributes() const {
             SECURITY_ATTRIBUTES sa{};
             sa.nLength = sizeof(sa);
@@ -1218,9 +1195,8 @@ namespace {
 
     // MARK: - Writing the wrapped key file
 
-    // Fills `buffer` with cryptographically random bytes via CNG's system RNG
-    // - the same BCryptGenRandom call this project's own AES-GCM code
-    // (src/aes_gcm.cpp) uses for nonces, not a plain PRNG.
+    // Fills `buffer` with cryptographically random bytes from CNG's system
+    // RNG.
     void FillRandom(std::vector<BYTE> &buffer) {
         NTSTATUS status =
                 BCryptGenRandom(nullptr, buffer.data(), static_cast<ULONG>(buffer.size()),
@@ -1271,36 +1247,110 @@ namespace {
     // GetFullPathName works on the text alone, so nothing is opened and no
     // link is followed. This is the "expected" side of check (3) above.
     std::string FullPath(const std::string &path) {
-        DWORD needed = GetFullPathNameA(path.c_str(), 0, nullptr, nullptr);
+        const std::wstring wide = Utf8ToWide(path);
+        DWORD needed = GetFullPathNameW(wide.c_str(), 0, nullptr, nullptr);
         if (needed == 0) {
             throw CliError("GetFullPathName failed for " + path + ": " + FormatWin32Error(GetLastError()));
         }
-        std::string full(needed, '\0');
-        DWORD written = GetFullPathNameA(path.c_str(), needed, full.data(), nullptr);
+        std::wstring full(needed, L'\0');
+        DWORD written = GetFullPathNameW(wide.c_str(), needed, full.data(), nullptr);
         if (written == 0 || written >= needed) {
             throw CliError("GetFullPathName failed for " + path + ": " + FormatWin32Error(GetLastError()));
         }
         full.resize(written);
-        return full;
+        return WideToUtf8(full);
     }
 
-    // This tool's paths are ANSI (argv, the A-suffixed Win32 calls); the
-    // walk is in UTF-16. Converted with the same code page CreateFileA would
-    // use, so the same names are meant.
-    std::wstring AnsiToWide(const std::string &s) {
+    // Arguments arrive as UTF-16 (wmain) and are held as UTF-8, the encoding
+    // the library's ABI takes; every Win32 call is the W form, through these
+    // two conversions. Both are exact for well-formed text - nothing is
+    // best-fit mapped to a look-alike character - so the library sees the
+    // service name and paths exactly as they were typed.
+    std::wstring Utf8ToWide(const std::string &s) {
         if (s.empty()) return {};
-        int len = MultiByteToWideChar(CP_ACP, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
-        std::wstring wide(static_cast<size_t>(len > 0 ? len : 0), L'\0');
-        if (len > 0) MultiByteToWideChar(CP_ACP, 0, s.data(), static_cast<int>(s.size()), wide.data(), len);
+        const int len = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.data(), static_cast<int>(s.size()), nullptr, 0);
+        if (len <= 0) {
+            throw CliError("text is not valid UTF-8: " + FormatWin32Error(GetLastError()));
+        }
+        std::wstring wide(static_cast<size_t>(len), L'\0');
+        MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.data(), static_cast<int>(s.size()), wide.data(), len);
         return wide;
     }
 
-    std::string WideToAnsi(const std::wstring &w) {
+    // Win32 text (final paths, account names, error messages) to UTF-8. A
+    // lone surrogate, which NTFS permits in a name, becomes U+FFFD; such text
+    // is only ever shown, never turned back into a path.
+    std::string WideToUtf8(const std::wstring &w) {
         if (w.empty()) return {};
-        int len = WideCharToMultiByte(CP_ACP, 0, w.data(), static_cast<int>(w.size()), nullptr, 0, nullptr, nullptr);
-        std::string narrow(static_cast<size_t>(len > 0 ? len : 0), '\0');
-        if (len > 0) WideCharToMultiByte(CP_ACP, 0, w.data(), static_cast<int>(w.size()), narrow.data(), len, nullptr, nullptr);
-        return narrow;
+        const int len = WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), nullptr, 0, nullptr, nullptr);
+        std::string utf8(static_cast<size_t>(len > 0 ? len : 0), '\0');
+        if (len > 0) WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), utf8.data(), len, nullptr, nullptr);
+        return utf8;
+    }
+
+    // Case-insensitive comparison the way the file system compares names:
+    // ordinal and culture-independent, so "É" matches "é" (as it does on
+    // disk) while no two distinct characters are folded together.
+    bool EqualsIgnoreCase(const std::string &a, const std::string &b) {
+        const std::wstring wa = Utf8ToWide(a);
+        const std::wstring wb = Utf8ToWide(b);
+        return CompareStringOrdinal(wa.c_str(), static_cast<int>(wa.size()), wb.c_str(), static_cast<int>(wb.size()),
+                                    TRUE) == CSTR_EQUAL;
+    }
+
+    // Output: on a console the text is written as UTF-16 (WriteConsoleW), so
+    // it reads correctly whatever the console's code page; redirected to a
+    // file or pipe it is UTF-8 bytes.
+    void Print(FILE *stream, const std::string &utf8) {
+        fflush(stream);
+        HANDLE console = reinterpret_cast<HANDLE>(_get_osfhandle(_fileno(stream)));
+        DWORD mode = 0;
+        if (console != INVALID_HANDLE_VALUE && GetConsoleMode(console, &mode)) {
+            // Not Utf8ToWide: output must never throw, so an invalid byte
+            // (none is expected) becomes U+FFFD instead of an error.
+            const int len = MultiByteToWideChar(CP_UTF8, 0, utf8.data(), static_cast<int>(utf8.size()), nullptr, 0);
+            std::wstring wide(static_cast<size_t>(len > 0 ? len : 0), L'\0');
+            if (len > 0) MultiByteToWideChar(CP_UTF8, 0, utf8.data(), static_cast<int>(utf8.size()), wide.data(), len);
+            size_t done = 0;
+            while (done < wide.size()) {
+                DWORD written = 0;
+                if (!WriteConsoleW(console, wide.data() + done, static_cast<DWORD>(wide.size() - done), &written,
+                                   nullptr) ||
+                    written == 0) {
+                    break;
+                }
+                done += written;
+            }
+            return;
+        }
+        fwrite(utf8.data(), 1, utf8.size(), stream);
+        fflush(stream);
+    }
+
+    void Printf(FILE *stream, const char *format, ...) {
+        va_list args;
+        va_start(args, format);
+        va_list sizing;
+        va_copy(sizing, args);
+        const int len = vsnprintf(nullptr, 0, format, sizing);
+        va_end(sizing);
+        std::vector<char> buffer(static_cast<size_t>(len > 0 ? len : 0) + 1, '\0');
+        if (len > 0) vsnprintf(buffer.data(), buffer.size(), format, args);
+        va_end(args);
+        Print(stream, std::string(buffer.data(), static_cast<size_t>(len > 0 ? len : 0)));
+    }
+
+    void PrintfW(FILE *stream, const wchar_t *format, ...) {
+        va_list args;
+        va_start(args, format);
+        va_list sizing;
+        va_copy(sizing, args);
+        const int len = _vscwprintf(format, sizing);
+        va_end(sizing);
+        std::vector<wchar_t> buffer(static_cast<size_t>(len > 0 ? len : 0) + 1, L'\0');
+        if (len > 0) vswprintf(buffer.data(), buffer.size(), format, args);
+        va_end(args);
+        Print(stream, WideToUtf8(std::wstring(buffer.data(), static_cast<size_t>(len > 0 ? len : 0))));
     }
 
     std::string FinalPathOfHandle(HANDLE file, const std::string &path);
@@ -1315,8 +1365,8 @@ namespace {
     hkdfguard_nofollow::FolderChain WalkToParent(const std::string &full, const std::string &what) {
         hkdfguard_nofollow::FolderChain chain;
         hkdfguard_nofollow::Error error;
-        if (!hkdfguard_nofollow::OpenFolderChain(AnsiToWide(full), chain, error)) {
-            const std::string at = WideToAnsi(error.at);
+        if (!hkdfguard_nofollow::OpenFolderChain(Utf8ToWide(full), chain, error)) {
+            const std::string at = WideToUtf8(error.at);
             switch (error.failure) {
                 case hkdfguard_nofollow::Failure::NotLocalDrive:
                     throw CliError(
@@ -1337,9 +1387,9 @@ namespace {
                     throw CliError(what + " names an alternate data stream or has an empty folder name");
             }
         }
-        const std::string parent = WideToAnsi(chain.parentPath());
+        const std::string parent = WideToUtf8(chain.parentPath());
         const std::string actual = TrimTrailingSeparators(FinalPathOfHandle(chain.parent(), what));
-        if (_stricmp(actual.c_str(), TrimTrailingSeparators(parent).c_str()) != 0) {
+        if (!EqualsIgnoreCase(actual, TrimTrailingSeparators(parent))) {
             throw CliError(
                 what + " uses an 8.3 short name (such as PROGRA~1); spell every folder and the file with its full name");
         }
@@ -1352,30 +1402,29 @@ namespace {
     // the "actual" side of check (3) above - it reflects every reparse point
     // that was traversed to reach the object, which is the whole point.
     std::string FinalPathOfHandle(HANDLE file, const std::string &path) {
-        // Sized by retrying rather than by trusting the size query: the ANSI
-        // variant's "buffer too small" return has been observed to *exclude*
-        // the terminator (the documented contract says include), so a buffer
-        // of exactly that size is always one short. Growing to whatever the
-        // call last reported, plus one, and retrying converges either way.
+        // Sized by retrying rather than by trusting the size query alone:
+        // growing to whatever the call last reported, plus one, converges
+        // whether or not that count included the terminator.
         const DWORD flags = FILE_NAME_NORMALIZED | VOLUME_NAME_DOS;
-        std::string final(MAX_PATH, '\0');
+        std::wstring wide(MAX_PATH, L'\0');
         DWORD written = 0;
         for (int attempt = 0; attempt < 4; ++attempt) {
-            written = GetFinalPathNameByHandleA(file, final.data(), static_cast<DWORD>(final.size()), flags);
+            written = GetFinalPathNameByHandleW(file, wide.data(), static_cast<DWORD>(wide.size()), flags);
             if (written == 0) {
                 throw CliError(
                     "GetFinalPathNameByHandle failed for " + path + ": " + FormatWin32Error(GetLastError()));
             }
-            if (written < final.size()) {
+            if (written < wide.size()) {
                 break;
             }
-            final.assign(static_cast<size_t>(written) + 1, '\0');
+            wide.assign(static_cast<size_t>(written) + 1, L'\0');
         }
-        if (written >= final.size()) {
+        if (written >= wide.size()) {
             throw CliError("GetFinalPathNameByHandle could not size its result for " + path);
         }
-        final.resize(written);
+        wide.resize(written);
 
+        std::string final = WideToUtf8(wide);
         if (final.rfind("\\\\?\\UNC\\", 0) == 0) {
             final = "\\\\" + final.substr(8);
         } else if (final.rfind("\\\\?\\", 0) == 0) {
@@ -1431,10 +1480,65 @@ namespace {
         // 8.3 short name in the last component.
         std::string actual = TrimTrailingSeparators(FinalPathOfHandle(file, path));
         std::string want = TrimTrailingSeparators(expected);
-        if (_stricmp(actual.c_str(), want.c_str()) != 0) {
+        if (!EqualsIgnoreCase(actual, want)) {
             throw CliError(
                 path + " uses an 8.3 short name (such as PROGRA~1), resolving to \"" + actual +
                 "\"; spell every folder and the file with its full name");
+        }
+    }
+
+    // Refuses a path that Win32 would quietly rewrite or redirect, so the
+    // file opened is the one typed. In every folder and the file name:
+    //   - a trailing '.' or space, which Win32 path handling strips
+    //     ("key.bin." would be written as "key.bin");
+    //   - a reserved device name (CON, PRN, AUX, NUL, COM0-9, LPT0-9, the
+    //     superscript-digit COM/LPT forms, CONIN$, CONOUT$), with or without
+    //     an extension, since Win32 programs open the device rather than a
+    //     file of that name.
+    // And the path must not end in a separator: it has to name a file.
+    // `.` and `..` components, a drive ("C:") and the "?" of a \\?\ prefix
+    // are left for the other checks.
+    void RequireExactPathNames(const std::string &path, const std::string &what) {
+        if (!path.empty() && (path.back() == '\\' || path.back() == '/')) {
+            throw CliError(what + " ends in a path separator; give the path of a file");
+        }
+        static const char *const kReserved[] = {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"};
+        size_t start = 0;
+        while (start <= path.size()) {
+            size_t end = path.find_first_of("\\/", start);
+            if (end == std::string::npos) end = path.size();
+            const std::string part = path.substr(start, end - start);
+            start = end + 1;
+            const bool drive = part.size() == 2 && part[1] == ':';
+            if (part.empty() || part == "." || part == ".." || part == "?" || drive) {
+                continue;
+            }
+            if (part.back() == '.' || part.back() == ' ') {
+                throw CliError(what + ": \"" + part + "\" ends in a " + (part.back() == '.' ? "dot" : "space") +
+                               ", which Windows drops from the name; remove it");
+            }
+            // The device name is the part before the first dot, without
+            // trailing spaces: "nul.txt" and "COM1 .key" are devices too.
+            std::string stem = part.substr(0, part.find('.'));
+            while (!stem.empty() && stem.back() == ' ') stem.pop_back();
+            bool reserved = false;
+            for (const char *name : kReserved) {
+                reserved = reserved || EqualsIgnoreCase(stem, name);
+            }
+            const std::wstring wide = Utf8ToWide(stem);
+            if (wide.size() == 4) {
+                const std::wstring prefix = wide.substr(0, 3);
+                const wchar_t digit = wide[3];
+                const bool comOrLpt = CompareStringOrdinal(prefix.c_str(), 3, L"COM", 3, TRUE) == CSTR_EQUAL ||
+                                      CompareStringOrdinal(prefix.c_str(), 3, L"LPT", 3, TRUE) == CSTR_EQUAL;
+                const bool deviceDigit = (digit >= L'0' && digit <= L'9') || digit == L'\x00B9' ||
+                                         digit == L'\x00B2' || digit == L'\x00B3';
+                reserved = reserved || (comOrLpt && deviceDigit);
+            }
+            if (reserved) {
+                throw CliError(what + ": \"" + part + "\" is a reserved Windows device name; Windows programs would "
+                               "open the device rather than a file, so choose another name");
+            }
         }
     }
 
@@ -1448,13 +1552,12 @@ namespace {
     // server the caller's NTLM credentials. Links further down the path are
     // the walk's job (WalkToParent). `what` names the path in the message.
     void RequireLocalDrivePath(const std::string &path, const std::string &what) {
-        char fullBuf[MAX_PATH * 4];
-        DWORD fullLen = GetFullPathNameA(path.c_str(), static_cast<DWORD>(sizeof(fullBuf)), fullBuf, nullptr);
-        if (fullLen == 0 || fullLen >= sizeof(fullBuf)) {
+        wchar_t fullBuf[MAX_PATH * 4];
+        DWORD fullLen = GetFullPathNameW(Utf8ToWide(path).c_str(), static_cast<DWORD>(std::size(fullBuf)), fullBuf, nullptr);
+        if (fullLen == 0 || fullLen >= std::size(fullBuf)) {
             throw CliError("failed to resolve " + what + ": " + FormatWin32Error(GetLastError()));
         }
-        const std::string full(fullBuf, fullLen);
-        if (!hkdfguard_nofollow::IsLocalDrivePath(AnsiToWide(full))) {
+        if (!hkdfguard_nofollow::IsLocalDrivePath(std::wstring(fullBuf, fullLen))) {
             throw CliError(
                 what + " is not on a local drive (UNC paths, mapped network and SUBST drives, and devices are "
                 "refused)");
@@ -1471,9 +1574,8 @@ namespace {
     // SYSTEM, Administrators, TrustedInstaller or the reading account and
     // lets no other account delete, rename or take over its entries, and
     // unless every folder below the drive root - the key file's own folder
-    // included - also lets no other account create files or folders in it
-    // (the Linux build's "no directory writable by group or others", sticky
-    // or not). The drive root is exempt from that last part only: a default
+    // included - also lets no other account create files or folders in it.
+    // The drive root is exempt from that last part only: a default
     // C:\ lets Authenticated Users create folders, and the folders below it
     // are judged themselves. See src/key_file.cpp, whose rule this mirrors
     // ACE for ACE so that wrap never writes a file the library would refuse
@@ -1496,17 +1598,17 @@ namespace {
     // instead of suggesting icacls on them.
     bool IsSharedSystemFolder(const std::string &folder) {
         auto same = [&folder](const std::string &other) {
-            return !other.empty() && _stricmp(TrimTrailingSeparators(other).c_str(), folder.c_str()) == 0;
+            return !other.empty() && EqualsIgnoreCase(TrimTrailingSeparators(other), folder);
         };
-        auto env = [](const char *name) {
-            char value[MAX_PATH * 2] = {};
-            DWORD len = GetEnvironmentVariableA(name, value, static_cast<DWORD>(sizeof(value)));
-            return (len > 0 && len < sizeof(value)) ? std::string(value, len) : std::string();
+        auto env = [](const wchar_t *name) {
+            wchar_t value[MAX_PATH * 2] = {};
+            DWORD len = GetEnvironmentVariableW(name, value, static_cast<DWORD>(std::size(value)));
+            return (len > 0 && len < std::size(value)) ? WideToUtf8(std::wstring(value, len)) : std::string();
         };
-        char windows[MAX_PATH + 1] = {};
-        UINT len = GetSystemWindowsDirectoryA(windows, MAX_PATH + 1);
-        const std::string windowsTemp = (len > 0 && len <= MAX_PATH) ? std::string(windows, len) + "\\Temp" : "";
-        return same(env("ProgramData")) || same(env("PUBLIC")) || same(windowsTemp);
+        wchar_t windows[MAX_PATH + 1] = {};
+        UINT len = GetSystemWindowsDirectoryW(windows, MAX_PATH + 1);
+        const std::string windowsTemp = (len > 0 && len <= MAX_PATH) ? WideToUtf8(std::wstring(windows, len)) + "\\Temp" : "";
+        return same(env(L"ProgramData")) || same(env(L"PUBLIC")) || same(windowsTemp);
     }
 
     // The fix for a folder that fails the rule, as icacls commands an
@@ -1538,11 +1640,11 @@ namespace {
 
     // "*S-1-..." for icacls, or empty if the SID can't be rendered.
     std::string IcaclsSid(PSID sid) {
-        LPSTR text = nullptr;
-        if (!ConvertSidToStringSidA(sid, &text)) {
+        LPWSTR text = nullptr;
+        if (!ConvertSidToStringSidW(sid, &text)) {
             return std::string();
         }
-        std::string s = std::string("*") + text;
+        std::string s = "*" + WideToUtf8(text);
         LocalFree(text);
         return s;
     }
@@ -1569,13 +1671,14 @@ namespace {
             for (const auto &entry: cache) {
                 if (EqualSid(sid, const_cast<BYTE *>(entry.first.data()))) return entry.second;
             }
-            LPSTR text = nullptr;
-            if (!ConvertSidToStringSidA(sid, &text)) {
+            LPWSTR text = nullptr;
+            if (!ConvertSidToStringSidW(sid, &text)) {
                 throw CliError("ConvertSidToStringSid failed: " + FormatWin32Error(GetLastError()));
             }
-            int trusted = 0;
-            int32_t rc = hkdfguard_key_file_principal_trusted(text, &trusted);
+            const std::string sidString = WideToUtf8(text);
             LocalFree(text);
+            int trusted = 0;
+            int32_t rc = hkdfguard_key_file_principal_trusted(sidString.c_str(), &trusted);
             if (rc != HKDFGUARD_OK) {
                 throw CliError("could not check who may write key files: " + DescribeStatus(rc));
             }
@@ -1596,7 +1699,7 @@ namespace {
 
         for (size_t i = 0; i < chain.handles.size(); ++i) {
             const bool driveRoot = i == 0;
-            const std::string folder = TrimTrailingSeparators(WideToAnsi(chain.paths[i]));
+            const std::string folder = TrimTrailingSeparators(WideToUtf8(chain.paths[i]));
             const std::string what = "--key-file-path " + path + ": " + (driveRoot ? "the drive root " : "the folder ") +
                                      "\"" + folder + "\"";
             PSID owner = nullptr;
@@ -1665,7 +1768,7 @@ namespace {
 
     // Fail-fast version of the checks above, run before any KEK or DEK work
     // so a bad output path is rejected without touching the key store or
-    // reading the DEK at all: every folder down to the file's must be real
+    // reading the DEK: every folder down to the file's must be real
     // (WalkToParent) and pass the library's folder rule
     // (RequireTrustedKeyFileFolders), and if something already exists at the
     // leaf it must pass checks (1)-(4). Returns whether something exists there. The
@@ -1711,9 +1814,7 @@ namespace {
     // kSecureOverwritePassCount (8) alternating all-zero/random passes, each
     // flushed to the storage medium before the next pass starts so they're
     // genuinely sequential rather than coalesced by the page cache - and only
-    // then deletes it. Only ever called when --force was passed; without
-    // --force, an existing file is never touched at all
-    // (WriteWrappedKeyFile's CREATE_NEW fails outright instead).
+    // then deletes it. Called only with --force.
     //
     // The file is reached by the walk (WalkToParent), opened relative to its
     // folder without following a reparse point, and vetted by
@@ -1725,14 +1826,13 @@ namespace {
     // If the file doesn't exist, this is a no-op. If it exists but can't be
     // opened for writing (ERROR_ACCESS_DENIED, or ERROR_SHARING_VIOLATION if
     // another process has it open) the overwrite passes are skipped entirely
-    // and this falls back to a delete-only open, per explicit product
-    // direction: destroying the old bytes first is worth attempting, but not
+    // and this falls back to a delete-only open, by design: destroying the
+    // old bytes first is worth attempting, but not
     // worth failing the whole command over when this process isn't even
     // allowed to write to the file it's about to replace. That fallback is
     // vetted the same way before it deletes anything.
     //
-    // Caveat this can't fully solve, worth knowing rather than assuming away:
-    // on SSDs generally (wear leveling) and on any filesystem that does
+    // Caveat: on SSDs generally (wear leveling) and on any filesystem that does
     // copy-on-write or transparent compression, writing new bytes to a file's
     // logical offsets does not guarantee those bytes land on the same physical
     // storage cells the old bytes occupied - the old bytes can persist in
@@ -1784,9 +1884,9 @@ namespace {
 
             for (size_t pass = 0; pass < kSecureOverwritePassCount; ++pass) {
                 if (pass % 2 == 0) {
-                    std::fill(buffer.begin(), buffer.end(), static_cast<BYTE>(0)); // "step 1": all-zero
+                    std::fill(buffer.begin(), buffer.end(), static_cast<BYTE>(0)); // all-zero pass
                 } else {
-                    FillRandom(buffer); // "step 2": random bits, via the OS CSPRNG
+                    FillRandom(buffer); // random pass, via the OS CSPRNG
                 }
 
                 LARGE_INTEGER zero{};
@@ -1824,13 +1924,11 @@ namespace {
         DeleteViaHandle(file.get(), path);
     }
 
-    // Opens `path` fresh (CREATE_NEW - atomically fails if it already exists,
-    // this tool's actual correctness guarantee against the exists-then-create
-    // race, same role O_EXCL/O_CREAT plays in the macOS/Linux tools) and writes
-    // `bytes` to it, with `security`'s ACL attached from the moment the file is
-    // created - no window where it briefly exists with broader (e.g.
-    // inherited-from-parent-directory) permissions before being locked down
-    // after the fact.
+    // Creates `path` fresh (FILE_CREATE atomically fails if it already
+    // exists - the guarantee against an exists-then-create race) and writes
+    // `bytes` to it, with `security`'s ACL attached from the moment the file
+    // is created, so it never briefly exists with broader (e.g. inherited)
+    // permissions.
     //
     // Created relative to its folder's handle from the walk (WalkToParent),
     // so no link above it is followed. A link *at* the path is an existing
@@ -1891,8 +1989,7 @@ namespace {
         // survives a crash. On any failure the file is deleted through its
         // own handle (it goes when that handle closes): a failed wrap
         // never leaves an empty or truncated key file behind, for the next
-        // `wrap` to call "already exists" or a service to read as malformed -
-        // the same rule as the Linux tool's finish_key_file.
+        // `wrap` to call "already exists" or a service to read as malformed.
         auto discard = [&file](const std::string &message) {
             FILE_DISPOSITION_INFO disposition{};
             disposition.DeleteFile = TRUE;
@@ -1919,9 +2016,8 @@ namespace {
 
     // MARK: - Reading the DEK from a file
 
-    // The SID of the account this process runs as (TokenUser), as an owned
-    // buffer - for the --dek-file trust check, which accepts the file's own
-    // user, as the Linux tool accepts a file owned by its euid.
+    // The SID of the account this process runs as (TokenUser) - for the
+    // --dek-file trust check, which accepts a file owned by this account.
     std::vector<BYTE> GetProcessUserSid() {
         HANDLE hToken = nullptr;
         if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) {
@@ -1947,15 +2043,15 @@ namespace {
     // An account's name for an error message ("DOMAIN\\name"), or its SID
     // string when it can't be resolved.
     std::string AccountNameOf(PSID sid) {
-        char name[256], domain[256];
-        DWORD nameLen = sizeof(name), domainLen = sizeof(domain);
+        wchar_t name[256], domain[256];
+        DWORD nameLen = static_cast<DWORD>(std::size(name)), domainLen = static_cast<DWORD>(std::size(domain));
         SID_NAME_USE use;
-        if (LookupAccountSidA(nullptr, sid, name, &nameLen, domain, &domainLen, &use)) {
-            return domainLen > 0 ? std::string(domain) + "\\" + name : std::string(name);
+        if (LookupAccountSidW(nullptr, sid, name, &nameLen, domain, &domainLen, &use)) {
+            return domainLen > 0 ? WideToUtf8(domain) + "\\" + WideToUtf8(name) : WideToUtf8(name);
         }
-        LPSTR text = nullptr;
-        if (ConvertSidToStringSidA(sid, &text)) {
-            std::string s(text);
+        LPWSTR text = nullptr;
+        if (ConvertSidToStringSidW(sid, &text)) {
+            std::string s = WideToUtf8(text);
             LocalFree(text);
             return s;
         }
@@ -1963,9 +2059,8 @@ namespace {
     }
 
     // A --dek-file holds the plaintext DEK, so it must be readable by
-    // nobody but the accounts that could read it anyway - the Linux tool's
-    // "owned by root or this user, no group or other bits at all", in ACL
-    // form. Judged on the open handle, so it's the file actually read:
+    // nobody but the accounts that could read it anyway. Judged on the open
+    // handle, so it's the file actually read:
     //   - the owner is SYSTEM, Administrators or this account;
     //   - the DACL grants nothing (any right, read included) to anyone else.
     //     Deny and inherit-only ACEs don't count; OWNER RIGHTS is the owner,
@@ -2047,7 +2142,7 @@ namespace {
     // then RequireTrustedDekFile, then at most kMaxDekStdinLen bytes. Opened
     // with read sharing only, so nobody can change it while it's read.
     // Unlike the key file, a hard link isn't refused: nothing here writes
-    // through it, and the Linux tool doesn't refuse one either.
+    // through it.
     void ReadDekFile(const std::string &path, DekScratch &scratch) {
         const std::string what = "--dek-file " + path;
         RequireLocalDrivePath(path, what);
@@ -2074,7 +2169,7 @@ namespace {
             throw CliError("--dek-file " + path + " is not a regular file");
         }
         const std::string actual = TrimTrailingSeparators(FinalPathOfHandle(file.get(), path));
-        if (_stricmp(actual.c_str(), TrimTrailingSeparators(expected).c_str()) != 0) {
+        if (!EqualsIgnoreCase(actual, TrimTrailingSeparators(expected))) {
             throw CliError(
                 what + " uses an 8.3 short name (such as PROGRA~1), resolving to \"" + actual +
                 "\"; give its full local path");
@@ -2093,8 +2188,8 @@ namespace {
     // kek_store.cpp does (machine scope, silent), and nothing here ever
     // creates or modifies a key.
 
-    // RAII for an NCrypt provider or key handle - this tool's own copy of
-    // src/handle_traits.h's: this tool compiles nothing from src/.
+    // Owns an NCrypt provider or key handle (a copy of src/handle_traits.h's,
+    // since this tool compiles nothing from src/).
     class ScopedNCryptHandle {
     public:
         ScopedNCryptHandle() = default;
@@ -2151,7 +2246,7 @@ namespace {
     // KeyName(service, kCurrentKeyId) - a FROZEN format there. `service` is
     // already validated and lowercased, so the widen is exact.
     std::wstring KekKeyName(const std::string &service) {
-        return L"hkdfguardwin_" + std::wstring(service.begin(), service.end()) + L"_v1";
+        return L"hkdfguardwin_" + Utf8ToWide(service) + L"_v1";
     }
 
     std::string NCryptErrorText(SECURITY_STATUS status) {
@@ -2340,7 +2435,7 @@ namespace {
         if (source == nullptr) {
             return false;
         }
-        std::wstring full(text.begin(), text.end());
+        std::wstring full = Utf8ToWide(text);
         wchar_t exe[MAX_PATH] = {};
         DWORD n = GetModuleFileNameW(nullptr, exe, MAX_PATH);
         full += L" Process: " + std::wstring(n > 0 && n < MAX_PATH ? exe : L"(unknown)") + L" (PID " +
@@ -2408,15 +2503,14 @@ namespace {
 
     // Read-only. Exits 0 whenever there was a definite answer (present,
     // absent, corrupt or unusable) and 1 when there wasn't (access denied, a
-    // provider error), so scripts can tell "no key" from "can't tell" - the
-    // macOS tool's rule.
+    // provider error), so scripts can tell "no key" from "can't tell".
     void RunStatus(const StatusArgs &args) {
         ValidateServiceCharset(args.serviceName);
         const std::string service = LowercaseService(args.serviceName);
-        fprintf(stdout, "service: %s\n", service.c_str());
+        Printf(stdout, "service: %s\n", service.c_str());
         {
             const SecurityModelInfo info = ReadSecurityModel();
-            fprintf(stdout, "security model: %s (this account %s persist key files)\n",
+            Printf(stdout, "security model: %s (this account %s persist key files)\n",
                     SecurityModelName(info.model), info.mayWriteKeyFiles ? "may" : "may not");
         }
 
@@ -2428,7 +2522,7 @@ namespace {
         std::vector<FoundKek> found = FindKeks(service);
 
         if (exists == 0) {
-            fprintf(stdout, "kek: absent\n");
+            Printf(stdout, "kek: absent\n");
         } else {
             Fingerprint fp{};
             rc = ReadKekFingerprint(service, fp);
@@ -2441,12 +2535,12 @@ namespace {
                     anyP256 = anyP256 || k.inspection.isP256Ecdh;
                 }
                 if (anyP256) {
-                    fprintf(stdout, "kek: unusable (%s)\n", DescribeStatus(rc).c_str());
+                    Printf(stdout, "kek: unusable (%s)\n", DescribeStatus(rc).c_str());
                 } else {
-                    fprintf(stdout, "kek: corrupt (not a P-256 ECDH key; see retire --corrupt)\n");
+                    Printf(stdout, "kek: corrupt (not a P-256 ECDH key; see retire --corrupt)\n");
                 }
                 for (const FoundKek &k : found) {
-                    fprintf(stdout, "key under this name: %s\n", DescribeFound(k).c_str());
+                    Printf(stdout, "key under this name: %s\n", DescribeFound(k).c_str());
                 }
                 return;
             }
@@ -2456,21 +2550,21 @@ namespace {
                     DescribeStatus(rc));
             }
 
-            fprintf(stdout, "kek: present\n");
+            Printf(stdout, "kek: present\n");
             for (auto it = found.begin(); it != found.end(); ++it) {
                 if (it->inspection.isP256Ecdh && it->inspection.fingerprint == fp) {
-                    fprintf(stdout, "provider: %s\n", ProviderLabel(it->opened.provider));
+                    Printf(stdout, "provider: %s\n", ProviderLabel(it->opened.provider));
                     found.erase(it);
                     break;
                 }
             }
-            fprintf(stdout, "fingerprint: %s\n", HexString(fp).c_str());
+            Printf(stdout, "fingerprint: %s\n", HexString(fp).c_str());
         }
 
         // A key on a provider the KeyStoragePolicy doesn't select is unused
         // today but would be picked up if the policy changed - worth seeing.
         for (const FoundKek &k : found) {
-            fprintf(stdout, "other key under this name (not selected by the KeyStoragePolicy): %s\n",
+            Printf(stdout, "other key under this name (not selected by the KeyStoragePolicy): %s\n",
                     DescribeFound(k).c_str());
         }
     }
@@ -2553,7 +2647,7 @@ namespace {
             "KEK retired for service '" + service + "' on the " + ProviderLabel(provider) + " (" + identity +
             ") by " + kProgramNameNarrow + " retire. Every DEK wrapped under it is permanently unrecoverable.");
         if (!logged) {
-            fprintf(stderr, "warning: the retirement could not be recorded in the Application event log (event 1004)\n");
+            Printf(stderr, "warning: the retirement could not be recorded in the Application event log (event 1004)\n");
         }
 
         // Then confirm it's gone, by reopening the name on that provider.
@@ -2561,10 +2655,10 @@ namespace {
             throw CliError(where + " was deleted, but a key under its name is still found; investigate before relying on it being gone");
         }
 
-        fprintf(stdout, "retired KEK for service \"%s\" (%s, %s)\n", service.c_str(), identity.c_str(),
+        Printf(stdout, "retired KEK for service \"%s\" (%s, %s)\n", service.c_str(), identity.c_str(),
                 ProviderLabel(provider));
         if (args.fingerprint) {
-            fprintf(stdout, "every payload wrapped under it is now permanently unrecoverable\n");
+            Printf(stdout, "every payload wrapped under it is now permanently unrecoverable\n");
         }
 
         // A key on the other provider, if any, is untouched - and may be the
@@ -2573,13 +2667,13 @@ namespace {
         try {
             std::vector<FoundKek> remaining = FindKeks(service);
             if (!remaining.empty()) {
-                fprintf(stdout, "note: service \"%s\" still has a key on the other provider (%s); run `%s status`\n",
+                Printf(stdout, "note: service \"%s\" still has a key on the other provider (%s); run `%s status`\n",
                         service.c_str(), DescribeFound(remaining.front()).c_str(), kProgramNameNarrow);
             } else if (!args.fingerprint) {
-                fprintf(stdout, "service \"%s\" can now be provisioned again\n", service.c_str());
+                Printf(stdout, "service \"%s\" can now be provisioned again\n", service.c_str());
             }
         } catch (const CliError &e) {
-            fprintf(stdout, "note: could not check the other provider for a key under this name: %s\n",
+            Printf(stdout, "note: could not check the other provider for a key under this name: %s\n",
                     e.message.c_str());
         }
     }
@@ -2587,8 +2681,6 @@ namespace {
     // MARK: - Run: provision
 
     void RunProvision(const ProvisionArgs &args) {
-        // `service` is not secret -- it's a logical identifier, not key
-        // material.
         ValidateServiceCharset(args.serviceName);
         const bool created = EnsureKekProvisioned(args.serviceName);
 
@@ -2599,13 +2691,12 @@ namespace {
                 "the KEK for service \"" + args.serviceName + "\" exists but its fingerprint could not be read: " +
                 DescribeStatus(rc));
         }
-        // The macOS tool's wording. A KEK this operator didn't create could
-        // have been planted by another administrator; the fingerprint is how
-        // to tell.
+        // A KEK this operator didn't create could have been planted by
+        // another administrator; the fingerprint is how to tell.
         if (created) {
-            fprintf(stdout, "fingerprint: %s -- record this; retire requires it\n", HexString(fp).c_str());
+            Printf(stdout, "fingerprint: %s -- record this; retire requires it\n", HexString(fp).c_str());
         } else {
-            fprintf(stdout, "fingerprint: %s -- confirm it matches the one recorded when this service was provisioned\n",
+            Printf(stdout, "fingerprint: %s -- confirm it matches the one recorded when this service was provisioned\n",
                     HexString(fp).c_str());
         }
     }
@@ -2613,9 +2704,14 @@ namespace {
     // MARK: - Run: wrap
 
     void RunWrap(WrapArgs &args) {
-        // First, before anything - even the exists pre-check below - touches
-        // a path: a UNC or mapped-drive path would make this process connect
-        // to the server it names. The same rule as hkdfguard_open_file.
+        // First, before anything touches a path: a UNC or mapped-drive path
+        // would make this process connect to the server it names. The same
+        // rule as hkdfguard_open_file. Before even that, the names
+        // themselves: the path is used exactly as typed or not at all.
+        RequireExactPathNames(args.keyFilePath, "--key-file-path " + args.keyFilePath);
+        if (args.dekFile) {
+            RequireExactPathNames(*args.dekFile, "--dek-file " + *args.dekFile);
+        }
         RequireLocalDrivePath(args.keyFilePath, args.keyFilePath);
         if (args.dekFile) {
             RequireLocalDrivePath(*args.dekFile, "--dek-file " + *args.dekFile);
@@ -2633,42 +2729,34 @@ namespace {
         // rights, create rights included - so the operator prepares the
         // folder (docs/admin-guide.md) and a missing one is an error.
         //
-        // Then a fast, friendly pre-check: fail before ever touching the
-        // TPM/Software Key Storage Provider if the output path already exists
-        // and --force wasn't passed. WriteWrappedKeyFile's FILE_CREATE is the
-        // actual correctness guarantee against the exists-then-create race;
-        // this is purely a fail-fast convenience on top of it.
+        // Also fail before touching a key storage provider if the output
+        // path already exists and --force wasn't passed. WriteWrappedKeyFile's
+        // FILE_CREATE is the actual guarantee against the exists-then-create
+        // race; this is a fail-fast convenience.
         const bool exists = ValidateOutputPathIsReal(args.keyFilePath);
         if (exists && !args.force) {
             throw CliError(args.keyFilePath + " already exists; pass --force|-f to overwrite");
         }
 
-        // Resolved before any TPM/Software Key Storage Provider work, so a bad
-        // --group name fails fast rather than after an expensive (and, with
-        // --force, destructive) operation has already run. Doesn't touch any
-        // secret material either way. Without --group: owner-only.
+        // Resolved before any key storage provider work, so a bad --group
+        // name fails before an expensive (and, with --force, destructive)
+        // operation runs. Without --group: owner-only.
         KeyFileSecurity security(
             GetProcessOwnerSid(),
             args.groupName ? std::optional<std::vector<BYTE>>(ResolveGroupSid(*args.groupName)) : std::nullopt);
 
-        // `service` (and its UTF-8 form) is not secret -- it's a logical
-        // identifier, not key material -- so both live for the rest of this
-        // function's scope, including the final status message below.
+        // `service` is a logical identifier, not secret.
         ValidateServiceCharset(args.serviceName);
         const std::string &service = args.serviceName;
 
         std::vector<uint8_t> wrapped;
         {
-            // Both the base64 *text* read from stdin and the decoded
-            // plaintext DEK *bytes* are secret. Both live only in `scratch`
-            // (locked into RAM, see DekScratch), which is wiped the instant
-            // this block ends - immediately after WrapDek is done with it,
-            // not at the end of RunWrap() (which would otherwise leave it in
-            // memory through the potentially-slow 8-pass secure-overwrite and
-            // the final file write below). hkdfguard_wrap_dek reads the
-            // plaintext DEK directly from the pointer it's given and never
-            // copies or zeroes it (see aes_gcm.cpp), so this caller-side
-            // wiping is the only place it happens at all.
+            // Both the base64 text and the decoded DEK bytes are secret and
+            // live only in `scratch` (locked into RAM, see DekScratch), which
+            // is wiped when this block ends - right after WrapDek, not
+            // through the slow secure-overwrite and file write below.
+            // hkdfguard_wrap_dek never zeroes the DEK it is given (see
+            // aes_gcm.cpp), so this caller-side wipe is the one that counts.
             DekScratch scratch;
             if (args.dekFile) {
                 ReadDekFile(*args.dekFile, scratch);
@@ -2685,14 +2773,10 @@ namespace {
                     std::to_string(scratch.decodedLen));
             }
 
-            // No provisioning happens here - "wrap" only ever opens an
-            // existing KEK. If none exists yet for this service, WrapDek's
-            // HKDFGUARD_ERR_KEK_NOT_FOUND path below reports that and points
-            // at "provision".
+            // Never provisions: a missing KEK is reported by WrapDek with a
+            // pointer to "provision".
             wrapped = WrapDek(service, scratch.decoded(), scratch.decodedLen);
-            // `scratch` is wiped, unlocked and freed here, as this block
-            // ends - only the wrapped (encrypted, no longer secret) form
-            // survives past this point.
+            // Only the wrapped (encrypted) form survives past this block.
         }
 
         // Wrapping in memory is open to any account with key use on the KEK;
@@ -2713,10 +2797,9 @@ namespace {
 
         WriteWrappedKeyFile(args.keyFilePath, wrapped, security);
 
-        // The same wording as the Linux tool.
         const std::string access =
                 args.groupName ? "owner read/write + " + *args.groupName + " read-only" : std::string("owner read/write");
-        fprintf(
+        Printf(
             stdout, "wrapped key written to %s (%zu bytes, %s, service \"%s\")\n",
             args.keyFilePath.c_str(), wrapped.size(), access.c_str(), service.c_str());
     }
@@ -2732,7 +2815,7 @@ namespace {
                 return 0;
             }
         } catch (const CliError &e) {
-            fprintf(stderr, "error: %s\n", e.message.c_str());
+            Printf(stderr, "error: %s\n", e.message.c_str());
             PrintUsage();
             return 2;
         }
@@ -2741,32 +2824,54 @@ namespace {
             run(args);
             return 0;
         } catch (const CliError &e) {
-            fprintf(stderr, "error: %s\n", e.message.c_str());
+            Printf(stderr, "error: %s\n", e.message.c_str());
             return 1;
         } catch (const std::exception &e) {
-            fprintf(stderr, "error: %hs\n", e.what());
+            Printf(stderr, "error: %hs\n", e.what());
             return 1;
         }
     }
 } // namespace
 
-int main(int argc, char *argv[]) {
+int wmain(int argc, wchar_t *wargv[]) {
     // Before anything is read: this process holds a plaintext DEK, so it
     // must not be dumpable, debuggable or injectable by other processes of
     // the same user - including through threads the key storage provider
     // starts later, which is what the strict flag adds on Windows (see
     // hkdfguard_harden_process_with_flags). Refuse to run rather than handle
-    // a DEK unprotected - the same rule as the Linux CLI.
+    // a DEK unprotected.
     {
         int rc = hkdfguard_harden_process_with_flags(HKDFGUARD_HARDEN_REQUIRE_PROTECTED_SIGNATURE);
         if (rc != HKDFGUARD_OK) {
-            fprintf(stderr, "error: %s; refusing to handle key material\n", DescribeStatus(rc).c_str());
+            Printf(stderr, "error: %s; refusing to handle key material\n", DescribeStatus(rc).c_str());
             return 1;
         }
     }
 
+    // The arguments as UTF-8, the encoding the rest of the tool and the
+    // library's ABI work in. The conversion is exact or it fails: a lone
+    // surrogate has no UTF-8 form, and a best-fit substitute would mean
+    // acting on a different name than the one typed.
+    std::vector<std::string> utf8Args;
+    for (int i = 0; i < argc; ++i) {
+        const int len = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wargv[i], -1, nullptr, 0, nullptr, nullptr);
+        if (len <= 0) {
+            Printf(stderr, "error: argument %d is not valid Unicode text\n", i);
+            return 2;
+        }
+        std::string arg(static_cast<size_t>(len), '\0');
+        WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wargv[i], -1, arg.data(), len, nullptr, nullptr);
+        arg.resize(static_cast<size_t>(len) - 1); // without the terminator
+        utf8Args.push_back(std::move(arg));
+    }
+    std::vector<char *> argv;
+    for (std::string &arg : utf8Args) {
+        argv.push_back(arg.data());
+    }
+    argv.push_back(nullptr);
+
     if (argc < 2) {
-        fprintf(stderr, "error: missing subcommand: expected %s\n", kSubcommandList);
+        Printf(stderr, "error: missing subcommand: expected %s\n", kSubcommandList);
         PrintUsage();
         return 2;
     }
@@ -2778,19 +2883,19 @@ int main(int argc, char *argv[]) {
     }
 
     if (command == "provision") {
-        return Dispatch<ProvisionArgs>(argc, argv, ParseProvisionArgs, RunProvision);
+        return Dispatch<ProvisionArgs>(argc, argv.data(), ParseProvisionArgs, RunProvision);
     }
     if (command == "wrap") {
-        return Dispatch<WrapArgs>(argc, argv, ParseWrapArgs, RunWrap);
+        return Dispatch<WrapArgs>(argc, argv.data(), ParseWrapArgs, RunWrap);
     }
     if (command == "retire") {
-        return Dispatch<RetireArgs>(argc, argv, ParseRetireArgs, RunRetire);
+        return Dispatch<RetireArgs>(argc, argv.data(), ParseRetireArgs, RunRetire);
     }
     if (command == "status") {
-        return Dispatch<StatusArgs>(argc, argv, ParseStatusArgs, RunStatus);
+        return Dispatch<StatusArgs>(argc, argv.data(), ParseStatusArgs, RunStatus);
     }
 
-    fprintf(stderr, "error: unknown subcommand \"%s\": expected %s\n", command.c_str(), kSubcommandList);
+    Printf(stderr, "error: unknown subcommand \"%s\": expected %s\n", command.c_str(), kSubcommandList);
     PrintUsage();
     return 2;
 }

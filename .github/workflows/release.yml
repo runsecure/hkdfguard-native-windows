@@ -1,13 +1,11 @@
-# Builds hkdfguard-native-windows's Release artifacts for both x64 and ARM64,
-# validates each natively (ctest suite + CLI wrap / DLL unwrap round trip via
-# scripts/Build-Test-Verify.ps1, run ON that architecture, not
-# cross-compiled and merely hoped to work), signs everything through Azure
-# Artifact Signing, then publishes one versioned GitHub Release - so other
-# repositories (e.g. a C# wrapper) can pull a stable, versioned download URL
-# instead of an ephemeral workflow artifact.
+# Builds the Release artifacts for x64 and ARM64, validates each natively on
+# its own architecture (ctest suite + CLI wrap / DLL unwrap round trip via
+# scripts/Build-Test-Verify.ps1), signs everything through Azure Artifact
+# Signing, then publishes one versioned GitHub Release, giving consumers a
+# stable download URL rather than an ephemeral workflow artifact.
 #
-# Triggered by pushing a version tag (vX.Y.Z). Reuses this repo's own
-# scripts/ rather than duplicating their logic here. Three jobs:
+# Triggered by pushing a version tag (vX.Y.Z). Uses the repository's own
+# scripts/ rather than duplicating their logic. Three jobs:
 #
 #   build    build.yml, the same reusable workflow ci.yml runs: per
 #            architecture, build, test, stage the UNSIGNED binaries.
@@ -102,7 +100,8 @@ jobs:
           path: dist/win-arm64
 
       # The MSI ProductVersion is the tag without its "v"; it must fit MSI's
-      # major.minor.build limits.
+      # major.minor.build limits, and equal the project() VERSION in
+      # CMakeLists.txt, which the binaries' version resources carry.
       - name: Determine the release version
         id: version
         shell: powershell
@@ -116,7 +115,11 @@ jobs:
               [int]$Matches[1] -gt 255 -or [int]$Matches[2] -gt 255 -or [int]$Matches[3] -gt 65535) {
             throw "Tag '$tag' is not vMAJOR.MINOR.BUILD within MSI limits (major, minor <= 255; build <= 65535)."
           }
-          "version=$($tag.Substring(1))" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          $version = $tag.Substring(1)
+          if ((Get-Content -Raw CMakeLists.txt) -notmatch 'project\(hkdfguard-native-windows\s+VERSION\s+(\d+\.\d+\.\d+)' -or $Matches[1] -ne $version) {
+            throw "Tag '$tag' does not match the project() VERSION in CMakeLists.txt; bump that version and tag the commit that carries it."
+          }
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
       # Federated (OIDC) sign-in: GitHub's short-lived token is exchanged for
       # an Azure token for AZURE_CLIENT_ID - no stored Azure secret. Leaves
@@ -130,12 +133,14 @@ jobs:
 
       # The signtool plugin for Artifact Signing (Azure.CodeSigning.Dlib.dll),
       # taken from Microsoft's NuGet package rather than the client tools
-      # MSI: the MSI copies the same files and then hung in InstallFinalize on
+      # MSI, which installs the same files but can hang in InstallFinalize on
       # hosted runners. signtool itself comes from the runner's Windows SDK.
       #
       # Pinned by version and by the package's SHA-256, and the plugin must
       # carry a valid Microsoft Authenticode signature. To move to a newer
-      # version, update both and check the new package's plugin the same way.
+      # version, update both, check the new package's plugin the same way,
+      # and update the same pins (plus the plugin's own SHA-256) in
+      # scripts/ArtifactSigning.ps1, which local signing uses.
       - name: Get the Artifact Signing plugin
         shell: powershell
         timeout-minutes: 10
