@@ -8,8 +8,7 @@
 
 namespace hkdfguard {
 
-    // Default local groups used when present.
-    // These groups are optional and will be applied only if they exist.
+    // Optional default local groups, applied only if they exist.
     inline constexpr wchar_t kHkdfGuardAdminsGroup[] =
         L"HkdfGuardAdmins";
 

@@ -798,35 +798,20 @@ namespace hkdfguard {
     void VerifyKeyAcl(
         NCRYPT_KEY_HANDLE key,
         const std::vector<std::wstring> &additionalGroups) {
-        //
-        // Read security descriptor
-        //
-
         std::vector<BYTE> descriptor;
         PACL acl = ReadKeyDacl(key, descriptor, HKDFGUARD_ERR_PROVIDER_ERROR);
-
-        //
-        // Verify SYSTEM
-        //
 
         VerifyPrincipalPresent(
             acl,
             CreateWellKnownSidBuffer(
                 WinLocalSystemSid));
 
-        //
-        // Verify Administrators
-        //
-
         VerifyPrincipalPresent(
             acl,
             CreateWellKnownSidBuffer(
                 WinBuiltinAdministratorsSid));
 
-        //
-        // Optional groups
-        //
-
+        // Optional groups: checked only if they resolve.
         if (auto sid =
                 TryResolveAccountSid(
                     kHkdfGuardAdminsGroup)) {
@@ -861,12 +846,6 @@ namespace hkdfguard {
     }
 
     namespace {
-        // Appends the SID of every direct member of the local group `sid`.
-        // Level 0 returns members by SID only, so nothing is resolved by
-        // name and no domain controller is contacted, even for a domain
-        // account that is a direct member. A well-known group (NT SERVICE,
-        // NT AUTHORITY) isn't in the local group database and has no
-        // enumerable members: it contributes only its own SID.
         // Whether a direct member of a deployer group may be trusted to have
         // written a key file: a single account, never a group. Trusted: a
         // user account, and an individual service's own SID (NT SERVICE\x,
@@ -889,6 +868,11 @@ namespace hkdfguard {
                    *GetSidSubAuthority(member, 0) == SECURITY_SERVICE_ID_BASE_RID;
         }
 
+        // Appends the SID of every direct member of the local group `sid`
+        // that IsTrustableDeployerMember accepts. A well-known group (NT
+        // SERVICE, NT AUTHORITY) isn't in the local group database and has
+        // no enumerable members, so it adds nothing here; the caller adds
+        // the group's own SID.
         void AppendDirectMembers(const SidBuffer &sid, std::vector<SidBuffer> &out) {
             wchar_t name[256] = {};
             wchar_t domain[256] = {};

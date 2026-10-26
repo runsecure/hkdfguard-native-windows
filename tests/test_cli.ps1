@@ -13,19 +13,15 @@ to it as base64 text on stdin via --dek-stdin, never as a command-line
 argument), "status" (read-only) and "retire" (deletes a KEK by fingerprint;
 elevated only - it also serves as the elevated scenarios' cleanup).
 
-Most scenarios below are reachable without ever creating a machine-wide KEK
-(each one fails - by design - before RunWrap()/RunProvision() in
-hkdfguard_cli.cpp ever calls into HkdfGuard.dll), so this test
-passes whether or not the process is elevated. This includes "wrap" against a
-service that was never provisioned - opening a nonexistent key fails
-(NTE_BAD_KEYSET -> HKDFGUARD_ERR_KEK_NOT_FOUND) regardless of privilege
-level, so that scenario also runs unconditionally. The handful of scenarios
-that need a real, persisted machine-wide KEK (an actual provision + wrap
-round trip, and a --force overwrite of the resulting file) do need the
-machine-wide KEK and so only run when this process happens to be elevated;
-they're skipped (not failed) otherwise, consistent with this project's
-existing convention that full wrap/unwrap coverage requires `ctest` to be
-run elevated.
+Most scenarios never create a machine-wide KEK (each one fails, by design,
+before RunWrap()/RunProvision() in hkdfguard_cli.cpp calls into
+HkdfGuard.dll), so they run whether or not the process is elevated. That
+includes "wrap" against a never-provisioned service: opening a nonexistent
+key fails (NTE_BAD_KEYSET -> HKDFGUARD_ERR_KEK_NOT_FOUND) at any privilege
+level. The scenarios that need a real, persisted machine-wide KEK (a
+provision + wrap round trip, a --force overwrite, retire) run only when
+elevated and are skipped, not failed, otherwise: full wrap/unwrap coverage
+requires `ctest` to be run elevated.
 #>
 param(
     [Parameter(Mandatory = $true)]
@@ -65,13 +61,11 @@ function Format-CliArg([string]$arg) {
 # trailing newline is added.
 #
 # Bytes are written straight to the pipe, never through
-# $proc.StandardInput's text writer. On Windows PowerShell 5.1 (.NET
-# Framework) that writer uses [Console]::InputEncoding, and when that is
-# UTF-8 with a preamble it writes a byte-order mark into the pipe the moment
-# Process.Start creates it - before anything the scenario sends. So the
-# console's input encoding is switched to BOM-less UTF-8 just around
-# Process.Start, then restored, which keeps results independent of the
-# console the test happens to run in.
+# $proc.StandardInput's text writer. On Windows PowerShell 5.1 that writer
+# uses [Console]::InputEncoding, and when that is UTF-8 with a preamble it
+# writes a byte-order mark into the pipe as soon as Process.Start creates it.
+# So the console's input encoding is switched to BOM-less UTF-8 just around
+# Process.Start, then restored, keeping results independent of the console.
 function Invoke-Cli {
     param(
         [string[]]$CliArgs,
@@ -174,7 +168,7 @@ try {
     # ---- 1. Top-level --help exits 0. ----
     $r = Invoke-Cli @("--help")
     Check ($r.ExitCode -eq 0) "--help exits 0"
-    # "help" too, as the Linux tool accepts it.
+    # The bare word "help" is accepted too.
     $r = Invoke-Cli @("help")
     Check ($r.ExitCode -eq 0) "help exits 0"
 
@@ -192,7 +186,7 @@ try {
     $r = Invoke-Cli @("provision", "--service-name", "svc", "--force")
     Check (($r.ExitCode -eq 2) -and ($r.StdErr -match 'is not valid for `provision`; it belongs to `wrap`')) "provision refuses wrap-only flags, as on Linux"
 
-    # #12: every repeated flag is a usage error, not "the last one wins".
+    # Every repeated flag is a usage error, not "the last one wins".
     foreach ($case in @(
             @(@("wrap", "-kf", "a.key", "-kf", "b.key", "-sn", "svc", "--dek-stdin"), "--key-file-path"),
             @(@("wrap", "-kf", "a.key", "-sn", "a", "--service-name", "b", "--dek-stdin"), "--service-name"),
@@ -203,12 +197,12 @@ try {
         Check (($r.ExitCode -eq 2) -and ($r.StdErr -match "give $($case[1]) at most once")) "a repeated $($case[1]) is a usage error ($($case[0] -join ' '))"
     }
 
-    # #16: an over-long service name gets the Linux tool's message, before the library sees it.
+    # An over-long service name is refused by the CLI, before the library sees it.
     $r = Invoke-Cli @("provision", "-sn", ("a" * 129))
     Check (($r.ExitCode -eq 1) -and ($r.StdErr -match "--service-name must be at most 128 bytes, got 129")) "an over-long service name gets the Linux tool's message"
 
     # ---- 3b. retire and status argument parsing - usage errors (exit 2), ----
-    #          all before any key is looked at. The macOS tool's messages.
+    #          all before any key is looked at.
     $zeroFp = "0" * 64
     foreach ($case in @(
             @(@("retire", "-sn", "svc"), "missing required --fingerprint\|-fp"),
@@ -235,7 +229,7 @@ try {
         if (-not (($r.ExitCode -eq 2) -and ($r.StdErr -match $case[1]))) { Write-Host "    exit $($r.ExitCode); stderr: $($r.StdErr)" }
     }
 
-    # --help after either new subcommand prints the usage and exits 0.
+    # --help after retire or status prints the usage and exits 0.
     foreach ($sub in "retire", "status") {
         $r = Invoke-Cli @($sub, "--help")
         Check (($r.ExitCode -eq 0) -and ($r.StdErr -match "hkdfguard retire --service-name")) "$sub --help prints the usage (exit 0)"
@@ -469,7 +463,7 @@ try {
     # no-kek.key, so a looser pattern would match any error echoing the path.
     Check ($r.StdErr -match "no KEK is provisioned for service") "wrap against a never-provisioned service reports a KEK-not-found/provision error"
 
-    # ---- 12a. --group is optional, as on Linux: without it the arguments ----
+    # ---- 12a. --group is optional: without it the arguments ----
     #           are complete, so the same call gets as far as the KEK lookup
     #           (not a usage error, exit 2). Given twice, it is a usage error.
     $noGroupFile = Join-Path $workDir "no-group.key"
@@ -495,7 +489,7 @@ try {
     Check ($r.StdErr -match "no KEK is provisioned for service") "wrap with a UTF-8 byte-order mark decodes the DEK and proceeds to the KEK lookup"
     Check (-not (Test-Path $bomKeyFile)) "wrap with a UTF-8 byte-order mark against a never-provisioned service creates no key file"
 
-    # ---- 12b2. Strict base64, the Linux tool's rules exactly: one trailing ----
+    # ---- 12b2. Strict base64: one trailing ----
     #            newline (LF or CRLF) and nothing else; canonical padding;
     #            the standard alphabet only. Accepted input reaches the KEK
     #            lookup (never provisioned); refused input says why.
@@ -520,8 +514,8 @@ try {
             Check (($r.ExitCode -eq 1) -and ($r.StdErr -match "no KEK is provisioned for service")) "strict base64: $($case.What) is accepted"
         } else {
             Check (($r.ExitCode -eq 1) -and ($r.StdErr -match "not valid base64")) "strict base64: $($case.What) is refused"
-            # One fixed message, the Linux tool's: no character, offset or
-            # bits of the input reach it.
+            # One fixed message: no character, offset or bits of the input
+            # reach it.
             Check ($r.StdErr -match [regex]::Escape("error: the DEK input is not valid base64 (standard alphabet, padded, at most one trailing newline)")) "strict base64: $($case.What) gets the one fixed message"
             Check ($r.StdErr -notmatch "offset") "strict base64: $($case.What) names no offset"
             if ($r.StdErr -notmatch "not valid base64") { Write-Host "    stderr: $($r.StdErr)" }
@@ -558,8 +552,8 @@ try {
         Write-Host "[SKIP] wrap --dek-stdin refuses an interactive console (this run has no console to hand it)"
     }
 
-    # ---- 12d. --dek-file: the DEK read from a file, by the Linux tool's ----
-    #           rules in ACL form. Accepted input reaches the KEK lookup
+    # ---- 12d. --dek-file: the DEK read from a file, which must be private ----
+    #           (checked by its ACL). Accepted input reaches the KEK lookup
     #           (never provisioned). The scratch folder is under %TEMP%, so a
     #           new file inherits SYSTEM, Administrators and this user only -
     #           exactly what the rule accepts.
@@ -727,14 +721,13 @@ try {
     # Finds an event this run caused in the Application log under the
     # library's event source. Matched on the event's insertion string (the
     # full text event_log.cpp builds), which is present whether or not the
-    # source is registered on this machine - so this works on a dev box
-    # where the MSI was never installed, too.
+    # source is registered on this machine (it isn't until the MSI is
+    # installed).
     #
     # XPath rather than -FilterHashtable: the hashtable's ProviderName key
     # looks up the provider's registration and throws ("The parameter is
-    # incorrect") when the source isn't registered, which is the normal
-    # state before the MSI is installed. Get-WinEvent also reports "no
-    # events found" as an error, hence the try/catch.
+    # incorrect") when the source isn't registered. Get-WinEvent also
+    # reports "no events found" as an error, hence the try/catch.
     function Find-HkdfEvent([datetime]$Since, [int]$Id, [string]$Needle) {
         $sinceUtc = $Since.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
         $xpath = "*[System[Provider[@Name='hkdfguard-native-windows'] and EventID=$Id and TimeCreated[@SystemTime>='$sinceUtc']]]"
@@ -753,9 +746,8 @@ try {
     $isAdmin = $principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
     if ($isAdmin) {
         $happyKeyFile = Join-Path $workDir "happy.key"
-        # Alphanumeric only - see the "service name containing a hyphen is
-        # rejected" scenario above; the CLI's ValidateServiceCharset would
-        # reject a hyphenated name like the other tests' "hkdfguard-*" ones.
+        # Alphanumeric only: the CLI rejects a hyphenated service name
+        # (scenario 10).
         $serviceName = "hkdfguardclitest"
 
         $provisionStart = (Get-Date).AddSeconds(-2)
@@ -1107,10 +1099,9 @@ try {
         }
         Check (-not (Test-Path '\\localhost\C$\Windows\hkdfguard-probe.key')) "no key file was written to the share"
 
-        # Fallback cleanup, if retire couldn't run. Full path, not just
-        # "certutil" - this test's PATH is whatever ctest baked into its
-        # ENVIRONMENT property at configure time (see tests/CMakeLists.txt),
-        # which isn't guaranteed to still resolve ordinary system tools.
+        # Fallback cleanup, if retire couldn't run. certutil by full path:
+        # this test's PATH comes from ctest's ENVIRONMENT property (see
+        # tests/CMakeLists.txt) and may not resolve ordinary system tools.
         if ($providerName -and -not $retired) {
             # Matches kek_store.cpp's KeyName(): every piece is lowercase, and
             # $serviceName is already lowercase.

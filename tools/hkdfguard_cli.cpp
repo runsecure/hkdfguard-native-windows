@@ -22,8 +22,8 @@
 //       C ABI offers no delete, so no application that loads it gets a
 //       one-call wipe. Requires an elevated process. Every payload wrapped
 //       under a retired KEK is permanently unrecoverable. Logged as event
-//       1004. The macOS tool's retire, with --provider added because a
-//       Windows service can have a KEK on each of two providers.
+//       1004. --provider exists because a Windows service can have a KEK on
+//       each of two providers.
 //
 //   status --service-name|-sn <name>
 //       Reports whether the service has a KEK, which provider holds it, and
@@ -35,27 +35,24 @@
 //       writes the wrapped payload to <path>. Never provisions a KEK - if
 //       none exists yet for this service, this fails with KEK_NOT_FOUND and
 //       a hint to run "provision" first. The DEK (32 raw bytes,
-//       base64-encoded) is read from stdin rather than a command-line
-//       argument, specifically so it never appears in this process's argv -
-//       and is therefore not visible to other processes on the same host
-//       via a command-line/process listing (e.g. a WMI query) for the life
-//       of this process, unlike a plain --dek=<value> argument would be.
+//       base64-encoded) is read from stdin or a file, never from argv, so it
+//       is not visible to other processes via a command-line/process listing
+//       (e.g. a WMI query).
 //
 // Calls into HkdfGuard.dll through its stable C ABI - hkdfguard_kek_exists,
-// hkdfguard_create_kek, hkdfguard_kek_fingerprint and hkdfguard_wrap_dek -
-// the same interface any other-language caller uses; this tool links only
+// hkdfguard_create_kek, hkdfguard_kek_fingerprint and hkdfguard_wrap_dek;
+// this tool links only
 // against include/hkdfguard.h and the hkdfguard import library, nothing from
 // src/. The one exception is retire/status's direct NCrypt access to the
 // KEK's persisted key (see "KEK inspection and retirement" below): the ABI
 // deliberately has no way to delete a key or address one provider's copy.
 //
 // The KEK's `service` identity is exactly --service-name's value, passed
-// straight through to the hkdfguard_* calls as `service`, and shared
-// between the two subcommands - "provision" and "wrap" for the same
-// service name operate on the same KEK. The KEK itself is meant to be
+// straight through to the hkdfguard_* calls, so every subcommand given the
+// same service name operates on the same KEK. The KEK is meant to be
 // long-lived: DEKs are re-minted every release under the same service
-// name, and if a genuinely new KEK is ever wanted, the service name is
-// simply versioned (e.g. "myapp.v2") - there is no in-place key rotation.
+// name, and a new KEK is obtained by versioning the service name (e.g.
+// "myapp.v2") - there is no in-place key rotation.
 // Creating a KEK (provision, the first run for a given service name) needs
 // an elevated process; wrapping against an existing one (wrap) does not,
 // subject to the key's ACL.
@@ -63,25 +60,20 @@
 // The wrapped payload is written to <key-file-path> with an explicit,
 // non-inherited DACL: the calling account (the process token's owner SID -
 // Administrators when run elevated) gets read+write and no one else is
-// granted anything - the Windows analog of the Linux tool's POSIX 0600.
-// With --group, that group also gets read-only: the analog of the Linux
-// tool's --group, mode 0640 (owner rw, one group r, no one else). Set
-// atomically at file-creation time via CreateFileW's own
-// security-attributes parameter, not applied after the fact. --group is a
-// "wrap"-only concept:
-// it governs the wrapped-key *file's* ACL, not the KEK's - which principals
-// may use the KEK is a separate, machine-level registry policy
-// (KeyUseGroups; see include/hkdfguard.h), not something either subcommand
-// accepts on the command line.
+// granted anything (in POSIX terms, 0600). With --group, that group also
+// gets read-only (0640). The DACL is set atomically at file-creation time
+// via CreateFileW's security-attributes parameter, not applied after the
+// fact. --group governs only the wrapped-key *file's* ACL, not the KEK's:
+// which principals may use the KEK is a machine-level registry policy
+// (KeyUseGroups; see include/hkdfguard.h), not a command-line option.
 //
 // With --force against a pre-existing file, that file's old contents are
 // securely overwritten in place (8 alternating all-zero/random passes,
 // each flushed before the next starts) and deleted before the new file is
 // created - see SecureOverwriteAndRemoveIfExists/WriteWrappedKeyFile below
-// for the exact sequence and its one intentional fallback, matching this
-// project's macOS implementation pass-for-pass. Only ever runs when
-// --force is passed; without it, an existing file is never touched at all
-// (WriteWrappedKeyFile's plain CREATE_NEW fails outright instead).
+// for the exact sequence and its one intentional fallback. Without --force,
+// an existing file is never touched (WriteWrappedKeyFile's CREATE_NEW fails
+// instead).
 //
 // The wrapped-key path must be a real file reached through real directories:
 // a symbolic link, junction, or other reparse point at the path or anywhere
@@ -89,8 +81,8 @@
 // --force. There is no legitimate reason for a secrets file to live behind a
 // link, and allowing one would let whoever can plant a link in the output
 // directory redirect an elevated `wrap --force` at an arbitrary file. See the
-// "output path must be a real file" section below for exactly how that is
-// enforced on open handles rather than on re-queried paths. And the folders
+// "output path must be a real file" section below for how that is enforced
+// on open handles rather than on re-queried paths. The folders
 // above it must be ones hkdfguard_open_file will read from: no account but
 // SYSTEM, Administrators, TrustedInstaller and the caller may create, delete
 // or rename entries in any of them below the drive root (see "The folders a
@@ -123,28 +115,21 @@
 
 namespace {
     constexpr wchar_t kProgramName[] = L"hkdfguard";
-    // Narrow-string twin of kProgramName, for use in narrow (std::string)
-    // error/hint text - everything in this tool that isn't a PrintUsage-style
-    // fwprintf is narrow, matching the non-UNICODE Win32 API variants and
-    // std::string this tool uses throughout.
+    // Narrow twin of kProgramName, for the tool's narrow (std::string)
+    // error/hint text; only PrintUsage is wide.
     constexpr char kProgramNameNarrow[] = "hkdfguard";
     constexpr size_t kDekLen = 32;
-    // Generous starting capacity for the wrapped payload - retried once at the
-    // library-reported size on HKDFGUARD_ERR_BUFFER_TOO_SMALL, so this only
-    // needs to be a reasonable common case, not an absolute upper bound.
-    // Matches the macOS/Linux tools' own initial-capacity constant.
+    // Starting capacity for the wrapped payload; WrapDek retries once at the
+    // library-reported size on HKDFGUARD_ERR_BUFFER_TOO_SMALL, so this is a
+    // common case, not an upper bound.
     constexpr int32_t kInitialWrappedCapacity = 512;
-    // Number of secure-overwrite passes SecureOverwriteAndRemoveIfExists below
-    // performs on a pre-existing file before deleting it, alternating an
-    // all-zero pass and a random-bytes pass, four times each.
+    // Secure-overwrite passes on a pre-existing file before deletion:
+    // all-zero and random-bytes, alternating, four times each.
     constexpr size_t kSecureOverwritePassCount = 8;
 
-    // This tool's own operational-error type - deliberately not reusing the
-    // DLL's internal HkdfGuardError (src/errors.h), since this tool depends
-    // only on the public C ABI (include/hkdfguard.h) and the import library,
-    // nothing from src/. Carries a narrow std::string message, matching the
-    // narrow (non-UNICODE) Win32 API variants and std::string arguments this
-    // tool uses throughout - so every fprintf of it must use %s, never %ls.
+    // This tool's operational-error type. Not the DLL's HkdfGuardError
+    // (src/errors.h): this tool depends only on the public C ABI. The message
+    // is narrow, so every fprintf of it uses %s, never %ls.
     struct CliError {
         std::string message;
 
@@ -152,9 +137,8 @@ namespace {
         }
     };
 
-    // Renders a Win32 error code (as returned by GetLastError(), or an NTSTATUS
-    // cast to DWORD for a BCrypt failure) as a human-readable string, the
-    // standard documented FormatMessageW idiom.
+    // Renders a Win32 error code (from GetLastError(), or an NTSTATUS cast to
+    // DWORD for a BCrypt failure) as a human-readable string.
     std::string FormatWin32Error(DWORD code) {
         LPSTR buf = nullptr;
 
@@ -222,8 +206,7 @@ namespace {
     enum class ParseOutcome { Run, Help };
 
     // The one usage text, printed for every help request and after every
-    // usage error - the Linux tool's, line for line, with this platform's
-    // paths and examples.
+    // usage error.
     void PrintUsage() {
         fwprintf(
             stderr,
@@ -271,15 +254,14 @@ namespace {
             kProgramName, kProgramName);
     }
 
-    // The subcommand list every "missing/unknown subcommand" error names -
-    // the macOS tool's wording.
+    // The subcommand list every "missing/unknown subcommand" error names.
     constexpr char kSubcommandList[] = "`provision`, `wrap`, `retire` or `status`";
 
     // Stores a flag's value, refusing a second one rather than letting the
     // last win: `-kf a.key ... -kf b.key` is ambiguous about which file the
     // operator meant, and silently picking one is how the wrong key file gets
     // written or the wrong service's KEK gets used. `flag` is the flag's long
-    // name. The Linux tool's set_once.
+    // name.
     void SetOnce(std::optional<std::string> &slot, const char *flag, const std::string &value) {
         if (slot) {
             throw CliError(std::string("give ") + flag + " at most once");
@@ -408,8 +390,7 @@ namespace {
 
     // Exactly 64 hex digits, either case. No separators or prefixes: the
     // value is meant to be pasted from provision's output, and a strict
-    // format keeps a truncated paste from ever looking valid. The macOS
-    // tool's parseFingerprintHex.
+    // format keeps a truncated paste from ever looking valid.
     Fingerprint ParseFingerprintHex(const std::string &text) {
         if (text.size() != kFingerprintLen * 2) {
             throw CliError(
@@ -522,25 +503,24 @@ namespace {
 
     // MARK: - The DEK's one buffer
 
-    // Upper bound on how much stdin "wrap --dek-stdin" will accept - the
-    // Linux tool's MAX_DEK_INPUT_LEN. A 32-byte DEK is 44 base64 characters;
+    // Upper bound on how much DEK input "wrap" will accept. A 32-byte DEK is
+    // 44 base64 characters;
     // 64 leaves room for a UTF-8 byte-order mark and a trailing CRLF, and
     // nothing longer can be a valid DEK under the rules DecodeDek applies.
     constexpr size_t kMaxDekStdinLen = 64;
 
-    // Any DEK input that isn't strict, padded, standard base64 - the Linux
-    // tool's wording. Deliberately fixed: it names no character, offset or
-    // bit pattern, so a mistyped DEK never puts part of itself into a log.
+    // Any DEK input that isn't strict, padded, standard base64. Deliberately
+    // fixed: it names no character, offset or bit pattern, so a mistyped DEK
+    // never puts part of itself into a log.
     constexpr char kInvalidBase64DekMessage[] =
             "the DEK input is not valid base64 (standard alphabet, padded, at most one trailing newline)";
 
-    // Refusing to read the DEK from an interactive console - the Linux
-    // tool's wording, with this tool's own example.
+    // Refusing to read the DEK from an interactive console.
     constexpr char kTerminalDekMessage[] =
             "refusing to read the DEK from an interactive terminal, where it would be echoed and kept in the "
             "scrollback; pipe it in instead, e.g. $dekBase64 | hkdfguard.exe wrap ... --dek-stdin";
 
-    // Refusing UTF-16 input - the Linux tool's wording.
+    // Refusing UTF-16 input.
     constexpr char kUtf16DekMessage[] =
             "the DEK input is UTF-16 encoded; send it as ASCII or UTF-8 base64 text "
             "(in PowerShell, set [Console]::OutputEncoding or $OutputEncoding to UTF-8)";
@@ -549,15 +529,14 @@ namespace {
     // from stdin, and the bytes that decodes to - lives in one fixed
     // allocation, never grown or moved, wiped before it's freed. It is
     // locked into RAM with VirtualLock, so the DEK is never written to the
-    // page file: the Linux CLI's DekScratch, with VirtualLock for mlock. Two
-    // pages, well inside the default minimum working set VirtualLock draws
-    // on. One allocation, not one per buffer, for the same reason as on
-    // Linux: locks work on whole pages.
+    // page file. Two pages, well inside the default minimum working set
+    // VirtualLock draws on. One allocation, not one per buffer, because locks
+    // work on whole pages.
     //
-    // This covers the CLI's own copies. Windows has no counterpart of
-    // Linux's mlockall, so the library's transient copies (on its stack,
-    // while it wraps) are not locked; process hardening (see main) still
-    // keeps them out of crash dumps and away from same-user processes.
+    // This covers the CLI's own copies. Windows has no process-wide memory
+    // lock, so the library's transient copies (on its stack, while it wraps)
+    // are not locked; process hardening (see main) still keeps them out of
+    // crash dumps and away from same-user processes.
     class DekScratch {
     public:
         // One byte more than accepted, so over-long input is detected
@@ -609,15 +588,11 @@ namespace {
         bool locked_ = false;
     };
 
-    // Reads all of stdin (expected to be base64 text for the DEK) into
-    // `scratch`. Used only by "wrap --dek-stdin", specifically so the DEK
-    // never appears in this process's argv - see this file's header comment.
-    // ReadFile on the stdin handle, not the C runtime's fread: the CRT keeps
-    // its own buffer for a FILE stream, which would hold a copy of the DEK
-    // text this code could neither lock nor wipe.
     // Reads at most kMaxDekStdinLen bytes from `in` into scratch's text
-    // buffer, refusing more. `what` names the source in errors, as the Linux
-    // tool's read_bounded does ("the DEK on stdin", "--dek-file").
+    // buffer, refusing more. `what` names the source in errors ("the DEK on
+    // stdin", "--dek-file"). Uses ReadFile, not the C runtime's fread: the
+    // CRT keeps its own buffer for a FILE stream, which would hold a copy of
+    // the DEK text this code could neither lock nor wipe.
     void ReadBoundedInto(HANDLE in, const std::string &what, DekScratch &scratch) {
         for (;;) {
             DWORD got = 0;
@@ -645,7 +620,7 @@ namespace {
                     " bytes; expected base64 of a 32-byte DEK");
             }
         }
-        // Empty input is reported by DecodeDek, as on Linux.
+        // Empty input is reported by DecodeDek.
     }
 
     void ReadDekBase64FromStdin(DekScratch &scratch) {
@@ -675,10 +650,10 @@ namespace {
 
     // The 6-bit value of a standard-alphabet base64 character, or -1 - in
     // constant time: no branch and no table lookup depends on `c`, which is
-    // a character of the secret DEK text. The same arithmetic as RustCrypto's
-    // base64ct (which the Linux tool uses) and libsodium: start at -1 and,
-    // for each range, add a correction masked to apply only when `c` is in
-    // it. Every term is computed for every character.
+    // a character of the secret DEK text. The same arithmetic as base64ct and
+    // libsodium: start at -1 and, for each range, add a correction masked to
+    // apply only when `c` is in it. Every term is computed for every
+    // character.
     inline int32_t Base64ValueCt(uint8_t c) {
         const int32_t ch = c;
         int32_t value = -1;
@@ -690,8 +665,7 @@ namespace {
         return value;
     }
 
-    // Decodes scratch's base64 text into its decoded bytes, by the Linux
-    // tool's rules exactly, so the same input is accepted or refused on both:
+    // Decodes scratch's base64 text into its decoded bytes, by these rules:
     //
     //   - A leading UTF-8 byte-order mark (EF BB BF) is skipped: some
     //     PowerShell and .NET configurations prepend one when piping text to
@@ -703,10 +677,10 @@ namespace {
     //   - Then strict standard base64 (RFC 4648 section 4, the `+/` alphabet)
     //     with canonical padding: a length that's a multiple of 4, `=` only
     //     as the last one or two characters, and the unused bits before the
-    //     padding zero - what base64ct, which the Linux tool uses, accepts.
+    //     padding zero.
     //
-    // Constant time with respect to the secret text, as base64ct is on
-    // Linux: every character goes through Base64ValueCt, problems are
+    // Constant time with respect to the secret text: every character goes
+    // through Base64ValueCt, problems are
     // collected into one flag rather than reported where they're found, and
     // the flag is checked once, after the whole input has been processed.
     // Only public facts decide anything earlier: the length, where the
@@ -817,8 +791,7 @@ namespace {
     }
 
     // Calls hkdfguard_wrap_dek, retrying once at the library-reported required
-    // size if the initial buffer was too small - same pattern as the
-    // macOS/Linux tools' own wrap helper. Never provisions a KEK - a missing
+    // size if the initial buffer was too small. Never provisions a KEK - a missing
     // KEK surfaces as HKDFGUARD_ERR_KEK_NOT_FOUND, with a hint pointing at
     // this tool's "provision" subcommand.
     std::vector<uint8_t> WrapDek(const std::string &service, const BYTE *dek, size_t dekLen) {
@@ -836,8 +809,8 @@ namespace {
         }
 
         if (rc != HKDFGUARD_OK) {
-            // The Linux tool's wording for the one failure an operator is most
-            // likely to hit, with the command that fixes it.
+            // The failure an operator is most likely to hit, with the
+            // command that fixes it.
             if (rc == HKDFGUARD_ERR_KEK_NOT_FOUND) {
                 throw CliError(
                     "no KEK is provisioned for service \"" + service + "\"; run `" + kProgramNameNarrow +
@@ -889,7 +862,6 @@ namespace {
             throw CliError(message);
         }
 
-        // The Linux tool's wording.
         if (exists != 0) {
             fprintf(stdout, "KEK already provisioned for service \"%s\"; verified, nothing to do\n", service.c_str());
         } else {
@@ -927,8 +899,8 @@ namespace {
 
     // Enforces that --service-name - the exact value passed to
     // the hkdfguard_* calls as `service` - contains only ASCII alphanumeric
-    // characters or '.', does not start with '.', and does not contain "..",
-    // matching this project's macOS/Linux tools. The library enforces the
+    // characters or '.', does not start with '.', and does not contain "..".
+    // The library enforces the
     // same rules; checking here first gives the operator a specific message.
     void ValidateServiceCharset(const std::string &service) {
         constexpr size_t kMaxServiceLen = 128; // the ABI's limit
@@ -954,8 +926,7 @@ namespace {
 
     // Fetches the current process token's owner SID (TokenOwner) - the SID
     // Windows itself documents as "the default owner for objects this process
-    // creates" - as an owned buffer (copied out of the token info block, which
-    // is about to be freed).
+    // creates" - copied out of the token info block.
     std::vector<BYTE> GetProcessOwnerSid() {
         HANDLE hToken = nullptr;
         if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) {
@@ -992,8 +963,7 @@ namespace {
     // rollback note in README.md - or copy the file elsewhere. The same set
     // the DLL refuses as a KEK key-use group (src/key_acl.cpp's
     // kOverBroadSids/kOverBroadSidStrings), duplicated here because this tool
-    // deliberately depends only on the public C ABI, nothing from src/. Keep
-    // the two lists in sync.
+    // depends only on the public C ABI. Keep the two lists in sync.
     constexpr WELL_KNOWN_SID_TYPE kOverBroadGroupSids[] = {
         WinNullSid,
         WinWorldSid, // Everyone

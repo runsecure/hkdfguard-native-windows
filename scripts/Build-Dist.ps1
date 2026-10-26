@@ -5,40 +5,28 @@
     CLI - into dist\win-<arch>.
 
 .DESCRIPTION
-    1. Locates the MSVC/CMake/Ninja toolchain from the Visual Studio Build
-       Tools install and puts them on PATH for this process, targeting
-       -Arch (x64 or ARM64) - cross-compiling if the host architecture
-       differs from -Arch, native otherwise. Requires that VS install to
-       have the matching C++ build tools component: VC.Tools.x86.x64 for
-       x64, VC.Tools.ARM64 for ARM64 - these are separate, independently
-       installed workload components.
+    1. Enters the Visual Studio Build Tools developer environment for -Arch
+       (x64 or ARM64), cross-compiling when the host architecture differs.
+       The VS install needs the matching C++ build tools component:
+       VC.Tools.x86.x64 for x64, VC.Tools.ARM64 for ARM64.
     2. Deletes any existing build-release-<arch>\ and dist\win-<arch>\
        directories, then configures and builds Release from scratch
-       (cmake -G Ninja -DCMAKE_BUILD_TYPE=Release) - "clean" specifically
-       because a stale build directory left over from before a
-       CMakeLists.txt change (e.g. the static-runtime-linking flag) can
-       silently keep old settings baked into an incrementally-reused build
-       directory. Each architecture gets its own build directory so
-       building both doesn't clobber the other's cached CMake config.
-    3. Copies HkdfGuard.dll and hkdfguard.exe
-       (which needs that DLL sitting next to it - Windows won't find it
-       across directories) into dist\win-<arch>\, ready to hand to a C#
-       wrapper or copy to another machine.
-    4. Reports each binary's DLL dependencies (dumpbin /dependents) as a
-       sanity check that the static-runtime-linking CMakeLists.txt setting
-       actually took effect - neither should depend on MSVCP140.dll/
-       VCRUNTIME140*.dll/the api-ms-win-crt-*.dll forwarders, only core
-       Windows system DLLs.
+       (cmake -G Ninja -DCMAKE_BUILD_TYPE=Release), so no setting cached in
+       a reused build directory can outlive a CMakeLists.txt change. Each
+       architecture has its own build directory.
+    3. Checks each binary's target architecture and exploit mitigations.
+    4. Copies HkdfGuard.dll and hkdfguard.exe (which needs the DLL next to
+       it) into dist\win-<arch>\.
+    5. Reports each binary's DLL dependencies (dumpbin /dependents) to
+       confirm the static runtime linking took effect: neither should
+       depend on MSVCP140.dll, VCRUNTIME140*.dll or the api-ms-win-crt-*.dll
+       forwarders, only core Windows system DLLs.
 
     Does not run the test suite (that needs an elevated shell - see
-    run-build-test-verify.bat/Build-Test-Verify.ps1 for that) and does not
-    itself require elevation: building Release doesn't touch the
-    machine-wide KEK, only actually wrapping a DEK does. Note that when
-    cross-compiling (-Arch differs from the host architecture), nothing
-    this script produces has actually been *run* on that architecture -
-    only compiled for it. Validate a cross-compiled ARM64 build by actually
-    running scripts/Build-Test-Verify.ps1 on real (or emulated) ARM64
-    Windows before trusting it in production.
+    Build-Test-Verify.ps1) and does not need elevation itself: building
+    doesn't touch the machine-wide KEK. A cross-compiled build has only been
+    compiled, not run, for its architecture; run Build-Test-Verify.ps1 on
+    real or emulated ARM64 Windows before trusting an ARM64 build.
 
 .PARAMETER Arch
     Target architecture: x64 or ARM64. Default: x64.
@@ -104,11 +92,9 @@ if (-not (Test-Path $vswhere)) {
 }
 $env:PATH = "$env:PATH;$installerDir"
 
-# The C++ build tools component is architecture-specific: VC.Tools.x86.x64
-# and VC.Tools.ARM64 are separate, independently installed components, so
-# requiring the wrong one here would let vswhere find a VS install that
-# actually can't compile for -Arch at all, and fail later with a much less
-# clear "cl.exe not found" error instead of this one.
+# The C++ build tools component is architecture-specific. Requiring the one
+# for -Arch makes vswhere skip installs that can't compile for it, so the
+# failure is this clear error rather than a later "cl.exe not found".
 $requiredComponent = if ($Arch -eq "ARM64") {
     "Microsoft.VisualStudio.Component.VC.Tools.ARM64"
 } else {
@@ -125,17 +111,13 @@ if (-not (Test-Path $devShell)) {
     throw "Launch-VsDevShell.ps1 not found under $vsInstallPath"
 }
 
-# Launch-VsDevShell.ps1's own -Arch/-HostArch naming (amd64/arm64/x86/arm)
-# differs from this script's -Arch (x64/ARM64, matching common Windows
-# architecture naming and the eventual win-x64/win-arm64 dist folder names).
+# Launch-VsDevShell.ps1 names architectures amd64/arm64; this script uses
+# x64/ARM64, matching the win-x64/win-arm64 dist folder names.
 $vsArchMap = @{ "x64" = "amd64"; "ARM64" = "arm64" }
 $vsTargetArch = $vsArchMap[$Arch]
 
-# Detects the *host's* architecture so a build run on an ARM64 machine
-# targeting ARM64 (or an x64 machine targeting x64) correctly sets up a
-# native toolchain rather than an unnecessary cross-compiler - and so
-# targeting the other architecture correctly cross-compiles instead of
-# silently trying to run a mismatched-architecture cl.exe.
+# The host architecture decides between a native toolchain and a
+# cross-compiler, so cl.exe always runs on the host it was built for.
 $hostArchMap = @{ "AMD64" = "amd64"; "ARM64" = "arm64"; "x86" = "x86" }
 $vsHostArch = $hostArchMap[$env:PROCESSOR_ARCHITECTURE]
 if (-not $vsHostArch) { $vsHostArch = "amd64" } # unrecognized value - amd64 is by far the common case
@@ -181,11 +163,9 @@ foreach ($p in $dllPath, $cliPath) {
 }
 
 # ---- Verify the build actually produced the target architecture -----------
-# A misconfigured toolchain (e.g. -HostArch/-Arch resolved to the same
-# native compiler despite -Arch ARM64 being requested) would otherwise
-# silently produce an x64 binary in an "ARM64" dist folder. dumpbin
-# /headers' "machine type" line reports what the linker actually targeted,
-# independent of anything this script assumed going in.
+# A misconfigured toolchain could put an x64 binary in an "ARM64" dist
+# folder. dumpbin /headers' "machine" line reports what the linker actually
+# targeted.
 Write-Section "Verifying target architecture"
 $expectedMachine = if ($Arch -eq "ARM64") { "ARM64" } else { "x64" }
 foreach ($bin in $dllPath, $cliPath) {

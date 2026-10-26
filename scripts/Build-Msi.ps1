@@ -175,13 +175,10 @@ $installer = New-Object -ComObject WindowsInstaller.Installer
 # 0 = msiOpenDatabaseModeReadOnly.
 $db = $installer.OpenDatabase([string]$MsiPath, 0)
 # Returns each row as a string array of `$columns` fields. Fields are read
-# with a plain for-loop and an explicit [int]: piping indexes through
-# ForEach-Object hands COM a wrapped object, and the Windows Installer
-# automation interface rejects that (DISP_E_TYPEMISMATCH) or misreads it.
-#
-# The [void] casts matter: these automation methods return nothing, but
-# PowerShell still emits a $null into the function's output for each call,
-# which would otherwise arrive ahead of the real rows.
+# with a plain for-loop and an explicit [int]: an index piped through
+# ForEach-Object reaches COM as a wrapped object, which the Windows Installer
+# automation interface rejects (DISP_E_TYPEMISMATCH) or misreads. The [void]
+# casts keep the $null each automation call emits out of the returned rows.
 function Get-Rows([string]$sql, [int]$columns) {
     $view = $db.OpenView($sql)
     [void]$view.Execute()

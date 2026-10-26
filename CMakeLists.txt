@@ -24,7 +24,7 @@ endif()
 # fall back to an older standard if the compiler doesn't support it.
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-# Only the two functions explicitly marked HKDFGUARD_API (dllexport) in
+# Only the functions explicitly marked HKDFGUARD_API (dllexport) in
 # hkdfguard.h should be exported from the DLL - this turns off CMake's
 # option to auto-export every symbol, which would defeat the point of
 # hand-picking a minimal, stable ABI surface.

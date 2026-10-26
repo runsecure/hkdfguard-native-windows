@@ -4,18 +4,16 @@
     of hkdfguard-native-windows.
 
 .DESCRIPTION
-    1. Locates the MSVC/CMake/Ninja toolchain from the Visual Studio Build
-       Tools install and puts them on PATH for this process - the native
-       toolchain for this process's architecture (x64 or ARM64), since
-       everything built here is also run here.
+    1. Enters the Visual Studio Build Tools developer environment with the
+       native toolchain for this process's architecture (x64 or ARM64),
+       since everything built here is also run here.
     2. Configures and builds the project (cmake -G Ninja).
-    3. Runs the project's own ctest suite (roundtrip).
-    4. Generates a random 32-byte DEK, wraps it with the CLI tool
-       (tools/hkdfguard.exe), then independently unwraps the
-       resulting file via a direct P/Invoke call into HkdfGuard.dll's public
-       hkdfguard_unwrap_dek and confirms the recovered bytes match the
-       original DEK - i.e. verifies the CLI's wrap output is unwrappable by
-       the DLL, not just by the CLI itself.
+    3. Runs the project's ctest suite (roundtrip).
+    4. Wraps a random 32-byte DEK with the CLI (tools/hkdfguard.exe), then
+       reads and unwraps the resulting file through HkdfGuard.dll's public
+       hkdfguard_open_file and hkdfguard_unwrap_dek via P/Invoke and checks
+       the recovered bytes match - so the CLI's output is proven unwrappable
+       by the DLL, not just by the CLI.
 
     Must be run elevated: creating the machine-wide KEK
     (NCRYPT_MACHINE_KEY_FLAG) on first use requires Administrator rights.
@@ -66,11 +64,11 @@ if (-not $principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Adm
 
 # ---- Run in a child process --------------------------------------------
 # The end-to-end check below loads build\HkdfGuard.dll into this process
-# through Add-Type/[DllImport], and nothing unloads it until the process
-# exits. Run in the caller's own window, a second run would then fail to
-# relink the DLL (LNK1168) and to Add-Type HkdfGuardNative again. So the
-# work runs in a child of the same PowerShell executable (same edition and
-# architecture, and the same elevated token), which exits when it's done.
+# through Add-Type/[DllImport], and it stays loaded until the process exits.
+# In the caller's own window, a second run would then fail to relink the DLL
+# (LNK1168) and to Add-Type HkdfGuardNative again. So the work runs in a
+# child of the same PowerShell executable (same edition, architecture and
+# elevated token), which exits when it's done.
 if ($env:HKDFGUARD_BTV_CHILD -ne "1") {
     $childArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $PSCommandPath, "-Configuration", $Configuration, "-Group", $Group)
     if ($NoCleanup) { $childArgs += "-NoCleanup" }
@@ -93,12 +91,10 @@ if (-not (Test-Path $vswhere)) {
 }
 $env:PATH = "$env:PATH;$installerDir"
 
-# Builds for the architecture of *this PowerShell process*, natively: the
-# tests below have to run what was built, and the DLL unwrap check loads
-# HkdfGuard.dll into this very process via P/Invoke, which only works when
-# the two architectures match. On ARM64 Windows that means ARM64 binaries
-# from a native ARM64 powershell.exe (an x64 powershell.exe running under
-# emulation reports AMD64 and gets x64 binaries, which it can load).
+# Builds natively for the architecture of this PowerShell process: the tests
+# run what was built, and the P/Invoke check loads HkdfGuard.dll into this
+# process, which needs matching architectures. An x64 powershell.exe under
+# emulation on ARM64 reports AMD64 and gets x64 binaries, which it can load.
 $hostArchMap = @{ "AMD64" = "amd64"; "ARM64" = "arm64" }
 $vsArch = $hostArchMap[$env:PROCESSOR_ARCHITECTURE]
 if (-not $vsArch) { throw "Unsupported process architecture '$env:PROCESSOR_ARCHITECTURE' (expected AMD64 or ARM64)." }
@@ -127,10 +123,9 @@ Write-Ok "cl, cmake, ninja, dumpbin resolved"
 
 # ---- Configure + build --------------------------------------------------
 Write-Section "Configuring (cmake -G Ninja)"
-# A build folder configured for another checkout - this repository moved, or
-# was copied - can't be reused: CMake refuses a cache generated for a
-# different source directory. Drop that cache so the folder is configured
-# afresh; the build tree it describes is regenerated anyway.
+# CMake refuses a cache generated for a different source directory (a moved
+# or copied checkout), so such a cache is dropped and the folder configured
+# afresh.
 $cache = Join-Path $RepoRoot "build\CMakeCache.txt"
 if (Test-Path -LiteralPath $cache) {
     $cacheSource = (Select-String -LiteralPath $cache -Pattern '^CMAKE_HOME_DIRECTORY:INTERNAL=(.*)$' |
@@ -174,10 +169,8 @@ if ($LASTEXITCODE -eq 0) {
     Write-Ok "ctest: all tests passed"
 } else {
     Write-Bad "ctest: one or more tests failed (exit $LASTEXITCODE) - see output above"
-    # Each failed check prints "[FAIL] <what>" somewhere in hundreds of lines
-    # of test output; collect them from ctest's full log so they are listed
-    # together here - and, under GitHub Actions, raised as error annotations
-    # on the run's summary page.
+    # Lists every "[FAIL] <what>" line from ctest's full log in one place,
+    # and under GitHub Actions raises each as an error annotation.
     $ctestLog = Join-Path $RepoRoot "build\Testing\Temporary\LastTest.log"
     if (Test-Path $ctestLog) {
         $failedChecks = @(Select-String -Path $ctestLog -Pattern '^\[FAIL\] (.*)$' |
@@ -195,31 +188,25 @@ if ($LASTEXITCODE -eq 0) {
 # ---- CLI provision + wrap + independent DLL unwrap verification ----------
 Write-Section "CLI provision + wrap + DLL unwrap round-trip verification"
 
-# The key file goes in an administrator-owned folder under C:\ - the key
-# folder layout docs/admin-guide.md describes - not under the repo or
-# %TEMP%. hkdfguard_open_file refuses a file when any folder above it is
-# owned by, or below the drive root lets create, delete or replace entries,
-# an account it doesn't trust. Under the production security model (the
-# default) that is everyone but SYSTEM, Administrators, TrustedInstaller and
-# the deployer groups - so not this account's own profile (%TEMP% is under
-# it, owned by the user), nor a checkout under C:\a\... (which inherits
-# Authenticated Users: Modify from C:\), nor C:\ProgramData. This script
-# runs elevated, so the folder is made Administrators-owned with SYSTEM and
-# Administrators full control and Users read, as the admin guide does with
-# icacls.
+# The key file goes in an administrator-owned folder under C:\, the key
+# folder layout docs/admin-guide.md describes. hkdfguard_open_file refuses a
+# file when any folder above it is owned by, or below the drive root lets
+# create, delete or replace entries, an account it doesn't trust - under the
+# default production security model, everyone but SYSTEM, Administrators,
+# TrustedInstaller and the deployer groups. That rules out %TEMP% (in the
+# user's profile), a checkout under C:\a\... (Authenticated Users: Modify
+# inherited from C:\) and C:\ProgramData.
 $verifyDir = Join-Path $env:SystemDrive ("\hkdfguard-verify-" + [Guid]::NewGuid().ToString("N"))
 $verifyDirInfo = New-Item -ItemType Directory -Force -Path $verifyDir
 # The whole security descriptor is replaced in one step - owner
 # Administrators, a protected DACL of exactly SYSTEM and Administrators full
-# control and Users read - rather than edited with icacls: on GitHub's
-# hosted runners an Authenticated Users entry survived
-# `icacls /inheritance:r /grant:r` on a folder made under C:\, and a
-# replaced DACL can't keep anything. Then read back and checked, so a
-# runner image that still manages to differ fails here, showing the SDDL,
-# instead of in the wrap below. PowerShell 7 (.NET) exposes the ACL calls
-# as FileSystemAclExtensions; Windows PowerShell as DirectoryInfo methods.
-# Only the owner and DACL sections are set: loading a whole SDDL would mark
-# the SACL for writing too, which needs SeSecurityPrivilege.
+# control and Users read - rather than edited with icacls, which can leave an
+# Authenticated Users entry on a folder under C:\ (GitHub's hosted runners
+# do). It is then read back and checked, so a difference fails here with the
+# SDDL rather than in the wrap below. PowerShell 7 exposes the ACL calls as
+# FileSystemAclExtensions, Windows PowerShell as DirectoryInfo methods. Only
+# the owner and DACL sections are set: a whole SDDL would mark the SACL for
+# writing too, which needs SeSecurityPrivilege.
 $verifySddl = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)"
 $verifySecurity = New-Object System.Security.AccessControl.DirectorySecurity
 $verifySecurity.SetSecurityDescriptorSddlForm($verifySddl, [System.Security.AccessControl.AccessControlSections]::Access)
@@ -257,10 +244,9 @@ $auditStart = (Get-Date).AddSeconds(-2)
 
 if (Test-Path $keyFile) { Remove-Item -Force $keyFile }
 
-# hkdfguard.exe (build\tools\) links against HkdfGuard.dll
-# (build\), a different directory - Windows won't find the DLL by default,
-# so prepend its directory to PATH for both calls below, same as
-# tests/CMakeLists.txt already does for ctest via ENVIRONMENT PATH.
+# hkdfguard.exe (build\tools\) needs HkdfGuard.dll (build\), so the DLL's
+# directory goes on PATH for the calls below, as tests/CMakeLists.txt does
+# for ctest.
 $dllDir = Split-Path -Parent $dllPath
 $oldPath = $env:PATH
 $env:PATH = "$dllDir;$env:PATH"
@@ -316,11 +302,8 @@ if ($cliExit -eq 0) {
         Write-Bad "unrecognized provider_type byte: $providerType"
     }
 
-    # P/Invoke straight into the built DLL's public hkdfguard_unwrap_dek -
-    # deliberately not reusing the CLI (which only wraps) or ctest (which
-    # links the DLL at build time) - this calls the *exact* HkdfGuard.dll
-    # the CLI just used, dynamically, the same way any external consumer
-    # (C#, Python, etc. - see README.md) would.
+    # P/Invoke into the exact HkdfGuard.dll the CLI just used, loaded
+    # dynamically the way an external consumer (see README.md) loads it.
     Add-Type -TypeDefinition @"
 using System;
 using System.Runtime.InteropServices;

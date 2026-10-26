@@ -13,14 +13,14 @@ namespace hkdfguard {
     // Test-only seam: redirects every "TPM" provider open in kek_store.cpp
     // (KekExists / CreateKek / OpenKekForWrap under RequireTpm and PreferTpm,
     // and unwrap/delete of a kProviderTypeTpm key) from
-    // MS_PLATFORM_CRYPTO_PROVIDER to `providerName` - pointing it at a name
-    // no provider is registered under makes this machine look TPM-less, so
-    // the PreferTpm fallback and RequireTpm fail-closed paths can be tested
-    // deterministically on hardware that does have a TPM. std::nullopt
-    // clears it. Same scope and caveats as policy.h's SetTestPolicyOverride:
-    // compiled in only when HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE is defined
-    // (tests/CMakeLists.txt, for test_roundtrip's own copy of kek_store.cpp),
-    // never in HkdfGuard.dll; not thread-safe, by design.
+    // MS_PLATFORM_CRYPTO_PROVIDER to `providerName`. Naming an unregistered
+    // provider makes the machine look TPM-less, so the PreferTpm fallback
+    // and RequireTpm fail-closed paths can be tested on hardware that has a
+    // TPM. std::nullopt clears it. Same scope and caveats as policy.h's
+    // SetTestPolicyOverride: compiled in only when
+    // HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE is defined (tests/CMakeLists.txt,
+    // for test_roundtrip's own copy of kek_store.cpp), never in
+    // HkdfGuard.dll; not thread-safe.
 #if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
     void SetTestTpmProviderNameOverride(std::optional<std::wstring> providerName);
 
@@ -36,28 +36,22 @@ namespace hkdfguard {
         std::optional<SECURITY_STATUS> openKeyStatus;
 
         // When true, property verification of any TPM key (provider_type 1)
-        // fails with HKDFGUARD_ERR_PROVIDER_ERROR - simulating an existing TPM KEK
-        // that a firmware quirk or fault makes fail verification.
+        // fails with HKDFGUARD_ERR_PROVIDER_ERROR, simulating an existing
+        // TPM KEK that fails verification.
         bool failVerification = false;
     };
     void SetTestTpmFaults(const TestTpmFaults &faults);
 #endif
 
     // Every `service` parameter below is used verbatim to build the
-    // persisted KEK's name (see kek_store.cpp's KeyName) - this layer does
-    // no normalization of its own. The public C ABI (hkdfguard.cpp)
-    // lowercases and validates `service` before calling any of these, so
-    // two callers whose service names differ only in case resolve to the
-    // same KEK; a caller that reaches this API directly (bypassing
-    // hkdfguard.cpp, as this project's own tests do to reach CreateKek/
-    // KekExists/DeleteKek for setup and cleanup) is responsible for
-    // supplying an already-normalized `service` itself if it wants that
-    // same behavior.
+    // persisted KEK's name (see kek_store.cpp's KeyName); this layer does
+    // no normalization. The public C ABI (hkdfguard.cpp) lowercases and
+    // validates `service` first, so names differing only in case resolve
+    // to the same KEK. A caller that uses this API directly (as the tests
+    // do for setup and cleanup) must pass an already-normalized `service`.
     //
-    // kCurrentKeyId lives in wire_format.h (visible here via the #include
-    // above) - it's fundamentally a wire-format fact (the one KeyId value
-    // ParseWrappedDek ever accepts), not a kek_store-specific one, and this
-    // file just reuses it for the key name it builds.
+    // kCurrentKeyId comes from wire_format.h: it is the one KeyId value
+    // ParseWrappedDek accepts, and is reused here for the key name.
 
     struct ResolvedKek {
         ScopedNCryptProv provider;
@@ -97,12 +91,8 @@ namespace hkdfguard {
         const std::wstring& service);
 
     //
-    // Opens an existing KEK for wrap operations.
-    //
-    // Never creates a key.
-    //
-    // Intended for runtime use after CreateKek()
-    // has completed provisioning.
+    // Opens an existing KEK for wrap operations, after CreateKek() has
+    // provisioned it. Never creates a key.
     //
     ResolvedKek OpenKekForWrap(
         const std::wstring& service);

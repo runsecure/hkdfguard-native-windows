@@ -712,9 +712,10 @@ It is read on every setup call.
   over-broad principal such as Everyone (`HKDFGUARD_ERR_KEK_INVALID` otherwise; the
   key is left untouched). Wrap, unwrap and `hkdfguard_kek_fingerprint` apply the same
   check whenever the calling account can read the KEK's ACL, so a KEK widened after
-  provisioning is refused as soon as an administrator or deployer uses it; an
-  application account with key use alone can't read the ACL, and for it the
-  provisioning-time check stands. `hkdfguard_wrap_dek` and `hkdfguard_unwrap_dek` only ever *open*
+  provisioning is refused as soon as an administrator or deployer uses it. Key use
+  is granted as `GENERIC_READ`, which normally includes reading the ACL, so an
+  application account will likely get the check too (untested); if it can't read
+  the ACL, the provisioning-time check stands for it. `hkdfguard_wrap_dek` and `hkdfguard_unwrap_dek` only ever *open*
   an existing KEK, never create one; unwrap opens the exact provider/key recorded in the
   payload. Every create/open/delete call passes `NCRYPT_MACHINE_KEY_FLAG` (and
   `NCRYPT_SILENT_FLAG`, so a key with an unexpected UI-requiring protection policy fails

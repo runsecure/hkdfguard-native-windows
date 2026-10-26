@@ -62,8 +62,7 @@ namespace hkdfguard {
     // This process has just made its (`calls` + 1)th setup call
     // (hkdfguard_create_kek / hkdfguard_kek_exists), each held to at least
     // `floor_ms`: the signature of a caller looping on them. Logged once
-    // per process, a warning - the counterpart of the Linux build's
-    // log::warn at the same point.
+    // per process, as a warning.
     void LogSetupCallsExceeded(unsigned long calls, unsigned long floor_ms) noexcept;
 
     // hkdfguard_open_file is trusting key files under the developer

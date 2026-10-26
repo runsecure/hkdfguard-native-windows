@@ -117,7 +117,9 @@ and the PCP does so in software before the TPM.
 
 **Why it matters.** `BCRYPT_KDF_RAW_SECRET` returns the secret
 **little-endian** (byte-reversed X). Feeding it as-is would derive a
-different key from the Linux construction for the same inputs.
+different key from the Linux construction for the same inputs. (The
+construction is what is shared; the authenticated bytes it is fed are
+Windows-specific - see section 10.)
 
 **Verified how.** The proof of concept behind section 13 compared
 `NCryptDeriveKey(BCRYPT_KDF_RAW_SECRET)` against an independent
@@ -277,14 +279,17 @@ over-broad well-known principal (Everyone, Authenticated Users, Anonymous,
 NULL, INTERACTIVE/NETWORK/BATCH/SERVICE/REMOTE INTERACTIVE LOGON,
 BUILTIN\Users, BUILTIN\Guests, Local account (S-1-5-113), This Organization
 (S-1-5-15), NT SERVICE\ALL SERVICES (S-1-5-80-0), LOCAL (S-1-2-0), CONSOLE
-LOGON (S-1-2-1), TERMINAL SERVER USER (S-1-5-13), and the
-authentication-package groups NTLM/SChannel/Digest Authentication
-(S-1-5-64-10/14/21)), nor the "Domain Users" group of any domain
-(S-1-5-21-...-513, which the local SAM names `None`). Local account, This
-Organization, ALL SERVICES, REMOTE INTERACTIVE LOGON, TERMINAL SERVER USER
-and the authentication-package groups resolve as `SidTypeWellKnownGroup` in
-an accepted domain (`NT AUTHORITY` or `NT SERVICE`), so the denylist alone
-excludes them. `None` is worse placed still: it is a real `SidTypeGroup` in
+LOGON (S-1-2-1), TERMINAL SERVER USER (S-1-5-13), the
+authentication-package groups NTLM/SChannel/Digest/Cloud Account
+Authentication (S-1-5-64-10/14/21/36), IUSR (S-1-5-17, every anonymous IIS
+request), BUILTIN\IIS_IUSRS (S-1-5-32-568, every IIS application pool),
+DIALUP (S-1-5-1) and OTHER ORGANIZATION (S-1-5-1000)), nor the "Domain
+Users" group of any domain (S-1-5-21-...-513, which the local SAM names
+`None`). Local account, This Organization, ALL SERVICES, REMOTE INTERACTIVE
+LOGON, TERMINAL SERVER USER, IUSR, DIALUP, OTHER ORGANIZATION and the
+authentication-package groups resolve as `SidTypeWellKnownGroup` in an
+accepted domain (`NT AUTHORITY` or `NT SERVICE`), and IIS_IUSRS as a
+`SidTypeAlias` in `BUILTIN`, so the denylist alone excludes them. `None` is worse placed still: it is a real `SidTypeGroup` in
 this machine's own domain, the primary group of every local account, and
 it has no fixed SID, so it is refused by shape (NT authority, five
 sub-authorities starting with 21, RID 513 - `IsDomainUsersRid`) rather than
@@ -292,8 +297,8 @@ from a list. Policy validation and the existing-key ACL check share one
 implementation (`IsOverBroadSid` in `src/key_acl.cpp`).
 
 **Verified how.** Tests (section 0d) cover Everyone by name and as
-`S-1-1-0`, Authenticated Users, BUILTIN\Users, the ten broad groups added
-above by SID string (Local account and ALL SERVICES by name too), `None` by
+`S-1-1-0`, Authenticated Users, BUILTIN\Users, the fifteen broad groups
+added above by SID string (Local account and ALL SERVICES by name too), `None` by
 name and as its resolved SID string (skipped where the name doesn't resolve
 to a local group, i.e. on a domain controller), a user account, an
 unresolvable name, a foreign-domain-qualified name, and every branch of
@@ -331,9 +336,14 @@ use) are still granted by *name*, now restricted to local groups.
   `HKDFGUARD_ERR_KEK_INVALID` and leaves the key untouched. The same
   invariants are checked again on every wrap, unwrap and fingerprint
   (`VerifyAclIfReadable` in `src/kek_store.cpp`), but only when the caller
-  can read the DACL: reading it needs `READ_CONTROL`, which key use alone
-  doesn't grant, so for an application account the provisioning-time check
-  stands, while an administrator, deployer or tool that can read it gets
+  can read the DACL. Reading it needs `READ_CONTROL`. Key use is granted as
+  `GENERIC_READ`, which under the standard generic mapping includes
+  `READ_CONTROL`, so a key-use account may well be able to read the DACL
+  too, and then the check runs for it as well; if the KSP maps
+  `GENERIC_READ` without `READ_CONTROL`, the provisioning-time check stands
+  for that account. **Assumed / not verified** which of the two holds: the
+  tests that exercise this ran elevated. Either outcome is safe, because the
+  check can only refuse, never grant. Any caller that can read the DACL gets
   `HKDFGUARD_ERR_KEK_INVALID` (event 2002) as soon as it uses a KEK whose ACL
   was widened. A failure to read the DACL is not itself an error. This
   catches a key widened to e.g. Everyone, and a pre-planted key whose DACL
@@ -388,7 +398,15 @@ use) are still granted by *name*, now restricted to local groups.
   AAD, **and** they end HKDF's info: `"hkdfguard-wrap-v1:" ||
   u16le(len(service)) || normalized service || authenticated bytes`. This
   is the Linux build's construction (`derive_wrapping_key`,
-  `Payload::authenticated_bytes`), adopted so both builds have one spec.
+  `Payload::authenticated_bytes`), adopted so both builds share one KDF and
+  one AAD rule. What is shared is the construction, not the bytes it is fed:
+  the payload layout, the authenticated bytes and the fingerprint encoding
+  are Windows-specific. Linux's payload has a variable-length key ID and
+  its authenticated bytes include the nonce; here the `KeyId` is a fixed
+  u32le and the nonce is left out (below); and this build fingerprints raw
+  `X||Y` where Linux and macOS hash `0x04||X||Y`. So the same KEK and DEK
+  give different payloads on the two platforms - cross-platform payload
+  parity is not a goal (`src/wire_format.h`).
   Every field a parser reads or routes on, the KEK, and the service are
   therefore bound into the wrapping key itself, not only checked by the
   tag. AES-GCM doesn't commit to its key, but here a payload's context

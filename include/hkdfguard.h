@@ -258,8 +258,12 @@ HKDFGUARD_API int hkdfguard_kek_fingerprint(
  * Each entry must resolve to a group - a user or computer account is
  * rejected - and must not be an over-broad principal: Everyone,
  * Authenticated Users, Users, Guests, Anonymous, NULL SID, Local account,
- * This Organization, ALL SERVICES, LOCAL, CONSOLE LOGON, or the logon-type
- * groups INTERACTIVE, NETWORK, BATCH, SERVICE and REMOTE INTERACTIVE LOGON.
+ * This Organization, OTHER ORGANIZATION, ALL SERVICES, LOCAL, CONSOLE
+ * LOGON, TERMINAL SERVER USER, DIALUP, IUSR, IIS_IUSRS, the logon-type
+ * groups INTERACTIVE, NETWORK, BATCH, SERVICE and REMOTE INTERACTIVE LOGON,
+ * the authentication-package groups NTLM, SChannel, Digest and Cloud
+ * Account Authentication, or a "Domain Users" group (S-1-5-21-...-513,
+ * which this machine's SAM names "None").
  * It must also be host-local: a group in this machine's own SAM, or a
  * BUILTIN, NT AUTHORITY or NT SERVICE principal. This protection is host-specific, so domain
  * groups are rejected even on a domain-joined machine, whether written
