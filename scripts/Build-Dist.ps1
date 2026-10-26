@@ -177,6 +177,26 @@ foreach ($bin in $dllPath, $cliPath) {
     Write-Ok "$name is $Arch ($($machineLine.ToString().Trim()))"
 }
 
+# ---- Verify the version resource ---------------------------------------------
+# The SDK loaders refuse a library with no readable version resource, so a
+# build that loses it (src/version.rc.in, hkdfguard_add_version_resource)
+# fails here. Compares the fixed file version - what the loaders and Windows
+# Installer read - with the project() VERSION in CMakeLists.txt.
+Write-Section "Verifying version resource"
+if ((Get-Content -Raw (Join-Path $RepoRoot "CMakeLists.txt")) -notmatch 'project\(hkdfguard-native-windows\s+VERSION\s+(\d+\.\d+\.\d+)') {
+    throw "Could not read the project() VERSION from CMakeLists.txt."
+}
+$projectVersion = $Matches[1]
+foreach ($bin in $dllPath, $cliPath) {
+    $name = Split-Path -Leaf $bin
+    $info = [Diagnostics.FileVersionInfo]::GetVersionInfo($bin)
+    $fixed = "{0}.{1}.{2}.{3}" -f $info.FileMajorPart, $info.FileMinorPart, $info.FileBuildPart, $info.FilePrivatePart
+    if ($fixed -ne "$projectVersion.0") {
+        throw "$name carries file version '$fixed', not the project() VERSION $projectVersion - is its version resource missing?"
+    }
+    Write-Ok "$name is version $projectVersion"
+}
+
 # ---- Verify the exploit mitigations made it into the binaries -------------
 # The flags are set by hkdfguard_apply_hardening in CMakeLists.txt; this
 # checks what the linker actually produced, so a dropped flag fails the
