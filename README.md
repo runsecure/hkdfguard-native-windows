@@ -262,6 +262,12 @@ with other processes. Window hooks into a GUI process stay outside it.
 
 ## Command-line tool
 
+Arguments are taken as the Unicode text they were typed as and handed to the library as
+UTF-8, with no code-page conversion in between: a path, service name or group name with
+characters outside the system code page is used exactly, never best-fit mapped to a
+look-alike (`ā` is not `a`). Output is written as Unicode on a console, whatever its code
+page, and as UTF-8 when redirected to a file or pipe.
+
 `tools/hkdfguard_cli.cpp` builds `hkdfguard.exe`, a thin
 wrapper around the ABI above with four subcommands: `provision`, `wrap`, `status` and
 `retire`.

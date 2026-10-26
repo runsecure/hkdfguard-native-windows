@@ -1497,13 +1497,12 @@ namespace {
     // server the caller's NTLM credentials. Links further down the path are
     // the walk's job (WalkToParent). `what` names the path in the message.
     void RequireLocalDrivePath(const std::string &path, const std::string &what) {
-        char fullBuf[MAX_PATH * 4];
-        DWORD fullLen = GetFullPathNameA(path.c_str(), static_cast<DWORD>(sizeof(fullBuf)), fullBuf, nullptr);
-        if (fullLen == 0 || fullLen >= sizeof(fullBuf)) {
+        wchar_t fullBuf[MAX_PATH * 4];
+        DWORD fullLen = GetFullPathNameW(Utf8ToWide(path).c_str(), static_cast<DWORD>(std::size(fullBuf)), fullBuf, nullptr);
+        if (fullLen == 0 || fullLen >= std::size(fullBuf)) {
             throw CliError("failed to resolve " + what + ": " + FormatWin32Error(GetLastError()));
         }
-        const std::string full(fullBuf, fullLen);
-        if (!hkdfguard_nofollow::IsLocalDrivePath(Utf8ToWide(full))) {
+        if (!hkdfguard_nofollow::IsLocalDrivePath(std::wstring(fullBuf, fullLen))) {
             throw CliError(
                 what + " is not on a local drive (UNC paths, mapped network and SUBST drives, and devices are "
                 "refused)");
@@ -1617,13 +1616,14 @@ namespace {
             for (const auto &entry: cache) {
                 if (EqualSid(sid, const_cast<BYTE *>(entry.first.data()))) return entry.second;
             }
-            LPSTR text = nullptr;
-            if (!ConvertSidToStringSidA(sid, &text)) {
+            LPWSTR text = nullptr;
+            if (!ConvertSidToStringSidW(sid, &text)) {
                 throw CliError("ConvertSidToStringSid failed: " + FormatWin32Error(GetLastError()));
             }
-            int trusted = 0;
-            int32_t rc = hkdfguard_key_file_principal_trusted(text, &trusted);
+            const std::string sidString = WideToUtf8(text);
             LocalFree(text);
+            int trusted = 0;
+            int32_t rc = hkdfguard_key_file_principal_trusted(sidString.c_str(), &trusted);
             if (rc != HKDFGUARD_OK) {
                 throw CliError("could not check who may write key files: " + DescribeStatus(rc));
             }

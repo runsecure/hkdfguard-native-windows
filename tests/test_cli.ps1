@@ -80,6 +80,10 @@ function Invoke-Cli {
     $psi.Arguments = ($CliArgs | ForEach-Object { Format-CliArg $_ }) -join " "
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
+    # Redirected, the CLI writes UTF-8; read it as such so a non-ASCII path
+    # or name it echoes compares equal to the one passed in.
+    $psi.StandardOutputEncoding = New-Object System.Text.UTF8Encoding($false)
+    $psi.StandardErrorEncoding = New-Object System.Text.UTF8Encoding($false)
     $psi.RedirectStandardInput = $true
     $psi.UseShellExecute = $false
     $savedInputEncoding = $null
@@ -252,6 +256,19 @@ try {
     $r = Invoke-Cli @("status", "-sn", $absentService)
     Check (($r.ExitCode -eq 0) -and ($r.StdOut -match "kek: absent")) "status reports a never-provisioned service as absent (exit 0)"
     Check ($r.StdOut -match "security model: (production|developer) \(this account (may|may not) persist key files\)") "status reports the security model and whether this account may persist key files"
+
+    # ---- 3d. Names arrive exactly as typed: a non-ASCII service name is ----
+    #          rejected and echoed character for character, never best-fit
+    #          mapped to an ASCII look-alike that would then be accepted
+    #          (under the ANSI code page, ā becomes a and fullwidth Ａ becomes A).
+    foreach ($case in @(
+            @{ Name = "svc" + [char]0x0101; What = "a Latin letter with a macron" },
+            @{ Name = [string][char]0xFF21 + "bc"; What = "a fullwidth letter" },
+            @{ Name = "svc" + [char]0x4E2D; What = "a CJK character" })) {
+        $r = Invoke-Cli @("status", "-sn", $case.Name)
+        Check ($r.ExitCode -eq 1) "status: a service name with $($case.What) is rejected, not folded to ASCII"
+        Check ($r.StdErr -match [regex]::Escape('"' + $case.Name + '"')) "status: the rejected name is echoed exactly as typed ($($case.What))"
+    }
 
     if (-not $developerModel) {
         Write-Host "[SKIP] the wrap scenarios: production security model and not elevated - this account's own key folders aren't trusted, and SecurityModel can't be set for the run"
@@ -462,6 +479,20 @@ try {
     # Exact library wording, not just "KEK": the output file is named
     # no-kek.key, so a looser pattern would match any error echoing the path.
     Check ($r.StdErr -match "no KEK is provisioned for service") "wrap against a never-provisioned service reports a KEK-not-found/provision error"
+
+    # ---- 12f. A key-file path is used exactly as typed: with non-ASCII ----
+    #           characters it passes every path check and reaches the KEK
+    #           lookup, and an existing file there is named under that exact
+    #           path in the refusal.
+    $unicodeKeyFile = Join-Path $workDir ("unicode-" + [char]0x0101 + [char]0x20AC + [char]0x4E2D + " " + [char]0x00E9 + ".key")
+    $r = Invoke-Cli @(
+        "wrap", "--key-file-path", $unicodeKeyFile, "--service-name", $neverProvisionedService, "--dek-stdin") -StdIn $validB64
+    Check (($r.ExitCode -eq 1) -and ($r.StdErr -match "no KEK is provisioned for service")) "wrap: a non-ASCII key-file path passes the path checks and reaches the KEK lookup"
+    Check (-not (Test-Path -LiteralPath $unicodeKeyFile)) "wrap: a non-ASCII key-file path against a never-provisioned service creates no file"
+    [System.IO.File]::WriteAllBytes($unicodeKeyFile, (New-Object byte[] 132))
+    $r = Invoke-Cli @(
+        "wrap", "--key-file-path", $unicodeKeyFile, "--service-name", $neverProvisionedService, "--dek-stdin") -StdIn $validB64
+    Check (($r.ExitCode -eq 1) -and ($r.StdErr -match [regex]::Escape($unicodeKeyFile)) -and ($r.StdErr -match "already exists")) "wrap: an existing file at a non-ASCII path is refused under exactly the path typed"
 
     # ---- 12a. --group is optional: without it the arguments ----
     #           are complete, so the same call gets as far as the KEK lookup
@@ -834,6 +865,14 @@ try {
         $rf = Invoke-Cli @("wrap", "--key-file-path", $fromFileKey, "--service-name", $serviceName, "--dek-file", $elevDekFile)
         Check ($rf.ExitCode -eq 0) "full wrap with --dek-file succeeds (elevated)"
         if ($rf.ExitCode -ne 0) { Write-Host "    stderr: $($rf.StdErr)" }
+
+        # A non-ASCII path is written exactly as typed: the file exists under
+        # that name, not under an ASCII look-alike, and holds a payload.
+        $unicodeWrapFile = Join-Path $workDir ("wrapped-" + [char]0x0101 + [char]0x4E2D + ".key")
+        $ru = Invoke-Cli @("wrap", "--key-file-path", $unicodeWrapFile, "--service-name", $serviceName, "--dek-stdin") -StdIn $dekB64
+        Check ($ru.ExitCode -eq 0) "full wrap to a non-ASCII key-file path succeeds (elevated)"
+        if ($ru.ExitCode -ne 0) { Write-Host "    stderr: $($ru.StdErr)" }
+        Check ((Test-Path -LiteralPath $unicodeWrapFile) -and ((Get-Item -LiteralPath $unicodeWrapFile).Length -eq 132)) "the key file exists under exactly the non-ASCII name given, holding a 132-byte payload"
 
         $ownerOnlyFile = Join-Path $workDir "owner-only.key"
         $ro = Invoke-Cli @(
