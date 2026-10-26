@@ -48,6 +48,12 @@
 //                     the registry is misconfigured, so calls fail closed.
 //   2005 Error        PROVIDER_ERROR / CRYPTO_ERROR / INTERNAL_ERROR: the
 //                     key storage provider or crypto layer itself failed.
+//   2006 Error        FILE_PLAINTEXT_KEY: hkdfguard_open_file refused a file
+//                     that looks like an unwrapped DEK - a possible key
+//                     exposure. The path is logged, never the contents.
+//   2007 Warning      The process exceeded the expected number of setup
+//                     calls (hkdfguard_create_kek / hkdfguard_kek_exists),
+//                     once per process - likely a caller looping on them.
 //
 // Not logged: INVALID_ARGUMENT / BUFFER_TOO_SMALL /
 // INVALID_SERVICE_NAME (caller programming errors), and KEK_NOT_FOUND

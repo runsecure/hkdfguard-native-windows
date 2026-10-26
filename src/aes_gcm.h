@@ -14,18 +14,11 @@ namespace hkdfguard {
     // staging buffer. Throws HkdfGuardError on failure.
     //
     // hkdfguard.cpp passes the payload's authenticated bytes, `header || KEK
-    // fingerprint`, as `aad` here (built by wire_format.h's
-    // BuildWrappedDekAuthenticated - see that file for why): it binds a
-    // wrapped payload to its version and routing fields and the specific KEK
-    // it was wrapped under. The service is bound through the key itself
-    // (ecdh_hkdf.h).
+    // fingerprint`, as `aad` (wire_format.h's BuildWrappedDekAuthenticated),
+    // binding a payload to its version and routing fields and its KEK. The
+    // service is bound through the key itself (ecdh_hkdf.h).
     //
-    // `unsigned long` (rather than this project's usual uint32_t/int32_t) is
-    // used for the length parameters purely because that's the literal type
-    // Windows' own BCryptEncrypt/BCryptDecrypt functions declare their length
-    // parameters as (as `ULONG`, which is itself just `unsigned long` on
-    // Windows) - matching it here avoids an implicit conversion at every call
-    // site in aes_gcm.cpp.
+    // Lengths are `unsigned long` to match CNG's ULONG parameters.
     void AesGcmEncrypt(
         const uint8_t key[32],
         const uint8_t *plaintext, unsigned long plaintext_len,

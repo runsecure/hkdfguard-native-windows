@@ -7,20 +7,19 @@
 
 // Point decompression - finding Y from X - is the one piece of P-256
 // arithmetic CNG doesn't expose, so it is done here with a minimal
-// arithmetic modulo p. The design goal is being obviously correct rather
-// than fast: field elements are four 64-bit limbs, and multiplication is
+// arithmetic modulo p. It aims to be obviously correct rather than fast:
+// field elements are four 64-bit limbs, and multiplication is
 // double-and-add over modular addition, so nothing beyond add/subtract with
-// carry is ever needed. One point costs about a millisecond - small beside
-// the TPM agreement it feeds. Every point produced is also checked by the
+// carry is needed. One point costs about a millisecond - small beside the
+// TPM agreement it feeds. Every point produced is also checked by the
 // caller through BCryptImportKeyPair (ecdh_hkdf.cpp), so an arithmetic
-// mistake here could only ever fail closed, and tests/test_roundtrip.cpp
-// pins the output against vectors from the Linux implementation's own
-// p256 crate.
+// mistake here fails closed, and tests/test_roundtrip.cpp pins the output
+// against reference vectors.
 
 namespace hkdfguard {
     namespace {
         constexpr char kDomain[] = "HkdfGuard-P256-payload-ECDH-point-v1:";
-        constexpr int kMaxAttempts = 255; // counters 0..254, as on Linux (0..u8::MAX)
+        constexpr int kMaxAttempts = 255; // counters 0..254
 
         // A field element mod p: little-endian 64-bit limbs, v[0] least significant.
         struct Fe {
@@ -172,7 +171,7 @@ namespace hkdfguard {
 
             Fe x = FromBigEndian(x_bytes);
             if (GreaterOrEqual(x, kP)) {
-                continue; // not a field element (as the p256 crate's SEC1 decoder rejects it)
+                continue; // not a field element
             }
             // rhs = x^3 - 3x + b
             Fe x3 = MulMod(MulMod(x, x), x);

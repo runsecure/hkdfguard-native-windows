@@ -72,7 +72,7 @@
 // each flushed before the next starts) and deleted before the new file is
 // created - see SecureOverwriteAndRemoveIfExists/WriteWrappedKeyFile below
 // for the exact sequence and its one intentional fallback. Without --force,
-// an existing file is never touched (WriteWrappedKeyFile's CREATE_NEW fails
+// an existing file is never touched (WriteWrappedKeyFile's FILE_CREATE fails
 // instead).
 //
 // The wrapped-key path must be a real file reached through real directories:
@@ -1108,10 +1108,7 @@ namespace {
 
     // Owns every buffer a security descriptor granting "owner read/write,
     // optionally one group read-only, no one else, no inherited ACEs" needs
-    // to stay alive for as long as it's in use - a self-contained bundle
-    // rather than several out-parameters the caller would otherwise have to
-    // keep in sync by hand. The Windows analog of the Linux tool's POSIX 0600
-    // (no group) and 0640 (with --group: owner rw, one group r, no one else).
+    // while it is in use (in POSIX terms, 0600, or 0640 with --group).
     class KeyFileSecurity {
     public:
         KeyFileSecurity(std::vector<BYTE> ownerSid, std::optional<std::vector<BYTE>> groupSid)
@@ -1122,9 +1119,8 @@ namespace {
             DWORD aclSize = static_cast<DWORD>(
                 sizeof(ACL) + (sizeof(ACCESS_ALLOWED_ACE) - sizeof(DWORD)) + GetLengthSid(owner) +
                 (group ? (sizeof(ACCESS_ALLOWED_ACE) - sizeof(DWORD)) + GetLengthSid(group) : 0));
-            // ACL buffers must be DWORD-aligned, per Windows' own documented
-            // requirement; round up rather than trust the sum above to already
-            // land on a boundary.
+            // ACL buffers must be DWORD-aligned; round up rather than trust
+            // the sum above to land on a boundary.
             aclSize = (aclSize + 7) & ~static_cast<DWORD>(7);
 
             aclBuf_.resize(aclSize);
@@ -1154,21 +1150,18 @@ namespace {
             if (!SetSecurityDescriptorDacl(&sd_, TRUE, acl, FALSE)) {
                 throw CliError("SetSecurityDescriptorDacl failed: " + FormatWin32Error(GetLastError()));
             }
-            // Blocks this DACL from being merged with any inherited ACEs from
-            // the parent directory - without this, a permissive parent-folder
-            // ACL could silently widen access beyond the ACEs just set.
+            // Blocks inherited ACEs from the parent directory, which could
+            // otherwise widen access beyond the ACEs just set.
             if (!SetSecurityDescriptorControl(&sd_, SE_DACL_PROTECTED, SE_DACL_PROTECTED)) {
                 throw CliError("SetSecurityDescriptorControl failed: " + FormatWin32Error(GetLastError()));
             }
         }
 
-        // Valid only for as long as this object is alive - the returned
-        // SECURITY_ATTRIBUTES' lpSecurityDescriptor points at this object's own
-        // sd_ member, which in turn points into ownerSid_/groupSid_/aclBuf_,
-        // all owned together right here.
         // The DACL itself, for re-applying it as protected on the open file.
         PACL Dacl() const { return reinterpret_cast<PACL>(const_cast<BYTE *>(aclBuf_.data())); }
 
+        // Valid only while this object is alive: lpSecurityDescriptor points
+        // at sd_, which points into ownerSid_/groupSid_/aclBuf_.
         SECURITY_ATTRIBUTES attributes() const {
             SECURITY_ATTRIBUTES sa{};
             sa.nLength = sizeof(sa);
@@ -1188,9 +1181,8 @@ namespace {
 
     // MARK: - Writing the wrapped key file
 
-    // Fills `buffer` with cryptographically random bytes via CNG's system RNG
-    // - the same BCryptGenRandom call this project's own AES-GCM code
-    // (src/aes_gcm.cpp) uses for nonces, not a plain PRNG.
+    // Fills `buffer` with cryptographically random bytes from CNG's system
+    // RNG.
     void FillRandom(std::vector<BYTE> &buffer) {
         NTSTATUS status =
                 BCryptGenRandom(nullptr, buffer.data(), static_cast<ULONG>(buffer.size()),
@@ -1441,9 +1433,8 @@ namespace {
     // SYSTEM, Administrators, TrustedInstaller or the reading account and
     // lets no other account delete, rename or take over its entries, and
     // unless every folder below the drive root - the key file's own folder
-    // included - also lets no other account create files or folders in it
-    // (the Linux build's "no directory writable by group or others", sticky
-    // or not). The drive root is exempt from that last part only: a default
+    // included - also lets no other account create files or folders in it.
+    // The drive root is exempt from that last part only: a default
     // C:\ lets Authenticated Users create folders, and the folders below it
     // are judged themselves. See src/key_file.cpp, whose rule this mirrors
     // ACE for ACE so that wrap never writes a file the library would refuse
@@ -1635,7 +1626,7 @@ namespace {
 
     // Fail-fast version of the checks above, run before any KEK or DEK work
     // so a bad output path is rejected without touching the key store or
-    // reading the DEK at all: every folder down to the file's must be real
+    // reading the DEK: every folder down to the file's must be real
     // (WalkToParent) and pass the library's folder rule
     // (RequireTrustedKeyFileFolders), and if something already exists at the
     // leaf it must pass checks (1)-(4). Returns whether something exists there. The
@@ -1681,9 +1672,7 @@ namespace {
     // kSecureOverwritePassCount (8) alternating all-zero/random passes, each
     // flushed to the storage medium before the next pass starts so they're
     // genuinely sequential rather than coalesced by the page cache - and only
-    // then deletes it. Only ever called when --force was passed; without
-    // --force, an existing file is never touched at all
-    // (WriteWrappedKeyFile's CREATE_NEW fails outright instead).
+    // then deletes it. Called only with --force.
     //
     // The file is reached by the walk (WalkToParent), opened relative to its
     // folder without following a reparse point, and vetted by
@@ -1695,14 +1684,13 @@ namespace {
     // If the file doesn't exist, this is a no-op. If it exists but can't be
     // opened for writing (ERROR_ACCESS_DENIED, or ERROR_SHARING_VIOLATION if
     // another process has it open) the overwrite passes are skipped entirely
-    // and this falls back to a delete-only open, per explicit product
-    // direction: destroying the old bytes first is worth attempting, but not
+    // and this falls back to a delete-only open, by design: destroying the
+    // old bytes first is worth attempting, but not
     // worth failing the whole command over when this process isn't even
     // allowed to write to the file it's about to replace. That fallback is
     // vetted the same way before it deletes anything.
     //
-    // Caveat this can't fully solve, worth knowing rather than assuming away:
-    // on SSDs generally (wear leveling) and on any filesystem that does
+    // Caveat: on SSDs generally (wear leveling) and on any filesystem that does
     // copy-on-write or transparent compression, writing new bytes to a file's
     // logical offsets does not guarantee those bytes land on the same physical
     // storage cells the old bytes occupied - the old bytes can persist in
@@ -1754,9 +1742,9 @@ namespace {
 
             for (size_t pass = 0; pass < kSecureOverwritePassCount; ++pass) {
                 if (pass % 2 == 0) {
-                    std::fill(buffer.begin(), buffer.end(), static_cast<BYTE>(0)); // "step 1": all-zero
+                    std::fill(buffer.begin(), buffer.end(), static_cast<BYTE>(0)); // all-zero pass
                 } else {
-                    FillRandom(buffer); // "step 2": random bits, via the OS CSPRNG
+                    FillRandom(buffer); // random pass, via the OS CSPRNG
                 }
 
                 LARGE_INTEGER zero{};
@@ -1794,13 +1782,11 @@ namespace {
         DeleteViaHandle(file.get(), path);
     }
 
-    // Opens `path` fresh (CREATE_NEW - atomically fails if it already exists,
-    // this tool's actual correctness guarantee against the exists-then-create
-    // race, same role O_EXCL/O_CREAT plays in the macOS/Linux tools) and writes
-    // `bytes` to it, with `security`'s ACL attached from the moment the file is
-    // created - no window where it briefly exists with broader (e.g.
-    // inherited-from-parent-directory) permissions before being locked down
-    // after the fact.
+    // Creates `path` fresh (FILE_CREATE atomically fails if it already
+    // exists - the guarantee against an exists-then-create race) and writes
+    // `bytes` to it, with `security`'s ACL attached from the moment the file
+    // is created, so it never briefly exists with broader (e.g. inherited)
+    // permissions.
     //
     // Created relative to its folder's handle from the walk (WalkToParent),
     // so no link above it is followed. A link *at* the path is an existing
@@ -1861,8 +1847,7 @@ namespace {
         // survives a crash. On any failure the file is deleted through its
         // own handle (it goes when that handle closes): a failed wrap
         // never leaves an empty or truncated key file behind, for the next
-        // `wrap` to call "already exists" or a service to read as malformed -
-        // the same rule as the Linux tool's finish_key_file.
+        // `wrap` to call "already exists" or a service to read as malformed.
         auto discard = [&file](const std::string &message) {
             FILE_DISPOSITION_INFO disposition{};
             disposition.DeleteFile = TRUE;
@@ -1889,9 +1874,8 @@ namespace {
 
     // MARK: - Reading the DEK from a file
 
-    // The SID of the account this process runs as (TokenUser), as an owned
-    // buffer - for the --dek-file trust check, which accepts the file's own
-    // user, as the Linux tool accepts a file owned by its euid.
+    // The SID of the account this process runs as (TokenUser) - for the
+    // --dek-file trust check, which accepts a file owned by this account.
     std::vector<BYTE> GetProcessUserSid() {
         HANDLE hToken = nullptr;
         if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) {
@@ -1933,9 +1917,8 @@ namespace {
     }
 
     // A --dek-file holds the plaintext DEK, so it must be readable by
-    // nobody but the accounts that could read it anyway - the Linux tool's
-    // "owned by root or this user, no group or other bits at all", in ACL
-    // form. Judged on the open handle, so it's the file actually read:
+    // nobody but the accounts that could read it anyway. Judged on the open
+    // handle, so it's the file actually read:
     //   - the owner is SYSTEM, Administrators or this account;
     //   - the DACL grants nothing (any right, read included) to anyone else.
     //     Deny and inherit-only ACEs don't count; OWNER RIGHTS is the owner,
@@ -2017,7 +2000,7 @@ namespace {
     // then RequireTrustedDekFile, then at most kMaxDekStdinLen bytes. Opened
     // with read sharing only, so nobody can change it while it's read.
     // Unlike the key file, a hard link isn't refused: nothing here writes
-    // through it, and the Linux tool doesn't refuse one either.
+    // through it.
     void ReadDekFile(const std::string &path, DekScratch &scratch) {
         const std::string what = "--dek-file " + path;
         RequireLocalDrivePath(path, what);
@@ -2063,8 +2046,8 @@ namespace {
     // kek_store.cpp does (machine scope, silent), and nothing here ever
     // creates or modifies a key.
 
-    // RAII for an NCrypt provider or key handle - this tool's own copy of
-    // src/handle_traits.h's: this tool compiles nothing from src/.
+    // Owns an NCrypt provider or key handle (a copy of src/handle_traits.h's,
+    // since this tool compiles nothing from src/).
     class ScopedNCryptHandle {
     public:
         ScopedNCryptHandle() = default;
@@ -2378,8 +2361,7 @@ namespace {
 
     // Read-only. Exits 0 whenever there was a definite answer (present,
     // absent, corrupt or unusable) and 1 when there wasn't (access denied, a
-    // provider error), so scripts can tell "no key" from "can't tell" - the
-    // macOS tool's rule.
+    // provider error), so scripts can tell "no key" from "can't tell".
     void RunStatus(const StatusArgs &args) {
         ValidateServiceCharset(args.serviceName);
         const std::string service = LowercaseService(args.serviceName);
@@ -2557,8 +2539,6 @@ namespace {
     // MARK: - Run: provision
 
     void RunProvision(const ProvisionArgs &args) {
-        // `service` is not secret -- it's a logical identifier, not key
-        // material.
         ValidateServiceCharset(args.serviceName);
         const bool created = EnsureKekProvisioned(args.serviceName);
 
@@ -2569,9 +2549,8 @@ namespace {
                 "the KEK for service \"" + args.serviceName + "\" exists but its fingerprint could not be read: " +
                 DescribeStatus(rc));
         }
-        // The macOS tool's wording. A KEK this operator didn't create could
-        // have been planted by another administrator; the fingerprint is how
-        // to tell.
+        // A KEK this operator didn't create could have been planted by
+        // another administrator; the fingerprint is how to tell.
         if (created) {
             fprintf(stdout, "fingerprint: %s -- record this; retire requires it\n", HexString(fp).c_str());
         } else {
@@ -2583,9 +2562,9 @@ namespace {
     // MARK: - Run: wrap
 
     void RunWrap(WrapArgs &args) {
-        // First, before anything - even the exists pre-check below - touches
-        // a path: a UNC or mapped-drive path would make this process connect
-        // to the server it names. The same rule as hkdfguard_open_file.
+        // First, before anything touches a path: a UNC or mapped-drive path
+        // would make this process connect to the server it names. The same
+        // rule as hkdfguard_open_file.
         RequireLocalDrivePath(args.keyFilePath, args.keyFilePath);
         if (args.dekFile) {
             RequireLocalDrivePath(*args.dekFile, "--dek-file " + *args.dekFile);
@@ -2603,42 +2582,34 @@ namespace {
         // rights, create rights included - so the operator prepares the
         // folder (docs/admin-guide.md) and a missing one is an error.
         //
-        // Then a fast, friendly pre-check: fail before ever touching the
-        // TPM/Software Key Storage Provider if the output path already exists
-        // and --force wasn't passed. WriteWrappedKeyFile's FILE_CREATE is the
-        // actual correctness guarantee against the exists-then-create race;
-        // this is purely a fail-fast convenience on top of it.
+        // Also fail before touching a key storage provider if the output
+        // path already exists and --force wasn't passed. WriteWrappedKeyFile's
+        // FILE_CREATE is the actual guarantee against the exists-then-create
+        // race; this is a fail-fast convenience.
         const bool exists = ValidateOutputPathIsReal(args.keyFilePath);
         if (exists && !args.force) {
             throw CliError(args.keyFilePath + " already exists; pass --force|-f to overwrite");
         }
 
-        // Resolved before any TPM/Software Key Storage Provider work, so a bad
-        // --group name fails fast rather than after an expensive (and, with
-        // --force, destructive) operation has already run. Doesn't touch any
-        // secret material either way. Without --group: owner-only.
+        // Resolved before any key storage provider work, so a bad --group
+        // name fails before an expensive (and, with --force, destructive)
+        // operation runs. Without --group: owner-only.
         KeyFileSecurity security(
             GetProcessOwnerSid(),
             args.groupName ? std::optional<std::vector<BYTE>>(ResolveGroupSid(*args.groupName)) : std::nullopt);
 
-        // `service` (and its UTF-8 form) is not secret -- it's a logical
-        // identifier, not key material -- so both live for the rest of this
-        // function's scope, including the final status message below.
+        // `service` is a logical identifier, not secret.
         ValidateServiceCharset(args.serviceName);
         const std::string &service = args.serviceName;
 
         std::vector<uint8_t> wrapped;
         {
-            // Both the base64 *text* read from stdin and the decoded
-            // plaintext DEK *bytes* are secret. Both live only in `scratch`
-            // (locked into RAM, see DekScratch), which is wiped the instant
-            // this block ends - immediately after WrapDek is done with it,
-            // not at the end of RunWrap() (which would otherwise leave it in
-            // memory through the potentially-slow 8-pass secure-overwrite and
-            // the final file write below). hkdfguard_wrap_dek reads the
-            // plaintext DEK directly from the pointer it's given and never
-            // copies or zeroes it (see aes_gcm.cpp), so this caller-side
-            // wiping is the only place it happens at all.
+            // Both the base64 text and the decoded DEK bytes are secret and
+            // live only in `scratch` (locked into RAM, see DekScratch), which
+            // is wiped when this block ends - right after WrapDek, not
+            // through the slow secure-overwrite and file write below.
+            // hkdfguard_wrap_dek never zeroes the DEK it is given (see
+            // aes_gcm.cpp), so this caller-side wipe is the one that counts.
             DekScratch scratch;
             if (args.dekFile) {
                 ReadDekFile(*args.dekFile, scratch);
@@ -2655,14 +2626,10 @@ namespace {
                     std::to_string(scratch.decodedLen));
             }
 
-            // No provisioning happens here - "wrap" only ever opens an
-            // existing KEK. If none exists yet for this service, WrapDek's
-            // HKDFGUARD_ERR_KEK_NOT_FOUND path below reports that and points
-            // at "provision".
+            // Never provisions: a missing KEK is reported by WrapDek with a
+            // pointer to "provision".
             wrapped = WrapDek(service, scratch.decoded(), scratch.decodedLen);
-            // `scratch` is wiped, unlocked and freed here, as this block
-            // ends - only the wrapped (encrypted, no longer secret) form
-            // survives past this point.
+            // Only the wrapped (encrypted) form survives past this block.
         }
 
         // Wrapping in memory is open to any account with key use on the KEK;
@@ -2683,7 +2650,6 @@ namespace {
 
         WriteWrappedKeyFile(args.keyFilePath, wrapped, security);
 
-        // The same wording as the Linux tool.
         const std::string access =
                 args.groupName ? "owner read/write + " + *args.groupName + " read-only" : std::string("owner read/write");
         fprintf(
@@ -2726,7 +2692,7 @@ int main(int argc, char *argv[]) {
     // the same user - including through threads the key storage provider
     // starts later, which is what the strict flag adds on Windows (see
     // hkdfguard_harden_process_with_flags). Refuse to run rather than handle
-    // a DEK unprotected - the same rule as the Linux CLI.
+    // a DEK unprotected.
     {
         int rc = hkdfguard_harden_process_with_flags(HKDFGUARD_HARDEN_REQUIRE_PROTECTED_SIGNATURE);
         if (rc != HKDFGUARD_OK) {

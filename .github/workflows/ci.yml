@@ -1,11 +1,10 @@
 # Continuous integration: every push to main, every pull request, and on
-# demand. First lints the workflows and parses every PowerShell script
-# (lint), then runs the same build.yml that release.yml runs - so a green CI
-# commit is one a tag will build and test identically - then builds both
-# MSIs unsigned so a packaging mistake (WiX, the .wxs, Build-Msi.ps1's
-# content checks) shows up here rather than in the middle of a release.
-# Finally installs the x64 MSI on clean windows-2022 and windows-2025
-# runners and tests the installed files (install-test).
+# demand. Lints the workflows and parses every PowerShell script (lint),
+# runs the same build.yml that release.yml runs, so a green commit builds
+# and tests identically when tagged, then builds both MSIs unsigned so a
+# packaging mistake shows up here rather than during a release. Finally
+# installs the x64 MSI on clean windows-2022 and windows-2025 runners and
+# tests the installed files (install-test).
 #
 # No signing, no secrets, no "release" environment: pull requests from forks
 # run this too, and must not be able to reach the signing account.
@@ -26,11 +25,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Seconds, not minutes: checks the workflows themselves and every
-  # PowerShell script before the long Windows jobs depend on them, so a
-  # broken workflow or a script syntax error fails here - not twenty minutes
-  # into a build, and never for the first time on a release tag (release.yml
-  # can't run until a tag is pushed, so this lint is its only pre-tag check).
+  # Checks the workflows and every PowerShell script in seconds, before the
+  # long Windows jobs, so a broken workflow or script syntax error fails
+  # early. It is also release.yml's only check before a tag is pushed.
   lint:
     runs-on: ubuntu-latest
     permissions:
@@ -99,8 +96,8 @@ jobs:
           name: unsigned-win-arm64
           path: dist/win-arm64
 
-      # Unsigned (no -Sign), default version 0.9.0: this checks that both
-      # MSIs build and contain exactly what they should, not that they ship.
+      # Unsigned, at the project() VERSION: checks that both MSIs build and
+      # contain exactly what they should.
       - name: Build the MSI installers (unsigned)
         shell: powershell
         run: |

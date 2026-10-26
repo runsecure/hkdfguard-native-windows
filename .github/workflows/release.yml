@@ -1,13 +1,11 @@
-# Builds hkdfguard-native-windows's Release artifacts for both x64 and ARM64,
-# validates each natively (ctest suite + CLI wrap / DLL unwrap round trip via
-# scripts/Build-Test-Verify.ps1, run ON that architecture, not
-# cross-compiled and merely hoped to work), signs everything through Azure
-# Artifact Signing, then publishes one versioned GitHub Release - so other
-# repositories (e.g. a C# wrapper) can pull a stable, versioned download URL
-# instead of an ephemeral workflow artifact.
+# Builds the Release artifacts for x64 and ARM64, validates each natively on
+# its own architecture (ctest suite + CLI wrap / DLL unwrap round trip via
+# scripts/Build-Test-Verify.ps1), signs everything through Azure Artifact
+# Signing, then publishes one versioned GitHub Release, giving consumers a
+# stable download URL rather than an ephemeral workflow artifact.
 #
-# Triggered by pushing a version tag (vX.Y.Z). Reuses this repo's own
-# scripts/ rather than duplicating their logic here. Three jobs:
+# Triggered by pushing a version tag (vX.Y.Z). Uses the repository's own
+# scripts/ rather than duplicating their logic. Three jobs:
 #
 #   build    build.yml, the same reusable workflow ci.yml runs: per
 #            architecture, build, test, stage the UNSIGNED binaries.
@@ -135,13 +133,13 @@ jobs:
 
       # The signtool plugin for Artifact Signing (Azure.CodeSigning.Dlib.dll),
       # taken from Microsoft's NuGet package rather than the client tools
-      # MSI: the MSI copies the same files and then hung in InstallFinalize on
+      # MSI, which installs the same files but can hang in InstallFinalize on
       # hosted runners. signtool itself comes from the runner's Windows SDK.
       #
       # Pinned by version and by the package's SHA-256, and the plugin must
       # carry a valid Microsoft Authenticode signature. To move to a newer
-      # version, update both and check the new package's plugin the same way
-      # - and update the same pins (plus the plugin's own SHA-256) in
+      # version, update both, check the new package's plugin the same way,
+      # and update the same pins (plus the plugin's own SHA-256) in
       # scripts/ArtifactSigning.ps1, which local signing uses.
       - name: Get the Artifact Signing plugin
         shell: powershell

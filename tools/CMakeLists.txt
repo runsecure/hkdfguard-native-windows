@@ -1,14 +1,7 @@
-# hkdfguard-cli (built as hkdfguard.exe): a standalone command-line utility that wraps a
-# caller-supplied DEK and writes it to a file, using HkdfGuard.dll purely
+# hkdfguard-cli (built as hkdfguard.exe): the command-line tool that wraps a
+# caller-supplied DEK and writes it to a file, using HkdfGuard.dll only
 # through its public C ABI (include/hkdfguard.h) - deliberately not linked
-# against anything in src/, matching this project's macOS and Linux
-# equivalents (which also only ever go through their platform's public C
-# ABI, never an internal shortcut).
-#
-# Linking against the "hkdfguard" CMake target (not its renamed output
-# file - see the root CMakeLists.txt's OUTPUT_NAME comment) transitively
-# brings along its PUBLIC include/ directory, so no separate
-# target_include_directories call is needed here for hkdfguard.h.
+# against anything in src/. The hkdfguard target supplies include/.
 add_executable(hkdfguard-cli hkdfguard_cli.cpp)
 target_link_libraries(hkdfguard-cli PRIVATE hkdfguard bcrypt.lib ncrypt.lib advapi32.lib ntdll.lib)
 # The one header shared from src/: no_follow_open.h, header-only and

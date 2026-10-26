@@ -1,19 +1,17 @@
 # Reusable build-and-test workflow, called by ci.yml (every push and pull
 # request) and release.yml (version tags), so a release ships exactly what
-# CI built and tested - there is one definition of "the build", not two.
+# CI built and tested.
 #
-# Per architecture, on a runner OF that architecture: runs the ctest suite
-# and the CLI wrap / DLL unwrap round trip natively (scripts/Build-Test-Verify.ps1
-# builds for the runner's own architecture and checks the machine type, so
-# the ARM64 leg really runs ARM64 code), then builds the distributable
-# binaries (scripts/Build-Dist.ps1) and uploads them UNSIGNED as
-# "unsigned-win-x64" / "unsigned-win-arm64". Holds no signing access at all;
-# signing happens only in release.yml's sign job.
+# Per architecture, on a runner of that architecture: runs the ctest suite
+# and the CLI wrap / DLL unwrap round trip natively (Build-Test-Verify.ps1
+# checks the machine type, so the ARM64 leg really runs ARM64 code), then
+# builds the distributable binaries (Build-Dist.ps1) and uploads them
+# unsigned as "unsigned-win-x64" / "unsigned-win-arm64". Holds no signing
+# access; signing happens only in release.yml's sign job.
 #
-# The ARM64 leg runs on the "windows-11-arm" hosted runner label. That
-# label's availability depends on your plan/repo visibility - verify it's
-# available (Settings > Actions > Runners, or just watch the first run) and
-# swap in a self-hosted ARM64 runner's label here if not.
+# The ARM64 leg uses the "windows-11-arm" hosted runner label, whose
+# availability depends on the plan and repository visibility; substitute a
+# self-hosted ARM64 runner's label if it isn't available.
 name: Build
 
 on:
@@ -40,13 +38,12 @@ jobs:
     permissions:
       contents: read
     env:
-      # The hardening flags (/sdl, /Qspectre, CFG, and on x64 /CETCOMPAT and
-      # /guard:ehcont) come from CMakeLists.txt's hkdfguard_apply_hardening,
-      # so every build below gets them with no workflow-specific flags. This
-      # variable makes CMake refuse to configure if the Spectre-mitigated
-      # runtime libraries are missing, instead of only warning - a release
-      # must never ship with the unmitigated static runtime. The step
-      # "Ensure Spectre-mitigated runtime libraries" installs them first.
+      # The hardening flags come from CMakeLists.txt's
+      # hkdfguard_apply_hardening, with no workflow-specific flags. This
+      # variable makes CMake refuse to configure, rather than warn, when the
+      # Spectre-mitigated runtime libraries are missing, so a release never
+      # ships the unmitigated static runtime. The step "Ensure
+      # Spectre-mitigated runtime libraries" installs them first.
       HKDFGUARD_REQUIRE_SPECTRE_LIBS: "1"
     steps:
       - name: Check out repository
@@ -56,17 +53,13 @@ jobs:
 
       - name: Report elevation status
         shell: powershell
-        # Machine-wide KEK *creation* (NCRYPT_MACHINE_KEY_FLAG) requires an
-        # elevated process token, regardless of which NCrypt provider ends
-        # up serving it (see kek_store.cpp) - this is the one real
-        # precondition for the test step to pass on a hosted runner (a
-        # missing TPM is NOT a precondition: kek_store.cpp already falls
-        # back to the Software Key Storage Provider automatically, and every
-        # test asserts on that provider generically rather than requiring
-        # TPM specifically). Surfaced as its own early, clearly labeled
-        # step - via ::warning:: rather than a silent skip - so a
-        # non-elevated runner shows up as an obvious annotation in the
-        # Actions UI, not just a wall of failed checks further down.
+        # Machine-wide KEK creation (NCRYPT_MACHINE_KEY_FLAG) requires an
+        # elevated token whichever NCrypt provider serves it - the one real
+        # precondition for the tests on a hosted runner. A missing TPM is
+        # not: kek_store.cpp falls back to the Software Key Storage Provider
+        # and the tests accept either provider. A non-elevated runner shows
+        # up here as a ::warning:: annotation rather than only as failed
+        # checks further down.
         run: |
           $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
           $principal = New-Object System.Security.Principal.WindowsPrincipal($identity)
@@ -80,12 +73,11 @@ jobs:
 
       # /Qspectre only covers this project's own code; the statically linked
       # C/C++ runtime is mitigated only if the Spectre-mitigated runtime
-      # libraries are linked (CMake picks them up from the toolset's
-      # lib\spectre\<arch> directory). Hosted runner images don't promise
-      # them, so this checks the toolset the build scripts will use - the
-      # newest Visual Studio with this runner's C++ tools, as both
-      # Build-Test-Verify.ps1 and Build-Dist.ps1 select it - and installs
-      # both architectures' libraries if either is missing.
+      # libraries (the toolset's lib\spectre\<arch>) are linked. Hosted
+      # runner images don't promise them, so this checks the toolset the
+      # build scripts select - the newest Visual Studio with this runner's
+      # C++ tools - and installs both architectures' libraries if either is
+      # missing.
       - name: Ensure Spectre-mitigated runtime libraries
         shell: powershell
         run: |

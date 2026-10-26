@@ -36,9 +36,8 @@ namespace hkdfguard {
     // 0..39 - Version, ProviderType, Reserved, KeyId and Salt - so every
     // field a parser reads or routes on is authenticated: a payload whose
     // version, provider type or KeyId was rewritten fails even when the
-    // rewritten value would itself parse, which is what keeps a future
-    // second format version from being able to relabel a payload as the
-    // first. The service name is bound through the key (HKDF info), not the
+    // rewritten value would itself parse, so a future format version cannot
+    // relabel a payload as this one. The service name is bound through the key (HKDF info), not the
     // AAD: unwrapped under the wrong service, the key is wrong and the tag
     // fails. The Nonce is not authenticated bytes: AesGcmEncrypt generates
     // it, so it does not exist yet when they are fixed, and GCM
@@ -59,42 +58,23 @@ namespace hkdfguard {
     // for a matching fingerprint would let an attacker-controlled field
     // steer key selection.
     //
-    // The input hashed is the raw 64-byte X || Y, with no 0x04 prefix. The
-    // Linux and macOS implementations hash the uncompressed SEC1 encoding
-    // (0x04 || X || Y), so the same key fingerprints differently there. That
-    // is harmless - a payload is only ever opened on the host that wrapped
-    // it, and cross-platform payload parity is not a goal - but a
-    // fingerprint is only meaningful on the platform that produced it.
+    // The input hashed is the raw 64-byte X || Y, with no 0x04 prefix. Other
+    // platforms hash the SEC1 encoding (0x04 || X || Y), so a fingerprint is
+    // only meaningful on the platform that produced it; payloads are only
+    // opened on the host that wrapped them.
     //
-    // Deliberately serialized field-by-field rather than via a packed C struct,
-    // so the wire format has no dependency on compiler struct-packing rules.
+    // Serialized field-by-field rather than via a packed C struct, so the
+    // wire format has no dependency on compiler struct-packing rules.
 
-    // `constexpr` (as opposed to plain `const`) tells the compiler this value
-    // must be computable at compile time, not just "never reassigned at
-    // runtime." That matters here because these constants are used as array
-    // sizes and template arguments below (e.g. `SecureBuffer<kSharedSecretLen>`
-    // elsewhere in the project) - positions where the language requires a
-    // compile-time constant, not merely a read-only variable.
-    //
-    // Compared to hkdfguard.h's `#define` macros, `constexpr` values are real,
-    // typed C++ constants: the compiler checks their type (uint8_t vs size_t
-    // here) and they show up as named symbols in a debugger, whereas a `#define`
-    // is just blind text substitution performed before the compiler even sees
-    // the code. Internal-only code in src/ uses constexpr for this reason; the
-    // public hkdfguard.h uses #define instead specifically because plain C (and
-    // the non-C++ language bindings the ABI targets) has no constexpr at all.
     constexpr uint8_t kFormatVersion1 = 1;
 
     // The only KeyId value this format version ever produces or accepts.
     // HkdfGuard has no key-rotation mechanism by design: a KEK is meant to
-    // be long-lived, and the DEKs it protects are re-minted on every
-    // release under the same service name; if a genuinely new KEK is ever
-    // wanted, that is done by versioning the *service name* (e.g.
-    // "myapp.v2" gets its own, independent KEK), not by rotating KeyId
-    // under a fixed service name. ParseWrappedDek below therefore rejects
-    // any other KeyId as malformed, rather than accepting an arbitrary
-    // uint32_t from the payload and letting kek_store.cpp's KeyName go
-    // looking for a persisted key that was never meant to exist.
+    // be long-lived, and a new KEK is obtained by versioning the *service
+    // name* (e.g. "myapp.v2" gets its own, independent KEK), not by rotating
+    // KeyId. ParseWrappedDek therefore rejects any other KeyId as malformed
+    // rather than letting kek_store.cpp's KeyName look for a persisted key
+    // that cannot exist.
     constexpr uint32_t kCurrentKeyId = 1;
 
     constexpr uint8_t kProviderTypeTpm = 1; // Microsoft Platform Crypto Provider
@@ -109,10 +89,7 @@ namespace hkdfguard {
     constexpr size_t kTagLen = 16;
     constexpr size_t kFingerprintLen = 32; // SHA-256 output
 
-    // Byte offsets of each field within the 132-byte payload. Each one is
-    // defined in terms of the previous field's offset and length, so if a field
-    // length above ever changed, every later offset would automatically recompute
-    // correctly at compile time rather than needing to be hand-edited.
+    // Byte offsets of each field within the 132-byte payload.
     constexpr size_t kVersionOffset = 0;
     constexpr size_t kProviderTypeOffset = 1;
     constexpr size_t kReservedOffset = 2;
@@ -133,20 +110,12 @@ namespace hkdfguard {
     // header || KekFingerprint: the AES-GCM AAD, and the tail of HKDF's info.
     constexpr size_t kAuthenticatedLen = kHeaderLen + kFingerprintLen; // 72
 
-    // A plain C++ `struct` (equivalent to a `class` whose members default to
-    // `public`) used purely to bundle the parsed-out pieces of a wrapped
-    // payload for easy return from ParseWrappedDek below. None of these fields
-    // are secret (they're either public metadata, the public salt, or
-    // AES-GCM ciphertext/tag bytes that are meant to be stored/transmitted), so
-    // unlike SecureBuffer there's no zero-on-destruction behavior needed here.
+    // The parsed-out fields of a wrapped payload, returned by
+    // ParseWrappedDek. Nothing here is secret (metadata, the salt, and the
+    // ciphertext/tag), so no wiping is needed.
     //
-    // The four pointer fields don't own their own memory - they simply point
-    // into the middle of the caller's original `wrapped` byte buffer (see
-    // ParseWrappedDek's implementation in wire_format.cpp, which sets each one
-    // to `wrapped + <offset>`). That's why the comment below warns they're only
-    // valid as long as the original buffer is; if the caller's `wrapped` array
-    // were destroyed or reused while a ParsedWrappedDek pointing into it was
-    // still alive, those pointers would dangle.
+    // The pointer fields do not own memory: they point into the caller's
+    // `wrapped` buffer and are valid only as long as it is.
     struct ParsedWrappedDek {
         uint8_t provider_type;
         uint32_t key_id;
@@ -158,21 +127,8 @@ namespace hkdfguard {
         const uint8_t *fingerprint; // kFingerprintLen bytes
     };
 
-    // Only the function *declarations* (signatures) live in this header; their
-    // bodies are in wire_format.cpp. This is the ordinary C/C++ header/source
-    // split: any .cpp file that #includes this header knows enough (the name,
-    // parameter types, and return type) to *call* these functions, even though
-    // the compiler compiles wire_format.cpp separately and the linker stitches
-    // the two together afterward.
-    //
-    // Writes a kTotalLen-byte WrappedDekV1 payload into out. The parameter
-    // types like `const uint8_t salt[kSaltLen]` are a bit of
-    // C/C++ notation worth knowing: as a *function parameter*, an array type
-    // always silently decays to a plain pointer (`const uint8_t*`) - the
-    // `[kSaltLen]` here is purely documentation for a human reader of
-    // exactly how many bytes the function expects to find at that pointer; the
-    // compiler does not actually check the caller passed an array of that
-    // length.
+    // Writes a kTotalLen-byte WrappedDekV1 payload into out. Array-parameter
+    // sizes document the expected byte counts; they are not enforced.
     void SerializeWrappedDek(
         uint8_t provider_type,
         uint32_t key_id,
@@ -206,16 +162,8 @@ namespace hkdfguard {
     // HKDFGUARD_ERR_PAYLOAD_UNSUPPORTED if the version is not recognized,
     // and with HKDFGUARD_ERR_PAYLOAD_MALFORMED if wrapped_len != kTotalLen,
     // the reserved bytes are not zero, the provider type is not
-    // recognized, or KeyId is not kCurrentKeyId - see that constant's
-    // comment for why a payload naming any other KeyId is rejected outright
-    // rather than passed through to look up a key that, by design, could
-    // never legitimately exist. (The fingerprint is *not* checked here -
-    // that needs the KEK opened, which is hkdfguard.cpp's job.) Returning a
-    // ParsedWrappedDek *by value* (rather than through an out-parameter) is
-    // idiomatic modern C++: the compiler builds the struct directly in the
-    // caller's variable (no separate temporary gets copied), and if parsing
-    // fails, throwing an exception instead of returning a special "invalid"
-    // value means the caller can never accidentally forget to check for
-    // failure and use a garbage result.
+    // recognized, or KeyId is not kCurrentKeyId (see that constant). The
+    // fingerprint is *not* checked here - that needs the KEK opened, which
+    // is hkdfguard.cpp's job.
     ParsedWrappedDek ParseWrappedDek(const uint8_t *wrapped, int32_t wrapped_len);
 } // namespace hkdfguard

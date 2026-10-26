@@ -661,10 +661,10 @@ constexpr char kGoldenKekX[] = "a55c04e4b2113126f3ea5244034decd0c0c9f55cd25d2e03
 constexpr char kGoldenKekY[] = "4ab897ae67c14350a0213b0a67d416472aa053a16992018ac4d874dc8529569d";
 constexpr char kGoldenKekD[] = "9639379738995d1017b34a6398b444cf9cd0c82acb0dc0cd5d40c91b513f4e90";
 constexpr char kGoldenSalt[] = "4242424242424242424242424242424242424242424242424242424242424242";
-// H(kGoldenSalt): produced by the Linux implementation's payload_ecdh_point
-// on the RustCrypto p256 0.14 crate - NOT by this project's
-// hash_to_curve.cpp - so the golden payload pins Windows to the Linux
-// hash-to-curve as well as to the rest of the construction.
+// H(kGoldenSalt): produced by the Linux implementation's payload_ecdh_point,
+// not by this project's hash_to_curve.cpp, so the golden payload pins this
+// library to the documented hash-to-curve as well as the rest of the
+// construction.
 constexpr char kGoldenPointX[] = "23705f112056934aef2059c9c3ffa610ccb2f070d266d4ffa06210d37e9a0de5";
 constexpr char kGoldenPointY[] = "df412b76994469fb7c27385e2d8f389f3da716076c79a19bb57249c9755f032a";
 constexpr char kGoldenNonce[] = "977bcd31c21caffe32bc3f6a";
@@ -672,14 +672,13 @@ constexpr char kGoldenService[] = "hkdfguardwin.test.golden";
 constexpr wchar_t kGoldenServiceWide[] = L"hkdfguardwin.test.golden";
 
 // The golden WrappedDekV1 payload: MakeDek() wrapped under the golden KEK
-// for kGoldenService, with the golden salt and nonce, under the Linux
-// build's key derivation (HKDF info = "hkdfguard-wrap-v1:" || u16le(len) ||
+// for kGoldenService, with the golden salt and nonce, under the documented
+// key derivation (HKDF info = "hkdfguard-wrap-v1:" || u16le(len) ||
 // service || header || fingerprint; AAD = header || fingerprint). Computed
-// outside this project with .NET's HKDF and AesGcm, and its wrapping key
-// (4de2f10c...) confirmed by the Linux crate's own derive_wrapping_key.
-// Frozen from the first release on: if a code change makes this stop
-// unwrapping, that change breaks every payload already deployed - fix the
-// change, never this constant.
+// outside this project, and its wrapping key (4de2f10c...) matches the
+// Linux implementation's derive_wrapping_key. Frozen: if a code change
+// makes this stop unwrapping, that change breaks every payload already
+// deployed - fix the change, never this constant.
 constexpr char kGoldenPayloadHex[] =
     "010200000100000042424242424242424242424242424242424242424242424242424242"
     "42424242977bcd31c21caffe32bc3f6a83bd5956cb4af147e9f9bdbe2efedd0eefc55ddb"
@@ -1505,7 +1504,7 @@ int main() {
     // the real output length coming back.
     int32_t wrapped_len = static_cast<int32_t>(wrapped.size());
 
-    rc =hkdfguard_wrap_dek(kService, dek.data(), static_cast<int32_t>(dek.size()), wrapped.data(), &wrapped_len);
+    rc = hkdfguard_wrap_dek(kService, dek.data(), static_cast<int32_t>(dek.size()), wrapped.data(), &wrapped_len);
     CheckNeedsElevation(rc == HKDFGUARD_OK, "wrap succeeds");
     const bool primary_wrap_ok = (rc == HKDFGUARD_OK);
     Check(wrapped_len == HKDFGUARD_WRAPPED_MAX_LEN, "wrap produces fixed-size payload");
@@ -2213,7 +2212,16 @@ int main() {
         DWORD temp_long_len = GetLongPathNameW(temp, temp_long, MAX_PATH + 1);
         const std::wstring own = std::wstring((temp_long_len > 0 && temp_long_len <= MAX_PATH) ? temp_long : temp) +
                                  L"hkdfguard-production-" + std::to_wstring(GetCurrentProcessId()) + L".key";
-        if (WriteTestFile(own, wrapped)) {
+        // Production trusts deployer-group members' files, so when this
+        // account is a deployer its own file is correctly accepted.
+        int32_t me_trusted = -1;
+        const bool me_is_deployer =
+            hkdfguard_key_file_principal_trusted(ToUtf8(CurrentUserSidString()).c_str(), &me_trusted) == HKDFGUARD_OK &&
+            me_trusted == 1;
+        if (me_is_deployer) {
+            Skip("open_file: under the production model, a key file this account wrote itself is refused "
+                 "(this account is in a deployer group, which production trusts)");
+        } else if (WriteTestFile(own, wrapped)) {
             std::vector<uint8_t> out(HKDFGUARD_WRAPPED_MAX_LEN);
             int32_t len = static_cast<int32_t>(out.size());
             Check(hkdfguard_open_file(ToUtf8(own).c_str(), out.data(), &len) == HKDFGUARD_ERR_FILE_UNTRUSTED,
@@ -3068,8 +3076,8 @@ int main() {
             if (got != c.want) std::printf("    (CheckKeyFileSecurity returned %d)\n", got);
         }
 
-        // The production model: this account is no longer trusted for
-        // being the caller; the deployer groups are. BUILTIN\Performance
+        // The production model: this account isn't trusted for being the
+        // caller; the deployer groups are. BUILTIN\Performance
         // Log Users (S-1-5-32-559) stands in for a deployer group: a real,
         // host-local, not over-broad group. This account is a member of
         // neither it nor HkdfGuardDeployers on a test machine; if it is, the
@@ -3138,8 +3146,7 @@ int main() {
         Check(!plain(b64 + "="), "detector: an extra '=' is not a DEK");
         Check(!plain("\v" + b64), "detector: vertical tab is not trimmed (as Rust's trim_ascii)");
         Check(plain(std::string(HKDFGUARD_DEK_LEN, '\0')), "detector: any 32 raw bytes");
-        // The constant-time rewrite: the same answers as the Linux build's
-        // edge-case test (the_detector_s_edge_cases_match_the_windows_build).
+        // Further edge cases: trimming, empty input, alphabets, hex.
         Check(plain("\f" + b64 + "\f"), "detector: form feed is trimmed");
         Check(!plain(""), "detector: empty is not a DEK");
         Check(!plain(std::string(50, ' ')), "detector: only whitespace is not a DEK");
@@ -3267,15 +3274,11 @@ int main() {
     //          a test-only override so this doesn't depend on this
     //          machine's real registry policy setting or TPM/vTPM
     //          availability (see policy.h's SetTestPolicyOverride and
-    //          CheckPolicyCreatesKek above). Every check above this point
-    //          already exercises the real, registry-reading
-    //          LoadEffectivePolicy() inside HkdfGuard.dll on every wrap/
-    //          unwrap/create_kek call - HkdfGuard.dll never calls
-    //          SetTestPolicyOverride itself, and the override lives in a
-    //          separate copy of policy.cpp's state compiled directly into
-    //          this .exe (see tests/CMakeLists.txt), so it has no way to
-    //          affect the DLL even if it wanted to. This section is the
-    //          only place that test-only override is exercised.
+    //          CheckPolicyCreatesKek above). The checks above exercise the
+    //          real, registry-reading LoadEffectivePolicy() inside
+    //          HkdfGuard.dll; the override lives in a separate copy of
+    //          policy.cpp's state compiled into this .exe (see
+    //          tests/CMakeLists.txt), so it cannot affect the DLL.
     CheckPolicyCreatesKek(
         hkdfguard::KeyStoragePolicy::SoftwareOnly,
         L"hkdfguardwin.test.policy.softwareonly",
@@ -3296,21 +3299,13 @@ int main() {
 
     // ---- 25b. An invalid KeyStoragePolicy value fails closed with ----
     //           HKDFGUARD_ERR_POLICY_INVALID, rather than being silently
-    //           treated as PreferTpm. KeyStoragePolicy::Invalid is exactly
-    //           what policy.cpp's ParsePolicyValue returns for a REG_DWORD
-    //           value that isn't 0/1/2, or what LoadEffectivePolicy returns
-    //           for a value of the wrong registry type - see policy.h's
-    //           comment on why that's a deliberate fail-closed choice
-    //           rather than a default substitution. Forced via the same
-    //           test-only override as section 25 above, so this needs
-    //           neither a real bad registry value nor elevation:
-    //           KekExists/CreateKek/OpenKekForWrap all read policy and
-    //           react to it immediately, before ever calling into NCrypt.
-    //           (OpenKekForUnwrap has the identical `if (policy ==
-    //           KeyStoragePolicy::Invalid) throw ...` guard - see
-    //           kek_store.cpp - but only reaches it after successfully
-    //           opening a real key, so exercising it here would need a
-    //           provisioned KEK; not duplicated as a separate check.)
+    //           treated as PreferTpm (see policy.h for why this fails
+    //           closed). Forced via the same test-only override as section
+    //           25, so this needs neither a real bad registry value nor
+    //           elevation: KekExists/CreateKek/OpenKekForWrap read policy
+    //           before calling into NCrypt. (OpenKekForUnwrap has the same
+    //           guard - see kek_store.cpp - but only after opening a real
+    //           key, so it isn't checked separately here.)
     hkdfguard::SetTestPolicyOverride(hkdfguard::KeyStoragePolicy::Invalid);
 
     bool kek_exists_rejects_invalid_policy = false;
@@ -3344,12 +3339,10 @@ int main() {
     //           at one no provider is registered under (see kek_store.h's
     //           SetTestTpmProviderNameOverride - a test-only seam, absent
     //           from HkdfGuard.dll), so this is deterministic on hardware
-    //           that does have a TPM. Guards against the regression where
-    //           KekExists threw HKDFGUARD_ERR_PROVIDER_ERROR here while CreateKek
-    //           and OpenKekForWrap on the same host happily fell back -
-    //           which made hkdfguard_kek_exists, and so the CLI's
-    //           `provision`, fail on exactly the hosts the fallback is for.
-    //           The RequireTpm half checks the opposite contract: with no
+    //           that does have a TPM. KekExists must fall back just as
+    //           CreateKek and OpenKekForWrap do, or hkdfguard_kek_exists (and
+    //           so the CLI's `provision`) would fail on exactly the hosts the
+    //           fallback is for. The RequireTpm half checks the opposite contract: with no
     //           TPM, "exists?" must fail closed with PROVIDER_ERROR rather than
     //           answer from the software provider.
     constexpr const wchar_t* kServiceNoTpmWide = L"hkdfguardwin.test.policy.notpm";
@@ -3395,10 +3388,10 @@ int main() {
     // ---- 25d. Re-provisioning a KEK whose ACL has been widened since ----
     //           creation (or that was pre-planted with a wide ACL) fails
     //           with HKDFGUARD_ERR_KEK_INVALID, and the key is left
-    //           exactly where it was - never deleted or replaced. Before
-    //           this check, create_kek accepted any existing key under the
-    //           service's name as "already provisioned" without looking at
-    //           who it admits. SoftwareOnly keeps this off the TPM so it's
+    //           exactly where it was - never deleted or replaced. An
+    //           existing key under the service's name only counts as
+    //           "already provisioned" if its ACL admits no one it shouldn't.
+    //           SoftwareOnly keeps this off the TPM so it's
     //           deterministic; elevated-only (KEK creation), so it's skipped
     //           when not elevated.
     constexpr const wchar_t* kServiceAclWidenedWide = L"hkdfguardwin.test.aclwidened";
@@ -3408,8 +3401,8 @@ int main() {
         hkdfguard::CreateKek(kServiceAclWidenedWide);
         acl_widened_created = true;
 
-        // Re-provisioning an untouched KEK is still fine (baseline for the
-        // check below - the new ACL check must not reject our own keys).
+        // Baseline: re-provisioning an untouched KEK succeeds - the ACL
+        // check must not reject our own keys.
         Check(
             InternalCreateKekResult(kServiceAclWidenedWide) == HKDFGUARD_OK,
             "create_kek accepts its own, unmodified existing KEK");
@@ -3503,9 +3496,9 @@ int main() {
         hkdfguard::SetTestPolicyOverride(hkdfguard::KeyStoragePolicy::PreferTpm);
 
         // 26a. A TPM that errors while being probed (here: not ready) may
-        //      have a KEK behind it, so nothing may fall back. Before the
-        //      fix, KekExists answered "false" from software, wrap opened
-        //      the software provider, and create made a software KEK.
+        //      have a KEK behind it, so nothing may fall back: KekExists must
+        //      not answer "false" from software, wrap must not open the
+        //      software provider, and create must not make a software KEK.
         //      The fault is injected at NCryptOpenKey, which is only reached
         //      once the TPM provider itself has opened. Without one (e.g. a
         //      hosted CI runner), opening the provider fails first - which is
@@ -3628,7 +3621,7 @@ int main() {
 
     // ---- 28. Re-provisioning refuses an existing KEK whose ACL grants an ----
     //          over-broad principal through a conditional (callback) allow
-    //          ACE, or grants one of the broad groups added to the denylist.
+    //          ACE, or grants one of the broad groups on the denylist.
     //          Complements 25d, which covers a plain grant to Everyone.
     {
         constexpr const wchar_t* kServiceAclEntries = L"hkdfguardwin.test.aclentries";
