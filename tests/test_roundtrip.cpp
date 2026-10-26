@@ -13,10 +13,12 @@
 #include "no_follow_open.h" // IsLocalDrivePath / IsLocalVolumeDeviceTarget - section -2d
 
 #include <aclapi.h>  // SetEntriesInAclW - section 25d widens an existing KEK's ACL
+#include <psapi.h>   // GetProcessMemoryInfo - section 30's leak probe
 #include <lm.h>      // NetLocalGroupAdd/AddMembers - section 24e makes this account a deployer
 #include <winioctl.h> // FSCTL_SET_REPARSE_POINT - section 24c plants a junction
 #include <sddl.h>    // ConvertStringSecurityDescriptorToSecurityDescriptorW - section 28
 #include <algorithm> // std::equal - section 24c
+#include <atomic>    // std::atomic - section 30's thread probe
 #include <chrono>    // steady_clock - section 0c2 times the setup floor
 #include <thread>    // std::thread - section 0c2 checks setup calls are serialized
 #include <cstdio>
@@ -3747,6 +3749,348 @@ int main() {
             } else {
                 Skip("golden payload: the shipped DLL unwraps the frozen payload (needs elevation)");
             }
+        }
+    }
+
+    // ---- 30. ABI contract sweep: the buffer and argument contracts of ----
+    //          every exported function, checked exhaustively where the input
+    //          is small enough to allow it (every byte of a payload, every
+    //          output capacity), with canaries past each buffer, plus a leak
+    //          probe and a thread probe. Expected codes are the header's.
+    {
+        // Every status this build may return, per include/hkdfguard.h. Any
+        // other value - or one the header says is never returned on Windows
+        // - is a contract break, however the call was abused.
+        auto documented = [](int32_t code) {
+            static const int32_t kCodes[] = {
+                HKDFGUARD_OK, HKDFGUARD_ERR_INVALID_ARGUMENT, HKDFGUARD_ERR_BUFFER_TOO_SMALL,
+                HKDFGUARD_ERR_PROVIDER_ERROR, HKDFGUARD_ERR_CRYPTO_ERROR, HKDFGUARD_ERR_INTERNAL_ERROR,
+                HKDFGUARD_ERR_INVALID_SERVICE_NAME, HKDFGUARD_ERR_POLICY_INVALID, HKDFGUARD_ERR_PAYLOAD_MALFORMED,
+                HKDFGUARD_ERR_PAYLOAD_AUTH_FAILED, HKDFGUARD_ERR_PAYLOAD_UNSUPPORTED,
+                HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH, HKDFGUARD_ERR_KEK_NOT_FOUND, HKDFGUARD_ERR_KEK_ACCESS_DENIED,
+                HKDFGUARD_ERR_KEK_INVALID, HKDFGUARD_ERR_PROCESS_HARDENING_FAILED, HKDFGUARD_ERR_FILE_NOT_FOUND,
+                HKDFGUARD_ERR_FILE_ACCESS_DENIED, HKDFGUARD_ERR_FILE_IO, HKDFGUARD_ERR_FILE_TOO_SHORT,
+                HKDFGUARD_ERR_FILE_TOO_LONG, HKDFGUARD_ERR_FILE_PLAINTEXT_KEY, HKDFGUARD_ERR_FILE_MALFORMED,
+                HKDFGUARD_ERR_FILE_UNTRUSTED, HKDFGUARD_ERR_WIN_GROUP_INVALID};
+            for (int32_t c : kCodes) {
+                if (c == code) return true;
+            }
+            return false;
+        };
+        static constexpr uint8_t kCanary = 0xA5;
+        static constexpr size_t kPad = 64;
+        // A buffer of `cap` usable bytes followed by kPad canary bytes: a
+        // write past the stated capacity shows up as a damaged canary.
+        auto canary_buffer = [&](size_t cap) { return std::vector<uint8_t>(cap + kPad, kCanary); };
+        auto canary_intact = [&](const std::vector<uint8_t>& buf, size_t cap) {
+            return std::all_of(buf.begin() + static_cast<std::ptrdiff_t>(cap), buf.end(),
+                               [](uint8_t b) { return b == kCanary; });
+        };
+
+        // A payload that parses - version, provider type, reserved bytes and
+        // KeyId all valid - for a service that has no KEK, so every call on
+        // it gets exactly as far as the KEK lookup.
+        std::vector<uint8_t> synthetic(HKDFGUARD_WRAPPED_MAX_LEN);
+        for (size_t i = 0; i < synthetic.size(); ++i) synthetic[i] = static_cast<uint8_t>((i * 37 + 11) & 0xFF);
+        synthetic[0] = hkdfguard::kFormatVersion1;
+        synthetic[1] = hkdfguard::kProviderTypeSoftware;
+        synthetic[2] = synthetic[3] = 0;
+        const uint32_t key_id = hkdfguard::kCurrentKeyId;
+        std::memcpy(&synthetic[4], &key_id, sizeof(key_id));
+        {
+            auto out = canary_buffer(HKDFGUARD_DEK_LEN);
+            int32_t len = HKDFGUARD_DEK_LEN;
+            int32_t r = hkdfguard_unwrap_dek(kServiceNoKek, synthetic.data(), HKDFGUARD_WRAPPED_MAX_LEN, out.data(), &len);
+            Check(r == HKDFGUARD_ERR_KEK_NOT_FOUND, "sweep setup: the synthetic payload parses and reaches the KEK lookup");
+        }
+
+        // 30a. Every single-bit mutation of every payload byte, through
+        //      unwrap: the field's documented code comes back, the output is
+        //      zeroed, out_len is untouched and nothing is written past it.
+        //      Header bytes are refused by the parser; everything after them
+        //      parses, so (with no KEK) the lookup fails next.
+        {
+            int bad_code = 0, not_zeroed = 0, outlen_moved = 0, overran = 0, undocumented = 0;
+            size_t first_bad = SIZE_MAX;
+            int32_t first_bad_rc = 0;
+            for (size_t off = 0; off < HKDFGUARD_WRAPPED_MAX_LEN; ++off) {
+                for (uint8_t mask : {uint8_t{0x01}, uint8_t{0x80}}) {
+                    std::vector<uint8_t> mutated = synthetic;
+                    mutated[off] ^= mask;
+                    const int32_t expected = off == 0   ? HKDFGUARD_ERR_PAYLOAD_UNSUPPORTED
+                                             : off < 8  ? HKDFGUARD_ERR_PAYLOAD_MALFORMED
+                                                        : HKDFGUARD_ERR_KEK_NOT_FOUND;
+                    auto out = canary_buffer(HKDFGUARD_DEK_LEN);
+                    int32_t len = HKDFGUARD_DEK_LEN;
+                    const int32_t r = hkdfguard_unwrap_dek(kServiceNoKek, mutated.data(), HKDFGUARD_WRAPPED_MAX_LEN,
+                                                           out.data(), &len);
+                    if (!documented(r)) ++undocumented;
+                    if (r != expected) {
+                        if (++bad_code == 1) { first_bad = off; first_bad_rc = r; }
+                    }
+                    if (!AllZero(out.data(), HKDFGUARD_DEK_LEN)) ++not_zeroed;
+                    if (len != HKDFGUARD_DEK_LEN) ++outlen_moved;
+                    if (!canary_intact(out, HKDFGUARD_DEK_LEN)) ++overran;
+                }
+            }
+            Check(bad_code == 0, "unwrap: every single-bit mutation of every payload byte (264 cases) gets its field's documented code");
+            if (bad_code) std::printf("    (%d mismatches; first at offset %zu returned %d)\n", bad_code, first_bad, first_bad_rc);
+            Check(undocumented == 0, "unwrap: no mutation produced an undocumented status code");
+            Check(not_zeroed == 0, "unwrap: the output buffer is zeroed after every one of those failures");
+            Check(outlen_moved == 0, "unwrap: out_len is left unchanged by every one of those failures");
+            Check(overran == 0, "unwrap: nothing is written past the stated output capacity in any of them");
+        }
+
+        // The same sweep on a real payload under a real KEK: past the
+        // header, the salt, nonce, ciphertext and tag fail authentication,
+        // and the fingerprint bytes are caught before any decryption.
+        if (primary_wrap_ok) {
+            int bad_code = 0, not_zeroed = 0;
+            size_t first_bad = SIZE_MAX;
+            int32_t first_bad_rc = 0;
+            for (size_t off = 0; off < HKDFGUARD_WRAPPED_MAX_LEN; ++off) {
+                std::vector<uint8_t> mutated = wrapped;
+                mutated[off] ^= 0x01;
+                const int32_t expected = off == 0     ? HKDFGUARD_ERR_PAYLOAD_UNSUPPORTED
+                                         : off < 8    ? HKDFGUARD_ERR_PAYLOAD_MALFORMED
+                                         : off < 100  ? HKDFGUARD_ERR_PAYLOAD_AUTH_FAILED
+                                                      : HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH;
+                auto out = canary_buffer(HKDFGUARD_DEK_LEN);
+                int32_t len = HKDFGUARD_DEK_LEN;
+                const int32_t r = hkdfguard_unwrap_dek(kService, mutated.data(), HKDFGUARD_WRAPPED_MAX_LEN, out.data(), &len);
+                if (r != expected) {
+                    if (++bad_code == 1) { first_bad = off; first_bad_rc = r; }
+                }
+                if (!AllZero(out.data(), HKDFGUARD_DEK_LEN)) ++not_zeroed;
+            }
+            Check(bad_code == 0, "unwrap: on a real payload, every byte's mutation fails with its field's code (unsupported / malformed / auth failed / fingerprint mismatch)");
+            if (bad_code) std::printf("    (%d mismatches; first at offset %zu returned %d)\n", bad_code, first_bad, first_bad_rc);
+            Check(not_zeroed == 0, "unwrap: no plaintext is left behind after any of those failures");
+        } else {
+            Skip("unwrap: the real-payload mutation sweep (needs elevation)");
+        }
+
+        // 30b. A wrapped_len that lies about a real 132-byte buffer: refused
+        //      as malformed from the length alone, so nothing past the buffer
+        //      is read (INT32_MAX would fault if it were).
+        {
+            int bad = 0;
+            for (int32_t lie : {int32_t{0}, int32_t{1}, int32_t{HKDFGUARD_WRAPPED_MAX_LEN - 1},
+                                int32_t{HKDFGUARD_WRAPPED_MAX_LEN + 1}, INT32_MAX}) {
+                auto out = canary_buffer(HKDFGUARD_DEK_LEN);
+                int32_t len = HKDFGUARD_DEK_LEN;
+                const int32_t r = hkdfguard_unwrap_dek(kServiceNoKek, synthetic.data(), lie, out.data(), &len);
+                if (r != HKDFGUARD_ERR_PAYLOAD_MALFORMED || !AllZero(out.data(), HKDFGUARD_DEK_LEN) || len != HKDFGUARD_DEK_LEN ||
+                    !canary_intact(out, HKDFGUARD_DEK_LEN)) {
+                    ++bad;
+                    std::printf("    (wrapped_len %d: returned %d)\n", lie, r);
+                }
+            }
+            Check(bad == 0, "unwrap: wrapped_len of 0, 1, 131, 133 and INT32_MAX are each refused as malformed without reading past the buffer");
+        }
+
+        // 30c. out_len is untouched, nothing is written past the capacity,
+        //      and (unwrap, open_file) the output is zeroed, on a failure
+        //      that is not BUFFER_TOO_SMALL - here an invalid service name or
+        //      a missing file - for each of the five buffer functions, at
+        //      capacities from exact to generous.
+        {
+            const std::string too_long(129, 'a');
+            int bad = 0;
+            for (size_t cap : {size_t{32}, size_t{132}, size_t{133}, size_t{4096}}) {
+                auto out = canary_buffer(cap);
+                int32_t len = static_cast<int32_t>(cap);
+                int32_t r = hkdfguard_kek_fingerprint(too_long.c_str(), out.data(), &len);
+                if (r != HKDFGUARD_ERR_INVALID_SERVICE_NAME || len != static_cast<int32_t>(cap) || !canary_intact(out, cap)) ++bad;
+
+                out = canary_buffer(cap); len = static_cast<int32_t>(cap);
+                r = hkdfguard_wrap_dek(too_long.c_str(), dek.data(), HKDFGUARD_DEK_LEN, out.data(), &len);
+                if (r != HKDFGUARD_ERR_INVALID_SERVICE_NAME || len != static_cast<int32_t>(cap) || !canary_intact(out, cap)) ++bad;
+
+                out = canary_buffer(cap); len = static_cast<int32_t>(cap);
+                r = hkdfguard_generate_and_wrap_dek(too_long.c_str(), out.data(), &len);
+                if (r != HKDFGUARD_ERR_INVALID_SERVICE_NAME || len != static_cast<int32_t>(cap) || !canary_intact(out, cap)) ++bad;
+
+                out = canary_buffer(cap); len = static_cast<int32_t>(cap);
+                r = hkdfguard_unwrap_dek(too_long.c_str(), synthetic.data(), HKDFGUARD_WRAPPED_MAX_LEN, out.data(), &len);
+                if (r != HKDFGUARD_ERR_INVALID_SERVICE_NAME || len != static_cast<int32_t>(cap) || !canary_intact(out, cap) ||
+                    !AllZero(out.data(), cap)) ++bad;
+
+                out = canary_buffer(cap); len = static_cast<int32_t>(cap);
+                r = hkdfguard_open_file("C:\\hkdfguard-no-such-dir\\absent.key", out.data(), &len);
+                const bool open_ok = cap >= HKDFGUARD_WRAPPED_MAX_LEN
+                                         ? (r == HKDFGUARD_ERR_FILE_NOT_FOUND && len == static_cast<int32_t>(cap) && AllZero(out.data(), cap))
+                                         : (r == HKDFGUARD_ERR_BUFFER_TOO_SMALL && len == HKDFGUARD_WRAPPED_MAX_LEN);
+                if (!open_ok || !canary_intact(out, cap)) ++bad;
+            }
+            Check(bad == 0, "every buffer function: on a non-size failure, out_len is untouched and nothing is written past the capacity (unwrap/open_file also zero the output), at four capacities");
+            if (bad) std::printf("    (%d of 20 calls broke the contract)\n", bad);
+        }
+
+        // 30d. The service-name rule, identically through every entry point
+        //      that takes one.
+        {
+            const std::string too_long(129, 'a');
+            const char* const names[] = {nullptr, "", too_long.c_str(), "caf\xC3\xA9", ".a", "a..b", "a-b", "a b", "a/b", "\t"};
+            int bad = 0;
+            for (const char* name : names) {
+                int32_t exists = -1, len;
+                auto out = canary_buffer(HKDFGUARD_WRAPPED_MAX_LEN);
+                if (hkdfguard_kek_exists(name, &exists) != HKDFGUARD_ERR_INVALID_SERVICE_NAME || exists != -1) ++bad;
+                len = HKDFGUARD_KEK_FINGERPRINT_LEN;
+                if (hkdfguard_kek_fingerprint(name, out.data(), &len) != HKDFGUARD_ERR_INVALID_SERVICE_NAME) ++bad;
+                if (hkdfguard_create_kek(name) != HKDFGUARD_ERR_INVALID_SERVICE_NAME) ++bad;
+                len = HKDFGUARD_WRAPPED_MAX_LEN;
+                if (hkdfguard_wrap_dek(name, dek.data(), HKDFGUARD_DEK_LEN, out.data(), &len) != HKDFGUARD_ERR_INVALID_SERVICE_NAME) ++bad;
+                len = HKDFGUARD_DEK_LEN;
+                if (hkdfguard_unwrap_dek(name, synthetic.data(), HKDFGUARD_WRAPPED_MAX_LEN, out.data(), &len) != HKDFGUARD_ERR_INVALID_SERVICE_NAME) ++bad;
+                len = HKDFGUARD_WRAPPED_MAX_LEN;
+                if (hkdfguard_generate_and_wrap_dek(name, out.data(), &len) != HKDFGUARD_ERR_INVALID_SERVICE_NAME) ++bad;
+                if (!canary_intact(out, HKDFGUARD_WRAPPED_MAX_LEN)) ++bad;
+            }
+            Check(bad == 0, "service names: null, empty, 129 bytes, non-ASCII, dot rules and separators are refused identically by all six entry points (60 calls)");
+            if (bad) std::printf("    (%d calls broke the rule)\n", bad);
+        }
+
+        // 30e. SID strings through key_file_principal_trusted: well-formed
+        //      ones answer, everything else is an argument error, and the
+        //      answer slot is untouched on failure.
+        {
+            const std::string long_sid = "S-1-5-21-" + std::string(10000, '1');
+            std::string sixteen = "S-1-5";
+            for (int i = 0; i < 15; ++i) sixteen += "-1"; // 16 sub-authorities: one over the maximum
+            const char* const sids[] = {"", "S", "S-", "S-1", "S-1-", "S-1-5-", "*S-1-5-32-544", "s-1-5-32-544",
+                                        "S-1-5-32-544 ", " S-1-5-32-544", "S-1-5-32-544\n", "S-1-5-32-544x",
+                                        "S-1-5-4294967296", "S-1-5--1", "S-1-5-32-544-", "S-1-0x5-32-544",
+                                        "BUILTIN\\Administrators", "Everyone", "\xFF\xFE", long_sid.c_str(), sixteen.c_str()};
+            int bad = 0;
+            for (const char* sid : sids) {
+                int32_t trusted = -7;
+                const int32_t r = hkdfguard_key_file_principal_trusted(sid, &trusted);
+                const bool ok = (r == HKDFGUARD_OK && (trusted == 0 || trusted == 1)) ||
+                                (r == HKDFGUARD_ERR_INVALID_ARGUMENT && trusted == -7) ||
+                                ((r == HKDFGUARD_ERR_POLICY_INVALID || r == HKDFGUARD_ERR_WIN_GROUP_INVALID) && trusted == -7);
+                if (!ok) {
+                    ++bad;
+                    std::printf("    (sid \"%.40s\": returned %d, trusted %d)\n", sid, r, trusted);
+                }
+            }
+            Check(bad == 0, "key_file_principal_trusted: 21 malformed and borderline SID strings each get OK with 0/1 or an argument error with the answer untouched");
+        }
+
+        // 30f. Leak probe: a few thousand failing and succeeding calls that
+        //      never reach a provider, plus a handful that do, must not
+        //      accumulate handles or private memory.
+        {
+            wchar_t temp[MAX_PATH + 1] = {};
+            GetTempPathW(MAX_PATH + 1, temp);
+            const std::wstring dir = std::wstring(temp) + L"hkdfguard-abi-" + std::to_wstring(GetCurrentProcessId());
+            CreateDirectoryW(dir.c_str(), nullptr);
+            const std::wstring malformed_path = dir + L"\\malformed.key";
+            std::vector<uint8_t> malformed = synthetic;
+            malformed[2] = 1; // reserved byte: FILE_MALFORMED, after the size check, with the bytes read
+            const bool have_file = WriteTestFile(malformed_path, malformed);
+            const std::string malformed_utf8 = ToUtf8(malformed_path);
+
+            auto one_round = [&](size_t i) {
+                auto out = canary_buffer(HKDFGUARD_WRAPPED_MAX_LEN);
+                int32_t len = HKDFGUARD_WRAPPED_MAX_LEN;
+                if (have_file) hkdfguard_open_file(malformed_utf8.c_str(), out.data(), &len);
+                std::vector<uint8_t> mutated = synthetic;
+                mutated[8 + (i % 124)] ^= 0x01;
+                len = HKDFGUARD_DEK_LEN;
+                hkdfguard_unwrap_dek(kServiceNoKek, mutated.data(), HKDFGUARD_WRAPPED_MAX_LEN, out.data(), &len);
+                int32_t v = 0;
+                hkdfguard_key_file_principal_trusted("S-1-1-0", &v);
+                int32_t m = 0, w = 0;
+                hkdfguard_security_model(&m, &w);
+                hkdfguard_kek_exists("a..b", &v);
+            };
+            auto handles = []() { DWORD n = 0; GetProcessHandleCount(GetCurrentProcess(), &n); return n; };
+            auto private_bytes = []() {
+                PROCESS_MEMORY_COUNTERS_EX pmc{};
+                pmc.cb = sizeof(pmc);
+                GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof(pmc));
+                return pmc.PrivateUsage;
+            };
+            // Two equal phases after a warm-up: first-use allocation shows
+            // up in the first phase only, a leak grows both phases alike.
+            for (size_t i = 0; i < 50; ++i) one_round(i);
+            const DWORD handles_before = handles();
+            const SIZE_T bytes_before = private_bytes();
+            for (size_t i = 0; i < 1500; ++i) one_round(i);
+            const DWORD handles_mid = handles();
+            const SIZE_T bytes_mid = private_bytes();
+            for (size_t i = 0; i < 1500; ++i) one_round(i);
+            const SIZE_T bytes_after = private_bytes();
+            for (size_t i = 0; i < 1500; ++i) one_round(i);
+            const DWORD handles_after = handles();
+            const SIZE_T bytes_last = private_bytes();
+            auto grew = [](SIZE_T from, SIZE_T to) { return to > from ? to - from : 0; };
+            const SIZE_T grew_first = grew(bytes_before, bytes_mid);
+            const SIZE_T grew_second = grew(bytes_mid, bytes_after);
+            const SIZE_T grew_third = grew(bytes_after, bytes_last);
+            Check(handles_after <= handles_before + 8, "leak probe: 4500 rounds of failing ABI calls leave the handle count where it was");
+            Check(grew_third <= (512u << 10), "leak probe: the last 1500 rounds grow private memory by under 512 KB (no per-call leak)");
+            std::printf("    (handles %lu -> %lu -> %lu; private bytes grew %zu KB, %zu KB, then %zu KB)\n", handles_before,
+                        handles_mid, handles_after, static_cast<size_t>(grew_first >> 10),
+                        static_cast<size_t>(grew_second >> 10), static_cast<size_t>(grew_third >> 10));
+
+            // 30g. Thread probe: the same calls from eight threads at once;
+            //      every status must still be a documented one.
+            {
+                std::atomic<int> undocumented{0};
+                std::atomic<int> overran{0};
+                std::vector<std::thread> threads;
+                for (int t = 0; t < 8; ++t) {
+                    threads.emplace_back([&, t]() {
+                        for (int i = 0; i < 100; ++i) {
+                            auto out = canary_buffer(HKDFGUARD_WRAPPED_MAX_LEN);
+                            int32_t len = HKDFGUARD_WRAPPED_MAX_LEN;
+                            if (have_file && !documented(hkdfguard_open_file(malformed_utf8.c_str(), out.data(), &len))) ++undocumented;
+                            std::vector<uint8_t> mutated = synthetic;
+                            mutated[static_cast<size_t>(8 + ((i * 8 + t) % 124))] ^= 0x01;
+                            len = HKDFGUARD_DEK_LEN;
+                            if (!documented(hkdfguard_unwrap_dek(kServiceNoKek, mutated.data(), HKDFGUARD_WRAPPED_MAX_LEN, out.data(), &len))) ++undocumented;
+                            int32_t v = 0;
+                            if (!documented(hkdfguard_key_file_principal_trusted("S-1-5-32-544", &v))) ++undocumented;
+                            int32_t m = 0, w = 0;
+                            if (!documented(hkdfguard_security_model(&m, &w))) ++undocumented;
+                            if (!canary_intact(out, HKDFGUARD_WRAPPED_MAX_LEN)) ++overran;
+                        }
+                    });
+                }
+                for (auto& th : threads) th.join();
+                Check(undocumented == 0 && overran == 0, "thread probe: 8 threads x 100 rounds of concurrent ABI calls all return documented codes and stay inside their buffers");
+            }
+
+            // With a KEK: concurrent wrap/unwrap round trips must each
+            // recover the DEK they wrapped.
+            if (primary_wrap_ok) {
+                std::atomic<int> wrong{0};
+                std::vector<std::thread> threads;
+                for (int t = 0; t < 4; ++t) {
+                    threads.emplace_back([&, t]() {
+                        std::vector<uint8_t> my_dek(HKDFGUARD_DEK_LEN);
+                        for (size_t i = 0; i < my_dek.size(); ++i) my_dek[i] = static_cast<uint8_t>(i * 7 + t);
+                        for (int i = 0; i < 25; ++i) {
+                            std::vector<uint8_t> w(HKDFGUARD_WRAPPED_MAX_LEN);
+                            int32_t wl = HKDFGUARD_WRAPPED_MAX_LEN;
+                            if (hkdfguard_wrap_dek(kService, my_dek.data(), HKDFGUARD_DEK_LEN, w.data(), &wl) != HKDFGUARD_OK) { ++wrong; continue; }
+                            std::vector<uint8_t> back(HKDFGUARD_DEK_LEN);
+                            int32_t bl = HKDFGUARD_DEK_LEN;
+                            if (hkdfguard_unwrap_dek(kService, w.data(), wl, back.data(), &bl) != HKDFGUARD_OK || back != my_dek) ++wrong;
+                        }
+                    });
+                }
+                for (auto& th : threads) th.join();
+                Check(wrong == 0, "thread probe: 4 threads x 25 concurrent wrap/unwrap round trips each recover their own DEK");
+            } else {
+                Skip("thread probe: concurrent wrap/unwrap round trips (needs elevation)");
+            }
+
+            DeleteFileW(malformed_path.c_str());
+            RemoveDirectoryW(dir.c_str());
         }
     }
 

@@ -420,7 +420,7 @@ namespace {
             int hi = nibble(text[2 * i]);
             int lo = nibble(text[2 * i + 1]);
             if (hi < 0 || lo < 0) {
-                throw CliError("--fingerprint must contain only hex characters (0-9, a-f)");
+                throw CliError("--fingerprint must contain only hex characters (0-9, a-f, A-F)");
             }
             bytes[i] = static_cast<uint8_t>((hi << 4) | lo);
         }
@@ -1487,6 +1487,61 @@ namespace {
         }
     }
 
+    // Refuses a path that Win32 would quietly rewrite or redirect, so the
+    // file opened is the one typed. In every folder and the file name:
+    //   - a trailing '.' or space, which Win32 path handling strips
+    //     ("key.bin." would be written as "key.bin");
+    //   - a reserved device name (CON, PRN, AUX, NUL, COM0-9, LPT0-9, the
+    //     superscript-digit COM/LPT forms, CONIN$, CONOUT$), with or without
+    //     an extension, since Win32 programs open the device rather than a
+    //     file of that name.
+    // And the path must not end in a separator: it has to name a file.
+    // `.` and `..` components, a drive ("C:") and the "?" of a \\?\ prefix
+    // are left for the other checks.
+    void RequireExactPathNames(const std::string &path, const std::string &what) {
+        if (!path.empty() && (path.back() == '\\' || path.back() == '/')) {
+            throw CliError(what + " ends in a path separator; give the path of a file");
+        }
+        static const char *const kReserved[] = {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"};
+        size_t start = 0;
+        while (start <= path.size()) {
+            size_t end = path.find_first_of("\\/", start);
+            if (end == std::string::npos) end = path.size();
+            const std::string part = path.substr(start, end - start);
+            start = end + 1;
+            const bool drive = part.size() == 2 && part[1] == ':';
+            if (part.empty() || part == "." || part == ".." || part == "?" || drive) {
+                continue;
+            }
+            if (part.back() == '.' || part.back() == ' ') {
+                throw CliError(what + ": \"" + part + "\" ends in a " + (part.back() == '.' ? "dot" : "space") +
+                               ", which Windows drops from the name; remove it");
+            }
+            // The device name is the part before the first dot, without
+            // trailing spaces: "nul.txt" and "COM1 .key" are devices too.
+            std::string stem = part.substr(0, part.find('.'));
+            while (!stem.empty() && stem.back() == ' ') stem.pop_back();
+            bool reserved = false;
+            for (const char *name : kReserved) {
+                reserved = reserved || EqualsIgnoreCase(stem, name);
+            }
+            const std::wstring wide = Utf8ToWide(stem);
+            if (wide.size() == 4) {
+                const std::wstring prefix = wide.substr(0, 3);
+                const wchar_t digit = wide[3];
+                const bool comOrLpt = CompareStringOrdinal(prefix.c_str(), 3, L"COM", 3, TRUE) == CSTR_EQUAL ||
+                                      CompareStringOrdinal(prefix.c_str(), 3, L"LPT", 3, TRUE) == CSTR_EQUAL;
+                const bool deviceDigit = (digit >= L'0' && digit <= L'9') || digit == L'\x00B9' ||
+                                         digit == L'\x00B2' || digit == L'\x00B3';
+                reserved = reserved || (comOrLpt && deviceDigit);
+            }
+            if (reserved) {
+                throw CliError(what + ": \"" + part + "\" is a reserved Windows device name; Windows programs would "
+                               "open the device rather than a file, so choose another name");
+            }
+        }
+    }
+
     // Refuses `path` unless it names a file on a local drive: never a UNC
     // path (\\server\share\..., \\?\UNC\...), a device or \\?\ path, or a
     // mapped network drive, nor a SUBST drive (whose target is another path,
@@ -1497,13 +1552,12 @@ namespace {
     // server the caller's NTLM credentials. Links further down the path are
     // the walk's job (WalkToParent). `what` names the path in the message.
     void RequireLocalDrivePath(const std::string &path, const std::string &what) {
-        char fullBuf[MAX_PATH * 4];
-        DWORD fullLen = GetFullPathNameA(path.c_str(), static_cast<DWORD>(sizeof(fullBuf)), fullBuf, nullptr);
-        if (fullLen == 0 || fullLen >= sizeof(fullBuf)) {
+        wchar_t fullBuf[MAX_PATH * 4];
+        DWORD fullLen = GetFullPathNameW(Utf8ToWide(path).c_str(), static_cast<DWORD>(std::size(fullBuf)), fullBuf, nullptr);
+        if (fullLen == 0 || fullLen >= std::size(fullBuf)) {
             throw CliError("failed to resolve " + what + ": " + FormatWin32Error(GetLastError()));
         }
-        const std::string full(fullBuf, fullLen);
-        if (!hkdfguard_nofollow::IsLocalDrivePath(Utf8ToWide(full))) {
+        if (!hkdfguard_nofollow::IsLocalDrivePath(std::wstring(fullBuf, fullLen))) {
             throw CliError(
                 what + " is not on a local drive (UNC paths, mapped network and SUBST drives, and devices are "
                 "refused)");
@@ -1617,13 +1671,14 @@ namespace {
             for (const auto &entry: cache) {
                 if (EqualSid(sid, const_cast<BYTE *>(entry.first.data()))) return entry.second;
             }
-            LPSTR text = nullptr;
-            if (!ConvertSidToStringSidA(sid, &text)) {
+            LPWSTR text = nullptr;
+            if (!ConvertSidToStringSidW(sid, &text)) {
                 throw CliError("ConvertSidToStringSid failed: " + FormatWin32Error(GetLastError()));
             }
-            int trusted = 0;
-            int32_t rc = hkdfguard_key_file_principal_trusted(text, &trusted);
+            const std::string sidString = WideToUtf8(text);
             LocalFree(text);
+            int trusted = 0;
+            int32_t rc = hkdfguard_key_file_principal_trusted(sidString.c_str(), &trusted);
             if (rc != HKDFGUARD_OK) {
                 throw CliError("could not check who may write key files: " + DescribeStatus(rc));
             }
@@ -2651,7 +2706,12 @@ namespace {
     void RunWrap(WrapArgs &args) {
         // First, before anything touches a path: a UNC or mapped-drive path
         // would make this process connect to the server it names. The same
-        // rule as hkdfguard_open_file.
+        // rule as hkdfguard_open_file. Before even that, the names
+        // themselves: the path is used exactly as typed or not at all.
+        RequireExactPathNames(args.keyFilePath, "--key-file-path " + args.keyFilePath);
+        if (args.dekFile) {
+            RequireExactPathNames(*args.dekFile, "--dek-file " + *args.dekFile);
+        }
         RequireLocalDrivePath(args.keyFilePath, args.keyFilePath);
         if (args.dekFile) {
             RequireLocalDrivePath(*args.dekFile, "--dek-file " + *args.dekFile);
