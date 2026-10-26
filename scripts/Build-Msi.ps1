@@ -127,6 +127,18 @@ foreach ($b in $Binaries) {
     if (-not (Test-Path (Join-Path $StageDir $b))) { throw "staged binary missing: $StageDir\$b (run without -SkipBuild)" }
 }
 Write-Ok "staged binaries present in $StageDir"
+# With -SkipBuild the staged binaries come from elsewhere (the release
+# workflow's build job, or an older local build); an MSI must never install
+# files whose version disagrees with its ProductVersion, or that the SDK
+# loaders would refuse for having no version resource.
+foreach ($b in $Binaries) {
+    $info = [Diagnostics.FileVersionInfo]::GetVersionInfo((Join-Path $StageDir $b))
+    $fixed = "{0}.{1}.{2}.{3}" -f $info.FileMajorPart, $info.FileMinorPart, $info.FileBuildPart, $info.FilePrivatePart
+    if ($fixed -ne "$Version.0") {
+        throw "staged $b carries file version '$fixed', not $Version. Rebuild it (run without -SkipBuild)."
+    }
+}
+Write-Ok "staged binaries carry version $Version"
 
 # ---- 2. The binaries must be signed before packaging ---------------------------
 $stagedFiles = @($Binaries | ForEach-Object { Join-Path $StageDir $_ })
