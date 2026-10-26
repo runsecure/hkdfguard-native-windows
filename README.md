@@ -453,7 +453,7 @@ for what it means). There is no `unwrap` subcommand - unwrapping is DLL-only; se
 
 ## Building
 
-Requires CMake 3.20+, a Windows 10/11 SDK, and an MSVC C++17 toolchain (Visual Studio
+Requires CMake 3.20+, a Windows 10/11 SDK, and an MSVC C++20 toolchain (Visual Studio
 2022 Build Tools with the "Desktop development with C++" workload, or equivalent).
 
 **Recommended: `scripts\run-build-test-verify.bat`.** Double-click it, or run it from

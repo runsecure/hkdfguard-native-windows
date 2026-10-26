@@ -2763,11 +2763,13 @@ int main() {
             Check(r.rc == HKDFGUARD_OK && r.out == wrapped, "open_file accepts a \\\\?\\-prefixed path");
 
             wchar_t saved_cwd[MAX_PATH + 1] = {};
-            GetCurrentDirectoryW(MAX_PATH + 1, saved_cwd);
-            if (SetCurrentDirectoryW(dir.c_str())) {
+            const DWORD cwd_len = GetCurrentDirectoryW(MAX_PATH + 1, saved_cwd);
+            if (cwd_len == 0 || cwd_len > MAX_PATH) {
+                Check(false, "test setup: save the current directory");
+            } else if (SetCurrentDirectoryW(dir.c_str())) {
                 r = open("good.key");
                 Check(r.rc == HKDFGUARD_OK && r.out == wrapped, "open_file resolves a relative path against the current directory");
-                SetCurrentDirectoryW(saved_cwd);
+                Check(SetCurrentDirectoryW(saved_cwd) != FALSE, "test setup: restore the current directory");
             } else {
                 Check(false, "test setup: change into the scratch folder");
             }
