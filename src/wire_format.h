@@ -20,21 +20,17 @@ namespace hkdfguard {
     //   100     32    KekFingerprint     (SHA-256 of the KEK's public key, raw X || Y)
     //
     // The wrapping key is Z = ECDH(KEK private key, H(Salt)), where H hashes
-    // the salt to a P-256 point (hash_to_curve.h) - the same construction as
-    // this project's Linux implementation. Nobody knows the discrete log of
-    // H(Salt), so computing Z needs the KEK's *private* key: only an account
-    // authorized to use the KEK can create a payload, and knowing the KEK's
-    // public key is not enough to forge one. (The format carried an
-    // ephemeral public key here before the library's first release; that
-    // ECIES construction let anyone holding the public key forge payloads.)
-    // The salt is also HKDF's salt, and is otherwise unstructured - any 32
-    // bytes are a well-formed salt.
+    // the salt to a P-256 point (hash_to_curve.h). Nobody knows the discrete
+    // log of H(Salt), so computing Z needs the KEK's *private* key: only an
+    // account authorized to use the KEK can create a payload, and knowing
+    // the KEK's public key is not enough to forge one. The salt is also
+    // HKDF's salt, and is otherwise unstructured - any 32 bytes are a
+    // well-formed salt.
     //
     // The payload's *authenticated bytes* are header || KekFingerprint (see
     // BuildWrappedDekAuthenticated) - every byte except the Nonce,
-    // Ciphertext and Tag - and they are used twice, as on Linux (whose
-    // Payload::authenticated_bytes is the same idea over its own layout):
-    // as the AES-GCM AAD, and inside HKDF's info, after the normalized
+    // Ciphertext and Tag - and they are used twice: as the AES-GCM AAD, and
+    // inside HKDF's info, after the normalized
     // service name (see ecdh_hkdf.h). So every field is bound into the
     // wrapping key itself, not only checked by the tag. The header is bytes
     // 0..39 - Version, ProviderType, Reserved, KeyId and Salt - so every

@@ -359,12 +359,11 @@ public static class HkdfGuardNative {
 
     [Array]::Clear($outBuf, 0, $outBuf.Length)
 
-    # ---- Audit trail: the CLI's wrap and this script's unwrap of the ----
-    #      same payload should each be in the Application event log, under
-    #      this account, carrying the same payload SHA-256 - which is what
-    #      lets an operator tie every unwrap back to the wrap that produced
-    #      it. XPath, not -FilterHashtable, so this works whether or not the
-    #      MSI has registered the event source on this machine.
+    # ---- Audit trail: the wrap and the unwrap should each be in the ----
+    #      Application event log under this account with the same payload
+    #      SHA-256, which is what ties an unwrap to its wrap. XPath, not
+    #      -FilterHashtable, works whether or not the MSI has registered the
+    #      event source on this machine.
     $payloadHash = -join ([System.Security.Cryptography.SHA256]::Create().ComputeHash($wrapped) |
         ForEach-Object { $_.ToString("x2") })
     $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
@@ -399,12 +398,12 @@ if (-not $NoCleanup) {
         Remove-Item -Recurse -Force $verifyDir
     }
     if ($provisionExit -eq 0) {
-        # Retire the verification KEK with the CLI this run built - the only
-        # supported way to delete a KEK - which also verifies `status` and
+        # Retires the verification KEK with the CLI this run built (the only
+        # supported way to delete a KEK), which also tests `status` and
         # `retire` end to end: status reports the fingerprint, retire deletes
-        # only the key carrying it, logs event 1004, and status then reports
-        # the service absent. Runs whenever provision succeeded, so a failed
-        # wrap or unwrap doesn't leave the key behind either.
+        # only the key carrying it and logs event 1004, and status then
+        # reports the service absent. Runs whenever provision succeeded, so a
+        # failed wrap or unwrap doesn't leave the key behind.
         $env:PATH = "$dllDir;$env:PATH"
         try {
             $statusOutput = @(& $cliPath status --service-name $serviceName 2>&1 | ForEach-Object { "$_" })

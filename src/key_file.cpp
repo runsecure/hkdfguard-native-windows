@@ -701,14 +701,15 @@ namespace hkdfguard {
         // and can also wrap under the service's KEK could plant a DEK they
         // know, and unwrap would accept it as genuine. So the file and every
         // folder above it must be owned by SYSTEM, Administrators,
-        // TrustedInstaller or this account, and grant nobody else write,
-        // delete or ownership rights - nor, on the folders below the drive
-        // root, the right to create entries (see kFileWriteRights,
-        // kFolderRights and kDriveRootRights). Checked on the open handle,
-        // after the path checks above, so it's the file actually read that
-        // is judged. (The OS refusing the open itself is reported as
-        // HKDFGUARD_ERR_FILE_ACCESS_DENIED, above.) Who counts as trusted depends on the security model - see
-        // TrustedPrincipals; developer mode is announced in the event log.
+        // TrustedInstaller or a principal the security model trusts, and
+        // grant nobody else write, delete or ownership rights - nor, on the
+        // folders below the drive root, the right to create entries (see
+        // kFileWriteRights, kFolderRights and kDriveRootRights). Checked on
+        // the open handle, after the path checks above, so it's the file
+        // actually read that is judged. (The OS refusing the open itself is
+        // reported as HKDFGUARD_ERR_FILE_ACCESS_DENIED, above.) Who counts
+        // as trusted depends on the security model - see TrustedPrincipals;
+        // developer mode is announced in the event log.
         TrustedPrincipals trusted;
         if (trusted.model() == SecurityModel::Developer) {
             LogDeveloperModeKeyFile();

@@ -2098,8 +2098,8 @@ int main() {
     }
 
     // Forgery. The KEK's public key is readable by any account allowed to
-    // use the KEK. Under the earlier ECIES construction that was enough to
-    // build a payload unwrap accepted; now Z needs the private key. Built
+    // use the KEK, so it must not be enough to build a payload unwrap
+    // accepts: Z needs the private key. Built
     // here entirely outside the library: a payload sealed with the right
     // wrapping key must unwrap (proving the independent sealing is correct),
     // and one sealed with a key derived from the public key alone must not.
@@ -2295,8 +2295,7 @@ int main() {
                       "a 4096-byte file is too long");
 
         // A DEK written as text is a plaintext key too, whatever the
-        // surrounding whitespace - the same forms the Linux build refuses.
-        // The DEK starts FB EF BE FF FF FF so its standard and URL-safe
+        // surrounding whitespace. The DEK starts FB EF BE FF FF FF so its standard and URL-safe
         // encodings really differ ("++++////" vs "----____").
         {
             std::vector<uint8_t> text_dek = {0xFB, 0xEF, 0xBE, 0xFF, 0xFF, 0xFF};
@@ -2375,8 +2374,7 @@ int main() {
                           "a file in a folder Everyone may delete or rename is untrusted");
             // Create rights alone - "create files / write data" or "create
             // folders / append data" - for Users, Authenticated Users or
-            // Everyone: refused, like a group- or world-writable directory
-            // on Linux, sticky or not.
+            // Everyone: refused.
             struct CreateGrant {
                 const wchar_t* sid;
                 const wchar_t* mask;
