@@ -66,7 +66,6 @@ $root = "C:\HkdfGuardRoleTest-$tag"
 $plantDir = "C:\HkdfGuardRolePlant-$tag"
 $bin = Join-Path $root "bin"
 $keys = Join-Path $root "keys"
-$out = Join-Path $root "out"
 $keyFile = Join-Path $keys "service.key"
 $depName = "hkdfgdep$tag"
 $appName = "hkdfgapp$tag"
@@ -82,24 +81,52 @@ function New-Password {
 }
 
 # Runs $FilePath as $Credential with $Arguments, stdin from $StdIn (text, or
-# nothing), and returns its exit code and output. Output is captured to files
-# in $out, which only Administrators can read: the parent opens them.
+# nothing), and returns its exit code and output, read through pipes.
+#
+# Not Start-Process -Credential -Wait: that keeps only the new process's ID
+# and reopens it afterwards to wait on it, so a child that has already
+# exited - role_probe's quick queries, on a fast runner - fails the call
+# with "Cannot process request because the process (N) has exited".
+# Process.Start keeps the handle CreateProcessWithLogonW returns, so there
+# is nothing to race.
 function Invoke-As {
     param([System.Management.Automation.PSCredential]$Credential, [string]$FilePath, [string[]]$Arguments, [string]$StdIn = "")
-    $id = [Guid]::NewGuid().ToString("N")
-    $inFile = Join-Path $out "$id.in"; $outFile = Join-Path $out "$id.out"; $errFile = Join-Path $out "$id.err"
-    [System.IO.File]::WriteAllText($inFile, $StdIn)
     $quoted = $Arguments | ForEach-Object { if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ } }
-    $p = Start-Process -FilePath $FilePath -ArgumentList $quoted -Credential $Credential -WorkingDirectory $bin `
-        -RedirectStandardInput $inFile -RedirectStandardOutput $outFile -RedirectStandardError $errFile `
-        -NoNewWindow -Wait -PassThru
-    $result = [PSCustomObject]@{
-        ExitCode = $p.ExitCode
-        StdOut   = (Get-Content -Raw -ErrorAction SilentlyContinue $outFile) + ""
-        StdErr   = (Get-Content -Raw -ErrorAction SilentlyContinue $errFile) + ""
+    $network = $Credential.GetNetworkCredential()
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $FilePath
+    $psi.Arguments = $quoted -join " "
+    $psi.WorkingDirectory = $bin
+    $psi.UserName = $network.UserName
+    $psi.Domain = $network.Domain
+    $psi.Password = $Credential.Password
+    $psi.LoadUserProfile = $true
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $p = [System.Diagnostics.Process]::Start($psi)
+    try {
+        # Both streams are read concurrently, so a child that fills one
+        # pipe while the parent waits on the other can't deadlock.
+        $stdout = $p.StandardOutput.ReadToEndAsync()
+        $stderr = $p.StandardError.ReadToEndAsync()
+        # A child that exits without reading its input closes the pipe;
+        # its exit code and output are still the result.
+        try {
+            $p.StandardInput.Write($StdIn)
+            $p.StandardInput.Close()
+        } catch [System.IO.IOException] { }
+        $p.WaitForExit()
+        return [PSCustomObject]@{
+            ExitCode = $p.ExitCode
+            StdOut   = $stdout.GetAwaiter().GetResult() + ""
+            StdErr   = $stderr.GetAwaiter().GetResult() + ""
+        }
+    } finally {
+        $p.Dispose()
     }
-    Remove-Item -Force -ErrorAction SilentlyContinue $inFile, $outFile, $errFile
-    return $result
 }
 
 # ---- Local accounts and groups, through ADSI. ----
@@ -184,11 +211,9 @@ try {
     $dep = New-Object System.Management.Automation.PSCredential("$env:COMPUTERNAME\$depName", $depPassword)
     $app = New-Object System.Management.Automation.PSCredential("$env:COMPUTERNAME\$appName", $appPassword)
 
-    # ---- Folders: binaries everyone may run, an admin-only capture folder, ----
-    #      and the key folder.
-    New-Item -ItemType Directory -Path $root, $bin, $keys, $out | Out-Null
+    # ---- Folders: binaries everyone may run, and the key folder. ----
+    New-Item -ItemType Directory -Path $root, $bin, $keys | Out-Null
     Set-ProtectedAcl $root "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)"
-    Set-ProtectedAcl $out "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"
     $deployers = Get-AccountSid "HkdfGuardDeployers"
     $users = Get-AccountSid "HkdfGuardUsers"
     Set-ProtectedAcl $keys "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1301bf;;;$deployers)(A;OICI;0x1200a9;;;$users)"
