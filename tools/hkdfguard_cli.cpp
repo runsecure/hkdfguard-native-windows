@@ -100,6 +100,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit> // std::bit_cast - LARGE_INTEGER to LONGLONG
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -1424,13 +1425,13 @@ namespace {
         }
         wide.resize(written);
 
-        std::string final = WideToUtf8(wide);
-        if (final.rfind("\\\\?\\UNC\\", 0) == 0) {
-            final = "\\\\" + final.substr(8);
-        } else if (final.rfind("\\\\?\\", 0) == 0) {
-            final = final.substr(4);
+        std::string final_path = WideToUtf8(wide);
+        if (final_path.rfind("\\\\?\\UNC\\", 0) == 0) {
+            final_path = "\\\\" + final_path.substr(8);
+        } else if (final_path.rfind("\\\\?\\", 0) == 0) {
+            final_path = final_path.substr(4);
         }
-        return final;
+        return final_path;
     }
 
     // Removes trailing path separators, except on a bare drive root ("C:\"),
@@ -1874,13 +1875,14 @@ namespace {
         // Vet the handle before writing anything through it.
         RequireRealObjectAtExpectedPath(file.get(), full, path, /*allowDirectory=*/false);
 
-        LARGE_INTEGER fileSize{};
-        if (!GetFileSizeEx(file.get(), &fileSize)) {
+        LARGE_INTEGER sizeField{};
+        if (!GetFileSizeEx(file.get(), &sizeField)) {
             throw CliError("failed to get size of " + path + ": " + FormatWin32Error(GetLastError()));
         }
+        const auto fileSize = std::bit_cast<LONGLONG>(sizeField); // the whole union, not one member
 
-        if (fileSize.QuadPart > 0) {
-            std::vector<BYTE> buffer(static_cast<size_t>(fileSize.QuadPart), 0);
+        if (fileSize > 0) {
+            std::vector<BYTE> buffer(static_cast<size_t>(fileSize), 0);
 
             for (size_t pass = 0; pass < kSecureOverwritePassCount; ++pass) {
                 if (pass % 2 == 0) {
