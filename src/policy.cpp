@@ -34,6 +34,11 @@ namespace hkdfguard {
 
         // REG_MULTI_SZ under the same key: see LoadDeployerGroupsPolicy in
         // policy.h.
+        // REG_DWORD under the same key: see LoadPayloadVersionPolicy in
+        // policy.h.
+        constexpr wchar_t kClassicalModeValue[] =
+            L"ClassicalMode";
+
         constexpr wchar_t kDeployerGroupsValue[] =
             L"DeployerGroups";
 
@@ -53,6 +58,8 @@ namespace hkdfguard {
         // Same, for LoadSecurityModel and LoadDeployerGroupsPolicy.
         std::optional<SecurityModel> g_testSecurityModelOverride;
         std::optional<std::vector<std::wstring>> g_testDeployerGroupsOverride;
+        // Same, for LoadPayloadVersionPolicy.
+        std::optional<PayloadVersionPolicy> g_testPayloadVersionOverride;
 #endif
 
         std::wstring TrimW(const std::wstring& s)
@@ -477,5 +484,90 @@ namespace hkdfguard {
         }
         return ParsePolicyValue(value);
     }
+
+    PayloadVersionPolicy ParsePayloadVersionPolicy(bool found, unsigned long type, unsigned long value) noexcept
+    {
+        // Absent: the post-quantum default. Present: only an exact
+        // REG_DWORD 0 or 1 picks a version; anything else is a
+        // configuration error, never a guess.
+        if (!found)
+        {
+            return PayloadVersionPolicy::Version2;
+        }
+        if (type != REG_DWORD)
+        {
+            return PayloadVersionPolicy::Invalid;
+        }
+        switch (value)
+        {
+            case static_cast<unsigned long>(PayloadVersionPolicy::Version2):
+                return PayloadVersionPolicy::Version2;
+            case static_cast<unsigned long>(PayloadVersionPolicy::Version1):
+                return PayloadVersionPolicy::Version1;
+            default:
+                return PayloadVersionPolicy::Invalid;
+        }
+    }
+
+    PayloadVersionPolicy LoadPayloadVersionPolicy() noexcept
+    {
+#if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
+        if (g_testPayloadVersionOverride.has_value())
+        {
+            return *g_testPayloadVersionOverride;
+        }
+#endif
+        HKEY key = nullptr;
+
+        // KEY_WOW64_64KEY: see LoadGroupListValue.
+        const LONG open = RegOpenKeyExW(
+            HKEY_LOCAL_MACHINE,
+            kPolicyKey,
+            0,
+            KEY_QUERY_VALUE | KEY_WOW64_64KEY,
+            &key);
+
+        // As KeyStoragePolicyForUnopenedKey: a missing policy key is "never
+        // configured"; one that exists but can't be opened may hold
+        // ClassicalMode, so it fails closed.
+        if (open != ERROR_SUCCESS)
+        {
+            return open == ERROR_FILE_NOT_FOUND || open == ERROR_PATH_NOT_FOUND
+                ? PayloadVersionPolicy::Version2
+                : PayloadVersionPolicy::Invalid;
+        }
+
+        DWORD value = 0;
+        DWORD type = 0;
+        DWORD size = sizeof(value);
+
+        const LONG status = RegQueryValueExW(
+            key,
+            kClassicalModeValue,
+            nullptr,
+            &type,
+            reinterpret_cast<LPBYTE>(&value),
+            &size);
+
+        RegCloseKey(key);
+
+        if (status == ERROR_FILE_NOT_FOUND)
+        {
+            return ParsePayloadVersionPolicy(false, 0, 0);
+        }
+        // Present but unreadable as a DWORD: never a silent default.
+        if (status != ERROR_SUCCESS || size != sizeof(value))
+        {
+            return PayloadVersionPolicy::Invalid;
+        }
+        return ParsePayloadVersionPolicy(true, type, value);
+    }
+
+#if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
+    void SetTestPayloadVersionOverride(std::optional<PayloadVersionPolicy> version) noexcept
+    {
+        g_testPayloadVersionOverride = version;
+    }
+#endif
 
 } // namespace hkdfguard

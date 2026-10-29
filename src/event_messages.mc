@@ -91,3 +91,9 @@ SymbolicName=HKDFGUARD_EVT_SETUP_CALLS_EXCEEDED
 Language=English
 %1
 .
+
+MessageId=2008
+SymbolicName=HKDFGUARD_EVT_VERSION2_UNAVAILABLE
+Language=English
+%1
+.

@@ -30,17 +30,25 @@ namespace hkdfguard {
     // hardware protection the policy preferred.
     void LogKekCreated(const std::wstring &service, uint8_t providerType, int32_t tpmFallbackCode) noexcept;
 
+    // Payload version 2 is unavailable for `service` (event 2008): the TPM
+    // can't be used for it, for `reason`, and policy - or an existing TPM
+    // KEK - rules out the software KSP. kek_v2.cpp writes this, since only
+    // it knows the reason; LogOperationFailure doesn't log
+    // HKDFGUARD_ERR_PROVIDER_UNAVAILABLE again.
+    void LogVersion2Unavailable(const std::wstring &service, const std::string &reason) noexcept;
+
     // A wrap (op Wrap or GenerateAndWrap) or unwrap (op Unwrap) succeeded.
-    // Records which KEK was used (its public-key fingerprint) and which
-    // payload (SHA-256 of the 132 wrapped bytes) - both public values that
-    // reveal nothing about the DEK - so an unwrap can be matched back to the
-    // wrap that produced it, and a substituted older payload is visible.
-    // `payload` is the wrapped output (wrap) or input (unwrap); it is only
-    // hashed, never logged.
+    // Records the payload version, which KEK was used (its fingerprint) and
+    // which payload (SHA-256 of the 132 wrapped bytes) - all public values
+    // that reveal nothing about the DEK - so an unwrap can be matched back
+    // to the wrap that produced it, and a substituted older payload is
+    // visible. `payload` is the wrapped output (wrap) or input (unwrap); it
+    // is only hashed, never logged.
     void LogDekOperation(
         AuditOp op,
         const std::string &service,
         uint8_t providerType,
+        uint8_t payloadVersion,
         const uint8_t *kekFingerprint,
         const uint8_t *payload,
         size_t payloadLen) noexcept;

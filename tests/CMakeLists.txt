@@ -110,6 +110,41 @@ if(MSVC)
 endif()
 add_test(NAME tpm_key_file COMMAND test_tpm_key_file)
 
+# test_v2_kek checks payload version 2 end to end: the SP 800-108
+# construction against the Linux library's known answers, AES-CMAC, the
+# ClassicalMode rule, and - elevated - the DLL's TPM and software version 2
+# KEKs (create, wrap, unwrap, tampering, relabeling) and provider choice. It
+# compiles its own copies of the version 2 sources, with the test seams
+# enabled, for the provider-choice checks; everything else goes through
+# HkdfGuard.dll.
+add_executable(test_v2_kek
+    test_v2_kek.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/kek_v2.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/sp800_108.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/aes_cmac.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/tpm2_marshal.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/tpm2_session.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/tpm2_device.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/tpm_key_file.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/key_acl.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/policy.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/event_log.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/wire_format.cpp
+)
+target_include_directories(test_v2_kek PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src
+)
+target_compile_definitions(test_v2_kek PRIVATE HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE UNICODE _UNICODE)
+target_link_libraries(test_v2_kek PRIVATE hkdfguard ncrypt.lib bcrypt.lib advapi32.lib netapi32.lib tbs.lib shell32.lib ole32.lib ntdll.lib)
+if(MSVC)
+    target_compile_options(test_v2_kek PRIVATE /W4)
+endif()
+add_test(NAME v2_kek COMMAND test_v2_kek)
+set_tests_properties(v2_kek PROPERTIES
+    ENVIRONMENT "PATH=$<TARGET_FILE_DIR:hkdfguard>\\;${HKDFGUARD_TEST_PATH}"
+)
+
 # The same parsers under libFuzzer and AddressSanitizer, built only on
 # request: cmake -DHKDFGUARD_BUILD_FUZZERS=ON. Registered as a short ctest
 # smoke run (a fixed number of inputs); run the executable directly, with a
@@ -182,4 +217,4 @@ set_tests_properties(roles PROPERTIES
 # could save the other's temporary value and "restore" it, leaving the
 # machine in the developer model. A shared lock makes ctest run them one at
 # a time, whatever -j says; harden_process touches none of it.
-set_tests_properties(roundtrip cli roles PROPERTIES RESOURCE_LOCK HkdfGuardMachineState)
+set_tests_properties(roundtrip cli roles v2_kek PROPERTIES RESOURCE_LOCK HkdfGuardMachineState)

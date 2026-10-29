@@ -189,7 +189,19 @@ function Get-KeyFileAs($Credential, [string]$Path) {
     return $null
 }
 
+# The CLI's provision, retire and status still handle payload version 1 KEKs
+# only, so the run pins ClassicalMode to 1 (version 1), put back in the
+# finally block. Set inside the try, so it always is.
+$classicalKey = "HKLM:\Software\Policies\HkdfGuard"
+$priorClassical = $null
+try { $priorClassical = (Get-ItemProperty -Path $classicalKey -Name ClassicalMode -ErrorAction Stop).ClassicalMode } catch { }
+$pinnedClassical = $false
+
 try {
+    if (-not (Test-Path $classicalKey)) { New-Item -Path $classicalKey -Force | Out-Null }
+    $pinnedClassical = $true
+    Set-ItemProperty -Path $classicalKey -Name ClassicalMode -Type DWord -Value 1
+
     # ---- Groups and accounts. ----
     foreach ($group in "HkdfGuardUsers", "HkdfGuardDeployers") {
         if (-not (Test-LocalGroupExists $group)) {
@@ -316,6 +328,18 @@ finally {
         }
     } catch {
         Write-Host "[WARN] could not retire the test KEK for ${service}: $($_.Exception.Message)"
+    }
+    # After the retire above, which needed version 1.
+    if ($pinnedClassical) {
+        try {
+            if ($null -eq $priorClassical) {
+                Remove-ItemProperty -Path $classicalKey -Name ClassicalMode -ErrorAction SilentlyContinue
+            } else {
+                Set-ItemProperty -Path $classicalKey -Name ClassicalMode -Type DWord -Value $priorClassical
+            }
+        } catch {
+            Write-Host "[WARN] could not restore ClassicalMode: $($_.Exception.Message)"
+        }
     }
     foreach ($user in $createdUsers) { try { $computer.Delete("user", $user) } catch { Write-Host "[WARN] could not remove test account ${user}: $($_.Exception.Message)" } }
     foreach ($group in $createdGroups) { try { $computer.Delete("group", $group) } catch { Write-Host "[WARN] could not remove group ${group}: $($_.Exception.Message)" } }

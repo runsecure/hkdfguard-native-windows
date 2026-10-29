@@ -21,7 +21,8 @@
 //   1002 Information  A DEK was wrapped (hkdfguard_wrap_dek or
 //                     hkdfguard_generate_and_wrap_dek).
 //   1003 Information  A DEK was unwrapped.
-//                     Both record the KEK fingerprint and a SHA-256 of the
+//                     Both record the payload version, the KEK fingerprint
+//                     and a SHA-256 of the
 //                     wrapped payload, so each unwrap can be matched to the
 //                     wrap that produced it - which also makes a substituted
 //                     older payload visible, since deployment rollback is
@@ -40,10 +41,12 @@
 //                     name has an ACL this library would never create -
 //                     possibly pre-planted or widened. Worth investigating.
 //   2003 Warning      PAYLOAD_AUTH_FAILED / KEK_FINGERPRINT_MISMATCH /
-//                     PAYLOAD_MALFORMED / PAYLOAD_UNSUPPORTED on unwrap:
+//                     PAYLOAD_MALFORMED / PAYLOAD_UNSUPPORTED /
+//                     PAYLOAD_VERSION_REFUSED on unwrap:
 //                     the payload was tampered with, truncated, wrapped
-//                     for a different service, under a different KEK, or
-//                     in a format version this build does not know.
+//                     for a different service, under a different KEK, in
+//                     a format version this build does not know, or in the
+//                     version this host's ClassicalMode policy doesn't use.
 //   2004 Error        POLICY_INVALID / WIN_GROUP_INVALID: the machine policy in
 //                     the registry is misconfigured, so calls fail closed.
 //   2005 Error        PROVIDER_ERROR / CRYPTO_ERROR / INTERNAL_ERROR: the
@@ -54,6 +57,13 @@
 //   2007 Warning      The process exceeded the expected number of setup
 //                     calls (hkdfguard_create_kek / hkdfguard_kek_exists),
 //                     once per process - likely a caller looping on them.
+//   2008 Error        PROVIDER_UNAVAILABLE: this host can't do payload
+//                     version 2 - the TPM can't be used for it (named:
+//                     no TPM 2.0, no storage root key, a blocked command, a
+//                     failed known-answer test) and the KeyStoragePolicy,
+//                     or an existing TPM KEK, rules out the software KSP.
+//                     Written by kek_v2.cpp, which knows the reason, on
+//                     every failing call.
 //
 // Not logged: INVALID_ARGUMENT / BUFFER_TOO_SMALL /
 // INVALID_SERVICE_NAME (caller programming errors), and KEK_NOT_FOUND
@@ -86,6 +96,7 @@ namespace hkdfguard {
         constexpr DWORD kEvtOperationFailed = 2005;
         constexpr DWORD kEvtPlaintextKeyFile = 2006;
         constexpr DWORD kEvtSetupCallsExceeded = 2007;
+        constexpr DWORD kEvtVersion2Unavailable = 2008;
 
         const wchar_t *CodeName(int32_t code) noexcept {
             switch (code) {
@@ -101,6 +112,7 @@ namespace hkdfguard {
                 case HKDFGUARD_ERR_PAYLOAD_MALFORMED: return L"HKDFGUARD_ERR_PAYLOAD_MALFORMED";
                 case HKDFGUARD_ERR_PAYLOAD_AUTH_FAILED: return L"HKDFGUARD_ERR_PAYLOAD_AUTH_FAILED";
                 case HKDFGUARD_ERR_PAYLOAD_UNSUPPORTED: return L"HKDFGUARD_ERR_PAYLOAD_UNSUPPORTED";
+                case HKDFGUARD_ERR_PAYLOAD_VERSION_REFUSED: return L"HKDFGUARD_ERR_PAYLOAD_VERSION_REFUSED";
                 case HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH: return L"HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH";
                 case HKDFGUARD_ERR_KEK_NOT_FOUND: return L"HKDFGUARD_ERR_KEK_NOT_FOUND";
                 case HKDFGUARD_ERR_KEK_ACCESS_DENIED: return L"HKDFGUARD_ERR_KEK_ACCESS_DENIED";
@@ -247,19 +259,34 @@ namespace hkdfguard {
         }
     }
 
+    void LogVersion2Unavailable(const std::wstring &service, const std::string &reason) noexcept {
+        try {
+            Write(EVENTLOG_ERROR_TYPE, kEvtVersion2Unavailable,
+                  L"Payload version 2 is unavailable for service '" + service + L"': " + Widen(reason) +
+                  L". The call failed with HKDFGUARD_ERR_PROVIDER_UNAVAILABLE. Fix the TPM (or its Group Policy "
+                  L"list of blocked TPM commands), set KeyStoragePolicy to allow the software key store, or set "
+                  L"ClassicalMode to 1 to use payload version 1 on this host.");
+        } catch (...) {
+        }
+    }
+
     void LogDekOperation(
         AuditOp op,
         const std::string &service,
         uint8_t providerType,
+        uint8_t payloadVersion,
         const uint8_t *kekFingerprint,
         const uint8_t *payload,
         size_t payloadLen) noexcept {
         try {
             const bool unwrap = (op == AuditOp::Unwrap);
+            const wchar_t *format = payloadVersion == kFormatVersion2
+                                        ? L"version 2 (post-quantum). KEK fingerprint (a PRF output of the KEK): "
+                                        : L"version 1 (classical). KEK fingerprint (SHA-256 of public key): ";
             std::wstring text =
                     std::wstring(OpName(op)) + L" succeeded: DEK " + (unwrap ? L"unwrapped" : L"wrapped") +
                     L" for service '" + Widen(service) + L"' using the KEK on " + ProviderLabel(providerType) +
-                    L". KEK fingerprint (SHA-256 of public key): " + Hex(kekFingerprint, kFingerprintLen) +
+                    L". Payload " + format + Hex(kekFingerprint, kFingerprintLen) +
                     L". Wrapped payload SHA-256: " + Sha256Hex(payload, payloadLen) + L".";
             Write(EVENTLOG_INFORMATION_TYPE, unwrap ? kEvtDekUnwrapped : kEvtDekWrapped, text);
         } catch (...) {
@@ -291,6 +318,7 @@ namespace hkdfguard {
                 case HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH:
                 case HKDFGUARD_ERR_PAYLOAD_MALFORMED:
                 case HKDFGUARD_ERR_PAYLOAD_UNSUPPORTED:
+                case HKDFGUARD_ERR_PAYLOAD_VERSION_REFUSED:
                     if (op != AuditOp::Unwrap) {
                         return;
                     }
@@ -304,19 +332,30 @@ namespace hkdfguard {
                                         : code == HKDFGUARD_ERR_PAYLOAD_UNSUPPORTED
                                               ? L"the payload's format version is not one this build "
                                                 L"understands (corrupted, tampered with, or from a newer version)"
-                                              : L"the payload is not a valid wrapped DEK (truncated, corrupted, "
-                                                L"or tampered with)";
+                                              : code == HKDFGUARD_ERR_PAYLOAD_VERSION_REFUSED
+                                                    ? L"the payload's version is not the one this host's "
+                                                      L"ClassicalMode policy uses (wrapped under the other "
+                                                      L"setting, or relabeled); it was refused before any key "
+                                                      L"was opened"
+                                                    : L"the payload is not a valid wrapped DEK (truncated, "
+                                                      L"corrupted, or tampered with)";
                     break;
                 case HKDFGUARD_ERR_POLICY_INVALID:
                 case HKDFGUARD_ERR_WIN_GROUP_INVALID:
                     eventId = kEvtPolicyInvalid;
                     meaning = code == HKDFGUARD_ERR_POLICY_INVALID
-                                  ? L"HKLM\\Software\\Policies\\HkdfGuard\\KeyStoragePolicy is present but not a "
-                                    L"valid REG_DWORD 0, 1 or 2; every call fails closed until it is fixed"
+                                  ? L"a value under HKLM\\Software\\Policies\\HkdfGuard is present but invalid "
+                                    L"(KeyStoragePolicy not a REG_DWORD 0, 1 or 2, or SecurityModel or "
+                                    L"ClassicalMode not a REG_DWORD 0 or 1); every call that reads it fails "
+                                    L"closed until it is fixed"
                                   : L"an entry in HKLM\\Software\\Policies\\HkdfGuard\\KeyUseGroups is "
                                     L"unresolvable, not a group, over-broad, or not host-local";
                     break;
                 case HKDFGUARD_ERR_PROVIDER_UNAVAILABLE:
+                    // Payload version 2 unavailable: event 2008, written by
+                    // kek_v2.cpp with the specific reason, which isn't known
+                    // here.
+                    return;
                 case HKDFGUARD_ERR_PROVIDER_ERROR:
                 case HKDFGUARD_ERR_CRYPTO_ERROR:
                 case HKDFGUARD_ERR_INTERNAL_ERROR:
