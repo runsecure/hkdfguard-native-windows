@@ -46,6 +46,44 @@ set_tests_properties(roundtrip PROPERTIES
     ENVIRONMENT "PATH=$<TARGET_FILE_DIR:hkdfguard>\\;${HKDFGUARD_TEST_PATH}"
 )
 
+# test_tpm2_marshal checks src/tpm2_marshal.cpp, the TPM 2.0 command
+# encodings and response parsers of the version 2 TPM provider (see
+# docs/adr/0001-post-quantum-payload-version-2.md): golden command bytes, the
+# parsers on well-formed and malformed responses, and a mutation sweep. Pure
+# code - no TPM, no elevation, no machine state - so it needs neither the
+# DLL nor the resource lock below.
+add_executable(test_tpm2_marshal
+    test_tpm2_marshal.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/tpm2_marshal.cpp
+)
+target_include_directories(test_tpm2_marshal PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src
+)
+if(MSVC)
+    target_compile_options(test_tpm2_marshal PRIVATE /W4)
+endif()
+add_test(NAME tpm2_marshal COMMAND test_tpm2_marshal)
+
+# The same parsers under libFuzzer and AddressSanitizer, built only on
+# request: cmake -DHKDFGUARD_BUILD_FUZZERS=ON. Registered as a short ctest
+# smoke run (a fixed number of inputs); run the executable directly, with a
+# corpus folder, for a real fuzzing session.
+option(HKDFGUARD_BUILD_FUZZERS "Build the libFuzzer targets (MSVC, with AddressSanitizer)" OFF)
+if(HKDFGUARD_BUILD_FUZZERS AND MSVC)
+    add_executable(fuzz_tpm2_marshal
+        fuzz/fuzz_tpm2_marshal.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/tpm2_marshal.cpp
+    )
+    target_include_directories(fuzz_tpm2_marshal PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../include
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src
+    )
+    target_compile_options(fuzz_tpm2_marshal PRIVATE /fsanitize=fuzzer /fsanitize=address /Zi)
+    target_link_options(fuzz_tpm2_marshal PRIVATE /INCREMENTAL:NO)
+    add_test(NAME fuzz_tpm2_marshal COMMAND fuzz_tpm2_marshal -runs=200000 -max_len=4097)
+endif()
+
 # test_cli.ps1 exercises hkdfguard.exe's argument parsing, validation and
 # file handling, which test_roundtrip (DLL calls only) doesn't cover. It
 # gets the built CLI's path as -CliExePath and the same PATH as roundtrip.
