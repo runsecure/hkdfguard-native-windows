@@ -210,6 +210,13 @@ administrator.
   key that is not found counts as never configured, since an unreadable one
   may hold `RequireTpm`. **Verified** by test (`test_roundtrip.cpp` section
   25b) via the test-only override; the open-status rule by section -2c.
+- `ClassicalMode` follows the same rule: absent (value or key) is payload
+  version 2, the default; a `REG_DWORD` `0` or `1` is used as is; anything
+  else, and a policy key that exists but can't be opened, is `Invalid`, and
+  every wrap, unwrap, create, exists and fingerprint call fails closed with
+  `HKDFGUARD_ERR_POLICY_INVALID`. A typo must never pick a version.
+  **Verified** for the rule by `test_v2_kek` (section 3), and through the DLL
+  with the real registry value (`ClassicalMode` 7) in its sections 4 and 5.
 - `KeyUseGroups` read failures of any kind yield an empty list (no
   additional principals), never an exception. Entries are trimmed; a bad
   entry fails `hkdfguard_create_kek` before any key is touched.
@@ -494,7 +501,11 @@ use) are still granted by *name*, now restricted to local groups.
   hosted runner. ARM64 builds still get no shadow-stack or EH-continuation
   equivalent.
 - Only one TPM vendor/firmware has been exercised (section 4); other
-  Platform Crypto Provider backends may exhibit different quirks.
+  Platform Crypto Provider backends may exhibit different quirks. The same
+  holds for payload version 2's raw TPM path (section 17): it has run only on
+  that AMD firmware TPM. An Intel PTT firmware TPM, a discrete TPM and a
+  Hyper-V virtual TPM are untested; `tbs_probe` (the scratch probe the ADR
+  cites) is the quick check to run on each before relying on it there.
 - Release binaries and MSIs are Authenticode-signed through Azure Artifact
   Signing (`scripts/ArtifactSigning.ps1`), by a release-workflow job in the
   "release" environment that signs in to Azure over OIDC: no signing
@@ -972,3 +983,98 @@ payload format change is needed.
   trusted. That's deliberate: nothing is resolved through a domain controller.
 - **Removed deployers.** Key files owned by a deployer who leaves the group stop being
   trusted. Redeploy them under a current deployer before removing one.
+
+## 17. Payload version 2: the post-quantum KEK (design decision + verified where noted)
+
+**Claim.** A version 2 payload - the default - can't be unwrapped or forged by
+anyone without the use of its KEK, even with a quantum computer: the KEK is a
+symmetric key used as a PRF, so there is no public key for Shor's algorithm to
+work on. As in version 1, only an account allowed to use the KEK can wrap. The
+full design and the options rejected (a hybrid, ML-KEM/ML-DSA, the Platform
+Crypto Provider's undocumented HMAC key, a DPAPI secret) are in
+`docs/adr/0001-post-quantum-payload-version-2.md`.
+
+**Design.**
+
+- **Construction.** NIST SP 800-108 in counter mode, the KEK as the PRF's key,
+  then AES-256-GCM (`src/sp800_108.h`). The labels, framing and order are the
+  Linux library's, byte for byte. The PRF is HMAC-SHA-256 in the TPM and
+  AES-256-CMAC in the Software KSP (two CMAC blocks per 32-byte output). Both are
+  PRFs SP 800-108 approves.
+- **One version per host.** `ClassicalMode` (section 7) picks the version; unwrap
+  refuses the other version (`HKDFGUARD_ERR_PAYLOAD_VERSION_REFUSED`) before any key
+  is opened, and nothing falls back from one to the other. The version byte is also
+  bound into each version's key derivation and AAD.
+- **The TPM KEK** is a TPM-generated keyed-hash key under the storage root key
+  (`0x81000001`), with `fixedTPM`, `fixedParent`, `sensitiveDataOrigin`, `sign`,
+  `userWithAuth`, `noDA` and nothing else, used with raw TPM 2.0 commands through
+  TBS (`src/tpm2_*.h`) - not through NCrypt. Every load checks those attributes
+  exactly, so a key made with a chosen value (`sensitiveDataOrigin` clear) can't be
+  planted. Every `TPM2_HMAC` goes through a session salted to the storage root key
+  with AES-128-CFB parameter encryption both ways, and the TPM's response HMAC is
+  checked before the result is used: the wrapping key never crosses a discrete
+  TPM's bus in the clear.
+- **The TPM KEK's key file is its access control.** The TPM doesn't check who loads
+  a key, so whoever can read the key file can use the KEK. The file
+  (`ProgramData\HkdfGuard\TpmKeys`) gets the KEK ACL, and on every open the file
+  and every folder above it are walked without following links and checked: owners
+  and writers only SYSTEM, Administrators and `HkdfGuardAdmins` (and TrustedInstaller
+  above the store), no create rights on the store's own folders, and
+  `VerifyExistingKekDacl` on the file - so read access for an over-broad principal is
+  refused too (`src/tpm_key_file.h`). The file pins the storage root key's Name.
+- **Before first use** in each process, the TPM's HMAC must reproduce the Linux
+  library's known answer for a known key loaded with `TPM2_LoadExternal`; a TPM that
+  fails is not used.
+- **The software KEK** is a non-exportable AES-256 machine key; CMAC is computed in
+  this process from KSP block operations (one ECB call for the subkeys, one CBC call
+  with an explicit zero IV per block), so the key never leaves the KSP's isolated
+  process. Chaining mode is set per handle, never saved to the key.
+
+**Verified how** (AMD firmware TPM, Windows 11, 2026-10-28 and 29).
+
+- The probes behind the ADR (`tbs_probe`, `cmac_probe`), elevated, unelevated and as
+  new standard accounts in and outside a key-use group: TBS, the storage root key,
+  `TPM2_Create`/`Load`/`HMAC`, `LoadExternal`, salted encrypted sessions, the blocked
+  command list, the storage root key's Name across a reboot; and the Software KSP's
+  per-handle chaining mode, CMAC, export refusal and the key-use ACL.
+- `test_tpm2_marshal`: golden command bytes the TPM accepted; every response parser
+  under truncation, bit flips and 20,000 random edits per response; and a libFuzzer
+  target under AddressSanitizer (12.2 million inputs, no finding).
+- `test_tpm2_session`: KDFa, KDFe, AES-CFB and Names against independent references;
+  salts round-trip through generated keys; and live, a known-answer HMAC through RSA-
+  and ECC-salted sessions, and every single-bit flip of a response refused.
+- `test_tpm_key_file`: the format and template rules, and - elevated - every
+  tampering the store must refuse (widened ACLs, write or create rights for others,
+  symbolic links, corrupted contents, a pre-created store folder).
+- `test_v2_kek`: the construction against the Linux known answers and AES-CMAC
+  against NIST SP 800-38B, offline; and elevated, through the DLL, both KEKs end to
+  end - tampering, relabeling, the version rule both ways, an invalid
+  `ClassicalMode`, and `PreferTpm`'s fallback and `RequireTpm`'s refusal with the TPM
+  made unusable.
+- `test_roles.ps1`, under version 2: a real key-use account uses the KEK, and an
+  account outside every group can't.
+
+**Assumed / not verified.**
+
+- **Other TPMs.** Only the AMD firmware TPM above (section 12).
+- **The Software KSP's AES.** CMAC's composition is tested against NIST's vectors on
+  a BCrypt key; the KSP's own AES encryption is trusted, as BCrypt's is.
+- **TBS's command filtering.** Observed, not documented: on this machine TBS blocked
+  only `TPM2_GetTestResult` for a standard account, and the registry block list holds
+  only TPM 1.2 ordinals. A Group Policy block list could block more; the library then
+  reports event 2008 naming it.
+
+**Residual risk.**
+
+- **Session salting is classical.** The session salt is exchanged with the storage
+  root key's RSA or ECC key, as the TPM specification defines. Someone recording a
+  discrete TPM's bus today who can later break that key could recover the wrapping
+  keys that crossed it. Firmware and virtual TPMs have no bus.
+- **The key file's ACL.** Anyone an administrator lets read the key file - or an
+  administrator - can use the KEK; that is the same trust a version 1 KEK's ACL
+  expresses, now enforced on a file rather than by a key storage provider.
+- **A cleared TPM** loses its storage root key, and with it every version 2 TPM KEK
+  made under it; the payloads are unrecoverable, as they would be for a version 1 TPM
+  KEK.
+- **The software KEK** is protected at rest by the Software KSP's machine DPAPI, as a
+  version 1 software KEK is (section 9); it doesn't benefit from a TPM.

@@ -177,6 +177,21 @@ set_tests_properties(cli PROPERTIES
     ENVIRONMENT "PATH=$<TARGET_FILE_DIR:hkdfguard>\\;${HKDFGUARD_TEST_PATH}"
 )
 
+# test_cli_v2.ps1: the CLI's provision, status and retire for payload
+# version 2 KEKs, on the software key store and the TPM, including a
+# corrupted TPM key file and a version 1 KEK beside them. test_cli.ps1 keeps
+# testing everything else under version 1. Needs elevation; skipped
+# otherwise.
+add_test(
+    NAME cli_v2
+    COMMAND powershell.exe -NoProfile -ExecutionPolicy Bypass
+            -File "${CMAKE_CURRENT_SOURCE_DIR}/test_cli_v2.ps1"
+            -CliExePath "$<TARGET_FILE:hkdfguard-cli>"
+)
+set_tests_properties(cli_v2 PROPERTIES
+    ENVIRONMENT "PATH=$<TARGET_FILE_DIR:hkdfguard>\\;${HKDFGUARD_TEST_PATH}"
+)
+
 # test_harden_process checks hkdfguard_harden_process from outside the
 # hardened process - the only vantage point where a process DACL is visible
 # - by starting a copy of itself as a child and probing it (see the comment
@@ -217,4 +232,4 @@ set_tests_properties(roles PROPERTIES
 # could save the other's temporary value and "restore" it, leaving the
 # machine in the developer model. A shared lock makes ctest run them one at
 # a time, whatever -j says; harden_process touches none of it.
-set_tests_properties(roundtrip cli roles v2_kek PROPERTIES RESOURCE_LOCK HkdfGuardMachineState)
+set_tests_properties(roundtrip cli cli_v2 roles v2_kek PROPERTIES RESOURCE_LOCK HkdfGuardMachineState)

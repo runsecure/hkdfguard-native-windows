@@ -650,6 +650,84 @@ namespace hkdfguard {
         return true;
     }
 
+    V2KekInspection InspectV2Kek(const std::wstring &service, uint8_t provider_type) {
+        V2KekInspection result;
+        auto invalid = [&](const HkdfGuardError &e) {
+            result.state = V2KekInspection::State::Invalid;
+            result.problem = e.what();
+            return result;
+        };
+
+        if (provider_type == kProviderTypeTpm) {
+            // The key file decides presence. Absent is definite; a file that
+            // fails a check is a definite "invalid"; anything else (it can't
+            // be read by this account, an I/O error) propagates.
+            TpmKeyFile file;
+            try {
+                file = ReadTpmKeyFile(Store(), TpmKeyFileName(service, kCurrentKeyId), Narrow(service));
+            } catch (const HkdfGuardError &e) {
+                if (e.code() == HKDFGUARD_ERR_KEK_NOT_FOUND) {
+                    return result;
+                }
+                if (e.code() == HKDFGUARD_ERR_KEK_INVALID) {
+                    return invalid(e);
+                }
+                throw;
+            }
+            // Then the TPM. One that can't be used for version 2 leaves the
+            // KEK unjudged - it throws, with the reason. A key file pinned
+            // to a storage root key the TPM no longer has (a cleared TPM) is
+            // definitely unusable: invalid. A load or HMAC the TPM refuses
+            // propagates, since it can't be told apart here from a TPM that
+            // is merely failing now.
+            UsableTpm usable;
+            try {
+                usable = OpenUsableTpm();
+            } catch (const V2TpmUnusable &e) {
+                throw HkdfGuardError(HKDFGUARD_ERR_PROVIDER_UNAVAILABLE,
+                                     ("the TPM can't be used for version 2: " + e.reason()).c_str());
+            }
+            std::unique_ptr<TpmV2Kek> kek;
+            try {
+                kek = std::make_unique<TpmV2Kek>(std::move(usable), std::move(file));
+            } catch (const HkdfGuardError &e) {
+                if (e.code() == HKDFGUARD_ERR_KEK_INVALID) {
+                    return invalid(e);
+                }
+                throw;
+            }
+            kek->Fingerprint(result.fingerprint);
+            result.state = V2KekInspection::State::Valid;
+            return result;
+        }
+
+        if (provider_type == kProviderTypeSoftware) {
+            ScopedNCryptProv provider;
+            OpenProvider(provider);
+            ScopedNCryptKey key;
+            const SECURITY_STATUS status = OpenSoftwareKey(provider.get(), V2SoftwareKeyName(service, kCurrentKeyId), key);
+            if (status == NTE_BAD_KEYSET) {
+                return result;
+            }
+            if (status != ERROR_SUCCESS) {
+                ThrowForNCryptFailure(status, "NCryptOpenKey failed");
+            }
+            try {
+                VerifySoftwareKey(key.get());
+            } catch (const HkdfGuardError &e) {
+                if (e.code() == HKDFGUARD_ERR_KEK_INVALID) {
+                    return invalid(e);
+                }
+                throw;
+            }
+            SoftwareV2Kek(service).Fingerprint(result.fingerprint);
+            result.state = V2KekInspection::State::Valid;
+            return result;
+        }
+
+        throw HkdfGuardError(HKDFGUARD_ERR_INTERNAL_ERROR, "unknown provider type");
+    }
+
 #if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
     void SetTestV2TpmStore(std::optional<TpmKeyStore> store) {
         g_test_tpm_store = std::move(store);

@@ -2,10 +2,18 @@
 
 Windows-native Key Wrapper.
 Wraps and unwraps a 32-byte key using a persistent, machine-wide scoped, non-exportable
-P-256 ECDH Key Encryption Key (KEK) held by a TPM/vTPM via the Microsoft Platform Crypto
-Provider, or by the Microsoft Software Key Storage Provider - which one is machine
-policy (see "Key storage policy" below); the default prefers the TPM and falls back to
-software when no TPM is available (bare servers, VMs without a vTPM, containers).
+Key Encryption Key (KEK) held by a TPM/vTPM, or by the Microsoft Software Key Storage
+Provider - which one is machine policy (see "Key storage policy" below); the default
+prefers the TPM and falls back to software when no TPM is available (bare servers, VMs
+without a vTPM, containers).
+
+By default every payload is **version 2, post-quantum**: the KEK is a symmetric key the
+provider uses as a PRF - an HMAC-SHA-256 key in the TPM, used with raw TPM 2.0 commands
+through TBS, or an AES-256 key in the Software Key Storage Provider, used as AES-CMAC -
+so there is no public key for a quantum computer to break. The construction is the
+Linux library's, byte for byte. **Version 1**, the classical construction (a P-256 ECDH
+KEK), is used only where an administrator sets `ClassicalMode` (below). See
+[docs/adr/0001-post-quantum-payload-version-2.md](docs/adr/0001-post-quantum-payload-version-2.md).
 
 **Key storage policy**: the `REG_DWORD` value `HKLM\Software\Policies\HkdfGuard\KeyStoragePolicy`
 selects the provider: `0` = `PreferTpm` (the default when the value is absent - TPM if
@@ -23,6 +31,20 @@ so a consumer that needs to know can check. It applies only when the TPM is
 unusable for the service (no TPM, or the TPM key is absent and could not be created).
 An existing TPM KEK that fails verification, or a TPM that errors while being probed,
 fails the call instead of quietly creating or using a software KEK beside it.
+
+**Payload version**: the `REG_DWORD` value `HKLM\Software\Policies\HkdfGuard\ClassicalMode`
+selects the one payload version a host writes and accepts. Absent or `0` is version 2
+(post-quantum), the default; `1` is version 1 (classical). Anything else fails every
+call with `HKDFGUARD_ERR_POLICY_INVALID`. A host uses exactly one: unwrap refuses a
+payload of the other version with `HKDFGUARD_ERR_PAYLOAD_VERSION_REFUSED` before any key
+is opened, and nothing falls back from one version to the other. Each version has its
+own KEK, so `hkdfguard_create_kek` provisions the one for this host's setting. A TPM is
+usable for version 2 only if TBS reaches it, its storage root key is a SHA-256 storage
+key, no command it needs is blocked, and its HMAC passes a known-answer test. When it
+isn't, `PreferTpm` falls back to the software key store (event 1001) unless a version 2
+TPM KEK already exists, and `RequireTpm` fails with
+`HKDFGUARD_ERR_PROVIDER_UNAVAILABLE` and logs event 2008 with the reason - set
+`ClassicalMode` to `1` on such a host to keep using version 1.
 
 **Deployment model**: the KEK is created with `NCRYPT_MACHINE_KEY_FLAG`, not tied to
 the account that created it, and is meant to be long-lived - there is no key-rotation
@@ -379,12 +401,13 @@ away from other processes.
   touching the file, since `hkdfguard_open_file` would refuse a key file that account
   wrote. Wrapping in memory through the library is not restricted.
 
-- **`status`** - read-only. Reports whether the service has a KEK, which provider holds
-  it and its fingerprint. It also lists any other key under the service's name on the
-  provider the `KeyStoragePolicy` doesn't select. Such a key is unused today, but a
+- **`status`** - read-only. Reports the payload version this host uses, whether the
+  service has a KEK of that version, which provider holds it and its fingerprint. It also
+  lists any other key under the service's name: on the provider the `KeyStoragePolicy`
+  doesn't select, or of the other payload version. Such a key is unused today, but a
   policy change would pick it up. Exits `0` whenever it got a definite answer (present,
   absent, corrupt or unusable) and `1` when it couldn't tell (for example, access
-  denied).
+  denied, or a TPM that can't be reached to check a version 2 TPM KEK).
 
   It also prints the security model in force and whether the calling account may persist
   key files under it.
@@ -401,20 +424,24 @@ away from other processes.
   which key they mean:
 
   - `--fingerprint|-fp <hex>`: the 64 hex characters `provision` printed. The key under
-    the service's name must be a P-256 ECDH key with exactly that fingerprint.
-  - `--corrupt`: for a key under the service's name that is not a P-256 ECDH key at all,
-    so has no fingerprint. Deleted only when its properties read cleanly and say so. A
-    key that merely couldn't be read is never treated as corrupt.
+    the service's name must be a valid KEK with exactly that fingerprint.
+  - `--corrupt`: for a key under the service's name that definitely fails its KEK
+    checks, so has no fingerprint - for version 1, a key that is not a P-256 ECDH key;
+    for version 2, a TPM key file or AES key that fails them (a key file pinned to a
+    storage root key the TPM no longer has, after a TPM clear, among others). A key that
+    merely couldn't be checked is never treated as corrupt.
 
+  It retires the KEK of this host's payload version; `--version 1|2` picks the other's.
   A service can have a key on both the TPM and the software provider. Then `retire`
-  refuses to choose, and `--provider tpm|software` picks one. The key is opened once,
-  checked, and deleted through that same handle, so what is deleted is exactly what
-  was checked. The name is then re-opened to confirm the key is gone. Each retirement
-  is logged as event 1004 with the fingerprint and the calling user.
+  refuses to choose, and `--provider tpm|software` picks one. A version 1 key is opened
+  once, checked, and deleted through that same handle, so what is deleted is exactly what
+  was checked; a version 2 key is checked and deleted by the library's own version 2
+  code, which the CLI compiles in. The name is then re-opened to confirm the key is gone.
+  Each retirement is logged as event 1004 with the fingerprint and the calling user.
 
   ```
   hkdfguard.exe retire --service-name|-sn <name> (--fingerprint|-fp <hex> | --corrupt)
-                       [--provider tpm|software]
+                       [--provider tpm|software] [--version 1|2]
   ```
 
 Example, from an elevated PowerShell prompt - provisioning a KEK once, then wrapping a
@@ -608,16 +635,17 @@ including the impersonated client when a service acts on someone's behalf.
 | 1000 | Information | A KEK was created (not merely found). |
 | 1001 | Warning | A KEK was created on the software provider because `PreferTpm`'s TPM attempt failed, so it isn't hardware-protected. |
 | 1002 | Information | A DEK was wrapped (`hkdfguard_wrap_dek` or `hkdfguard_generate_and_wrap_dek`). |
-| 1003 | Information | A DEK was unwrapped. |
+| 1003 | Information | A DEK was unwrapped. 1002 and 1003 both record the payload version, the KEK fingerprint and a SHA-256 of the payload. |
 | 1004 | Warning | A KEK was retired (deleted) by `hkdfguard.exe retire`. Names the service, the provider and the fingerprint, or why the key was corrupt. Written by the CLI; the library has no delete. |
 | 1005 | Warning | `hkdfguard_open_file` read a key file under the developer security model, which trusts the caller's own key files. Once per process. Not expected on a production machine. |
 | 2000 | Warning | `KEK_ACCESS_DENIED` on any call: use of a KEK by an unauthorized account, or provisioning without elevation. |
 | 2002 | Error | `KEK_INVALID`: an existing KEK under the service name has an ACL this library would never create. Investigate it. |
-| 2003 | Warning | `PAYLOAD_AUTH_FAILED`, `KEK_FINGERPRINT_MISMATCH`, `PAYLOAD_MALFORMED` or `PAYLOAD_UNSUPPORTED` on unwrap: a tampered, corrupted, misdirected or unknown-version payload. |
+| 2003 | Warning | `PAYLOAD_AUTH_FAILED`, `KEK_FINGERPRINT_MISMATCH`, `PAYLOAD_MALFORMED`, `PAYLOAD_UNSUPPORTED` or `PAYLOAD_VERSION_REFUSED` on unwrap: a tampered, corrupted, misdirected or unknown-version payload, or one of the payload version this host doesn't use. |
 | 2004 | Error | `POLICY_INVALID` or `WIN_GROUP_INVALID`: the registry policy is misconfigured, so calls fail closed. |
-| 2005 | Error | `PROVIDER_UNAVAILABLE`, `PROVIDER_ERROR`, `CRYPTO_ERROR` or `INTERNAL_ERROR`: the key storage provider or crypto layer failed. |
+| 2005 | Error | `PROVIDER_ERROR`, `CRYPTO_ERROR` or `INTERNAL_ERROR`: the key storage provider or crypto layer failed. |
 | 2006 | Error | `hkdfguard_open_file` refused a file that looks like an unwrapped DEK (32 raw bytes, or its hex or base64), so possibly a plaintext key on disk. Names the file; none of its contents are logged or returned. Investigate it. |
 | 2007 | Warning | A process made more than 10 `hkdfguard_create_kek` / `hkdfguard_kek_exists` calls. They are meant to run once at startup, so a caller is probably looping on them. Logged once per process. |
+| 2008 | Error | `PROVIDER_UNAVAILABLE`: payload version 2 is unavailable on this host. Names the reason: no TPM 2.0 reachable through TBS, no usable storage root key, a TPM command blocked by Group Policy, or a failed known-answer test - and the fixes. Logged on every failing call. |
 
 The wrap and unwrap events also record the KEK's fingerprint and a SHA-256 of the
 wrapped payload. Both are public values that reveal nothing about the DEK. Because the
@@ -687,7 +715,24 @@ It is read on every setup call.
 
 ## Design
 
-- **Crypto**: ECDH (P-256) between the KEK's private key and a point hashed from a
+- **Crypto, version 2** (the default): NIST SP 800-108 in counter mode with the KEK as the
+  PRF's key, then AES-256-GCM (`src/sp800_108.h`, `src/kek_v2.h`). The wrapping key is
+  `PRF(KEK, [1]_32 || "hkdfguard-wrap-v1" || 0x00 || u16le(len(service)) || service ||
+  header || [256]_32)` and the KEK fingerprint the same over the label
+  `"hkdfguard-kek-fingerprint-v1"` and an empty context - byte for byte the Linux
+  library's construction, pinned by its known-answer values in `tests/test_v2_kek.cpp`.
+  In the TPM the PRF is HMAC-SHA-256: a TPM-generated, non-duplicable keyed-hash key under
+  the storage root key, used with raw TPM 2.0 commands through TBS (`src/tpm2_*.h`), the
+  HMAC's result encrypted on its way back in a session salted to the storage root key.
+  The key file (`src/tpm_key_file.h`, under `ProgramData\HkdfGuard\TpmKeys`) pins the
+  storage root key's Name, and its ACL is the KEK's access control, checked on every open.
+  In the Software Key Storage Provider the PRF is AES-256-CMAC over a non-exportable
+  AES-256 machine key (`src/aes_cmac.h`), two CMAC blocks per 32-byte output. Each
+  process checks the TPM's HMAC with a known-answer test before first using it. Wrapping
+  needs the KEK, as in version 1, so **only an account authorized to use the KEK can
+  create a payload**; and there is no public key at all. The AES-256-GCM step and the
+  fingerprint check are as for version 1, below.
+- **Crypto, version 1** (`ClassicalMode` = `1`): ECDH (P-256) between the KEK's private key and a point hashed from a
   random per-payload salt, then HKDF-SHA512 and AES-256-GCM. Each wrap draws a 32-byte
   salt and hashes it to a P-256 point `H(salt)` (`src/hash_to_curve.cpp`: RFC 9380
   `P256_XMD:SHA-256_SSWU_RO_`, checked against the RFC's test vectors). The shared
@@ -710,11 +755,15 @@ It is read on every setup call.
   checked against the opened KEK before any ECDH or decryption, so "wrong KEK"
   (`HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH`) is distinguishable from tampering
   (`HKDFGUARD_ERR_PAYLOAD_AUTH_FAILED`).
-- **Wire format**: `src/wire_format.h` documents the exact 132-byte `WrappedDekV1`
-  layout (version, provider type, key id, salt, AES-GCM nonce/ciphertext/tag, KEK
+- **Wire format**: `src/wire_format.h` documents the exact 132-byte layout, shared by
+  both versions (version, provider type, key id, salt, AES-GCM nonce/ciphertext/tag, KEK
   fingerprint), serialized field-by-field rather than via a packed
   C struct so the format has no dependency on compiler struct-packing rules.
-- **KEK lifecycle**: `src/kek_store.cpp` creates the KEK (Platform Crypto Provider first,
+- **KEK lifecycle**: the version 2 KEK lives in `src/kek_v2.cpp`, with the same
+  `KeyStoragePolicy` rules, ACL, creation-only and verify-on-every-open behavior as the
+  version 1 KEK described here; its own rule is that a TPM which can't do version 2 is
+  fallen back from under `PreferTpm` only while no version 2 TPM key file exists. For
+  version 1, `src/kek_store.cpp` creates the KEK (Platform Crypto Provider first,
   falling back to Software KSP under `PreferTpm`) only via `hkdfguard_create_kek`, which
   also applies the `KeyUseGroups`-driven ACL and is idempotent - safe to call again for
   an already-provisioned service, which just re-verifies it - including that the existing

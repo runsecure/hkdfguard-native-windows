@@ -78,10 +78,33 @@ namespace hkdfguard {
     // creates one.
     std::unique_ptr<V2Kek> OpenV2KekForUnwrap(const std::wstring &service, uint8_t provider_type, uint32_t key_id);
 
-    // Deletes the service's version 2 KEK on `provider_type`, if present.
-    // Returns whether anything was deleted. For the CLI's retire and the
-    // tests; needs an elevated caller.
+    // Deletes the service's version 2 KEK on `provider_type`, if present -
+    // whether or not it would pass its checks, so a corrupt one can be
+    // removed too. Returns whether anything was deleted. For the CLI's
+    // retire and the tests; needs an elevated caller. Never compiled into
+    // a path HkdfGuard.dll's ABI can reach: the library itself can't delete.
     bool DeleteV2Kek(const std::wstring &service, uint8_t provider_type, uint32_t key_id);
+
+    // What a service's version 2 KEK on one provider is, judged with no
+    // KeyStoragePolicy involved - for the CLI's status and retire, which
+    // must see every KEK, not just the one policy selects.
+    struct V2KekInspection {
+        enum class State {
+            Absent,  // no KEK of this version on that provider
+            Valid,   // present, passes every check; `fingerprint` is set
+            Invalid, // present, but fails a check; `problem` says which
+        };
+        State state = State::Absent;
+        uint8_t fingerprint[kFingerprintLen] = {};
+        std::string problem;
+    };
+
+    // Inspects the KEK on `provider_type` (kProviderTypeTpm or
+    // kProviderTypeSoftware). Only a definite answer is returned: anything
+    // that leaves the state unknown - access denied, a TPM that can't be
+    // used for version 2, an I/O or provider error - throws, so a KEK that
+    // merely can't be checked right now is never reported absent or corrupt.
+    V2KekInspection InspectV2Kek(const std::wstring &service, uint8_t provider_type);
 
     // The name of the service's version 2 software KEK in the Microsoft
     // Software KSP.
