@@ -65,6 +65,28 @@ if(MSVC)
 endif()
 add_test(NAME tpm2_marshal COMMAND test_tpm2_marshal)
 
+# test_tpm2_session checks the session cryptography (src/tpm2_session.cpp)
+# against independent references and, when TBS reaches a TPM 2.0, the whole
+# TPM path (src/tpm2_device.cpp) against the real TPM: a known-answer HMAC
+# through salted, encrypted sessions, a created key, and tampered responses.
+# Needs no elevation and leaves nothing in the TPM, so, like tpm2_marshal,
+# it takes no resource lock.
+add_executable(test_tpm2_session
+    test_tpm2_session.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/tpm2_marshal.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/tpm2_session.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/tpm2_device.cpp
+)
+target_include_directories(test_tpm2_session PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src
+)
+target_link_libraries(test_tpm2_session PRIVATE bcrypt.lib tbs.lib)
+if(MSVC)
+    target_compile_options(test_tpm2_session PRIVATE /W4)
+endif()
+add_test(NAME tpm2_session COMMAND test_tpm2_session)
+
 # The same parsers under libFuzzer and AddressSanitizer, built only on
 # request: cmake -DHKDFGUARD_BUILD_FUZZERS=ON. Registered as a short ctest
 # smoke run (a fixed number of inputs); run the executable directly, with a
