@@ -481,8 +481,13 @@ namespace hkdfguard {
             }
         }
 
+        // The KEK's security descriptor, self-relative, with its DACL. For
+        // a version 2 TPM key file (`for_file`), also BUILTIN\Administrators
+        // as owner and the DACL protected, so the file inherits nothing from
+        // its folder; a KSP key takes only the DACL.
         std::vector<BYTE> BuildSecurityDescriptor(
-            const std::vector<std::wstring> &additionalGroups) {
+            const std::vector<std::wstring> &additionalGroups,
+            bool for_file) {
             std::vector<EXPLICIT_ACCESSW> entries;
 
             auto systemSid =
@@ -575,6 +580,16 @@ namespace hkdfguard {
                     "SetSecurityDescriptorDacl failed");
             }
 
+            if (for_file &&
+                (!SetSecurityDescriptorOwner(&sd, adminSid.data(), FALSE) ||
+                 !SetSecurityDescriptorControl(&sd, SE_DACL_PROTECTED, SE_DACL_PROTECTED))) {
+                LocalFree(acl);
+
+                throw HkdfGuardError(
+                    HKDFGUARD_ERR_PROVIDER_ERROR,
+                    "setting the key file's owner or DACL protection failed");
+            }
+
             DWORD requiredSize = 0;
 
             MakeSelfRelativeSD(
@@ -639,7 +654,8 @@ namespace hkdfguard {
         const std::vector<std::wstring> &additionalGroups) {
         auto descriptor =
                 BuildSecurityDescriptor(
-                    additionalGroups);
+                    additionalGroups,
+                    false);
 
         SECURITY_STATUS status =
                 NCryptSetProperty(
@@ -727,10 +743,38 @@ namespace hkdfguard {
         }
     } // namespace
 
+    std::vector<BYTE> BuildKekFileSecurityDescriptor(
+        const std::vector<std::wstring> &additionalGroups) {
+        return BuildSecurityDescriptor(additionalGroups, true);
+    }
+
+    bool IsKekAdministrator(PSID sid) {
+        if (sid == nullptr || !IsValidSid(sid)) {
+            return false;
+        }
+        if (IsWellKnownSid(sid, WinLocalSystemSid) || IsWellKnownSid(sid, WinBuiltinAdministratorsSid)) {
+            return true;
+        }
+        // HkdfGuardAdmins counts only as TryResolveAccountSid accepts it: a
+        // group in this host's own SAM.
+        auto admins = TryResolveAccountSid(kHkdfGuardAdminsGroup);
+        return admins && EqualSid(sid, admins->data());
+    }
+
     void VerifyExistingKeyAcl(
         NCRYPT_KEY_HANDLE key) {
         std::vector<BYTE> descriptor;
         PACL acl = ReadKeyDacl(key, descriptor, HKDFGUARD_ERR_KEK_INVALID);
+        VerifyExistingKekDacl(acl);
+    }
+
+    void VerifyExistingKekDacl(
+        PACL acl) {
+        if (acl == nullptr) {
+            throw HkdfGuardError(
+                HKDFGUARD_ERR_KEK_INVALID,
+                "key ACL missing or NULL (grants everyone full access)");
+        }
 
         // The two principals every KEK this library creates grants, whatever
         // the policy was at the time.

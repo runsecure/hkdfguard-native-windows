@@ -87,6 +87,29 @@ if(MSVC)
 endif()
 add_test(NAME tpm2_session COMMAND test_tpm2_session)
 
+# test_tpm_key_file checks the version 2 TPM KEK's key file and its store
+# (src/tpm_key_file.cpp): the format, the KEK template, the file's security
+# descriptor, and - elevated - writing, reading and deleting in a throwaway
+# store under a new C:\ folder, and every tampering the store must refuse.
+# Needs no TPM. Its store is its own folder, never ProgramData's, so it
+# takes no resource lock either.
+add_executable(test_tpm_key_file
+    test_tpm_key_file.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/tpm2_marshal.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/tpm_key_file.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/key_acl.cpp
+)
+target_include_directories(test_tpm_key_file PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src
+)
+target_compile_definitions(test_tpm_key_file PRIVATE UNICODE _UNICODE)
+target_link_libraries(test_tpm_key_file PRIVATE bcrypt.lib ncrypt.lib advapi32.lib netapi32.lib shell32.lib ole32.lib ntdll.lib)
+if(MSVC)
+    target_compile_options(test_tpm_key_file PRIVATE /W4)
+endif()
+add_test(NAME tpm_key_file COMMAND test_tpm_key_file)
+
 # The same parsers under libFuzzer and AddressSanitizer, built only on
 # request: cmake -DHKDFGUARD_BUILD_FUZZERS=ON. Registered as a short ctest
 # smoke run (a fixed number of inputs); run the executable directly, with a
