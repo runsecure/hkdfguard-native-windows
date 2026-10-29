@@ -844,6 +844,17 @@ namespace hkdfguard {
         const std::vector<std::wstring> &additionalGroups) {
         std::vector<BYTE> descriptor;
         PACL acl = ReadKeyDacl(key, descriptor, HKDFGUARD_ERR_PROVIDER_ERROR);
+        VerifyKekDaclGrants(acl, additionalGroups);
+    }
+
+    void VerifyKekDaclGrants(
+        PACL acl,
+        const std::vector<std::wstring> &additionalGroups) {
+        if (acl == nullptr) {
+            throw HkdfGuardError(
+                HKDFGUARD_ERR_PROVIDER_ERROR,
+                "key ACL missing or NULL");
+        }
 
         VerifyPrincipalPresent(
             acl,

@@ -239,8 +239,15 @@ namespace hkdfguard {
         bool CreateTpmKek(const std::wstring &service, const std::vector<std::wstring> &groups) {
             const TpmKeyStore store = Store();
             const std::wstring file_name = TpmKeyFileName(service, kCurrentKeyId);
-            if (TpmKeyFileExists(store, file_name, Narrow(service))) {
+            // An existing KEK - found now, or created concurrently below -
+            // must still work and must grant every group the current
+            // policy names, as version 1's existing KEK must (VerifyKeyAcl).
+            const auto verify_existing = [&] {
                 OpenTpmKek(service)->Fingerprint(std::vector<uint8_t>(kFingerprintLen).data());
+                VerifyTpmKeyFileGrants(store, file_name, groups);
+            };
+            if (TpmKeyFileExists(store, file_name, Narrow(service))) {
+                verify_existing();
                 return false;
             }
 
@@ -261,7 +268,7 @@ namespace hkdfguard {
             if (!WriteTpmKeyFile(store, file_name, file, groups)) {
                 // Created concurrently by another provisioning run: that
                 // file is the KEK, and is verified like any existing one.
-                OpenTpmKek(service)->Fingerprint(std::vector<uint8_t>(kFingerprintLen).data());
+                verify_existing();
                 return false;
             }
             // Used once through the full open path before it counts; a KEK
@@ -269,6 +276,7 @@ namespace hkdfguard {
             try {
                 uint8_t fingerprint[kFingerprintLen];
                 OpenTpmKek(service)->Fingerprint(fingerprint);
+                VerifyTpmKeyFileGrants(store, file_name, groups);
             } catch (...) {
                 DeleteTpmKeyFile(store, file_name);
                 throw;

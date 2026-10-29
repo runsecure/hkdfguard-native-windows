@@ -435,6 +435,27 @@ void ElevatedChecks() {
         Check(TpmKeyFileExists(store, name, kService), "...and exists");
         Check(!WriteTpmKeyFile(store, name, SampleFile(), {}), "a second write doesn't replace it");
 
+        // Provisioning's check of an existing file against the current
+        // policy (VerifyTpmKeyFileGrants): written under the same policy it
+        // passes; a policy group the file doesn't grant is reported, and the
+        // file is left as it was.
+        Check(CodeOf([&] { hkdfguard::VerifyTpmKeyFileGrants(store, name, {}); }) == HKDFGUARD_OK,
+              "the key file grants every principal the policy it was written under names");
+        {
+            const int code = CodeOf([&] { hkdfguard::VerifyTpmKeyFileGrants(store, name, {kOtherGroup}); });
+            Check(code == HKDFGUARD_ERR_PROVIDER_ERROR,
+                  "a key-use group the policy now names but the file doesn't grant is reported (code " +
+                      std::to_string(code) + ")");
+        }
+        Check(SameFile(ReadTpmKeyFile(store, name, kService), sample), "...and the key file is left untouched");
+        {
+            const std::wstring granted = L"hkdfguardwin_test.keyfile_granted.tpmkey";
+            Check(WriteTpmKeyFile(store, granted, sample, {kOtherGroup}) &&
+                      CodeOf([&] { hkdfguard::VerifyTpmKeyFileGrants(store, granted, {kOtherGroup}); }) == HKDFGUARD_OK,
+                  "a key file written with that group grants it");
+            DeleteTpmKeyFile(store, granted);
+        }
+
         // SYSTEM S-1-5-18, Administrators S-1-5-32-544, Users S-1-5-32-545.
         for (const std::wstring& folder : {parent + L"\\HkdfGuard", keys}) {
             const ObjectSecurity sec = SecurityOf(folder);

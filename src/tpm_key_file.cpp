@@ -631,6 +631,44 @@ namespace hkdfguard {
         return true;
     }
 
+    void VerifyTpmKeyFileGrants(const TpmKeyStore &store, const std::wstring &file_name,
+                                const std::vector<std::wstring> &additional_groups) {
+        RequireFileName(file_name);
+        OpenStore opened;
+        OpenStoreFolders(store, false, opened);
+        Handle file;
+        DWORD win32 = 0;
+        if (!hkdfguard_nofollow::OpenRelative(opened.keys(), file_name, READ_CONTROL, FILE_SHARE_READ, FILE_OPEN,
+                                              FILE_NON_DIRECTORY_FILE, nullptr, file, win32)) {
+            ThrowOpenFailure(win32, "the TPM key file");
+        }
+        RequireKind(file.get(), false, "the TPM key file");
+        PACL dacl = nullptr;
+        PSECURITY_DESCRIPTOR sd = nullptr;
+        if (GetSecurityInfo(file.get(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr, nullptr, &dacl, nullptr,
+                            &sd) != ERROR_SUCCESS) {
+            IoFailure("reading the TPM key file's ACL failed");
+        }
+        try {
+            VerifyKekDaclGrants(dacl, additional_groups);
+        } catch (const HkdfGuardError &e) {
+            LocalFree(sd);
+            if (e.code() == HKDFGUARD_ERR_PROVIDER_ERROR) {
+                throw HkdfGuardError(
+                    HKDFGUARD_ERR_PROVIDER_ERROR,
+                    "the existing TPM key file's ACL doesn't grant every principal the current policy names "
+                    "(SYSTEM, Administrators, HkdfGuardAdmins, HkdfGuardUsers, HkdfGuardDeployers, KeyUseGroups, "
+                    "DeployerGroups); nothing was changed. Add the missing grant to the key file, or retire the KEK "
+                    "and provision again");
+            }
+            throw;
+        } catch (...) {
+            LocalFree(sd);
+            throw;
+        }
+        LocalFree(sd);
+    }
+
     bool DeleteTpmKeyFile(const TpmKeyStore &store, const std::wstring &file_name) {
         RequireFileName(file_name);
         RequireElevated();

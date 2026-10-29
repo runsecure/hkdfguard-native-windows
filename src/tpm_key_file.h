@@ -123,6 +123,19 @@ namespace hkdfguard {
     bool WriteTpmKeyFile(const TpmKeyStore &store, const std::wstring &file_name, const TpmKeyFile &file,
                          const std::vector<std::wstring> &additional_groups);
 
+    // Checks that the existing `file_name` in `store` grants every principal
+    // a KEK this library creates now would: SYSTEM, Administrators and
+    // HkdfGuardAdmins, and HkdfGuardUsers, HkdfGuardDeployers and
+    // `additional_groups` (the KeyUseGroups and DeployerGroups policy) -
+    // key_acl.h's VerifyKekDaclGrants, after the same folder checks as a
+    // read. For provisioning, which verifies an existing KEK against the
+    // current policy as version 1 does (VerifyKeyAcl): a group the policy
+    // names but the file doesn't grant is HKDFGUARD_ERR_PROVIDER_ERROR, and
+    // the file is left untouched. A grant the policy no longer names isn't
+    // detected here, as for version 1.
+    void VerifyTpmKeyFileGrants(const TpmKeyStore &store, const std::wstring &file_name,
+                                const std::vector<std::wstring> &additional_groups);
+
     // Deletes `file_name` from `store` after the same folder checks as a
     // read. Returns false if there is no such file. Needs an elevated caller.
     bool DeleteTpmKeyFile(const TpmKeyStore &store, const std::wstring &file_name);
