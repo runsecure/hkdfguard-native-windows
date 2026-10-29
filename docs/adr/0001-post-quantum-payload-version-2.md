@@ -293,7 +293,15 @@ key-use account in a new local group, and as an account outside it, on
 - A TPM 2.0 command layer and session cryptography to maintain and fuzz,
   which CNG used to own.
 - The TPM key file is now this library's to protect: its ACL is the
-  access control.
+  access control. That is weaker than version 1's TPM KEK, which the PCP
+  checks on every use: the file is a bearer credential, so an account
+  that reads it once can use the KEK on this host until the TPM is
+  cleared, and access can't be revoked short of retiring the KEK and
+  re-wrapping. Accepted as an administrator's choice (2026-10-29), since
+  quantum exposure of stored payloads can't be fixed later and this can.
+  The planned fix is a broker service that alone reads the key files and
+  performs `TPM2_HMAC` for callers it checks against the KEK's ACL.
+  `SecurityAssumptions.md` section 17 and the admin guide state the trade.
 - Two key types per provider while version 1 is supported. `retire` and
   `status` handle both.
 - Hosts provisioned under version 1 must set `ClassicalMode` to `1` before

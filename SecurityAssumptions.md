@@ -1070,9 +1070,37 @@ Crypto Provider's undocumented HMAC key, a DPAPI secret) are in
   root key's RSA or ECC key, as the TPM specification defines. Someone recording a
   discrete TPM's bus today who can later break that key could recover the wrapping
   keys that crossed it. Firmware and virtual TPMs have no bus.
-- **The key file's ACL.** Anyone an administrator lets read the key file - or an
-  administrator - can use the KEK; that is the same trust a version 1 KEK's ACL
-  expresses, now enforced on a file rather than by a key storage provider.
+- **The TPM key file is a bearer credential (accepted trade-off).** This is weaker
+  than a version 1 TPM KEK, and it is an administrator's choice, not an equivalence.
+  A version 1 TPM KEK is checked by the Platform Crypto Provider on every use, and no
+  caller ever holds its blob. A version 2 TPM KEK's blob is the key file itself. The
+  storage root key and the KEK both have an empty authValue, any account can reach
+  TBS, and `TPM2_Load` checks nothing about its caller. So:
+  - Whoever reads the key file once can use the KEK on this host for as long as the
+    storage root key exists - until the TPM is cleared - from a copy, whatever the
+    file's ACL says later.
+  - Access can't be revoked. Removing an account from `KeyUseGroups`, changing the
+    file's ACL, or deleting the file doesn't take away a copy already made. The only
+    revocation is to retire the KEK and wrap every DEK again under a new one.
+  - The readers are more than the key-use groups: administrators, any process with
+    `SeBackupPrivilege` (backup operators, backup and snapshot software), volume
+    shadow copies, and security or management agents that read files as SYSTEM.
+  - A copy is useless on another machine: the blob is encrypted to this TPM's
+    storage root key (`fixedTPM`, `fixedParent`). The exposure is to local accounts.
+  - The software provider doesn't have this property: the Software KSP checks the
+    version 2 software KEK's ACL on every use, as for version 1, and the key is
+    non-exportable. Under version 2, a host that must be able to revoke a key-use
+    account may prefer `KeyStoragePolicy` `SoftwareOnly`, at the cost of the TPM's
+    protection at rest.
+
+  Accepted because the alternative risk can't be fixed later: a payload harvested
+  today under version 1 is exposed to a future quantum computer for good, while the
+  key file's exposure is local, limited to accounts an administrator already trusts,
+  and can be closed in a later release. The planned fix is a broker service that
+  alone can read the key files and performs `TPM2_HMAC` for callers it has checked
+  against the KEK's ACL, restoring per-use checks and revocation. Until then, treat
+  read access to a key file as the right to use the KEK indefinitely, and keep it out
+  of backups that accounts outside the key-use groups can restore.
 - **A cleared TPM** loses its storage root key, and with it every version 2 TPM KEK
   made under it; the payloads are unrecoverable, as they would be for a version 1 TPM
   KEK.

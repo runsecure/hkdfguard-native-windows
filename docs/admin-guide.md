@@ -461,6 +461,29 @@ Where a version 2 KEK lives:
 | TPM | A key file, `C:\ProgramData\HkdfGuard\TpmKeys\hkdfguardwin_<service>_v1.tpmkey`. The TPM made the key and only it can use it; the file holds it encrypted for this TPM. **The file's access list is the KEK's**: SYSTEM, Administrators and `HkdfGuardAdmins` full control, the key-use groups read - the same rules as any KEK. The library checks the file and its folders on every use and refuses one that anyone else could change, replace or read. |
 | Software | An AES-256 machine key named `hkdfguardwin_<service>_v1_aes`, non-exportable, with the usual KEK access list. |
 
+**Know what the TPM key file means before you choose version 2 on a TPM.** Reading the key
+file is enough to use the KEK. The TPM doesn't check who loads it, so an account that reads
+the file once keeps the use of the KEK on this machine from its copy, even after you remove
+it from `KeyUseGroups` or change the file's access list. The only way to take that away is
+to retire the KEK and wrap every DEK again. Administrators, backup operators, backup and
+snapshot software, and agents running as SYSTEM can read the file too. A copy is useless on
+any other machine, since only this TPM can load it. A version 1 TPM KEK, and a version 2
+software KEK, don't have this weakness: their key store checks the access list on every use.
+
+This is a deliberate trade. Version 2 protects payloads stored today against a future
+quantum computer, which version 1 can't do and nothing can add later; the key file's
+weakness is local and is planned to be closed in a later release. Choose accordingly:
+
+- Version 2 on the TPM (the default): post-quantum, and the TPM protects the key at rest,
+  but key-use access can't be revoked short of retiring the KEK.
+- Version 2 with `KeyStoragePolicy` `SoftwareOnly`: post-quantum, and access is checked on
+  every use, but the key is protected at rest only by machine DPAPI.
+- Version 1 (`ClassicalMode` `1`): access checked on every use and TPM-protected, but not
+  post-quantum.
+
+Whichever you choose, keep the `HkdfGuard\TpmKeys` folder out of backups that accounts
+outside the key-use groups can restore.
+
 A TPM is used for version 2 only if all of these hold: Windows can reach it through TBS
 (TPM 2.0), its storage root key at `0x81000001` exists, none of the TPM commands the library
 needs is blocked (the Group Policy setting **Configure the list of blocked TPM commands**
