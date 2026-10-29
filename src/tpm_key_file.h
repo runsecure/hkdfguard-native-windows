@@ -45,7 +45,9 @@
 // file (or store folder) that doesn't exist; HKDFGUARD_ERR_KEK_ACCESS_DENIED
 // when the caller may not read it, or - writing or deleting - isn't elevated;
 // HKDFGUARD_ERR_KEK_INVALID for anything about the file or its folders that
-// fails a check; HKDFGUARD_ERR_PROVIDER_ERROR for an I/O failure.
+// fails a check - thrown as errors.h's KekAccessControlError when the
+// failure is the owner or DACL of the file or of a folder, which fixing the
+// ACL repairs; HKDFGUARD_ERR_PROVIDER_ERROR for an I/O failure.
 namespace hkdfguard {
     using tpm2::Bytes;
 

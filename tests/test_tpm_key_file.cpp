@@ -470,27 +470,55 @@ void ElevatedChecks() {
         DeleteTpmKeyFile(store, name);
         return WriteTpmKeyFile(store, name, sample, {});
     };
+    // A read's code, and whether it failed as an access-control problem
+    // (KekAccessControlError), which status reports as "fix the ACL" and
+    // retire --corrupt refuses, rather than as corruption.
+    auto read_code = [&](bool& access_control) {
+        access_control = false;
+        try {
+            ReadTpmKeyFile(store, name, kService);
+            return HKDFGUARD_OK;
+        } catch (const hkdfguard::KekAccessControlError& e) {
+            access_control = true;
+            return e.code();
+        } catch (const HkdfGuardError& e) {
+            return e.code();
+        } catch (...) {
+            return kOtherException;
+        }
+    };
+    // Refused for its access control: KEK_INVALID, as an access-control error.
+    auto expect_access_control = [&](const std::string& what) {
+        bool access_control = false;
+        const int code = read_code(access_control);
+        Check(code == HKDFGUARD_ERR_KEK_INVALID && access_control,
+              what + ", as an access-control failure (code " + std::to_string(code) + ")");
+    };
+    // Refused for what the file or a folder is: KEK_INVALID, never reported
+    // as an access-control error.
     auto expect_invalid = [&](const std::string& what) {
-        const int code = CodeOf([&] { ReadTpmKeyFile(store, name, kService); });
-        Check(code == HKDFGUARD_ERR_KEK_INVALID, what + " (code " + std::to_string(code) + ")");
+        bool access_control = false;
+        const int code = read_code(access_control);
+        Check(code == HKDFGUARD_ERR_KEK_INVALID && !access_control,
+              what + ", not as an access-control failure (code " + std::to_string(code) + ")");
     };
     Guarded("5. tampering", [&] {
         std::wstring original;
         Check(fresh() && AddAce(file_path, L"(A;;FR;;;WD)", original), "test setup: give Everyone read access to the key file");
-        expect_invalid("a key file Everyone may read is refused");
+        expect_access_control("a key file Everyone may read is refused");
         SetDacl(file_path, original);
 
         Check(AddAce(file_path, std::wstring(L"(A;;FW;;;") + kOtherGroup + L")", original), "test setup: give another group write access");
-        expect_invalid("a key file another group may write is refused");
+        expect_access_control("a key file another group may write is refused");
         SetDacl(file_path, original);
 
         Check(AddAce(keys, std::wstring(L"(A;;0x2;;;") + kOtherGroup + L")", original), "test setup: let another group add files to the store");
-        expect_invalid("a store folder others may add files to is refused");
+        expect_access_control("a store folder others may add files to is refused");
         SetDacl(keys, original);
 
         Check(AddAce(parent, std::wstring(L"(A;;0x40;;;") + kOtherGroup + L")", original),
               "test setup: let another group delete entries in a folder above the store");
-        expect_invalid("a folder above the store that lets others delete entries is refused");
+        expect_access_control("a folder above the store that lets others delete entries is refused");
         SetDacl(parent, original);
         Check(CodeOf([&] { ReadTpmKeyFile(store, name, kService); }) == HKDFGUARD_OK,
               "with every ACL restored, the key file reads again");

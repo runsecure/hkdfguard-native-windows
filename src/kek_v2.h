@@ -92,7 +92,13 @@ namespace hkdfguard {
         enum class State {
             Absent,  // no KEK of this version on that provider
             Valid,   // present, passes every check; `fingerprint` is set
-            Invalid, // present, but fails a check; `problem` says which
+            Invalid, // present, but fails a check of the key itself; `problem` says which
+            // Present, and fails only on its access control - the owner or
+            // DACL of the TPM key file or a folder above it, or the software
+            // KEK's DACL (errors.h's KekAccessControlError). The key may be
+            // fine: the remedy is to fix the ACL, never to retire it.
+            // `problem` says which check.
+            AccessControlInvalid,
         };
         State state = State::Absent;
         uint8_t fingerprint[kFingerprintLen] = {};
@@ -105,6 +111,17 @@ namespace hkdfguard {
     // used for version 2, an I/O or provider error - throws, so a KEK that
     // merely can't be checked right now is never reported absent or corrupt.
     V2KekInspection InspectV2Kek(const std::wstring &service, uint8_t provider_type);
+
+    // Why the key at 0x81000001 can't be the storage root key every version
+    // 2 TPM KEK is created under and every session is salted to, or
+    // std::nullopt if it can: a SHA-256 restricted decryption key bound to
+    // this TPM (fixedTPM, fixedParent, sensitiveDataOrigin, userWithAuth,
+    // noDA, restricted, decrypt; not sign), whose children are protected
+    // with AES-128 or -256 in CFB mode, with no scheme, and either RSA (at
+    // least 2048 bits, modulus matching its size, exponent 65537) or
+    // NIST P-256. OpenUsableTpm refuses any other key as unusable for
+    // version 2.
+    std::optional<std::string> StorageRootKeyProblem(const tpm2::PublicArea &srk);
 
     // The name of the service's version 2 software KEK in the Microsoft
     // Software KSP.

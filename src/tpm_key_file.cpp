@@ -62,6 +62,13 @@ namespace hkdfguard {
             throw HkdfGuardError(HKDFGUARD_ERR_KEK_INVALID, what.c_str());
         }
 
+        // The owner or DACL of the key file, or of a folder of the store or
+        // above it, breaks the rules: still KEK_INVALID, but recoverable by
+        // fixing the ACL, so never "corrupt" (errors.h).
+        [[noreturn]] void AccessControlInvalid(const std::string &what) {
+            throw KekAccessControlError(what.c_str());
+        }
+
         // An I/O failure, with the Windows error that caused it.
         [[noreturn]] void IoFailure(const std::string &what, DWORD win32 = GetLastError()) {
             throw HkdfGuardError(HKDFGUARD_ERR_PROVIDER_ERROR, (what + " (Windows error " + std::to_string(win32) + ")").c_str());
@@ -125,23 +132,23 @@ namespace hkdfguard {
                 throw HkdfGuardError(HKDFGUARD_ERR_KEK_ACCESS_DENIED, (what + ": its security can't be read").c_str());
             }
             if (rc != ERROR_SUCCESS) {
-                Invalid(what + ": its security can't be read");
+                AccessControlInvalid(what + ": its security can't be read");
             }
             try {
                 const char *trusted = installer_ok ? "SYSTEM, Administrators, HkdfGuardAdmins or TrustedInstaller"
                                                    : "SYSTEM, Administrators or HkdfGuardAdmins";
                 if (owner == nullptr || !MayOwn(owner, installer_ok)) {
-                    Invalid(what + " is not owned by " + trusted);
+                    AccessControlInvalid(what + " is not owned by " + trusted);
                 }
                 // GetSecurityInfo reports a missing and a NULL DACL alike:
                 // unrestricted access either way.
                 if (dacl == nullptr) {
-                    Invalid(what + " has no DACL, so everyone has full access to it");
+                    AccessControlInvalid(what + " has no DACL, so everyone has full access to it");
                 }
                 for (DWORD i = 0; i < dacl->AceCount; ++i) {
                     void *ace = nullptr;
                     if (!GetAce(dacl, i, &ace)) {
-                        Invalid(what + ": GetAce failed");
+                        AccessControlInvalid(what + ": GetAce failed");
                     }
                     const ACE_HEADER *header = static_cast<const ACE_HEADER *>(ace);
                     if (header->AceFlags & INHERIT_ONLY_ACE) {
@@ -160,13 +167,13 @@ namespace hkdfguard {
                             const auto *allowed = static_cast<const ACCESS_ALLOWED_ACE *>(ace);
                             PSID sid = const_cast<DWORD *>(&allowed->SidStart);
                             if ((allowed->Mask & forbidden) != 0 && !MayWrite(sid, installer_ok)) {
-                                Invalid(what + " grants write, delete, ownership or create rights to an account other than " +
+                                AccessControlInvalid(what + " grants write, delete, ownership or create rights to an account other than " +
                                         trusted);
                             }
                             continue;
                         }
                         default:
-                            Invalid(what + " has an access-allowed ACE of an unexpected type");
+                            AccessControlInvalid(what + " has an access-allowed ACE of an unexpected type");
                     }
                 }
             } catch (...) {
@@ -461,6 +468,12 @@ namespace hkdfguard {
         PSECURITY_DESCRIPTOR sd = CheckObjectSecurity(file.get(), kFileWriteRights, false, "the TPM key file", &dacl);
         try {
             VerifyExistingKekDacl(dacl);
+        } catch (const HkdfGuardError &e) {
+            LocalFree(sd);
+            if (e.code() == HKDFGUARD_ERR_KEK_INVALID) {
+                AccessControlInvalid(std::string("the TPM key file: ") + e.what());
+            }
+            throw;
         } catch (...) {
             LocalFree(sd);
             throw;

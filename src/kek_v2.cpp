@@ -173,11 +173,8 @@ namespace hkdfguard {
             } catch (const tpm2::TpmError &e) {
                 Unusable("reading the storage root key (0x81000001)", e);
             }
-            const bool storage_key = (usable.srk.attributes & tpm2::kObjRestricted) && (usable.srk.attributes & tpm2::kObjDecrypt);
-            const bool supported = usable.srk.type == tpm2::kAlgRsa ||
-                                   (usable.srk.type == tpm2::kAlgEcc && usable.srk.ecc_curve == 0x0003);
-            if (!storage_key || usable.srk.name_alg != tpm2::kAlgSha256 || !supported) {
-                throw V2TpmUnusable("the key at 0x81000001 is not a SHA-256 RSA or P-256 storage root key");
+            if (const auto problem = StorageRootKeyProblem(usable.srk)) {
+                throw V2TpmUnusable("the key at 0x81000001 is not a storage root key this library can use: " + *problem);
             }
             RunTpmKnownAnswerTest(*usable.tpm, usable.srk);
             return usable;
@@ -335,8 +332,12 @@ namespace hkdfguard {
             try {
                 VerifyExistingKeyAcl(key);
             } catch (const HkdfGuardError &e) {
+                // An ACL this library would never make: refused, but as an
+                // access-control failure, which fixing the ACL repairs - not
+                // as a corrupt key to retire.
                 if (e.code() == HKDFGUARD_ERR_KEK_INVALID) {
-                    throw;
+                    throw KekAccessControlError(
+                        (std::string("the version 2 software KEK's ACL: ") + e.what()).c_str());
                 }
             }
         }
@@ -515,6 +516,53 @@ namespace hkdfguard {
         }
     } // namespace
 
+    std::optional<std::string> StorageRootKeyProblem(const tpm2::PublicArea &srk) {
+        // A storage parent bound to this TPM, usable with its empty
+        // authValue through a password session, exempt from lockout, and
+        // never a signing key.
+        constexpr uint32_t kRequired = tpm2::kObjFixedTpm | tpm2::kObjFixedParent | tpm2::kObjSensitiveDataOrigin |
+                                       tpm2::kObjUserWithAuth | tpm2::kObjNoDa | tpm2::kObjRestricted |
+                                       tpm2::kObjDecrypt;
+        if (srk.name_alg != tpm2::kAlgSha256) {
+            return "its nameAlg is not SHA-256";
+        }
+        if ((srk.attributes & kRequired) != kRequired) {
+            return "it lacks a storage root key attribute (fixedTPM, fixedParent, sensitiveDataOrigin, userWithAuth, "
+                   "noDA, restricted or decrypt); attributes " + Hex32(srk.attributes);
+        }
+        if (srk.attributes & tpm2::kObjSign) {
+            return "it is a signing key; attributes " + Hex32(srk.attributes);
+        }
+        // The inner protection of every child's private blob, the KEK's
+        // among them.
+        if (srk.symmetric_alg != tpm2::kAlgAes || srk.symmetric_mode != tpm2::kAlgCfb ||
+            (srk.symmetric_key_bits != 128 && srk.symmetric_key_bits != 256)) {
+            return "it does not protect its children with AES-128 or AES-256 in CFB mode";
+        }
+        // A restricted decryption key has no scheme of its own.
+        if (srk.scheme != tpm2::kAlgNull) {
+            return "it has a scheme, which a storage key never has";
+        }
+        if (srk.type == tpm2::kAlgRsa) {
+            if (srk.rsa_key_bits < 2048 || srk.rsa_key_bits % 8 != 0 ||
+                srk.rsa_modulus.size() != static_cast<size_t>(srk.rsa_key_bits / 8)) {
+                return "its RSA key is shorter than 2048 bits, or its modulus does not match its size";
+            }
+            if (srk.rsa_exponent != 0 && srk.rsa_exponent != 65537) {
+                return "its RSA public exponent is not 65537";
+            }
+            return std::nullopt;
+        }
+        if (srk.type == tpm2::kAlgEcc) {
+            constexpr uint16_t kEccNistP256 = 0x0003;
+            if (srk.ecc_curve != kEccNistP256 || srk.ecc_kdf != tpm2::kAlgNull) {
+                return "its ECC key is not a NIST P-256 key without a KDF";
+            }
+            return std::nullopt;
+        }
+        return "it is neither an RSA nor an ECC key";
+    }
+
     std::wstring V2SoftwareKeyName(const std::wstring &service, uint32_t key_id) {
         return L"hkdfguardwin_" + service + L"_v" + std::to_wstring(key_id) + L"_aes";
     }
@@ -657,6 +705,13 @@ namespace hkdfguard {
             result.problem = e.what();
             return result;
         };
+        // Checked before `invalid`: an ACL failure is also KEK_INVALID, but
+        // must never be reported as a corrupt key (errors.h).
+        auto access_control_invalid = [&](const KekAccessControlError &e) {
+            result.state = V2KekInspection::State::AccessControlInvalid;
+            result.problem = e.what();
+            return result;
+        };
 
         if (provider_type == kProviderTypeTpm) {
             // The key file decides presence. Absent is definite; a file that
@@ -665,6 +720,8 @@ namespace hkdfguard {
             TpmKeyFile file;
             try {
                 file = ReadTpmKeyFile(Store(), TpmKeyFileName(service, kCurrentKeyId), Narrow(service));
+            } catch (const KekAccessControlError &e) {
+                return access_control_invalid(e);
             } catch (const HkdfGuardError &e) {
                 if (e.code() == HKDFGUARD_ERR_KEK_NOT_FOUND) {
                     return result;
@@ -714,6 +771,8 @@ namespace hkdfguard {
             }
             try {
                 VerifySoftwareKey(key.get());
+            } catch (const KekAccessControlError &e) {
+                return access_control_invalid(e);
             } catch (const HkdfGuardError &e) {
                 if (e.code() == HKDFGUARD_ERR_KEK_INVALID) {
                     return invalid(e);

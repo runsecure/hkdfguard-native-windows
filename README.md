@@ -429,7 +429,10 @@ away from other processes.
     checks, so has no fingerprint - for version 1, a key that is not a P-256 ECDH key;
     for version 2, a TPM key file or AES key that fails them (a key file pinned to a
     storage root key the TPM no longer has, after a TPM clear, among others). A key that
-    merely couldn't be checked is never treated as corrupt.
+    merely couldn't be checked is never treated as corrupt, and neither is a version 2 key
+    whose only fault is its access list (the owner or DACL of the key file, its folders or
+    the AES key): `status` reports that as `access list invalid`, and the fix is to restore
+    the ACL, not to retire the key.
 
   It retires the KEK of this host's payload version; `--version 1|2` picks the other's.
   A service can have a key on both the TPM and the software provider. Then `retire`

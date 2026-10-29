@@ -259,7 +259,8 @@ namespace {
             L"           needs an elevated prompt. Everything wrapped under that KEK becomes\n"
             L"           permanently unrecoverable: migrate to a new service name first. With\n"
             L"           --corrupt instead, deletes the key only if it fails its KEK checks (version\n"
-            L"           1: not a P-256 ECDH key; version 2: a key file or AES key that fails them).\n"
+            L"           1: not a P-256 ECDH key; version 2: a key file or AES key that fails them,\n"
+            L"           but never one whose only fault is its access list - fix that instead).\n"
             L"           --provider picks the key when both providers hold one; --version picks\n"
             L"           the payload version's KEK, by default this host's.\n"
             L"status     reports the payload version, whether the service has a KEK, which provider\n"
@@ -2579,10 +2580,23 @@ namespace {
         return k.inspection.state == hkdfguard::V2KekInspection::State::Valid;
     }
 
+    // Fails only on its access control (owner or DACL): not corrupt, and
+    // never retired as such - fixing the ACL is the remedy.
+    bool IsAccessControlInvalidV2(const FoundV2Kek &k) {
+        return k.inspection.state == hkdfguard::V2KekInspection::State::AccessControlInvalid;
+    }
+
     std::string DescribeFoundV2(const FoundV2Kek &k) {
-        return std::string(ProviderFlag(k.provider)) + ": " +
-               (IsValidV2(k) ? "fingerprint " + HexString(k.inspection.fingerprint, kFingerprintLen)
-                             : "invalid (" + k.inspection.problem + ")");
+        std::string state;
+        if (IsValidV2(k)) {
+            state = "fingerprint " + HexString(k.inspection.fingerprint, kFingerprintLen);
+        } else if (IsAccessControlInvalidV2(k)) {
+            state = "access list invalid (" + k.inspection.problem +
+                    "); fix the access list, do not retire it - every DEK wrapped under it would be lost";
+        } else {
+            state = "invalid (" + k.inspection.problem + ")";
+        }
+        return std::string(ProviderFlag(k.provider)) + ": " + state;
     }
 
     // MARK: - Security model
@@ -2692,9 +2706,21 @@ namespace {
         if (rc == HKDFGUARD_ERR_KEK_INVALID) {
             // A key file (or AES key) under the name that fails its checks:
             // the library won't even say whether a KEK exists. Show what is
-            // there - as version 1's status does for a corrupt key.
-            Printf(stdout, "kek: corrupt (%s; see retire --corrupt)\n", DescribeStatus(rc).c_str());
-            for (const FoundV2Kek &k : FindV2Keks(service)) {
+            // there - as version 1's status does for a corrupt key - but a
+            // key whose only fault is its access list is not corrupt, and
+            // its remedy is the opposite one.
+            const std::vector<FoundV2Kek> found = FindV2Keks(service);
+            const bool any_corrupt = std::any_of(found.begin(), found.end(), [](const FoundV2Kek &k) {
+                return k.inspection.state == hkdfguard::V2KekInspection::State::Invalid;
+            });
+            const bool any_access = std::any_of(found.begin(), found.end(), IsAccessControlInvalidV2);
+            if (any_access && !any_corrupt) {
+                Printf(stdout, "kek: access list invalid (%s; fix the key's access list - do not retire it)\n",
+                        DescribeStatus(rc).c_str());
+            } else {
+                Printf(stdout, "kek: corrupt (%s; see retire --corrupt)\n", DescribeStatus(rc).c_str());
+            }
+            for (const FoundV2Kek &k : found) {
                 Printf(stdout, "key under this name: %s\n", DescribeFoundV2(k).c_str());
             }
             return;
@@ -2820,6 +2846,18 @@ namespace {
             std::string("the payload version 2 KEK for service \"") + service + "\" on the " + V2ProviderLabel(provider);
         const Fingerprint target_fp = ToFingerprint(target.inspection.fingerprint);
 
+        // A key whose only fault is its access list is never deleted: its
+        // material may be intact, and deleting it would destroy every DEK
+        // wrapped under it. Fixing the ACL is the remedy; once fixed, it has
+        // a fingerprint again and can be retired with --fingerprint if that
+        // is really wanted.
+        if (IsAccessControlInvalidV2(target)) {
+            throw CliError(
+                where + " fails only its access-list checks (" + target.inspection.problem +
+                "), which is not corruption; nothing was deleted. Restore its access list (SYSTEM, Administrators "
+                "and HkdfGuardAdmins full control, the key-use groups read, nothing else; for a TPM key file, its "
+                "folders as provision created them), then run `" + kProgramNameNarrow + " status` again");
+        }
         if (args.fingerprint) {
             if (!IsValidV2(target)) {
                 throw CliError(

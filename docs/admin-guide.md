@@ -393,7 +393,8 @@ To see a service's KEK, run `status` from any account that can use the key:
 ```
 
 It prints the payload version this machine uses (see [ClassicalMode](#classicalmode)), and
-whether the KEK of that version is `present`, `absent`, `corrupt` or `unusable`. It also
+whether the KEK of that version is `present`, `absent`, `corrupt`, `unusable`, or, for a
+version 2 KEK, `access list invalid`. It also
 prints which key store holds the KEK (TPM or software) and its fingerprint. It also lists
 any other key under the service's name: in the key store the `KeyStoragePolicy` doesn't
 select, or of the other payload version. It never changes anything. It exits `0` when it
@@ -418,6 +419,14 @@ one: the library has no delete function.
   key file or AES key that fails its checks - including a key file whose TPM was cleared,
   so its storage root key is gone. `--corrupt` refuses a valid KEK, and refuses any key it
   couldn't check.
+- If a version 2 KEK fails only because of its access list - someone widened the ACL on
+  the TPM key file, on its folders, or on the AES key - `status` reports `access list
+  invalid`, not `corrupt`. The key itself may be fine, so `retire --corrupt` refuses it:
+  deleting it would destroy every DEK wrapped under it for a problem you can fix. Restore
+  the access list instead (SYSTEM, Administrators and `HkdfGuardAdmins` full control, the
+  key-use groups read, nothing else) and run `status` again. Remember that anyone who could
+  read a TPM key file while its access list was wide may have kept a copy; see
+  [ClassicalMode](#classicalmode).
 - If the service has a key in both the TPM and the software key store, `retire` won't
   choose between them. Run `status`, then add `--provider tpm` or `--provider software`.
 - `retire` acts on the KEK of this machine's payload version. Add `--version 1` or
@@ -692,6 +701,7 @@ was attempted) and `1` for an operational failure. On failure it prints an `erro
 | `payload version 2 is unavailable on this host` | The TPM can't be used for version 2 and the `KeyStoragePolicy` (or an existing version 2 TPM key file) rules out the software key store. Event 2008 names the reason. | Fix what event 2008 names (for a blocked command, the Group Policy list of blocked TPM commands). Or set `KeyStoragePolicy` to allow the software key store, or set [ClassicalMode](#classicalmode) to `1` before provisioning. |
 | `not the payload version this host uses` | The key file was wrapped while `ClassicalMode` had the other value. | Set `ClassicalMode` back to what it was when the file was wrapped, or provision this version's KEK and wrap the DEK again. |
 | `kek: corrupt` from `status`, for a TPM KEK | Often a TPM that was cleared since provisioning: the key file is pinned to a storage root key that no longer exists. | Everything wrapped under it is unrecoverable. Retire it with `--corrupt`, provision again and wrap new DEKs. |
+| `kek: access list invalid` from `status` | The ACL on a version 2 KEK, or on the `HkdfGuard\TpmKeys` folders, grants someone it shouldn't: write, ownership, or read for an over-broad group such as Users or Everyone. Group Policy file-permission settings and manual `icacls` changes are the usual causes. | Restore the access list; do not retire the key. If the over-broad grant was read access on a TPM key file, decide whether to treat the KEK as exposed (see [ClassicalMode](#classicalmode)). |
 | `a KeyUseGroups or DeployerGroups policy entry is ...` | An entry in either value is invalid, or a deployer group's members couldn't be read. | Fix the entry. See [KeyUseGroups](#keyusegroups) and [DeployerGroups](#deployergroups). |
 | `service name is missing or malformed` | The name uses characters other than ASCII letters, digits and `.`, starts with `.`, contains `..`, or is longer than 128. | Use a valid name. |
 
