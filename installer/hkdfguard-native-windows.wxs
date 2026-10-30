@@ -16,8 +16,6 @@
       production security model) if they don't already exist.
     - Registers the "hkdfguard-native-windows" Application event log source,
       using the DLL's own message table.
-    - Creates %ProgramData%\HkdfGuard\TpmKeys, the payload version 2 TPM key
-      store, with its access list (hkdfguard.exe prepare-store).
 
   Security properties this layout is relied on for:
     - The install folder lives under Program Files and inherits its ACL:
@@ -161,43 +159,9 @@
         Impersonate="no"
         Return="check" />
 
-    <!--
-      Create the payload version 2 TPM key store's folders,
-      %ProgramData%\HkdfGuard\TpmKeys, with their access list (tpm_key_file.h),
-      before any user can. C:\ProgramData lets every user create folders, so
-      a user who created HkdfGuard first would block every later provisioning
-      (the library refuses a store folder it didn't make, and fails closed).
-
-      Done by the installed CLI's prepare-store, not by a CreateFolder or
-      PermissionEx element: Windows Installer follows a junction a user
-      planted in the folder's place and, running as SYSTEM, would replace
-      the access list of whatever it points at. prepare-store walks the path
-      by handle, never follows a link, and creates or checks each folder
-      exactly as provisioning does. Return="check": a folder someone else put
-      there fails the install, with the reason in the MSI log - the signal
-      to investigate, rather than an install that works until the first
-      provision. Idempotent, so repairs and upgrades run it again harmlessly.
-      Not undone on uninstall: the folders hold KEKs (see the header comment).
-    -->
-    <SetProperty
-        Id="PrepareTpmKeyStore"
-        Value="&quot;[#HkdfGuardCliFile]&quot; prepare-store"
-        Before="PrepareTpmKeyStore"
-        Sequence="execute"
-        Condition="NOT REMOVE" />
-
-    <CustomAction
-        Id="PrepareTpmKeyStore"
-        BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"
-        DllEntry="WixQuietExec"
-        Execute="deferred"
-        Impersonate="no"
-        Return="check" />
-
     <InstallExecuteSequence>
       <Custom Action="CreateHkdfGuardUsersGroup" After="InstallFiles" Condition="NOT REMOVE" />
       <Custom Action="CreateHkdfGuardDeployersGroup" After="CreateHkdfGuardUsersGroup" Condition="NOT REMOVE" />
-      <Custom Action="PrepareTpmKeyStore" After="CreateHkdfGuardDeployersGroup" Condition="NOT REMOVE" />
     </InstallExecuteSequence>
 
   </Package>
