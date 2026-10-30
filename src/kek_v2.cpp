@@ -1,53 +1,46 @@
 #include "kek_v2.h"
-#include "aes_cmac.h"
 #include "errors.h"
 #include "event_log.h"     // LogKekCreated, LogVersion2Unavailable
 #include "handle_traits.h" // ScopedNCryptProv, ScopedNCryptKey
 #include "key_acl.h"       // ApplyKeyAcl, ValidateKeyUseGroups, VerifyExistingKeyAcl, VerifyKeyAcl
 #include "policy.h"        // LoadEffectivePolicy, LoadKeyUseGroupsPolicy, LoadDeployerGroupsPolicy
 #include "sp800_108.h"
-#include "tpm2_device.h"
 
 #include <windows.h>
+#include <bcrypt.h>
 #include <ncrypt.h>
 
 #include <atomic>
 #include <cstdio>  // snprintf
-#include <cstring> // memcpy, memcmp
+#include <cstring> // memcmp, strlen
+
+#ifndef TBS_E_TPM_NOT_FOUND
+#define TBS_E_TPM_NOT_FOUND ((SECURITY_STATUS)0x8028400FL)
+#endif
 
 namespace hkdfguard {
     namespace {
-        // Windows' storage root key, the parent of every version 2 TPM KEK.
-        constexpr uint32_t kStorageRootKey = 0x81000001;
-
-        // The known-answer test: the Linux library's own vector
-        // (hkdfguard-native-linux, src/crypto.rs, known_answer) - a KEK of 32
-        // bytes of 0x2a, whose fingerprint (HMAC-SHA-256 over the
-        // fingerprint block) is this.
-        constexpr uint8_t kKatKeyByte = 0x2a;
-        constexpr uint8_t kKatFingerprint[kFingerprintLen] = {
-            0x59, 0xaa, 0x2a, 0xc5, 0x50, 0xf7, 0xc4, 0x0e, 0xa3, 0xd5, 0x2b, 0x6c, 0x56, 0x72, 0x0f, 0xa8,
-            0xc6, 0x2b, 0x4c, 0x2e, 0x78, 0xbe, 0x0e, 0xf6, 0x4b, 0x77, 0xdc, 0x40, 0xeb, 0x01, 0x14, 0x5b};
-
-        // Once a test passes in this process it isn't repeated; a failure
-        // is retried on the next call, so a TPM that was briefly busy isn't
-        // written off for the life of the process.
-        std::atomic<bool> g_tpm_known_answer_passed{false};
-        std::atomic<bool> g_cmac_known_answer_passed{false};
+        // Once the software KSP's derivation has passed its check in this
+        // process it isn't repeated; a failure is retried on the next call.
+        std::atomic<bool> g_kdf_known_answer_passed{false};
 
 #if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
-        std::optional<TpmKeyStore> g_test_tpm_store;
         std::optional<std::string> g_test_tpm_unusable;
 #endif
 
-        // The TPM can't be used for version 2 at all, for `reason`. The one
-        // failure PreferTpm answers by falling back to the software KSP, as
-        // version 1's TpmUnusableError is - and never while a TPM key file
-        // exists. Its code is HKDFGUARD_ERR_PROVIDER_UNAVAILABLE.
+        constexpr size_t kPrfLen = 32; // one HMAC-SHA-256 output
+
+        // The TPM can't be used for version 2 at all, for `reason`: the
+        // Platform Crypto Provider can't be opened, reports no TPM device, or
+        // can't create the KEK (with nothing left behind). The one failure
+        // PreferTpm answers by falling back to the software KSP, as version
+        // 1's TpmUnusableError is. Its code is
+        // HKDFGUARD_ERR_PROVIDER_UNAVAILABLE.
         class V2TpmUnusable : public HkdfGuardError {
         public:
             explicit V2TpmUnusable(const std::string &reason)
-                : HkdfGuardError(HKDFGUARD_ERR_PROVIDER_UNAVAILABLE, "the TPM can't be used for version 2"),
+                : HkdfGuardError(HKDFGUARD_ERR_PROVIDER_UNAVAILABLE,
+                                 ("the TPM can't be used for version 2: " + reason).c_str()),
                   reason_(reason) {}
             const std::string &reason() const { return reason_; }
 
@@ -59,39 +52,6 @@ namespace hkdfguard {
             char buf[16];
             std::snprintf(buf, sizeof buf, "0x%08X", static_cast<unsigned>(v));
             return buf;
-        }
-
-        // A TpmError while proving the TPM usable becomes V2TpmUnusable; a
-        // blocked command is named as such, since its fix (Group Policy) is
-        // specific.
-        [[noreturn]] void Unusable(const std::string &step, const tpm2::TpmError &e) {
-            if (e.tpm_code() == tpm2::kRcCommandBlocked) {
-                throw V2TpmUnusable(step + ": TBS blocks a TPM command this needs (TPM_E_COMMAND_BLOCKED); check the "
-                                           "Group Policy list of blocked TPM commands");
-            }
-            throw V2TpmUnusable(step + " failed (TPM/TBS code " + Hex32(e.tpm_code()) + ")");
-        }
-
-        // The ASCII form of a normalized service name (letters, digits and
-        // '.', as hkdfguard.cpp's NormalizeService guarantees).
-        std::string Narrow(const std::wstring &service) {
-            std::string out;
-            for (wchar_t c : service) {
-                if (c > 0x7F) {
-                    throw HkdfGuardError(HKDFGUARD_ERR_INTERNAL_ERROR, "service name is not normalized");
-                }
-                out += static_cast<char>(c);
-            }
-            return out;
-        }
-
-        TpmKeyStore Store() {
-#if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
-            if (g_test_tpm_store) {
-                return *g_test_tpm_store;
-            }
-#endif
-            return DefaultTpmKeyStore();
         }
 
         std::vector<std::wstring> AclGroups() {
@@ -113,403 +73,418 @@ namespace hkdfguard {
             return policy;
         }
 
-        // ---- The TPM ----
+        // ---- The two providers ----
 
-        // A TBS connection, the storage root key's public area, and proof
-        // (the known-answer test) that the TPM's HMAC is HMAC-SHA-256.
-        struct UsableTpm {
-            std::unique_ptr<tpm2::Tpm> tpm;
-            tpm2::PublicArea srk;
-            Bytes srk_name;
-        };
+        bool IsTpm(uint8_t provider_type) { return provider_type == kProviderTypeTpm; }
 
-        void RunTpmKnownAnswerTest(tpm2::Tpm &tpm, const tpm2::PublicArea &srk) {
-            if (g_tpm_known_answer_passed.load()) {
-                return;
-            }
-            // The Linux vector's KEK, loaded as an external object in the
-            // NULL hierarchy: unique = SHA-256(seed || key), which the TPM
-            // checks.
-            const Bytes key(32, kKatKeyByte);
-            const Bytes seed(32, 0x5E);
-            Bytes seeded = seed;
-            seeded.insert(seeded.end(), key.begin(), key.end());
-            Bytes unique(32);
-            tpm2::Sha256(seeded.data(), seeded.size(), unique.data());
-            SecureBuffer<32> out;
-            try {
-                const tpm2::LoadResult loaded = tpm.LoadExternal(
-                    tpm2::KeyedHashSensitive(seed, key),
-                    tpm2::KeyedHashPublicArea(tpm2::kObjUserWithAuth | tpm2::kObjNoDa | tpm2::kObjSign, tpm2::kAlgSha256, unique),
-                    tpm2::kRhNull);
-                tpm2::ScopedTpmObject kat_key(tpm, loaded.object_handle);
-                tpm2::ScopedSession session(tpm, tpm.StartSaltedSession(kStorageRootKey, srk));
-                tpm.Hmac(*session, kat_key.get(), loaded.name, FingerprintBlock(1), out, false);
-            } catch (const tpm2::TpmError &e) {
-                Unusable("the TPM's HMAC-SHA-256 known-answer test", e);
-            }
-            if (std::memcmp(out.data(), kKatFingerprint, kFingerprintLen) != 0) {
-                throw V2TpmUnusable("the TPM's HMAC-SHA-256 failed its known-answer test");
-            }
-            g_tpm_known_answer_passed.store(true);
+        const char *Label(uint8_t provider_type) { return IsTpm(provider_type) ? "TPM" : "software"; }
+
+        std::wstring KeyName(const std::wstring &service, uint8_t provider_type) {
+            return IsTpm(provider_type) ? V2TpmKeyName(service, kCurrentKeyId) : V2SoftwareKeyName(service, kCurrentKeyId);
         }
 
-        UsableTpm OpenUsableTpm() {
-#if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
-            if (g_test_tpm_unusable) {
-                throw V2TpmUnusable(*g_test_tpm_unusable);
-            }
-#endif
-            UsableTpm usable;
-            try {
-                usable.tpm = std::make_unique<tpm2::Tpm>();
-            } catch (const tpm2::TpmError &e) {
-                throw V2TpmUnusable("no TPM 2.0 is reachable through TBS (TBS result " + Hex32(e.tpm_code()) + ")");
-            }
-            try {
-                tpm2::ReadPublicResult srk = usable.tpm->ReadPublic(kStorageRootKey);
-                usable.srk = tpm2::ParsePublicArea(srk.public_area);
-                usable.srk_name = std::move(srk.name);
-            } catch (const tpm2::TpmError &e) {
-                Unusable("reading the storage root key (0x81000001)", e);
-            }
-            if (const auto problem = StorageRootKeyProblem(usable.srk)) {
-                throw V2TpmUnusable("the key at 0x81000001 is not a storage root key this library can use: " + *problem);
-            }
-            RunTpmKnownAnswerTest(*usable.tpm, usable.srk);
-            return usable;
-        }
-
-        // A version 2 TPM KEK, loaded under the storage root key it was
-        // created under. The session is started on first use and serves
-        // every PRF call of the operation (the fingerprint, then the
-        // wrapping key), then is flushed with the key.
-        class TpmV2Kek : public V2Kek {
-        public:
-            TpmV2Kek(UsableTpm usable, TpmKeyFile file)
-                : V2Kek(kProviderTypeTpm, kCurrentKeyId), tpm_(std::move(usable.tpm)), srk_(std::move(usable.srk)),
-                  file_(std::move(file)) {
-                // The key file pins the storage root key it was made under.
-                if (file_.parent_handle != kStorageRootKey || file_.parent_name != usable.srk_name) {
-                    throw HkdfGuardError(HKDFGUARD_ERR_KEK_INVALID,
-                                         "the storage root key has changed since this KEK was created");
-                }
-                const tpm2::LoadResult loaded = tpm_->Load(file_.parent_handle, file_.private_blob, file_.public_blob);
-                key_ = std::make_unique<tpm2::ScopedTpmObject>(*tpm_, loaded.object_handle);
-                key_name_ = loaded.name;
-            }
-
-            void Fingerprint(uint8_t out[kFingerprintLen]) override {
-                SecureBuffer<32> value;
-                Prf(FingerprintBlock(1), value);
-                std::memcpy(out, value.data(), kFingerprintLen);
-            }
-
-            void WrappingKey(const std::string &service, const uint8_t header[kHeaderLen], SecureBuffer<32> &out) override {
-                Prf(WrapBlock(1, service, header, kHeaderLen), out);
-            }
-
-        private:
-            void Prf(const Bytes &block, SecureBuffer<32> &out) {
-                if (!session_ || !(*session_)->usable()) {
-                    session_.reset();
-                    session_ = std::make_unique<tpm2::ScopedSession>(*tpm_, tpm_->StartSaltedSession(file_.parent_handle, srk_));
-                }
-                tpm_->Hmac(**session_, key_->get(), key_name_, block, out, true);
-            }
-
-            // Destroyed in reverse: the session, then the key, then TBS.
-            std::unique_ptr<tpm2::Tpm> tpm_;
-            tpm2::PublicArea srk_;
-            TpmKeyFile file_;
-            std::unique_ptr<tpm2::ScopedTpmObject> key_;
-            Bytes key_name_;
-            std::unique_ptr<tpm2::ScopedSession> session_;
-        };
-
-        std::unique_ptr<V2Kek> OpenTpmKek(const std::wstring &service) {
-            // The key file first: it says whether a TPM KEK exists at all,
-            // whatever state the TPM is in.
-            TpmKeyFile file = ReadTpmKeyFile(Store(), TpmKeyFileName(service, kCurrentKeyId), Narrow(service));
-            return std::make_unique<TpmV2Kek>(OpenUsableTpm(), std::move(file));
-        }
-
-        // Creates the TPM KEK if its key file doesn't exist; verifies it if
-        // it does. Returns whether it created one.
-        bool CreateTpmKek(const std::wstring &service, const std::vector<std::wstring> &groups) {
-            const TpmKeyStore store = Store();
-            const std::wstring file_name = TpmKeyFileName(service, kCurrentKeyId);
-            // An existing KEK - found now, or created concurrently below -
-            // must still work and must grant every group the current
-            // policy names, as version 1's existing KEK must (VerifyKeyAcl).
-            const auto verify_existing = [&] {
-                OpenTpmKek(service)->Fingerprint(std::vector<uint8_t>(kFingerprintLen).data());
-                VerifyTpmKeyFileGrants(store, file_name, groups);
-            };
-            if (TpmKeyFileExists(store, file_name, Narrow(service))) {
-                verify_existing();
-                return false;
-            }
-
-            UsableTpm usable = OpenUsableTpm();
-            tpm2::CreateResult created;
-            try {
-                created = usable.tpm->Create(kStorageRootKey, TpmKekTemplate());
-            } catch (const tpm2::TpmError &e) {
-                Unusable("creating the KEK under the storage root key", e);
-            }
-            TpmKeyFile file;
-            file.service = Narrow(service);
-            file.parent_handle = kStorageRootKey;
-            file.parent_name = usable.srk_name;
-            file.public_blob = std::move(created.public_blob);
-            file.private_blob = std::move(created.private_blob);
-
-            if (!WriteTpmKeyFile(store, file_name, file, groups)) {
-                // Created concurrently by another provisioning run: that
-                // file is the KEK, and is verified like any existing one.
-                verify_existing();
-                return false;
-            }
-            // Used once through the full open path before it counts; a KEK
-            // that can't be is removed, not left for a later wrap to find.
-            try {
-                uint8_t fingerprint[kFingerprintLen];
-                OpenTpmKek(service)->Fingerprint(fingerprint);
-                VerifyTpmKeyFileGrants(store, file_name, groups);
-            } catch (...) {
-                DeleteTpmKeyFile(store, file_name);
-                throw;
-            }
-            return true;
-        }
-
-        // ---- The software KSP ----
-
-        // As version 1's ThrowForNCryptFailure, for the software KSP.
-        [[noreturn]] void ThrowForNCryptFailure(SECURITY_STATUS status, const char *message) {
+        // As version 1's ThrowForNCryptFailure: "absent", "not allowed" and
+        // "no TPM device" kept apart from a provider malfunction.
+        [[noreturn]] void ThrowForNCryptFailure(SECURITY_STATUS status, uint8_t provider_type, const char *message) {
             if (status == NTE_BAD_KEYSET) {
-                throw HkdfGuardError(HKDFGUARD_ERR_KEK_NOT_FOUND, "no version 2 software KEK is provisioned for this service");
+                throw HkdfGuardError(HKDFGUARD_ERR_KEK_NOT_FOUND, (std::string("no version 2 ") + Label(provider_type) +
+                                                                   " KEK is provisioned for this service").c_str());
             }
             if (status == NTE_PERM || status == static_cast<SECURITY_STATUS>(ERROR_ACCESS_DENIED)) {
-                throw HkdfGuardError(HKDFGUARD_ERR_KEK_ACCESS_DENIED, "access to the version 2 software KEK was denied");
+                throw HkdfGuardError(HKDFGUARD_ERR_KEK_ACCESS_DENIED,
+                                     (std::string("access to the version 2 ") + Label(provider_type) + " KEK was denied").c_str());
             }
-            throw HkdfGuardError(HKDFGUARD_ERR_PROVIDER_ERROR, message);
+            // No TPM device at all proves no TPM KEK can be in use. A TPM
+            // that is merely busy, locked out or not ready is deliberately not
+            // here: a TPM KEK may well exist behind it.
+            if (IsTpm(provider_type) && (status == TBS_E_TPM_NOT_FOUND || status == NTE_DEVICE_NOT_FOUND)) {
+                throw V2TpmUnusable("no TPM device is present");
+            }
+            throw HkdfGuardError(HKDFGUARD_ERR_PROVIDER_ERROR, (std::string(message) + " (" + Hex32(status) + ")").c_str());
         }
 
-        void OpenProvider(ScopedNCryptProv &provider) {
+        void OpenProvider(uint8_t provider_type, ScopedNCryptProv &provider) {
+            if (IsTpm(provider_type)) {
+#if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
+                if (g_test_tpm_unusable) {
+                    throw V2TpmUnusable(*g_test_tpm_unusable);
+                }
+#endif
+                const SECURITY_STATUS status = NCryptOpenStorageProvider(provider.put(), MS_PLATFORM_CRYPTO_PROVIDER, 0);
+                if (status != ERROR_SUCCESS) {
+                    throw V2TpmUnusable("the Platform Crypto Provider can't be opened (" + Hex32(status) + ")");
+                }
+                return;
+            }
             if (NCryptOpenStorageProvider(provider.put(), MS_KEY_STORAGE_PROVIDER, 0) != ERROR_SUCCESS) {
                 throw HkdfGuardError(HKDFGUARD_ERR_PROVIDER_ERROR, "NCryptOpenStorageProvider failed");
             }
         }
 
-        // NCRYPT_MACHINE_KEY_FLAG: a machine key, as version 1's; silent, so
-        // a key that would prompt fails instead.
-        SECURITY_STATUS OpenSoftwareKey(NCRYPT_PROV_HANDLE provider, const std::wstring &name, ScopedNCryptKey &key) {
+        // NCRYPT_MACHINE_KEY_FLAG: a machine key, as version 1's, so any
+        // account the ACL admits finds it; NCRYPT_SILENT_FLAG, so a key that
+        // would prompt fails instead.
+        SECURITY_STATUS OpenKey(NCRYPT_PROV_HANDLE provider, const std::wstring &name, ScopedNCryptKey &key) {
             return NCryptOpenKey(provider, key.put(), name.c_str(), 0, NCRYPT_MACHINE_KEY_FLAG | NCRYPT_SILENT_FLAG);
         }
 
-        DWORD DwordProperty(NCRYPT_KEY_HANDLE key, LPCWSTR property) {
+        // Reads a DWORD property; std::nullopt if the provider doesn't
+        // report it (NTE_NOT_SUPPORTED, NTE_NOT_FOUND).
+        std::optional<DWORD> DwordProperty(NCRYPT_HANDLE object, LPCWSTR property) {
             DWORD value = 0;
             DWORD got = 0;
-            if (NCryptGetProperty(key, property, reinterpret_cast<PBYTE>(&value), sizeof(value), &got, 0) != ERROR_SUCCESS ||
-                got != sizeof(value)) {
-                throw HkdfGuardError(HKDFGUARD_ERR_PROVIDER_ERROR, "reading a version 2 software KEK property failed");
+            const SECURITY_STATUS status =
+                NCryptGetProperty(object, property, reinterpret_cast<PBYTE>(&value), sizeof(value), &got, 0);
+            if (status == NTE_NOT_SUPPORTED || status == NTE_NOT_FOUND) {
+                return std::nullopt;
+            }
+            if (status != ERROR_SUCCESS || got != sizeof(value)) {
+                throw HkdfGuardError(HKDFGUARD_ERR_PROVIDER_ERROR, "reading a version 2 KEK property failed");
             }
             return value;
         }
 
-        // What every version 2 software KEK is: AES, 256 bits, never
-        // exportable; and an ACL this library would have made, when this
-        // caller may read it (as version 1's VerifyAclIfReadable).
-        void VerifySoftwareKey(NCRYPT_KEY_HANDLE key) {
-            wchar_t group[32] = {};
+        // What every version 2 KEK is, checked on every open. A violation is
+        // HKDFGUARD_ERR_KEK_INVALID: the key isn't one this library makes.
+        //
+        //   - Its algorithm. The software KSP reports SP800_108_CTR_HMAC (and
+        //     the group KEY_DERIVATION); the PCP reports HMAC-SHA256 and no
+        //     algorithm group at all, so the name is what's checked on both.
+        //   - On the TPM, the PCP's signature key usage, without which the
+        //     PCP won't compute an HMAC with it; and hardware backing, from
+        //     the provider handle when the key won't say (as version 1's
+        //     VerifyHardwareBacked).
+        //   - Never exportable.
+        //   - An ACL this library would have made, when this caller may read
+        //     it (as version 1's VerifyAclIfReadable). A violation is a
+        //     KekAccessControlError: fixing the ACL repairs it, not retiring
+        //     the key.
+        //
+        // The key length can't be checked: both providers report
+        // NCRYPT_LENGTH_PROPERTY as 0 for these keys. The software KEK is
+        // created with a 256-bit length, which CheckSoftwareKdfImplementation
+        // shows gives a 32-byte key; the PCP chooses its HMAC key's size.
+        void VerifyKey(NCRYPT_KEY_HANDLE key, NCRYPT_PROV_HANDLE provider, uint8_t provider_type) {
+            const std::string what = std::string("the version 2 ") + Label(provider_type) + " KEK";
+            wchar_t algorithm[64] = {};
             DWORD got = 0;
-            if (NCryptGetProperty(key, NCRYPT_ALGORITHM_GROUP_PROPERTY, reinterpret_cast<PBYTE>(group),
-                                  sizeof(group) - sizeof(wchar_t), &got, 0) != ERROR_SUCCESS) {
-                throw HkdfGuardError(HKDFGUARD_ERR_PROVIDER_ERROR, "reading the version 2 software KEK's algorithm failed");
+            if (NCryptGetProperty(key, NCRYPT_ALGORITHM_PROPERTY, reinterpret_cast<PBYTE>(algorithm),
+                                  sizeof(algorithm) - sizeof(wchar_t), &got, 0) != ERROR_SUCCESS) {
+                throw HkdfGuardError(HKDFGUARD_ERR_PROVIDER_ERROR, ("reading " + what + "'s algorithm failed").c_str());
             }
-            if (wcscmp(group, NCRYPT_AES_ALGORITHM_GROUP) != 0 || DwordProperty(key, NCRYPT_LENGTH_PROPERTY) != 256) {
-                throw HkdfGuardError(HKDFGUARD_ERR_KEK_INVALID, "the version 2 software KEK is not an AES-256 key");
+            const wchar_t *expected = IsTpm(provider_type) ? NCRYPT_HMAC_SHA256_ALGORITHM : NCRYPT_SP800108_CTR_HMAC_ALGORITHM;
+            if (wcscmp(algorithm, expected) != 0) {
+                throw HkdfGuardError(HKDFGUARD_ERR_KEK_INVALID,
+                                     (what + (IsTpm(provider_type) ? " is not an HMAC-SHA-256 key"
+                                                                   : " is not an SP 800-108 HMAC key")).c_str());
             }
+
+            if (IsTpm(provider_type)) {
+                const std::optional<DWORD> usage = DwordProperty(key, NCRYPT_PCP_KEY_USAGE_POLICY_PROPERTY);
+                if (!usage || (*usage & NCRYPT_PCP_SIGNATURE_KEY) == 0) {
+                    throw HkdfGuardError(HKDFGUARD_ERR_KEK_INVALID, (what + " lacks the PCP's signature key usage").c_str());
+                }
+                std::optional<DWORD> impl = DwordProperty(key, NCRYPT_IMPL_TYPE_PROPERTY);
+                if (!impl) {
+                    impl = DwordProperty(provider, NCRYPT_IMPL_TYPE_PROPERTY);
+                }
+                if (!impl || (*impl & NCRYPT_IMPL_HARDWARE_FLAG) == 0) {
+                    throw HkdfGuardError(HKDFGUARD_ERR_KEK_INVALID, (what + " is not hardware backed").c_str());
+                }
+            }
+
             constexpr DWORD kExportable = NCRYPT_ALLOW_EXPORT_FLAG | NCRYPT_ALLOW_PLAINTEXT_EXPORT_FLAG |
                                           NCRYPT_ALLOW_ARCHIVING_FLAG | NCRYPT_ALLOW_PLAINTEXT_ARCHIVING_FLAG;
-            if ((DwordProperty(key, NCRYPT_EXPORT_POLICY_PROPERTY) & kExportable) != 0) {
-                throw HkdfGuardError(HKDFGUARD_ERR_KEK_INVALID, "the version 2 software KEK is exportable");
+            const std::optional<DWORD> export_policy = DwordProperty(key, NCRYPT_EXPORT_POLICY_PROPERTY);
+            if (!export_policy) {
+                throw HkdfGuardError(HKDFGUARD_ERR_PROVIDER_ERROR, ("reading " + what + "'s export policy failed").c_str());
             }
+            if ((*export_policy & kExportable) != 0) {
+                throw HkdfGuardError(HKDFGUARD_ERR_KEK_INVALID, (what + " is exportable").c_str());
+            }
+
             try {
                 VerifyExistingKeyAcl(key);
             } catch (const HkdfGuardError &e) {
-                // An ACL this library would never make: refused, but as an
-                // access-control failure, which fixing the ACL repairs - not
-                // as a corrupt key to retire.
                 if (e.code() == HKDFGUARD_ERR_KEK_INVALID) {
-                    throw KekAccessControlError(
-                        (std::string("the version 2 software KEK's ACL: ") + e.what()).c_str());
+                    throw KekAccessControlError((what + "'s ACL: " + e.what()).c_str());
                 }
             }
         }
 
-        // A version 2 software KEK: two handles to the same key, one in ECB
-        // mode for single blocks and one in CBC mode - the chaining mode is
-        // a property of the handle only, never saved to the key.
-        class SoftwareV2Kek : public V2Kek {
+        // The software KSP's SP 800-108 derivation: one 32-byte output for
+        // `label` and `context` (none for the fingerprint, which the KSP
+        // frames exactly as an empty one). The KSP builds the block
+        // sp800_108.h describes and returns HMAC-SHA-256 of it under the key.
+        void KspDerive(NCRYPT_KEY_HANDLE key, const char *label, const std::vector<uint8_t> &context, uint8_t out[kPrfLen]) {
+            BCryptBuffer buffers[3] = {};
+            ULONG count = 0;
+            buffers[count++] = {static_cast<ULONG>(std::strlen(label)), KDF_LABEL, const_cast<char *>(label)};
+            if (!context.empty()) {
+                buffers[count++] = {static_cast<ULONG>(context.size()), KDF_CONTEXT, const_cast<uint8_t *>(context.data())};
+            }
+            buffers[count++] = {static_cast<ULONG>(sizeof(BCRYPT_SHA256_ALGORITHM)), KDF_HASH_ALGORITHM,
+                                const_cast<wchar_t *>(BCRYPT_SHA256_ALGORITHM)};
+            BCryptBufferDesc parameters = {BCRYPTBUFFER_VERSION, count, buffers};
+            DWORD got = 0;
+            const SECURITY_STATUS status =
+                NCryptKeyDerivation(key, &parameters, out, static_cast<DWORD>(kPrfLen), &got, NCRYPT_SILENT_FLAG);
+            if (status == NTE_PERM || status == static_cast<SECURITY_STATUS>(ERROR_ACCESS_DENIED)) {
+                ThrowForNCryptFailure(status, kProviderTypeSoftware, "NCryptKeyDerivation failed");
+            }
+            if (status != ERROR_SUCCESS || got != kPrfLen) {
+                SecureZeroMemory(out, kPrfLen);
+                throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO_ERROR, "the software KEK's key derivation failed");
+            }
+        }
+
+        // A version 2 TPM KEK: NCryptSignHash with the PCP's HMAC key is
+        // HMAC-SHA-256 of its input, computed in the TPM. The input is at
+        // most 196 bytes (a 128-byte service name), well under the 1,024 the
+        // PCP accepts.
+        class TpmV2Kek : public V2Kek {
         public:
-            explicit SoftwareV2Kek(const std::wstring &service) : V2Kek(kProviderTypeSoftware, kCurrentKeyId) {
-                OpenProvider(provider_);
-                const std::wstring name = V2SoftwareKeyName(service, kCurrentKeyId);
-                SECURITY_STATUS status = OpenSoftwareKey(provider_.get(), name, ecb_);
+            explicit TpmV2Kek(const std::wstring &service) : V2Kek(kProviderTypeTpm, kCurrentKeyId) {
+                OpenProvider(kProviderTypeTpm, provider_);
+                const SECURITY_STATUS status = OpenKey(provider_.get(), KeyName(service, kProviderTypeTpm), key_);
                 if (status != ERROR_SUCCESS) {
-                    ThrowForNCryptFailure(status, "NCryptOpenKey failed");
+                    ThrowForNCryptFailure(status, kProviderTypeTpm, "NCryptOpenKey failed");
                 }
-                VerifySoftwareKey(ecb_.get());
-                status = OpenSoftwareKey(provider_.get(), name, cbc_);
-                if (status != ERROR_SUCCESS) {
-                    ThrowForNCryptFailure(status, "NCryptOpenKey failed");
-                }
-                SetMode(ecb_.get(), BCRYPT_CHAIN_MODE_ECB);
-                SetMode(cbc_.get(), BCRYPT_CHAIN_MODE_CBC);
-                if (!g_cmac_known_answer_passed.load()) {
-                    CheckAesCmacImplementation();
-                    g_cmac_known_answer_passed.store(true);
-                }
-                aes_.encrypt_block = [this](const uint8_t *in, uint8_t *out) {
-                    DWORD got = 0;
-                    if (NCryptEncrypt(ecb_.get(), const_cast<PBYTE>(in), kAesBlockSize, nullptr, out, kAesBlockSize, &got,
-                                      NCRYPT_NO_PADDING_FLAG) != ERROR_SUCCESS || got != kAesBlockSize) {
-                        throw HkdfGuardError(HKDFGUARD_ERR_PROVIDER_ERROR, "AES block encryption with the software KEK failed");
-                    }
-                };
-                aes_.cbc_zero_iv = [this](const uint8_t *in, size_t len, uint8_t *out) {
-                    // The IV given on every call, so no chaining state
-                    // carries over from a previous one.
-                    uint8_t iv[kAesBlockSize] = {};
-                    NCRYPT_CIPHER_PADDING_INFO padding{};
-                    padding.cbSize = sizeof(padding);
-                    padding.dwFlags = NCRYPT_CIPHER_NO_PADDING_FLAG;
-                    padding.pbIV = iv;
-                    padding.cbIV = sizeof(iv);
-                    DWORD got = 0;
-                    if (NCryptEncrypt(cbc_.get(), const_cast<PBYTE>(in), static_cast<DWORD>(len), &padding, out,
-                                      static_cast<DWORD>(len), &got, NCRYPT_PAD_CIPHER_FLAG) != ERROR_SUCCESS ||
-                        got != len) {
-                        throw HkdfGuardError(HKDFGUARD_ERR_PROVIDER_ERROR, "AES-CBC with the software KEK failed");
-                    }
-                };
+                VerifyKey(key_.get(), provider_.get(), kProviderTypeTpm);
             }
 
             void Fingerprint(uint8_t out[kFingerprintLen]) override {
                 SecureBuffer<32> value;
-                Derive(FingerprintBlock(1), FingerprintBlock(2), value);
+                Prf(FingerprintBlock(1), value.data());
                 std::memcpy(out, value.data(), kFingerprintLen);
             }
 
             void WrappingKey(const std::string &service, const uint8_t header[kHeaderLen], SecureBuffer<32> &out) override {
-                Derive(WrapBlock(1, service, header, kHeaderLen), WrapBlock(2, service, header, kHeaderLen), out);
+                Prf(WrapBlock(1, service, header, kHeaderLen), out.data());
             }
 
         private:
-            static void SetMode(NCRYPT_KEY_HANDLE key, LPCWSTR mode) {
-                if (NCryptSetProperty(key, NCRYPT_CHAINING_MODE_PROPERTY, reinterpret_cast<PBYTE>(const_cast<LPWSTR>(mode)),
-                                      static_cast<DWORD>((wcslen(mode) + 1) * sizeof(wchar_t)), 0) != ERROR_SUCCESS) {
-                    throw HkdfGuardError(HKDFGUARD_ERR_PROVIDER_ERROR, "setting the software KEK handle's chaining mode failed");
+            // Exactly 32 bytes of output, always: given a shorter buffer the
+            // PCP reports success and 32 bytes without writing the result
+            // (observed on an AMD firmware TPM), so the size is never left
+            // to it.
+            void Prf(const std::vector<uint8_t> &block, uint8_t out[kPrfLen]) {
+                DWORD got = 0;
+                const SECURITY_STATUS status =
+                    NCryptSignHash(key_.get(), nullptr, const_cast<PBYTE>(block.data()), static_cast<DWORD>(block.size()),
+                                   out, static_cast<DWORD>(kPrfLen), &got, NCRYPT_SILENT_FLAG);
+                if (status == NTE_PERM || status == static_cast<SECURITY_STATUS>(ERROR_ACCESS_DENIED)) {
+                    ThrowForNCryptFailure(status, kProviderTypeTpm, "NCryptSignHash failed");
                 }
-            }
-
-            // Two CMAC blocks make the 256-bit output: counters 1 and 2.
-            void Derive(const std::vector<uint8_t> &first, const std::vector<uint8_t> &second, SecureBuffer<32> &out) {
-                AesCmac(aes_, first.data(), first.size(), out.data());
-                AesCmac(aes_, second.data(), second.size(), out.data() + kAesBlockSize);
+                if (status != ERROR_SUCCESS || got != kPrfLen) {
+                    SecureZeroMemory(out, kPrfLen);
+                    throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO_ERROR, ("the TPM's HMAC failed (" + Hex32(status) + ")").c_str());
+                }
             }
 
             ScopedNCryptProv provider_;
-            ScopedNCryptKey ecb_;
-            ScopedNCryptKey cbc_;
-            AesBlockOperations aes_;
+            ScopedNCryptKey key_;
         };
 
-        bool SoftwareKekExists(const std::wstring &service) {
+        // A version 2 software KEK: the KSP's SP800_108_CTR_HMAC key, used
+        // through NCryptKeyDerivation, so the key never leaves the KSP.
+        class SoftwareV2Kek : public V2Kek {
+        public:
+            explicit SoftwareV2Kek(const std::wstring &service) : V2Kek(kProviderTypeSoftware, kCurrentKeyId) {
+                if (!g_kdf_known_answer_passed.load()) {
+                    CheckSoftwareKdfImplementation();
+                    g_kdf_known_answer_passed.store(true);
+                }
+                OpenProvider(kProviderTypeSoftware, provider_);
+                const SECURITY_STATUS status = OpenKey(provider_.get(), KeyName(service, kProviderTypeSoftware), key_);
+                if (status != ERROR_SUCCESS) {
+                    ThrowForNCryptFailure(status, kProviderTypeSoftware, "NCryptOpenKey failed");
+                }
+                VerifyKey(key_.get(), provider_.get(), kProviderTypeSoftware);
+            }
+
+            void Fingerprint(uint8_t out[kFingerprintLen]) override {
+                SecureBuffer<32> value;
+                KspDerive(key_.get(), kFingerprintLabel, {}, value.data());
+                std::memcpy(out, value.data(), kFingerprintLen);
+            }
+
+            void WrappingKey(const std::string &service, const uint8_t header[kHeaderLen], SecureBuffer<32> &out) override {
+                KspDerive(key_.get(), kWrapLabel, WrapContext(service, header, kHeaderLen), out.data());
+            }
+
+        private:
+            ScopedNCryptProv provider_;
+            ScopedNCryptKey key_;
+        };
+
+        std::unique_ptr<V2Kek> OpenKek(const std::wstring &service, uint8_t provider_type) {
+            if (IsTpm(provider_type)) {
+                return std::make_unique<TpmV2Kek>(service);
+            }
+            return std::make_unique<SoftwareV2Kek>(service);
+        }
+
+        // Whether the service's KEK exists on the provider. A missing key is
+        // `false`; anything that leaves it unknown throws - NTE_PERM as
+        // KEK_ACCESS_DENIED, never as "absent".
+        bool KekExistsOn(const std::wstring &service, uint8_t provider_type) {
             ScopedNCryptProv provider;
-            OpenProvider(provider);
+            OpenProvider(provider_type, provider);
             ScopedNCryptKey key;
-            const SECURITY_STATUS status = OpenSoftwareKey(provider.get(), V2SoftwareKeyName(service, kCurrentKeyId), key);
+            const SECURITY_STATUS status = OpenKey(provider.get(), KeyName(service, provider_type), key);
+            if (status == ERROR_SUCCESS) {
+                return true;
+            }
             if (status == NTE_BAD_KEYSET) {
                 return false;
             }
-            if (status != ERROR_SUCCESS) {
-                ThrowForNCryptFailure(status, "NCryptOpenKey failed");
-            }
-            return true;
+            ThrowForNCryptFailure(status, provider_type, "NCryptOpenKey failed");
         }
 
-        // Creates the software KEK if missing; verifies it if present.
-        // Returns whether it created one.
-        bool CreateSoftwareKek(const std::wstring &service, const std::vector<std::wstring> &groups) {
-            const std::wstring name = V2SoftwareKeyName(service, kCurrentKeyId);
+        // The provider couldn't create the KEK: on the TPM, the fallback-
+        // eligible V2TpmUnusable (nothing was left behind); on the software
+        // KSP, a provider error.
+        [[noreturn]] void CannotCreate(uint8_t provider_type, const std::string &step, SECURITY_STATUS status) {
+            const std::string reason = step + " failed (" + Hex32(status) + ")";
+            if (IsTpm(provider_type)) {
+                throw V2TpmUnusable("the TPM can't create the KEK: " + reason);
+            }
+            throw HkdfGuardError(HKDFGUARD_ERR_PROVIDER_ERROR, ("creating the version 2 software KEK: " + reason).c_str());
+        }
+
+        // Creates the KEK on the provider if missing; verifies it if present.
+        // Returns whether it created one, as version 1's CreateKekOnProvider,
+        // whose rules it follows: an existing key is verified - its
+        // properties, every group the current policy names, and one PRF
+        // call - and never touched; a key this call creates is reopened and
+        // verified the same way, and deleted if it fails.
+        bool CreateKekOn(const std::wstring &service, uint8_t provider_type, const std::vector<std::wstring> &groups) {
             ScopedNCryptProv provider;
-            OpenProvider(provider);
+            OpenProvider(provider_type, provider);
+            const std::wstring name = KeyName(service, provider_type);
+
+            const auto verify = [&](NCRYPT_KEY_HANDLE key) {
+                VerifyKey(key, provider.get(), provider_type);
+                VerifyKeyAcl(key, groups);
+                uint8_t fingerprint[kFingerprintLen];
+                OpenKek(service, provider_type)->Fingerprint(fingerprint);
+            };
+            // An existing KEK - found now, or created concurrently below.
+            const auto verify_existing = [&] {
+                ScopedNCryptKey existing;
+                const SECURITY_STATUS status = OpenKey(provider.get(), name, existing);
+                if (status != ERROR_SUCCESS) {
+                    ThrowForNCryptFailure(status, provider_type, "NCryptOpenKey failed");
+                }
+                verify(existing.get());
+            };
+
             {
                 ScopedNCryptKey existing;
-                const SECURITY_STATUS status = OpenSoftwareKey(provider.get(), name, existing);
+                const SECURITY_STATUS status = OpenKey(provider.get(), name, existing);
                 if (status == ERROR_SUCCESS) {
-                    VerifySoftwareKey(existing.get());
-                    VerifyKeyAcl(existing.get(), groups);
+                    verify(existing.get());
                     return false;
                 }
+                // Only "absent" proceeds to creation; NTE_PERM (a key this
+                // caller may not open) and the rest are errors.
                 if (status != NTE_BAD_KEYSET) {
-                    ThrowForNCryptFailure(status, "NCryptOpenKey failed");
+                    ThrowForNCryptFailure(status, provider_type, "NCryptOpenKey failed");
                 }
             }
 
             ScopedNCryptKey key;
-            SECURITY_STATUS status = NCryptCreatePersistedKey(provider.get(), key.put(), NCRYPT_AES_ALGORITHM, name.c_str(), 0,
-                                                              NCRYPT_MACHINE_KEY_FLAG);
+            SECURITY_STATUS status = NCryptCreatePersistedKey(
+                provider.get(), key.put(),
+                IsTpm(provider_type) ? NCRYPT_HMAC_SHA256_ALGORITHM : NCRYPT_SP800108_CTR_HMAC_ALGORITHM, name.c_str(), 0,
+                NCRYPT_MACHINE_KEY_FLAG | NCRYPT_SILENT_FLAG);
             if (status == NTE_EXISTS) {
-                return CreateSoftwareKek(service, groups); // created concurrently: verify that one
+                verify_existing();
+                return false;
             }
             if (status != ERROR_SUCCESS) {
-                ThrowForNCryptFailure(status, "NCryptCreatePersistedKey failed");
+                CannotCreate(provider_type, "NCryptCreatePersistedKey", status);
             }
-            DWORD length = 256;
+
+            if (IsTpm(provider_type)) {
+                // The only usage the PCP finalizes an HMAC key with; without
+                // it NCryptFinalizeKey fails with NTE_NOT_SUPPORTED.
+                DWORD usage = NCRYPT_PCP_SIGNATURE_KEY;
+                status = NCryptSetProperty(key.get(), NCRYPT_PCP_KEY_USAGE_POLICY_PROPERTY, reinterpret_cast<PBYTE>(&usage),
+                                           sizeof(usage), 0);
+                if (status != ERROR_SUCCESS) {
+                    CannotCreate(provider_type, "setting the key usage", status);
+                }
+            } else {
+                DWORD length = 256;
+                status = NCryptSetProperty(key.get(), NCRYPT_LENGTH_PROPERTY, reinterpret_cast<PBYTE>(&length),
+                                           sizeof(length), 0);
+                if (status != ERROR_SUCCESS) {
+                    CannotCreate(provider_type, "setting the key length", status);
+                }
+            }
             DWORD export_policy = 0;
-            if (NCryptSetProperty(key.get(), NCRYPT_LENGTH_PROPERTY, reinterpret_cast<PBYTE>(&length), sizeof(length), 0) !=
-                    ERROR_SUCCESS ||
-                NCryptSetProperty(key.get(), NCRYPT_EXPORT_POLICY_PROPERTY, reinterpret_cast<PBYTE>(&export_policy),
-                                  sizeof(export_policy), 0) != ERROR_SUCCESS) {
-                throw HkdfGuardError(HKDFGUARD_ERR_PROVIDER_ERROR, "setting the version 2 software KEK's properties failed");
+            status = NCryptSetProperty(key.get(), NCRYPT_EXPORT_POLICY_PROPERTY, reinterpret_cast<PBYTE>(&export_policy),
+                                       sizeof(export_policy), 0);
+            if (status != ERROR_SUCCESS) {
+                CannotCreate(provider_type, "setting the export policy", status);
             }
-            ApplyKeyAcl(key.get(), groups);
+            try {
+                ApplyKeyAcl(key.get(), groups);
+            } catch (const HkdfGuardError &e) {
+                // Only the provider refusing the security descriptor is a
+                // provider capability; a key-use group that stopped resolving
+                // would fail on the software KSP just the same.
+                if (IsTpm(provider_type) && e.code() == HKDFGUARD_ERR_PROVIDER_ERROR) {
+                    throw V2TpmUnusable(std::string("the TPM can't create the KEK: ") + e.what());
+                }
+                throw;
+            }
+
             // Finalizing a machine key is what needs elevation.
             status = NCryptFinalizeKey(key.get(), NCRYPT_SILENT_FLAG);
+            if (status == NTE_PERM || status == static_cast<SECURITY_STATUS>(ERROR_ACCESS_DENIED)) {
+                ThrowForNCryptFailure(status, provider_type, "NCryptFinalizeKey failed");
+            }
             if (status == NTE_EXISTS) {
-                return CreateSoftwareKek(service, groups);
+                verify_existing();
+                return false;
             }
             if (status != ERROR_SUCCESS) {
-                ThrowForNCryptFailure(status, "NCryptFinalizeKey failed");
+                CannotCreate(provider_type, "NCryptFinalizeKey", status);
             }
-            key.reset();
 
-            // Reopened and used once before it counts; one that fails is
-            // deleted rather than left for a later wrap to find.
+            // Verified on a freshly reopened handle - the PCP reports stale
+            // values on the creation handle (kek_store.cpp) - and deleted, on
+            // its creation handle, if it fails.
             try {
-                ScopedNCryptKey reopened;
-                status = OpenSoftwareKey(provider.get(), name, reopened);
-                if (status != ERROR_SUCCESS) {
-                    ThrowForNCryptFailure(status, "NCryptOpenKey failed");
+                verify_existing();
+            } catch (const HkdfGuardError &e) {
+                const SECURITY_STATUS deleted = NCryptDeleteKey(key.get(), 0);
+                key.release(); // NCryptDeleteKey invalidates the handle even on failure
+                // Still there: reported, but never as fallback-eligible, so no
+                // software KEK is created beside it.
+                if (deleted != ERROR_SUCCESS) {
+                    throw HkdfGuardError(e.code(), e.what());
                 }
-                VerifyKeyAcl(reopened.get(), groups);
-                uint8_t fingerprint[kFingerprintLen];
-                SoftwareV2Kek(service).Fingerprint(fingerprint);
-            } catch (...) {
-                DeleteV2Kek(service, kProviderTypeSoftware, kCurrentKeyId);
+                // A key the TPM made but that isn't what was asked for, or
+                // won't compute, is the TPM's failure. One that fails only on
+                // its ACL isn't: the software KSP would fail the same way.
+                const bool acl_only = dynamic_cast<const KekAccessControlError *>(&e) != nullptr;
+                if (IsTpm(provider_type) && !acl_only &&
+                    (e.code() == HKDFGUARD_ERR_PROVIDER_ERROR || e.code() == HKDFGUARD_ERR_CRYPTO_ERROR ||
+                     e.code() == HKDFGUARD_ERR_KEK_INVALID)) {
+                    throw V2TpmUnusable(std::string("the TPM's new KEK failed its checks: ") + e.what());
+                }
                 throw;
             }
             return true;
         }
 
-        // A TPM that can't do version 2, under RequireTpm or behind an
-        // existing TPM key file: event 2008 with the reason, then
-        // HKDFGUARD_ERR_PROVIDER_UNAVAILABLE.
+        // A TPM that can't do version 2 where nothing may replace it: under
+        // RequireTpm, or for a payload or KEK that is the TPM's. Event 2008
+        // with the reason, then HKDFGUARD_ERR_PROVIDER_UNAVAILABLE.
         [[noreturn]] void ReportUnusable(const std::wstring &service, const V2TpmUnusable &e) {
             LogVersion2Unavailable(service, e.reason());
             throw HkdfGuardError(HKDFGUARD_ERR_PROVIDER_UNAVAILABLE, ("version 2 is unavailable: " + e.reason()).c_str());
@@ -517,85 +492,112 @@ namespace hkdfguard {
 
         std::unique_ptr<V2Kek> OpenTpmKekOrReport(const std::wstring &service) {
             try {
-                return OpenTpmKek(service);
+                return OpenKek(service, kProviderTypeTpm);
             } catch (const V2TpmUnusable &e) {
                 ReportUnusable(service, e);
             }
         }
+
+        // RAII wipe of a buffer that held key material.
+        struct Wiped {
+            std::vector<uint8_t> &bytes;
+            ~Wiped() { SecureZeroMemory(bytes.data(), bytes.size()); }
+        };
     } // namespace
 
-    std::optional<std::string> StorageRootKeyProblem(const tpm2::PublicArea &srk) {
-        // A storage parent bound to this TPM, usable with its empty
-        // authValue through a password session, exempt from lockout, and
-        // never a signing key.
-        constexpr uint32_t kRequired = tpm2::kObjFixedTpm | tpm2::kObjFixedParent | tpm2::kObjSensitiveDataOrigin |
-                                       tpm2::kObjUserWithAuth | tpm2::kObjNoDa | tpm2::kObjRestricted |
-                                       tpm2::kObjDecrypt;
-        if (srk.name_alg != tpm2::kAlgSha256) {
-            return "its nameAlg is not SHA-256";
-        }
-        if ((srk.attributes & kRequired) != kRequired) {
-            return "it lacks a storage root key attribute (fixedTPM, fixedParent, sensitiveDataOrigin, userWithAuth, "
-                   "noDA, restricted or decrypt); attributes " + Hex32(srk.attributes);
-        }
-        if (srk.attributes & tpm2::kObjSign) {
-            return "it is a signing key; attributes " + Hex32(srk.attributes);
-        }
-        // The inner protection of every child's private blob, the KEK's
-        // among them.
-        if (srk.symmetric_alg != tpm2::kAlgAes || srk.symmetric_mode != tpm2::kAlgCfb ||
-            (srk.symmetric_key_bits != 128 && srk.symmetric_key_bits != 256)) {
-            return "it does not protect its children with AES-128 or AES-256 in CFB mode";
-        }
-        // A restricted decryption key has no scheme of its own.
-        if (srk.scheme != tpm2::kAlgNull) {
-            return "it has a scheme, which a storage key never has";
-        }
-        if (srk.type == tpm2::kAlgRsa) {
-            // The modulus must really be keyBits long: the buffer's size and
-            // its top bit set. Leading zero bytes would make a much shorter
-            // key - the one the session salt is then encrypted to - pass as
-            // RSA-2048 (found by tests/fuzz/fuzz_srk_rule.cpp).
-            if (srk.rsa_key_bits < 2048 || srk.rsa_key_bits % 8 != 0 ||
-                srk.rsa_modulus.size() != static_cast<size_t>(srk.rsa_key_bits / 8) ||
-                (srk.rsa_modulus[0] & 0x80) == 0) {
-                return "its RSA key is shorter than 2048 bits, or its modulus does not match its size";
-            }
-            if (srk.rsa_exponent != 0 && srk.rsa_exponent != 65537) {
-                return "its RSA public exponent is not 65537";
-            }
-            return std::nullopt;
-        }
-        if (srk.type == tpm2::kAlgEcc) {
-            constexpr uint16_t kEccNistP256 = 0x0003;
-            if (srk.ecc_curve != kEccNistP256 || srk.ecc_kdf != tpm2::kAlgNull) {
-                return "its ECC key is not a NIST P-256 key without a KDF";
-            }
-            return std::nullopt;
-        }
-        return "it is neither an RSA nor an ECC key";
+    std::wstring V2TpmKeyName(const std::wstring &service, uint32_t key_id) {
+        return L"hkdfguardwin_" + service + L"_v" + std::to_wstring(key_id) + L"_hmac";
     }
 
     std::wstring V2SoftwareKeyName(const std::wstring &service, uint32_t key_id) {
-        return L"hkdfguardwin_" + service + L"_v" + std::to_wstring(key_id) + L"_aes";
+        return L"hkdfguardwin_" + service + L"_v" + std::to_wstring(key_id) + L"_kdf";
+    }
+
+    void CheckSoftwareKdfImplementation() {
+        // A throwaway key, never persisted, made the way the software KEK is
+        // (SP800_108_CTR_HMAC, 256 bits) but exportable, so its value can be
+        // compared with.
+        ScopedNCryptProv provider;
+        OpenProvider(kProviderTypeSoftware, provider);
+        ScopedNCryptKey key;
+        DWORD length = 256;
+        DWORD exportable = NCRYPT_ALLOW_EXPORT_FLAG | NCRYPT_ALLOW_PLAINTEXT_EXPORT_FLAG;
+        if (NCryptCreatePersistedKey(provider.get(), key.put(), NCRYPT_SP800108_CTR_HMAC_ALGORITHM, nullptr, 0,
+                                     NCRYPT_SILENT_FLAG) != ERROR_SUCCESS ||
+            NCryptSetProperty(key.get(), NCRYPT_LENGTH_PROPERTY, reinterpret_cast<PBYTE>(&length), sizeof(length), 0) !=
+                ERROR_SUCCESS ||
+            NCryptSetProperty(key.get(), NCRYPT_EXPORT_POLICY_PROPERTY, reinterpret_cast<PBYTE>(&exportable),
+                              sizeof(exportable), 0) != ERROR_SUCCESS ||
+            NCryptFinalizeKey(key.get(), NCRYPT_SILENT_FLAG) != ERROR_SUCCESS) {
+            throw HkdfGuardError(HKDFGUARD_ERR_PROVIDER_ERROR, "the software KSP's key derivation check couldn't run");
+        }
+
+        std::vector<uint8_t> blob(sizeof(BCRYPT_KEY_DATA_BLOB_HEADER) + 64);
+        Wiped wipe_blob{blob};
+        DWORD got = 0;
+        if (NCryptExportKey(key.get(), 0, BCRYPT_KEY_DATA_BLOB, nullptr, blob.data(), static_cast<DWORD>(blob.size()), &got,
+                            0) != ERROR_SUCCESS ||
+            got < sizeof(BCRYPT_KEY_DATA_BLOB_HEADER)) {
+            throw HkdfGuardError(HKDFGUARD_ERR_PROVIDER_ERROR, "the software KSP's key derivation check couldn't run");
+        }
+        BCRYPT_KEY_DATA_BLOB_HEADER header{};
+        std::memcpy(&header, blob.data(), sizeof(header));
+        // A 256-bit length must give a 32-byte key: the software KEK's
+        // length can't be read back once persisted (VerifyKey).
+        if (header.dwMagic != BCRYPT_KEY_DATA_BLOB_MAGIC || header.dwVersion != BCRYPT_KEY_DATA_BLOB_VERSION1 ||
+            header.cbKeyData != 32 || got != sizeof(header) + header.cbKeyData) {
+            throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO_ERROR, "the software KSP's SP 800-108 key is not a 256-bit key");
+        }
+        uint8_t *const secret = blob.data() + sizeof(header);
+
+        const auto expected = [&](const std::vector<uint8_t> &block, uint8_t out[kPrfLen]) {
+            if (BCryptHash(BCRYPT_HMAC_SHA256_ALG_HANDLE, secret, header.cbKeyData, const_cast<PUCHAR>(block.data()),
+                           static_cast<ULONG>(block.size()), out, static_cast<ULONG>(kPrfLen)) != 0) {
+                throw HkdfGuardError(HKDFGUARD_ERR_PROVIDER_ERROR, "the software KSP's key derivation check couldn't run");
+            }
+        };
+        // The fingerprint, and a wrap context with a header of every byte
+        // value 0..39.
+        const std::string service = "hkdfguard.kat";
+        uint8_t kat_header[kHeaderLen];
+        for (size_t i = 0; i < kHeaderLen; ++i) {
+            kat_header[i] = static_cast<uint8_t>(i);
+        }
+        SecureBuffer<32> want, have;
+        expected(FingerprintBlock(1), want.data());
+        KspDerive(key.get(), kFingerprintLabel, {}, have.data());
+        bool match = std::memcmp(want.data(), have.data(), kPrfLen) == 0;
+        expected(WrapBlock(1, service, kat_header, kHeaderLen), want.data());
+        KspDerive(key.get(), kWrapLabel, WrapContext(service, kat_header, kHeaderLen), have.data());
+        match = match && std::memcmp(want.data(), have.data(), kPrfLen) == 0;
+        if (!match) {
+            throw HkdfGuardError(HKDFGUARD_ERR_CRYPTO_ERROR,
+                                 "the software KSP's SP 800-108 derivation is not HMAC-SHA-256 over the expected block");
+        }
     }
 
     bool V2KekExists(const std::wstring &service) {
-        const KeyStoragePolicy policy = RequirePolicy();
-        const auto tpm_file = [&] {
-            return TpmKeyFileExists(Store(), TpmKeyFileName(service, kCurrentKeyId), Narrow(service));
-        };
-        switch (policy) {
+        switch (RequirePolicy()) {
             case KeyStoragePolicy::RequireTpm:
-                return tpm_file();
+                try {
+                    return KekExistsOn(service, kProviderTypeTpm);
+                } catch (const V2TpmUnusable &e) {
+                    ReportUnusable(service, e);
+                }
             case KeyStoragePolicy::SoftwareOnly:
-                return SoftwareKekExists(service);
+                return KekExistsOn(service, kProviderTypeSoftware);
             case KeyStoragePolicy::PreferTpm:
-                // As version 1: the TPM first. An error reading the TPM key
-                // file (one that exists but this caller can't read, or that
-                // fails a check) propagates, so a TPM KEK is never reported
-                // absent because of it.
-                return tpm_file() || SoftwareKekExists(service);
+                // As version 1: the TPM first, and the software KSP only when
+                // the TPM is unusable or has no KEK. NTE_PERM on the TPM - a
+                // TPM KEK this caller may not open - propagates, so it is
+                // never reported absent.
+                try {
+                    if (KekExistsOn(service, kProviderTypeTpm)) {
+                        return true;
+                    }
+                } catch (const V2TpmUnusable &) {
+                }
+                return KekExistsOn(service, kProviderTypeSoftware);
             default:
                 break;
         }
@@ -604,11 +606,10 @@ namespace hkdfguard {
 
     void CreateV2Kek(const std::wstring &service) {
         const std::vector<std::wstring> groups = AclGroups();
-        const KeyStoragePolicy policy = RequirePolicy();
-        switch (policy) {
+        switch (RequirePolicy()) {
             case KeyStoragePolicy::RequireTpm:
                 try {
-                    if (CreateTpmKek(service, groups)) {
+                    if (CreateKekOn(service, kProviderTypeTpm, groups)) {
                         LogKekCreated(service, kProviderTypeTpm, HKDFGUARD_OK);
                     }
                 } catch (const V2TpmUnusable &e) {
@@ -616,37 +617,28 @@ namespace hkdfguard {
                 }
                 return;
             case KeyStoragePolicy::SoftwareOnly:
-                if (CreateSoftwareKek(service, groups)) {
+                if (CreateKekOn(service, kProviderTypeSoftware, groups)) {
                     LogKekCreated(service, kProviderTypeSoftware, HKDFGUARD_OK);
                 }
                 return;
-            case KeyStoragePolicy::PreferTpm: {
-                // A TPM KEK already in use is never abandoned for the
-                // software KSP: with its key file present, a TPM that can't
-                // do version 2 is reported, not fallen back from.
-                if (TpmKeyFileExists(Store(), TpmKeyFileName(service, kCurrentKeyId), Narrow(service))) {
-                    try {
-                        CreateTpmKek(service, groups);
-                    } catch (const V2TpmUnusable &e) {
-                        ReportUnusable(service, e);
-                    }
-                    return;
-                }
+            case KeyStoragePolicy::PreferTpm:
                 try {
-                    if (CreateTpmKek(service, groups)) {
+                    if (CreateKekOn(service, kProviderTypeTpm, groups)) {
                         LogKekCreated(service, kProviderTypeTpm, HKDFGUARD_OK);
                     }
-                    return;
                 } catch (const V2TpmUnusable &e) {
                     // The fallback (event 1001 if it creates the software
-                    // KEK): the TPM can't do version 2 at all, and no TPM
-                    // KEK exists for this service.
-                    if (CreateSoftwareKek(service, groups)) {
+                    // KEK): the TPM is unusable and holds no KEK of this
+                    // service - CreateKekOn throws V2TpmUnusable only before
+                    // a key is found, or after deleting one it just made. An
+                    // existing TPM KEK that fails its checks, or a TPM KEK
+                    // this caller may not open, propagates instead: a
+                    // software KEK beside it would split the service.
+                    if (CreateKekOn(service, kProviderTypeSoftware, groups)) {
                         LogKekCreated(service, kProviderTypeSoftware, e.code());
                     }
-                    return;
                 }
-            }
+                return;
             default:
                 break;
         }
@@ -654,20 +646,25 @@ namespace hkdfguard {
     }
 
     std::unique_ptr<V2Kek> OpenV2KekForWrap(const std::wstring &service) {
-        const KeyStoragePolicy policy = RequirePolicy();
-        switch (policy) {
+        switch (RequirePolicy()) {
             case KeyStoragePolicy::RequireTpm:
                 return OpenTpmKekOrReport(service);
             case KeyStoragePolicy::SoftwareOnly:
-                return std::make_unique<SoftwareV2Kek>(service);
+                return OpenKek(service, kProviderTypeSoftware);
             case KeyStoragePolicy::PreferTpm:
-                // The TPM KEK if its key file exists - then a TPM that can't
-                // do version 2 is reported, never fallen back from - else
-                // the software KEK (the one a fallback created).
-                if (TpmKeyFileExists(Store(), TpmKeyFileName(service, kCurrentKeyId), Narrow(service))) {
-                    return OpenTpmKekOrReport(service);
+                // As version 1: the software KEK only when the TPM has none
+                // (the KEK a fallback created) or is unusable. A TPM KEK that
+                // fails its checks, or that this caller may not open,
+                // propagates rather than quietly wrapping under another key.
+                try {
+                    return OpenKek(service, kProviderTypeTpm);
+                } catch (const V2TpmUnusable &) {
+                } catch (const HkdfGuardError &e) {
+                    if (e.code() != HKDFGUARD_ERR_KEK_NOT_FOUND) {
+                        throw;
+                    }
                 }
-                return std::make_unique<SoftwareV2Kek>(service);
+                return OpenKek(service, kProviderTypeSoftware);
             default:
                 break;
         }
@@ -686,125 +683,69 @@ namespace hkdfguard {
         if (policy == KeyStoragePolicy::RequireTpm) {
             throw HkdfGuardError(HKDFGUARD_ERR_PROVIDER_ERROR, "KeyStoragePolicy requires a TPM KEK");
         }
-        return std::make_unique<SoftwareV2Kek>(service);
+        return OpenKek(service, kProviderTypeSoftware);
     }
 
     bool DeleteV2Kek(const std::wstring &service, uint8_t provider_type, uint32_t key_id) {
-        if (provider_type == kProviderTypeTpm) {
-            return DeleteTpmKeyFile(Store(), TpmKeyFileName(service, key_id));
+        if (provider_type != kProviderTypeTpm && provider_type != kProviderTypeSoftware) {
+            throw HkdfGuardError(HKDFGUARD_ERR_INTERNAL_ERROR, "unknown provider type");
         }
         ScopedNCryptProv provider;
-        OpenProvider(provider);
+        OpenProvider(provider_type, provider);
+        const std::wstring name =
+            IsTpm(provider_type) ? V2TpmKeyName(service, key_id) : V2SoftwareKeyName(service, key_id);
         ScopedNCryptKey key;
-        const SECURITY_STATUS status = OpenSoftwareKey(provider.get(), V2SoftwareKeyName(service, key_id), key);
+        const SECURITY_STATUS status = OpenKey(provider.get(), name, key);
         if (status == NTE_BAD_KEYSET) {
             return false;
         }
         if (status != ERROR_SUCCESS) {
-            ThrowForNCryptFailure(status, "NCryptOpenKey failed");
+            ThrowForNCryptFailure(status, provider_type, "NCryptOpenKey failed");
         }
-        // NCryptDeleteKey frees the handle on success.
-        if (NCryptDeleteKey(key.get(), NCRYPT_SILENT_FLAG) != ERROR_SUCCESS) {
-            throw HkdfGuardError(HKDFGUARD_ERR_PROVIDER_ERROR, "deleting the version 2 software KEK failed");
+        // No NCRYPT_SILENT_FLAG: the PCP refuses it here (NTE_BAD_FLAGS), and
+        // the key was opened silently already.
+        const SECURITY_STATUS deleted = NCryptDeleteKey(key.get(), 0);
+        key.release(); // NCryptDeleteKey invalidates the handle even on failure
+        if (deleted != ERROR_SUCCESS) {
+            ThrowForNCryptFailure(deleted, provider_type, "deleting the version 2 KEK failed");
         }
-        key.release();
         return true;
     }
 
     V2KekInspection InspectV2Kek(const std::wstring &service, uint8_t provider_type) {
+        if (provider_type != kProviderTypeTpm && provider_type != kProviderTypeSoftware) {
+            throw HkdfGuardError(HKDFGUARD_ERR_INTERNAL_ERROR, "unknown provider type");
+        }
         V2KekInspection result;
-        auto invalid = [&](const HkdfGuardError &e) {
-            result.state = V2KekInspection::State::Invalid;
-            result.problem = e.what();
+        // Absent is definite; so are a key that fails a check of its own
+        // (Invalid) and one that fails only on its ACL (AccessControlInvalid,
+        // checked first: it is KEK_INVALID too, but must never be reported
+        // as corrupt - errors.h). Anything else - a TPM provider that can't
+        // be opened, access denied, a provider error - throws, unjudged.
+        if (!KekExistsOn(service, provider_type)) {
             return result;
-        };
-        // Checked before `invalid`: an ACL failure is also KEK_INVALID, but
-        // must never be reported as a corrupt key (errors.h).
-        auto access_control_invalid = [&](const KekAccessControlError &e) {
+        }
+        std::unique_ptr<V2Kek> kek;
+        try {
+            kek = OpenKek(service, provider_type);
+        } catch (const KekAccessControlError &e) {
             result.state = V2KekInspection::State::AccessControlInvalid;
             result.problem = e.what();
             return result;
-        };
-
-        if (provider_type == kProviderTypeTpm) {
-            // The key file decides presence. Absent is definite; a file that
-            // fails a check is a definite "invalid"; anything else (it can't
-            // be read by this account, an I/O error) propagates.
-            TpmKeyFile file;
-            try {
-                file = ReadTpmKeyFile(Store(), TpmKeyFileName(service, kCurrentKeyId), Narrow(service));
-            } catch (const KekAccessControlError &e) {
-                return access_control_invalid(e);
-            } catch (const HkdfGuardError &e) {
-                if (e.code() == HKDFGUARD_ERR_KEK_NOT_FOUND) {
-                    return result;
-                }
-                if (e.code() == HKDFGUARD_ERR_KEK_INVALID) {
-                    return invalid(e);
-                }
+        } catch (const HkdfGuardError &e) {
+            if (e.code() != HKDFGUARD_ERR_KEK_INVALID) {
                 throw;
             }
-            // Then the TPM. One that can't be used for version 2 leaves the
-            // KEK unjudged - it throws, with the reason. A key file pinned
-            // to a storage root key the TPM no longer has (a cleared TPM) is
-            // definitely unusable: invalid. A load or HMAC the TPM refuses
-            // propagates, since it can't be told apart here from a TPM that
-            // is merely failing now.
-            UsableTpm usable;
-            try {
-                usable = OpenUsableTpm();
-            } catch (const V2TpmUnusable &e) {
-                throw HkdfGuardError(HKDFGUARD_ERR_PROVIDER_UNAVAILABLE,
-                                     ("the TPM can't be used for version 2: " + e.reason()).c_str());
-            }
-            std::unique_ptr<TpmV2Kek> kek;
-            try {
-                kek = std::make_unique<TpmV2Kek>(std::move(usable), std::move(file));
-            } catch (const HkdfGuardError &e) {
-                if (e.code() == HKDFGUARD_ERR_KEK_INVALID) {
-                    return invalid(e);
-                }
-                throw;
-            }
-            kek->Fingerprint(result.fingerprint);
-            result.state = V2KekInspection::State::Valid;
+            result.state = V2KekInspection::State::Invalid;
+            result.problem = e.what();
             return result;
         }
-
-        if (provider_type == kProviderTypeSoftware) {
-            ScopedNCryptProv provider;
-            OpenProvider(provider);
-            ScopedNCryptKey key;
-            const SECURITY_STATUS status = OpenSoftwareKey(provider.get(), V2SoftwareKeyName(service, kCurrentKeyId), key);
-            if (status == NTE_BAD_KEYSET) {
-                return result;
-            }
-            if (status != ERROR_SUCCESS) {
-                ThrowForNCryptFailure(status, "NCryptOpenKey failed");
-            }
-            try {
-                VerifySoftwareKey(key.get());
-            } catch (const KekAccessControlError &e) {
-                return access_control_invalid(e);
-            } catch (const HkdfGuardError &e) {
-                if (e.code() == HKDFGUARD_ERR_KEK_INVALID) {
-                    return invalid(e);
-                }
-                throw;
-            }
-            SoftwareV2Kek(service).Fingerprint(result.fingerprint);
-            result.state = V2KekInspection::State::Valid;
-            return result;
-        }
-
-        throw HkdfGuardError(HKDFGUARD_ERR_INTERNAL_ERROR, "unknown provider type");
+        kek->Fingerprint(result.fingerprint);
+        result.state = V2KekInspection::State::Valid;
+        return result;
     }
 
 #if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
-    void SetTestV2TpmStore(std::optional<TpmKeyStore> store) {
-        g_test_tpm_store = std::move(store);
-    }
-
     void SetTestV2TpmUnusable(std::optional<std::string> reason) {
         g_test_tpm_unusable = std::move(reason);
     }

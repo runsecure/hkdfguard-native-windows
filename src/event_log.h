@@ -31,8 +31,8 @@ namespace hkdfguard {
     void LogKekCreated(const std::wstring &service, uint8_t providerType, int32_t tpmFallbackCode) noexcept;
 
     // Payload version 2 is unavailable for `service` (event 2008): the TPM
-    // can't be used for it, for `reason`, and policy - or an existing TPM
-    // KEK - rules out the software KSP. kek_v2.cpp writes this, since only
+    // can't be used for it, for `reason`, and policy - or a TPM KEK or
+    // payload - rules out the software KSP. kek_v2.cpp writes this, since only
     // it knows the reason; LogOperationFailure doesn't log
     // HKDFGUARD_ERR_PROVIDER_UNAVAILABLE again.
     void LogVersion2Unavailable(const std::wstring &service, const std::string &reason) noexcept;

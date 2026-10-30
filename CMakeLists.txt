@@ -46,15 +46,10 @@ add_library(hkdfguard SHARED
     src/hash_to_curve.cpp
     src/process_hardening.cpp
     # Payload version 2 (docs/adr/0001-post-quantum-payload-version-2.md):
-    # the KEK store, its SP 800-108 derivation and AES-CMAC, and the TPM
-    # path - raw TPM 2.0 commands through TBS, and the TPM KEK's key file.
+    # the KEK store (NCrypt HMAC keys in the TPM and the Software KSP) and
+    # its SP 800-108 derivation.
     src/kek_v2.cpp
     src/sp800_108.cpp
-    src/aes_cmac.cpp
-    src/tpm2_marshal.cpp
-    src/tpm2_session.cpp
-    src/tpm2_device.cpp
-    src/tpm_key_file.cpp
 )
 
 # Event log message table: mc.exe (Windows SDK) compiles
@@ -117,10 +112,8 @@ target_include_directories(hkdfguard
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 # Windows system libraries: NCrypt/BCrypt for the cryptography, wer.lib for
-# process_hardening.cpp's WerSetFlags, plus ntdll and netapi32; tbs.lib for
-# the version 2 TPM path (tpm2_device.cpp), and shell32/ole32 for
-# tpm_key_file.cpp's SHGetKnownFolderPath and CoTaskMemFree.
-target_link_libraries(hkdfguard PRIVATE ncrypt.lib bcrypt.lib wer.lib ntdll.lib netapi32.lib tbs.lib shell32.lib ole32.lib)
+# process_hardening.cpp's WerSetFlags, plus ntdll and netapi32.
+target_link_libraries(hkdfguard PRIVATE ncrypt.lib bcrypt.lib wer.lib ntdll.lib netapi32.lib)
 
 # MSVC hardening flags, defined once as a function so the DLL and the CLI
 # (tools/CMakeLists.txt) always get the identical set. The linker's own defaults (/DYNAMICBASE,

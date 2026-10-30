@@ -28,8 +28,7 @@ namespace hkdfguard {
     };
 
     // A KEK that fails its checks only because of its access control: the
-    // owner, or the DACL, of a version 2 TPM key file or a folder above it,
-    // or of a version 2 software KEK. Still HKDFGUARD_ERR_KEK_INVALID across
+    // DACL of a version 2 KEK, on the TPM or in the software KSP. Still HKDFGUARD_ERR_KEK_INVALID across
     // the ABI - the key must not be used - but kept apart from a KEK whose
     // material is unusable, because the remedy is the opposite one: fix the
     // ACL, never retire the key (which would destroy every DEK under it).

@@ -8,32 +8,31 @@
 //      values (hkdfguard-native-linux, src/crypto.rs, known_answer): the
 //      fingerprint, the wrapping-key block for its header, and the wrapping
 //      key - so this build and Linux's derive identically.
-//   2. AES-CMAC, the software KEK's PRF, against NIST SP 800-38B.
+//   2. The Software KSP's SP800_108_CTR_HMAC derivation, the software KEK's
+//      PRF, against HMAC-SHA-256 over those blocks
+//      (CheckSoftwareKdfImplementation, with a throwaway key).
 //   3. The ClassicalMode rule, and the wire format's version 2.
-//   3a. The storage root key rule (StorageRootKeyProblem).
 // Elevated, through HkdfGuard.dll with ClassicalMode set to 0 (version 2):
-//   4. The TPM KEK (KeyStoragePolicy RequireTpm), when a TPM 2.0 is
-//      reachable: create, exists, fingerprint, wrap, unwrap, tampering,
-//      relabeling, and the ClassicalMode rule both ways; and a key file
-//      whose ACL is widened is inspected as an access-control failure, not
-//      as corrupt.
-//   5. The software KEK (SoftwareOnly): the same, with the AES key's ACL.
+//   4. The TPM KEK (KeyStoragePolicy RequireTpm), when the Platform Crypto
+//      Provider offers HMAC-SHA-256 keys: create, exists, fingerprint, wrap,
+//      unwrap, tampering, relabeling, and the ClassicalMode rule both ways;
+//      and a KEK whose ACL is widened is inspected as an access-control
+//      failure, not as corrupt.
+//   5. The software KEK (SoftwareOnly): the same; and a key of another type
+//      planted under its name is inspected as invalid.
 //   6. Provider choice through the internal API, with a TPM made unusable
 //      for version 2: PreferTpm falls back to the software KEK, and
 //      RequireTpm fails with PROVIDER_UNAVAILABLE.
 // Unelevated:
 //   7. Creating a version 2 KEK is refused (KEK_ACCESS_DENIED).
 #include "hkdfguard.h"
-#include "aes_cmac.h"
 #include "errors.h"
 #include "kek_v2.h"
 #include "policy.h"
 #include "sp800_108.h"
-#include "tpm2_device.h"
 #include "wire_format.h"
 
 #include <windows.h>
-#include <aclapi.h>
 #include <bcrypt.h>
 #include <ncrypt.h>
 #include <sddl.h>
@@ -111,13 +110,15 @@ bool IsElevated() {
            elevation.TokenIsElevated != 0;
 }
 
+// Whether the Platform Crypto Provider is here and offers HMAC-SHA-256 keys.
 bool HasTpm() {
-    try {
-        hkdfguard::tpm2::OpenTbsTransport();
-        return true;
-    } catch (...) {
+    NCRYPT_PROV_HANDLE provider = 0;
+    if (NCryptOpenStorageProvider(&provider, MS_PLATFORM_CRYPTO_PROVIDER, 0) != ERROR_SUCCESS) {
         return false;
     }
+    const bool supported = NCryptIsAlgSupported(provider, NCRYPT_HMAC_SHA256_ALGORITHM, 0) == ERROR_SUCCESS;
+    NCryptFreeObject(provider);
+    return supported;
 }
 
 // Sets a REG_DWORD under HKLM\Software\Policies\HkdfGuard for as long as the
@@ -175,40 +176,12 @@ std::vector<uint8_t> BcryptHmac(const std::vector<uint8_t>& key, const std::vect
     return out;
 }
 
-// The DACL of a file, as SDDL ("D:..."), and setting one (protected).
-std::wstring FileDaclSddl(const std::wstring& path) {
-    PSECURITY_DESCRIPTOR sd = nullptr;
-    if (GetNamedSecurityInfoW(path.c_str(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr, nullptr, nullptr,
-                              nullptr, &sd) != ERROR_SUCCESS) {
-        return L"";
-    }
-    LPWSTR text = nullptr;
-    ConvertSecurityDescriptorToStringSecurityDescriptorW(sd, SDDL_REVISION_1, DACL_SECURITY_INFORMATION, &text, nullptr);
-    std::wstring out = text ? text : L"";
-    LocalFree(text);
-    LocalFree(sd);
-    return out;
-}
-
-bool SetFileDaclSddl(const std::wstring& path, const std::wstring& sddl) {
-    PSECURITY_DESCRIPTOR sd = nullptr;
-    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.c_str(), SDDL_REVISION_1, &sd, nullptr)) return false;
-    BOOL present = FALSE, defaulted = FALSE;
-    PACL dacl = nullptr;
-    GetSecurityDescriptorDacl(sd, &present, &dacl, &defaulted);
-    const DWORD rc = SetNamedSecurityInfoW(const_cast<LPWSTR>(path.c_str()), SE_FILE_OBJECT,
-                                           DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION, nullptr,
-                                           nullptr, dacl, nullptr);
-    LocalFree(sd);
-    return rc == ERROR_SUCCESS;
-}
-
-// The DACL of a Software KSP machine key, as SDDL, and setting one.
-std::wstring KeyDaclSddl(const std::wstring& name) {
+// The DACL of a machine key on `provider_name`, as SDDL, and setting one.
+std::wstring KeyDaclSddl(LPCWSTR provider_name, const std::wstring& name) {
     NCRYPT_PROV_HANDLE provider = 0;
     NCRYPT_KEY_HANDLE key = 0;
     std::wstring out;
-    if (NCryptOpenStorageProvider(&provider, MS_KEY_STORAGE_PROVIDER, 0) == ERROR_SUCCESS &&
+    if (NCryptOpenStorageProvider(&provider, provider_name, 0) == ERROR_SUCCESS &&
         NCryptOpenKey(provider, &key, name.c_str(), 0, NCRYPT_MACHINE_KEY_FLAG | NCRYPT_SILENT_FLAG) == ERROR_SUCCESS) {
         DWORD size = 0;
         NCryptGetProperty(key, NCRYPT_SECURITY_DESCR_PROPERTY, nullptr, 0, &size, DACL_SECURITY_INFORMATION);
@@ -227,12 +200,12 @@ std::wstring KeyDaclSddl(const std::wstring& name) {
     return out;
 }
 
-bool SetKeyDaclSddl(const std::wstring& name, const std::wstring& sddl) {
+bool SetKeyDaclSddl(LPCWSTR provider_name, const std::wstring& name, const std::wstring& sddl) {
     NCRYPT_PROV_HANDLE provider = 0;
     NCRYPT_KEY_HANDLE key = 0;
     PSECURITY_DESCRIPTOR sd = nullptr;
     bool ok = ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.c_str(), SDDL_REVISION_1, &sd, nullptr) &&
-              NCryptOpenStorageProvider(&provider, MS_KEY_STORAGE_PROVIDER, 0) == ERROR_SUCCESS &&
+              NCryptOpenStorageProvider(&provider, provider_name, 0) == ERROR_SUCCESS &&
               NCryptOpenKey(provider, &key, name.c_str(), 0, NCRYPT_MACHINE_KEY_FLAG | NCRYPT_SILENT_FLAG) ==
                   ERROR_SUCCESS &&
               NCryptSetProperty(key, NCRYPT_SECURITY_DESCR_PROPERTY, static_cast<PBYTE>(sd),
@@ -291,145 +264,19 @@ void OfflineChecks() {
         Check(ToHex(block.data(), block.size()) == wrap_block, "SP 800-108: the wrapping-key block matches Linux's byte for byte");
         Check(ToHex(BcryptHmac(kek, block).data(), 32) == "a2790d8f1306fbb0f234811df731e4104e2cf1bc5883c75f6c8248312710b684",
               "SP 800-108: the wrapping key matches the Linux known answer");
-        const std::vector<uint8_t> second = hkdfguard::WrapBlock(2, service, linux_header.data(), linux_header.size());
-        Check(second.size() == block.size() && second[3] == 2 && std::memcmp(second.data() + 4, block.data() + 4, block.size() - 4) == 0,
-              "SP 800-108: the second block (AES-CMAC's) differs only in its counter");
+        const std::vector<uint8_t> context = hkdfguard::WrapContext(service, linux_header.data(), linux_header.size());
+        Check(hkdfguard::Sp800108Block(1, hkdfguard::kWrapLabel, context.data(), context.size()) == block,
+              "SP 800-108: the wrap block is the label and WrapContext the software KSP is given");
         Check(CodeOf([] { hkdfguard::WrapBlock(1, "", nullptr, 0); }) == HKDFGUARD_ERR_INTERNAL_ERROR,
               "SP 800-108: an empty service name is refused");
     }
 
-    // ---- 2. AES-CMAC ----
-    Check(CodeOf([] { hkdfguard::CheckAesCmacImplementation(); }) == HKDFGUARD_OK,
-          "AES-CMAC matches the NIST SP 800-38B AES-256 examples and BCrypt AES-CMAC");
-
-    // ---- 3a. The storage root key rule ----
+    // ---- 2. The Software KSP's SP 800-108 derivation ----
     {
-        namespace t2 = hkdfguard::tpm2;
-        using hkdfguard::StorageRootKeyProblem;
-        // Windows' RSA storage root key, as probed: attributes 0x00030472,
-        // AES-128-CFB, no scheme, RSA-2048 with the default exponent.
-        t2::PublicArea rsa;
-        rsa.type = t2::kAlgRsa;
-        rsa.name_alg = t2::kAlgSha256;
-        rsa.attributes = 0x00030472;
-        rsa.symmetric_alg = t2::kAlgAes;
-        rsa.symmetric_key_bits = 128;
-        rsa.symmetric_mode = t2::kAlgCfb;
-        rsa.scheme = t2::kAlgNull;
-        rsa.rsa_key_bits = 2048;
-        rsa.rsa_exponent = 0;
-        rsa.rsa_modulus.assign(256, 0xC5);
-        Check(!StorageRootKeyProblem(rsa), "storage root key: Windows' RSA-2048 key is accepted");
-
-        t2::PublicArea ecc = rsa;
-        ecc.type = t2::kAlgEcc;
-        ecc.rsa_key_bits = 0;
-        ecc.rsa_modulus.clear();
-        ecc.ecc_curve = 0x0003;
-        ecc.ecc_kdf = t2::kAlgNull;
-        ecc.ecc_x.assign(32, 0x11);
-        ecc.ecc_y.assign(32, 0x22);
-        Check(!StorageRootKeyProblem(ecc), "storage root key: an ECC P-256 storage key is accepted");
-
-        auto refused = [&](const t2::PublicArea& area, const std::string& what) {
-            const auto problem = StorageRootKeyProblem(area);
-            Check(problem.has_value(), "storage root key: refused when " + what + (problem ? " (" + *problem + ")" : ""));
-        };
-        for (const auto& [bit, name] : std::vector<std::pair<uint32_t, std::string>>{
-                 {t2::kObjFixedTpm, "fixedTPM"},
-                 {t2::kObjFixedParent, "fixedParent"},
-                 {t2::kObjSensitiveDataOrigin, "sensitiveDataOrigin"},
-                 {t2::kObjUserWithAuth, "userWithAuth"},
-                 {t2::kObjNoDa, "noDA"},
-                 {t2::kObjRestricted, "restricted"},
-                 {t2::kObjDecrypt, "decrypt"}}) {
-            t2::PublicArea a = rsa;
-            a.attributes &= ~bit;
-            refused(a, name + " is clear");
-        }
-        {
-            t2::PublicArea a = rsa;
-            a.attributes |= t2::kObjSign;
-            refused(a, "sign is set");
-        }
-        {
-            t2::PublicArea a = rsa;
-            a.name_alg = 0x0004; // SHA-1
-            refused(a, "its nameAlg is SHA-1");
-        }
-        {
-            t2::PublicArea a = rsa;
-            a.symmetric_alg = t2::kAlgNull;
-            a.symmetric_key_bits = 0;
-            a.symmetric_mode = 0;
-            refused(a, "it has no symmetric protection for its children");
-        }
-        {
-            t2::PublicArea a = rsa;
-            a.symmetric_mode = 0x0044; // CBC
-            refused(a, "its children are protected in a mode other than CFB");
-        }
-        {
-            t2::PublicArea a = rsa;
-            a.scheme = t2::kAlgRsaes;
-            refused(a, "it has a scheme");
-        }
-        {
-            t2::PublicArea a = rsa;
-            a.rsa_key_bits = 1024;
-            a.rsa_modulus.assign(128, 0xC5);
-            refused(a, "it is RSA-1024");
-        }
-        {
-            t2::PublicArea a = rsa;
-            a.rsa_modulus.assign(255, 0xC5);
-            refused(a, "its modulus is shorter than its stated size");
-        }
-        {
-            // Found by fuzz_srk_rule: 256 bytes, but leading zeros make the
-            // key itself far shorter than 2048 bits.
-            t2::PublicArea a = rsa;
-            for (size_t i = 0; i < 7; ++i) a.rsa_modulus[i] = 0x00;
-            a.rsa_modulus[7] = 0x02;
-            refused(a, "its 256-byte modulus starts with zero bytes, so the key is shorter than 2048 bits");
-            Check(CodeOf([&] {
-                      hkdfguard::SecureBuffer<32> s;
-                      t2::Bytes e;
-                      t2::MakeSessionSalt(a, s, e);
-                  }) == HKDFGUARD_ERR_PROVIDER_ERROR,
-                  "storage root key: a session salt is never encrypted to such a modulus");
-        }
-        {
-            t2::PublicArea a = rsa;
-            a.rsa_exponent = 3;
-            refused(a, "its RSA exponent is 3");
-        }
-        {
-            t2::PublicArea a = ecc;
-            a.ecc_curve = 0x0004; // P-384
-            refused(a, "it is an ECC key on P-384");
-        }
-        {
-            t2::PublicArea a = rsa;
-            a.type = t2::kAlgKeyedHash;
-            refused(a, "it is a keyed-hash object");
-        }
-
-        // And this machine's own storage root key, which needs no elevation:
-        // the rule must accept the key a real TPM has, or version 2 would
-        // never use it.
-        if (HasTpm()) {
-            std::optional<std::string> problem;
-            const int code = CodeOf([&] {
-                t2::Tpm tpm;
-                problem = StorageRootKeyProblem(t2::ParsePublicArea(tpm.ReadPublic(0x81000001).public_area));
-            });
-            Check(code == HKDFGUARD_OK && !problem,
-                  "storage root key: this TPM's key at 0x81000001 is accepted (code " + std::to_string(code) +
-                      (problem ? ", " + *problem : std::string()) + ")");
-        } else {
-            Skip("storage root key: this TPM's own key (no TPM 2.0 reachable through TBS)");
-        }
+        const int code = CodeOf([] { hkdfguard::CheckSoftwareKdfImplementation(); });
+        Check(code == HKDFGUARD_OK,
+              "the Software KSP's SP 800-108 derivation is HMAC-SHA-256 over the Linux blocks, with a 32-byte key (code " +
+                  std::to_string(code) + ")");
     }
 
     // ---- 3. ClassicalMode, and the wire format ----
@@ -539,25 +386,24 @@ void ElevatedChecks() {
             ScopedMachinePolicyDword require_tpm(L"KeyStoragePolicy", 1);
             DeleteV2Kek(tpm_service_w, hkdfguard::kProviderTypeTpm, hkdfguard::kCurrentKeyId);
             RoundTrip(tpm_service, hkdfguard::kProviderTypeTpm, "TPM");
-            const hkdfguard::TpmKeyStore store = hkdfguard::DefaultTpmKeyStore();
-            Check(hkdfguard::TpmKeyFileExists(store, hkdfguard::TpmKeyFileName(tpm_service_w, 1), tpm_service),
-                  "TPM: its key file is in the ProgramData store");
             {
-                std::wstring parent = store.parent;
-                if (!parent.empty() && parent.back() != L'\\') parent += L'\\';
-                const std::wstring file = parent + L"HkdfGuard\\TpmKeys\\" + hkdfguard::TpmKeyFileName(tpm_service_w, 1);
-                const std::wstring original = FileDaclSddl(file);
+                const std::wstring key_name = hkdfguard::V2TpmKeyName(tpm_service_w, hkdfguard::kCurrentKeyId);
+                const std::wstring original = KeyDaclSddl(MS_PLATFORM_CRYPTO_PROVIDER, key_name);
+                Check(!original.empty(), "TPM: the KEK is a machine key in the Platform Crypto Provider");
                 CheckWidenedAclIsNotCorrupt(
                     tpm_service_w, hkdfguard::kProviderTypeTpm, "TPM",
-                    [&] { return !original.empty() && SetFileDaclSddl(file, original + L"(A;;FR;;;WD)"); },
-                    [&] { return SetFileDaclSddl(file, original); });
+                    [&] {
+                        return !original.empty() &&
+                               SetKeyDaclSddl(MS_PLATFORM_CRYPTO_PROVIDER, key_name, original + L"(A;;GR;;;WD)");
+                    },
+                    [&] { return SetKeyDaclSddl(MS_PLATFORM_CRYPTO_PROVIDER, key_name, original); });
             }
             Check(DeleteV2Kek(tpm_service_w, hkdfguard::kProviderTypeTpm, hkdfguard::kCurrentKeyId), "TPM: test KEK removed");
             int exists = -1;
             Check(hkdfguard_kek_exists(tpm_service, &exists) == HKDFGUARD_OK && exists == 0, "TPM: ...and no longer exists");
         });
     } else {
-        Skip("4. TPM KEK: no TPM 2.0 reachable through TBS");
+        Skip("4. TPM KEK: the Platform Crypto Provider offers no HMAC-SHA-256 keys here");
     }
 
     // ---- 5. The software KEK ----
@@ -567,15 +413,45 @@ void ElevatedChecks() {
         ScopedMachinePolicyDword software(L"KeyStoragePolicy", 2);
         DeleteV2Kek(sw_service_w, hkdfguard::kProviderTypeSoftware, hkdfguard::kCurrentKeyId);
         RoundTrip(sw_service, hkdfguard::kProviderTypeSoftware, "software");
+        const std::wstring key_name = hkdfguard::V2SoftwareKeyName(sw_service_w, hkdfguard::kCurrentKeyId);
         {
-            const std::wstring key_name = hkdfguard::V2SoftwareKeyName(sw_service_w, hkdfguard::kCurrentKeyId);
-            const std::wstring original = KeyDaclSddl(key_name);
+            const std::wstring original = KeyDaclSddl(MS_KEY_STORAGE_PROVIDER, key_name);
             CheckWidenedAclIsNotCorrupt(
                 sw_service_w, hkdfguard::kProviderTypeSoftware, "software",
-                [&] { return !original.empty() && SetKeyDaclSddl(key_name, original + L"(A;;GR;;;WD)"); },
-                [&] { return SetKeyDaclSddl(key_name, original); });
+                [&] {
+                    return !original.empty() &&
+                           SetKeyDaclSddl(MS_KEY_STORAGE_PROVIDER, key_name, original + L"(A;;GR;;;WD)");
+                },
+                [&] { return SetKeyDaclSddl(MS_KEY_STORAGE_PROVIDER, key_name, original); });
         }
         Check(DeleteV2Kek(sw_service_w, hkdfguard::kProviderTypeSoftware, hkdfguard::kCurrentKeyId), "software: test KEK removed");
+
+        // A key of another type under the KEK's name - planted, or left by
+        // an earlier design - is invalid, never used, and can be deleted
+        // (retire --corrupt).
+        {
+            NCRYPT_PROV_HANDLE provider = 0;
+            NCRYPT_KEY_HANDLE key = 0;
+            const bool planted =
+                NCryptOpenStorageProvider(&provider, MS_KEY_STORAGE_PROVIDER, 0) == ERROR_SUCCESS &&
+                NCryptCreatePersistedKey(provider, &key, NCRYPT_AES_ALGORITHM, key_name.c_str(), 0,
+                                         NCRYPT_MACHINE_KEY_FLAG) == ERROR_SUCCESS &&
+                NCryptFinalizeKey(key, 0) == ERROR_SUCCESS;
+            if (key) NCryptFreeObject(key);
+            if (provider) NCryptFreeObject(provider);
+            Check(planted, "software: test setup: an AES key planted under the KEK's name");
+            hkdfguard::V2KekInspection inspection;
+            const int code =
+                CodeOf([&] { inspection = hkdfguard::InspectV2Kek(sw_service_w, hkdfguard::kProviderTypeSoftware); });
+            Check(code == HKDFGUARD_OK && inspection.state == State::Invalid,
+                  "software: a key of another type under the name is inspected as invalid (" + inspection.problem + ")");
+            std::vector<uint8_t> dek(HKDFGUARD_DEK_LEN), wrapped(HKDFGUARD_WRAPPED_MAX_LEN);
+            int len = HKDFGUARD_WRAPPED_MAX_LEN;
+            const int rc = hkdfguard_wrap_dek(sw_service, dek.data(), HKDFGUARD_DEK_LEN, wrapped.data(), &len);
+            Check(rc == HKDFGUARD_ERR_KEK_INVALID, "software: ...and wrap refuses it (" + std::to_string(rc) + ")");
+            Check(DeleteV2Kek(sw_service_w, hkdfguard::kProviderTypeSoftware, hkdfguard::kCurrentKeyId),
+                  "software: ...and it can be deleted");
+        }
     });
 
     // ---- 6. Provider choice, with the TPM unusable for version 2 ----
@@ -588,9 +464,11 @@ void ElevatedChecks() {
         hkdfguard::SetTestPolicyOverride(hkdfguard::KeyStoragePolicy::RequireTpm);
         Check(CodeOf([&] { hkdfguard::CreateV2Kek(fb_service); }) == HKDFGUARD_ERR_PROVIDER_UNAVAILABLE,
               "RequireTpm, TPM unusable: create fails with PROVIDER_UNAVAILABLE (and logs event 2008)");
-        Check(!hkdfguard::V2KekExists(fb_service), "...and creates nothing");
+        Check(CodeOf([&] { hkdfguard::V2KekExists(fb_service); }) == HKDFGUARD_ERR_PROVIDER_UNAVAILABLE,
+              "RequireTpm, TPM unusable: kek_exists can't answer either (PROVIDER_UNAVAILABLE), as version 1's throws");
 
         hkdfguard::SetTestPolicyOverride(hkdfguard::KeyStoragePolicy::PreferTpm);
+        Check(!hkdfguard::V2KekExists(fb_service), "...and the failed create left no software KEK behind");
         Check(CodeOf([&] { hkdfguard::CreateV2Kek(fb_service); }) == HKDFGUARD_OK,
               "PreferTpm, TPM unusable: create falls back to the software KEK (event 1001)");
         auto kek = hkdfguard::OpenV2KekForWrap(fb_service);

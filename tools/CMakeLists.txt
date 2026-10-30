@@ -8,8 +8,8 @@
 # delete, which the DLL deliberately doesn't offer. For a payload version 1
 # KEK the tool opens the persisted key with NCrypt itself. A payload version
 # 2 KEK has no public key - its fingerprint is a PRF output of the KEK,
-# computed in the TPM through TBS or with AES-CMAC over the Software KSP's
-# AES key - so for it the tool compiles the library's own version 2 key code
+# an HMAC computed by the TPM or the Software KSP - so for it the tool
+# compiles the library's own version 2 key code
 # (kek_v2.cpp and what it uses) rather than a second copy of it. Nothing else
 # from src/ is compiled in; and none of this is in the DLL that
 # applications load, so the library itself still can't delete a key.
@@ -17,18 +17,13 @@ add_executable(hkdfguard-cli
     hkdfguard_cli.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/kek_v2.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/sp800_108.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/aes_cmac.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/tpm2_marshal.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/tpm2_session.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/tpm2_device.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/tpm_key_file.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/key_acl.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/policy.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/event_log.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/wire_format.cpp
 )
 target_link_libraries(hkdfguard-cli PRIVATE hkdfguard bcrypt.lib ncrypt.lib advapi32.lib ntdll.lib
-    netapi32.lib tbs.lib shell32.lib ole32.lib)
+    netapi32.lib)
 # src/ for no_follow_open.h - header-only and exception-free, the path walk
 # that never follows a link, which the wrapped-key and --dek-file paths must
 # use exactly as hkdfguard_open_file does - and for the version 2 key code's

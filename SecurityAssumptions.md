@@ -192,6 +192,14 @@ opening a nonexistent key returned `NTE_BAD_KEYSET`, everything else
 succeeded. The flag is not passed to `NCryptOpenStorageProvider`,
 `NCryptExportKey` or the property calls, which were not tested.
 
+Payload version 2 (section 17) also passes it to `NCryptSignHash` on the
+Platform Crypto Provider's HMAC key and to `NCryptKeyDerivation` on the
+Software KSP's SP 800-108 key; both accept it and return the same output as
+without it (AMD firmware TPM, 2026-10-30). **`NCryptDeleteKey` is the
+exception:** the Platform Crypto Provider refuses it there with
+`NTE_BAD_FLAGS` (the Software KSP accepts it), so every delete passes no
+flags - the key was already opened silently.
+
 **Residual risk.** Only our own keys are created here and they set no UI
 policy; the flag defends against a pre-planted key, which requires an
 administrator.
@@ -502,14 +510,11 @@ use) are still granted by *name*, now restricted to local groups.
   equivalent.
 - Only one TPM vendor/firmware has been exercised (section 4); other
   Platform Crypto Provider backends may exhibit different quirks. The same
-  holds for payload version 2's raw TPM path (section 17): it has run on
-  that AMD firmware TPM and on an Intel PTT firmware TPM (manufacturer
-  `INTC`, firmware 500.14.0.0, Windows 11 26H2, the same build as the AMD
-  host - 26300.9711; reported working by the maintainer on 2026-10-29, the
-  exact checks run not recorded). A
-  discrete TPM and a Hyper-V virtual TPM are untested; `tbs_probe` (the
-  scratch probe the ADR cites) is the quick check to run on each before
-  relying on it there.
+  holds for payload version 2's TPM KEK (section 17), an HMAC-SHA-256 key in
+  the Platform Crypto Provider: it has run only on that AMD firmware TPM.
+  Intel PTT, a discrete TPM and a Hyper-V virtual TPM are untested, as is
+  Windows 11 24H2 (build 26100); the probes the ADR cites are the quick
+  check to run on each before relying on it there.
 - Release binaries and MSIs are Authenticode-signed through Azure Artifact
   Signing (`scripts/ArtifactSigning.ps1`), by a release-workflow job in the
   "release" environment that signs in to Azure over OIDC: no signing
@@ -992,138 +997,107 @@ payload format change is needed.
 
 **Claim.** A version 2 payload - the default - can't be unwrapped or forged by
 anyone without the use of its KEK, even with a quantum computer: the KEK is a
-symmetric key used as a PRF, so there is no public key for Shor's algorithm to
-work on. As in version 1, only an account allowed to use the KEK can wrap. The
-full design and the options rejected (a hybrid, ML-KEM/ML-DSA, the Platform
-Crypto Provider's undocumented HMAC key, a DPAPI secret) are in
+symmetric key used as an HMAC-SHA-256 PRF, so there is no public key for Shor's
+algorithm to work on. As in version 1, only an account allowed to use the KEK can
+wrap, and the provider checks that on every use. The full design and the options
+rejected (a hybrid, ML-KEM, a DPAPI secret) are in
 `docs/adr/0001-post-quantum-payload-version-2.md`.
 
 **Design.**
 
-- **Construction.** NIST SP 800-108 in counter mode, the KEK as the PRF's key,
-  then AES-256-GCM (`src/sp800_108.h`). The labels, framing and order are the
-  Linux library's, byte for byte. The PRF is HMAC-SHA-256 in the TPM and
-  AES-256-CMAC in the Software KSP (two CMAC blocks per 32-byte output). Both are
-  PRFs SP 800-108 approves.
+- **Construction.** NIST SP 800-108 in counter mode with HMAC-SHA-256 keyed by the
+  KEK, then AES-256-GCM (`src/sp800_108.h`). The labels, framing and order are the
+  Linux library's, byte for byte, and one HMAC block is the whole 32-byte output.
 - **One version per host.** `ClassicalMode` (section 7) picks the version; unwrap
   refuses the other version (`HKDFGUARD_ERR_PAYLOAD_VERSION_REFUSED`) before any key
   is opened, and nothing falls back from one to the other. The version byte is also
   bound into each version's key derivation and AAD.
-- **The TPM KEK** is a TPM-generated keyed-hash key under the storage root key
-  (`0x81000001`), with `fixedTPM`, `fixedParent`, `sensitiveDataOrigin`, `sign`,
-  `userWithAuth`, `noDA` and nothing else, used with raw TPM 2.0 commands through
-  TBS (`src/tpm2_*.h`) - not through NCrypt. Every load checks those attributes
-  exactly, so a key made with a chosen value (`sensitiveDataOrigin` clear) can't be
-  planted. Every `TPM2_HMAC` goes through a session salted to the storage root key
-  with AES-128-CFB parameter encryption both ways, and the TPM's response HMAC is
-  checked before the result is used: the wrapping key never crosses a discrete
-  TPM's bus in the clear.
-- **The TPM KEK's key file is its access control.** The TPM doesn't check who loads
-  a key, so whoever can read the key file can use the KEK. The file
-  (`ProgramData\HkdfGuard\TpmKeys`) gets the KEK ACL, and on every open the file
-  and every folder above it are walked without following links and checked: owners
-  and writers only SYSTEM, Administrators and `HkdfGuardAdmins` (and TrustedInstaller
-  above the store), no create rights on the store's own folders, and
-  `VerifyExistingKekDacl` on the file - so read access for an over-broad principal is
-  refused too (`src/tpm_key_file.h`). The file pins the storage root key's Name.
-- **Before first use** in each process, the TPM's HMAC must reproduce the Linux
-  library's known answer for a known key loaded with `TPM2_LoadExternal`; a TPM that
-  fails is not used.
-- **The software KEK** is a non-exportable AES-256 machine key; CMAC is computed in
-  this process from KSP block operations (one ECB call for the subkeys, one CBC call
-  with an explicit zero IV per block), so the key never leaves the KSP's isolated
-  process. Chaining mode is set per handle, never saved to the key.
+- **Both KEKs are NCrypt machine keys** (`src/kek_v2.cpp`): persisted,
+  non-exportable, created only by `hkdfguard_create_kek`, with version 1's ACL
+  (section 9), so the provider checks the caller on every use, exactly as for a
+  version 1 KEK. Their names are version 1's with `_hmac` (TPM) or `_kdf`
+  (software) appended.
+- **The TPM KEK** is an `HMAC-SHA256` key in the Platform Crypto Provider, created
+  with the PCP's signature key usage (`NCRYPT_PCP_SIGNATURE_KEY` - the PCP refuses to
+  finalize an HMAC key with any other). `NCryptSignHash` over the SP 800-108 block
+  returns HMAC-SHA-256 of it, computed in the TPM. Every open checks the algorithm
+  name (`HMAC-SHA256`; the PCP reports no algorithm group for it), the signature
+  usage, hardware backing (from the provider handle, as section 4 describes), the
+  export policy and the ACL.
+- **The software KEK** is an `SP800_108_CTR_HMAC` key in the Software KSP (key length
+  256). `NCryptKeyDerivation`, given the label, the context and SHA-256, builds the
+  same block and returns the same HMAC; for the fingerprint the context is left out,
+  which the KSP frames exactly as an empty one. Every open checks the algorithm name,
+  the export policy and the ACL.
+- **The software derivation is checked once per process** before first use
+  (`CheckSoftwareKdfImplementation`): a throwaway, exportable key made the same way
+  must export as 32 bytes, and its derivation must equal BCrypt's HMAC-SHA-256 over
+  the fingerprint block and a wrap block.
+- **The TPM's HMAC can't be checked against a known key**: the PCP won't import one.
+  The fingerprint, itself a PRF output, pins it instead. A TPM whose output changed
+  would no longer match any payload's fingerprint, and unwrap fails with
+  `HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH` before any decryption.
+- **Exactly 32 bytes, always.** Given a shorter output buffer, the PCP's
+  `NCryptSignHash` reports success and 32 bytes without writing the result. Every
+  call passes a 32-byte buffer and requires 32 bytes back.
+- **Provider choice** follows `KeyStoragePolicy` as version 1's does: the TPM is
+  unusable for version 2 when the PCP can't be opened, reports no TPM device, or
+  can't create the key (anything this call made deleted first). `PreferTpm` then
+  falls back to the software KEK (event 1001); `RequireTpm`, and any TPM payload or
+  KEK, fail with `HKDFGUARD_ERR_PROVIDER_UNAVAILABLE` and event 2008. A key of
+  another type under a version 2 name is `HKDFGUARD_ERR_KEK_INVALID`, never used,
+  and `retire --corrupt` may remove it.
 
-**Verified how** (AMD firmware TPM, Windows 11, 2026-10-28 and 29).
+**Verified how** (AMD firmware TPM, Windows 11 build 26300, 2026-10-30).
 
-- The probes behind the ADR (`tbs_probe`, `cmac_probe`), elevated, unelevated and as
-  new standard accounts in and outside a key-use group: TBS, the storage root key,
-  `TPM2_Create`/`Load`/`HMAC`, `LoadExternal`, salted encrypted sessions, the blocked
-  command list, the storage root key's Name across a reboot; and the Software KSP's
-  per-handle chaining mode, CMAC, export refusal and the key-use ACL.
-- `test_tpm2_marshal`: golden command bytes the TPM accepted; every response parser
-  under truncation, bit flips and 20,000 random edits per response; and a libFuzzer
-  target under AddressSanitizer (12.2 million inputs, no finding).
-- libFuzzer targets under AddressSanitizer for every input version 2 parses or judges
-  (`tests/fuzz`, seeds in `tests/fuzz/corpus`, built with `-DHKDFGUARD_BUILD_FUZZERS=ON`),
-  each checking properties, not only the absence of crashes: the key file parser (an
-  accepted file re-serializes to its own bytes, with the KEK template), the storage root
-  key rule (an accepted key has every property the rule promises), a `TPM2_HMAC` response
-  through the salted session (an unsigned response never verifies; after a verified one,
-  whether the session is open is the TPM's own continueSession bit), the three DACL walks
-  behind "access list invalid" and the provisioning grant check, and the SP 800-108
-  framing (injective, and never the fingerprint block) with AES-CMAC against BCrypt's.
-  Three minutes each on 2026-10-29. The storage root key rule's target found a gap:
-  it accepted a 256-byte RSA modulus with leading zero bytes - a much shorter key - as
-  RSA-2048, so a session salt could be encrypted to it. The rule now requires the
-  modulus's top bit, the salt is refused unless its ciphertext is the modulus's full
-  length, and the input is kept as a regression seed.
-- `test_tpm2_session`: KDFa, KDFe, AES-CFB and Names against independent references;
-  salts round-trip through generated keys; and live, a known-answer HMAC through RSA-
-  and ECC-salted sessions, and every single-bit flip of a response refused.
-- `test_tpm_key_file`: the format and template rules, and - elevated - every
-  tampering the store must refuse (widened ACLs, write or create rights for others,
-  symbolic links, corrupted contents, a pre-created store folder).
-- `test_v2_kek`: the construction against the Linux known answers and AES-CMAC
-  against NIST SP 800-38B, offline; and elevated, through the DLL, both KEKs end to
-  end - tampering, relabeling, the version rule both ways, an invalid
-  `ClassicalMode`, and `PreferTpm`'s fallback and `RequireTpm`'s refusal with the TPM
-  made unusable.
+- Standalone probes, unelevated and elevated: both key types created, stored,
+  reopened and used; private export, making the key exportable, widening its DACL
+  and deleting it all refused to an unelevated key-use account, which can still open
+  and use a machine key an administrator created; the Software KSP's derivation equal
+  to a hand-built HMAC-SHA-256 block for service names of 0 to 128 bytes (inputs of
+  68 to 196 bytes); the TPM's output 32 bytes, deterministic, different for two keys
+  and different from SHA-256 or an unkeyed HMAC of the same input, for inputs of 1 to
+  1,024 bytes, with 1,025 refused.
+- `test_v2_kek`: the construction against the Linux known answers and the Software
+  KSP's derivation against it, offline; and elevated, through the DLL, both KEKs end
+  to end - tampering, relabeling, the version rule both ways, an invalid
+  `ClassicalMode`, a widened ACL inspected as an access-control failure and not as
+  corrupt, a key of another type under the software KEK's name inspected as invalid,
+  and `PreferTpm`'s fallback and `RequireTpm`'s refusal with the TPM made unusable.
+- `test_cli_v2.ps1`: provision, status and retire on both providers, including a key
+  of another type planted under each KEK's name and removed by `retire --corrupt`.
+- libFuzzer targets under AddressSanitizer (`tests/fuzz`, built with
+  `-DHKDFGUARD_BUILD_FUZZERS=ON`): the SP 800-108 framing (injective, never the
+  fingerprint block, and the wrap block exactly the label and context the software
+  KSP is given) and the two DACL walks behind "access list invalid" and the
+  provisioning grant check.
 - `test_roles.ps1`, under version 2: a real key-use account uses the KEK, and an
   account outside every group can't.
 
 **Assumed / not verified.**
 
-- **Other TPMs.** The AMD firmware TPM above, and an Intel PTT firmware TPM
-  (`INTC`, firmware 500.14.0.0, Windows 11 26H2 build 26300.9711, 2026-10-29);
-  no discrete or virtual TPM yet
-  (section 12).
-- **The Software KSP's AES.** CMAC's composition is tested against NIST's vectors on
-  a BCrypt key; the KSP's own AES encryption is trusted, as BCrypt's is.
-- **TBS's command filtering.** Observed, not documented: on this machine TBS blocked
-  only `TPM2_GetTestResult` for a standard account, and the registry block list holds
-  only TPM 1.2 ordinals. A Group Policy block list could block more; the library then
-  reports event 2008 naming it.
+- **That the PCP's `NCryptSignHash` is HMAC-SHA-256.** It is shown to be a keyed
+  function of its input, under a key that never leaves the TPM, and its 1,024-byte
+  input limit matches the TPM 2.0 HMAC command's. That it is exactly HMAC-SHA-256 can't be shown
+  without a known key. Nothing in the payload depends on it being so - only on its
+  being a PRF the TPM computes, and on its staying the same, which the fingerprint
+  checks.
+- **The PCP's HMAC key is documented only in part.** `ncrypt.h` names
+  `HMAC-SHA256` for persistent HMAC keys in the TPM KSP, but not the signature usage
+  it needs or that signing means HMAC. A Windows update could change either; a
+  changed output is caught by the fingerprint, and a refused one fails closed.
+- **The key length can't be read back.** Both providers report
+  `NCRYPT_LENGTH_PROPERTY` as 0 for these keys. The software KEK's length is shown by
+  the per-process check above; the PCP chooses its HMAC key's size.
+- **Other TPMs and Windows builds** (section 12).
 
 **Residual risk.**
 
-- **Session salting is classical.** The session salt is exchanged with the storage
-  root key's RSA or ECC key, as the TPM specification defines. Someone recording a
-  discrete TPM's bus today who can later break that key could recover the wrapping
-  keys that crossed it. Firmware and virtual TPMs have no bus.
-- **The TPM key file is a bearer credential (accepted trade-off).** This is weaker
-  than a version 1 TPM KEK, and it is an administrator's choice, not an equivalence.
-  A version 1 TPM KEK is checked by the Platform Crypto Provider on every use, and no
-  caller ever holds its blob. A version 2 TPM KEK's blob is the key file itself. The
-  storage root key and the KEK both have an empty authValue, any account can reach
-  TBS, and `TPM2_Load` checks nothing about its caller. So:
-  - Whoever reads the key file once can use the KEK on this host for as long as the
-    storage root key exists - until the TPM is cleared - from a copy, whatever the
-    file's ACL says later.
-  - Access can't be revoked. Removing an account from `KeyUseGroups`, changing the
-    file's ACL, or deleting the file doesn't take away a copy already made. The only
-    revocation is to retire the KEK and wrap every DEK again under a new one.
-  - The readers are more than the key-use groups: administrators, any process with
-    `SeBackupPrivilege` (backup operators, backup and snapshot software), volume
-    shadow copies, and security or management agents that read files as SYSTEM.
-  - A copy is useless on another machine: the blob is encrypted to this TPM's
-    storage root key (`fixedTPM`, `fixedParent`). The exposure is to local accounts.
-  - The software provider doesn't have this property: the Software KSP checks the
-    version 2 software KEK's ACL on every use, as for version 1, and the key is
-    non-exportable. Under version 2, a host that must be able to revoke a key-use
-    account may prefer `KeyStoragePolicy` `SoftwareOnly`, at the cost of the TPM's
-    protection at rest.
-
-  Accepted because the alternative risk can't be fixed later: a payload harvested
-  today under version 1 is exposed to a future quantum computer for good, while the
-  key file's exposure is local, limited to accounts an administrator already trusts,
-  and can be closed in a later release. The planned fix is a broker service that
-  alone can read the key files and performs `TPM2_HMAC` for callers it has checked
-  against the KEK's ACL, restoring per-use checks and revocation. Until then, treat
-  read access to a key file as the right to use the KEK indefinitely, and keep it out
-  of backups that accounts outside the key-use groups can restore.
-- **A cleared TPM** loses its storage root key, and with it every version 2 TPM KEK
-  made under it; the payloads are unrecoverable, as they would be for a version 1 TPM
-  KEK.
+- **The PRF's output crossing a discrete TPM's bus.** Whether the PCP encrypts the
+  HMAC response on its way out of the TPM is not known. On a discrete TPM, someone
+  who can record the bus could capture wrapping keys as they are computed. Firmware
+  and virtual TPMs have no bus.
+- **A cleared TPM** loses every version 2 TPM KEK, as it does a version 1 TPM KEK;
+  the payloads are unrecoverable.
 - **The software KEK** is protected at rest by the Software KSP's machine DPAPI, as a
   version 1 software KEK is (section 9); it doesn't benefit from a TPM.

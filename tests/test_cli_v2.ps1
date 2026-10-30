@@ -7,9 +7,10 @@
     ClassicalMode to 1). This covers what version 2 adds: provision, status
     and retire of a version 2 KEK on the software key store and - when this
     machine's TPM can do version 2 - the TPM; retire's refusals (a valid KEK
-    as --corrupt, a wrong fingerprint, the other version); a corrupted TPM
-    key file found by status and removed by retire --corrupt; and a version 1
-    KEK shown as the other version, retired with --version 1.
+    as --corrupt, a wrong fingerprint, the other version); a key of another
+    type under a version 2 KEK's name, found as corrupt by status and removed
+    by retire --corrupt; and a version 1 KEK shown as the other version,
+    retired with --version 1.
 
     Needs elevation (it provisions machine keys and sets ClassicalMode and
     KeyStoragePolicy, restored afterwards); skipped otherwise. Exit code 0
@@ -97,22 +98,31 @@ try {
         $r = Run-Cli @("status", "-sn", $service)
         Check (($r.ExitCode -eq 0) -and ($r.Out -match "kek: absent")) "$prefix status: absent after retire"
 
-        if ($case.Flag -eq "tpm") {
-            # ---- A corrupted TPM key file: found, and removed by --corrupt. ----
-            $r = Run-Cli @("provision", "-sn", $service)
-            $keyFile = Join-Path $env:ProgramData "HkdfGuard\TpmKeys\hkdfguardwin_$($service)_v1.tpmkey"
-            Check (($r.ExitCode -eq 0) -and (Test-Path -LiteralPath $keyFile)) "tpm: a fresh KEK's key file is in the ProgramData store"
-            $bytes = [System.IO.File]::ReadAllBytes($keyFile)
-            $bytes[0] = $bytes[0] -bxor 0x01
-            [System.IO.File]::WriteAllBytes($keyFile, $bytes)
-            $r = Run-Cli @("status", "-sn", $service)
-            Check (($r.ExitCode -eq 0) -and ($r.Out -match "kek: corrupt") -and ($r.Out -match "tpm: invalid")) "tpm: status reports a corrupted key file as corrupt"
-            if ($r.Out -notmatch "kek: corrupt") { Write-Host "    $($r.Out)" }
-            $r = Run-Cli @("retire", "-sn", $service, "-fp", $wrong)
-            Check (($r.ExitCode -eq 1) -and ($r.Out -match "fails its KEK checks")) "tpm: retire by fingerprint refuses it (it has no fingerprint)"
-            $r = Run-Cli @("retire", "-sn", $service, "--corrupt")
-            Check (($r.ExitCode -eq 0) -and -not (Test-Path -LiteralPath $keyFile)) "tpm: retire --corrupt removes the corrupted key file"
+        # ---- A key of another type under the KEK's name: corrupt, removed by --corrupt. ----
+        $keyName = if ($case.Flag -eq "tpm") { "hkdfguardwin_$($service)_v1_hmac" } else { "hkdfguardwin_$($service)_v1_kdf" }
+        $providerName = if ($case.Flag -eq "tpm") { "Microsoft Platform Crypto Provider" } else { "Microsoft Software Key Storage Provider" }
+        $creation = [System.Security.Cryptography.CngKeyCreationParameters]::new()
+        $creation.Provider = [System.Security.Cryptography.CngProvider]::new($providerName)
+        $creation.KeyCreationOptions = [System.Security.Cryptography.CngKeyCreationOptions]::MachineKey
+        $planted = $null
+        try {
+            $planted = [System.Security.Cryptography.CngKey]::Create([System.Security.Cryptography.CngAlgorithm]::ECDsaP256, $keyName, $creation)
+        } catch {
+            Write-Host "    $($_.Exception.Message)"
         }
+        Check ($null -ne $planted) "$prefix test setup: an ECDSA key planted under the KEK's name"
+        if ($null -ne $planted) { $planted.Dispose() }
+        $r = Run-Cli @("status", "-sn", $service)
+        # kek_exists only opens the key, as version 1's does, so status takes
+        # its "unusable" branch: the key is there, but fails its checks.
+        Check (($r.ExitCode -eq 0) -and ($r.Out -match "kek: (corrupt|unusable)") -and ($r.Out -match "$($case.Flag): invalid")) "$prefix status reports a key of another type as invalid"
+        if ($r.Out -notmatch "$($case.Flag): invalid") { Write-Host "    $($r.Out)" }
+        $r = Run-Cli @("retire", "-sn", $service, "-fp", $wrong)
+        Check (($r.ExitCode -eq 1) -and ($r.Out -match "fails its KEK checks")) "$prefix retire by fingerprint refuses it (it has no fingerprint)"
+        $r = Run-Cli @("retire", "-sn", $service, "--corrupt")
+        Check ($r.ExitCode -eq 0) "$prefix retire --corrupt removes it"
+        $r = Run-Cli @("status", "-sn", $service)
+        Check (($r.ExitCode -eq 0) -and ($r.Out -match "kek: absent")) "$prefix ...and status finds nothing under the name"
     }
 
     # ---- A version 1 KEK beside a version 2 host: shown, and retired with --version 1. ----

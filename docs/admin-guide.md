@@ -52,8 +52,9 @@ The usual flow is:
 - Administrator rights to install, and to provision each service's KEK.
 - A TPM is optional. Without one, keys are held by the Microsoft Software Key Storage
   Provider, unless policy requires a TPM (see [`KeyStoragePolicy`](#keystoragepolicy)).
-  For the default, post-quantum payload version 2, a TPM 2.0 is used through TBS; see
-  [ClassicalMode](#classicalmode) for what it must allow.
+  For the default, post-quantum payload version 2, the TPM must be able to hold an
+  HMAC-SHA-256 key through the Microsoft Platform Crypto Provider; see
+  [ClassicalMode](#classicalmode).
 
 ## Download and verify
 
@@ -117,7 +118,6 @@ with a restart required. For anything else, see `install.log`.
 | Registry | `HKLM\Software\hkdfguard-native-windows`, value `InstallPath` (`REG_SZ`). Applications read it to find the DLL. |
 | Event log | Registers the Application log source `hkdfguard-native-windows`. |
 | Local groups | Creates `HkdfGuardUsers` (applications: wrap and unwrap) and `HkdfGuardDeployers` (deployers: wrap, unwrap, and write key files) if they don't already exist. |
-| TPM key store | Creates `C:\ProgramData\HkdfGuard\TpmKeys`, where version 2 TPM KEKs live, with its access list: SYSTEM and Administrators full control, everyone else only passing through. Done at install so no user can create `C:\ProgramData\HkdfGuard` first and block provisioning. If something is already there that the installer didn't make, the install fails and the MSI log says what; see [Troubleshooting](#troubleshooting). Kept on uninstall. |
 
 The installer doesn't set any policy values. Those are left to whatever already manages
 machine policy, such as Group Policy, Intune or SCCM.
@@ -416,18 +416,15 @@ one: the library has no delete function.
 
 - If a key under the service's name fails its KEK checks, it has no fingerprint. `status`
   reports it as `corrupt`. Retire it with `--corrupt` instead of `--fingerprint`. For a
-  version 1 KEK that means a key that isn't a valid P-256 key; for a version 2 KEK, a TPM
-  key file or AES key that fails its checks - including a key file whose TPM was cleared,
-  so its storage root key is gone. `--corrupt` refuses a valid KEK, and refuses any key it
-  couldn't check.
-- If a version 2 KEK fails only because of its access list - someone widened the ACL on
-  the TPM key file, on its folders, or on the AES key - `status` reports `access list
-  invalid`, not `corrupt`. The key itself may be fine, so `retire --corrupt` refuses it:
-  deleting it would destroy every DEK wrapped under it for a problem you can fix. Restore
-  the access list instead (SYSTEM, Administrators and `HkdfGuardAdmins` full control, the
-  key-use groups read, nothing else) and run `status` again. Remember that anyone who could
-  read a TPM key file while its access list was wide may have kept a copy; see
-  [ClassicalMode](#classicalmode).
+  version 1 KEK that means a key that isn't a valid P-256 key; for a version 2 KEK, a key
+  that isn't the TPM's HMAC-SHA-256 key or the software key store's SP 800-108 key, or that
+  is exportable. `--corrupt` refuses a valid KEK, and refuses any key it couldn't check.
+- If a version 2 KEK fails only because of its access list - someone widened its ACL -
+  `status` reports `access list invalid`, not `corrupt`. The key itself may be fine, so
+  `retire --corrupt` refuses it: deleting it would destroy every DEK wrapped under it for a
+  problem you can fix. Restore the access list instead (SYSTEM, Administrators and
+  `HkdfGuardAdmins` full control, the key-use groups read, nothing else) and run `status`
+  again.
 - If the service has a key in both the TPM and the software key store, `retire` won't
   choose between them. Run `status`, then add `--provider tpm` or `--provider software`.
 - `retire` acts on the KEK of this machine's payload version. Add `--version 1` or
@@ -450,7 +447,7 @@ KEK, wrap and unwrap.
 
 | Value | Payload version | KEK |
 |---|---|---|
-| absent or `0` | **2, post-quantum** (the default) | A symmetric key used as a PRF: an HMAC-SHA-256 key in the TPM, or an AES-256 key in the software key store. No public key, so nothing a quantum computer could break. |
+| absent or `0` | **2, post-quantum** (the default) | A symmetric key used as an HMAC-SHA-256 PRF: an HMAC key in the TPM, or an SP 800-108 key in the software key store. No public key, so nothing a quantum computer could break. |
 | `1` | 1, classical | A P-256 ECDH key in the TPM or the software key store. |
 
 Anything else, or a value of the wrong type, makes every call fail with
@@ -464,55 +461,27 @@ existing key file unreadable until it is changed back. To move a service to the 
 version, set the value, provision the service (which creates that version's KEK, with a
 new fingerprint) and wrap its DEKs again.
 
-Where a version 2 KEK lives:
+Where a version 2 KEK lives - like every KEK, a non-exportable machine key with the usual
+KEK access list, which the key store checks on every use:
 
 | Key store | Version 2 KEK |
 |---|---|
-| TPM | A key file, `C:\ProgramData\HkdfGuard\TpmKeys\hkdfguardwin_<service>_v1.tpmkey`. The TPM made the key and only it can use it; the file holds it encrypted for this TPM. **The file's access list is the KEK's**: SYSTEM, Administrators and `HkdfGuardAdmins` full control, the key-use groups read - the same rules as any KEK. The library checks the file and its folders on every use and refuses one that anyone else could change, replace or read. |
-| Software | An AES-256 machine key named `hkdfguardwin_<service>_v1_aes`, non-exportable, with the usual KEK access list. |
+| TPM | An HMAC-SHA-256 key named `hkdfguardwin_<service>_v1_hmac` in the Microsoft Platform Crypto Provider. The TPM made the key and only it can use it. |
+| Software | An SP 800-108 HMAC key named `hkdfguardwin_<service>_v1_kdf` in the Microsoft Software Key Storage Provider. |
 
-**Know what the TPM key file means before you choose version 2 on a TPM.** Reading the key
-file is enough to use the KEK. The TPM doesn't check who loads it, so an account that reads
-the file once keeps the use of the KEK on this machine from its copy, even after you remove
-it from `KeyUseGroups` or change the file's access list. The only way to take that away is
-to retire the KEK and wrap every DEK again. Administrators, backup operators, backup and
-snapshot software, and agents running as SYSTEM can read the file too. A copy is useless on
-any other machine, since only this TPM can load it. A version 1 TPM KEK, and a version 2
-software KEK, don't have this weakness: their key store checks the access list on every use.
+A TPM is used for version 2 only if the Microsoft Platform Crypto Provider can be opened,
+reports a TPM, and can create the HMAC-SHA-256 key. If not:
 
-This is a deliberate trade. Version 2 protects payloads stored today against a future
-quantum computer, which version 1 can't do and nothing can add later; the key file's
-weakness is local and is planned to be closed in a later release. Choose accordingly:
-
-- Version 2 on the TPM (the default): post-quantum, and the TPM protects the key at rest,
-  but key-use access can't be revoked short of retiring the KEK.
-- Version 2 with `KeyStoragePolicy` `SoftwareOnly`: post-quantum, and access is checked on
-  every use, but the key is protected at rest only by machine DPAPI.
-- Version 1 (`ClassicalMode` `1`): access checked on every use and TPM-protected, but not
-  post-quantum.
-
-Whichever you choose, keep the `HkdfGuard\TpmKeys` folder out of backups that accounts
-outside the key-use groups can restore.
-
-A TPM is used for version 2 only if all of these hold: Windows can reach it through TBS
-(TPM 2.0), its storage root key at `0x81000001` exists, none of the TPM commands the library
-needs is blocked (the Group Policy setting **Configure the list of blocked TPM commands**
-must not block `TPM2_Create`, `TPM2_Load`, `TPM2_LoadExternal`, `TPM2_HMAC`,
-`TPM2_StartAuthSession`, `TPM2_ReadPublic`, `TPM2_FlushContext` or `TPM2_GetCapability`), and
-its HMAC passes a known-answer test. If not:
-
-- Under `PreferTpm`, the KEK goes in the software key store instead (event 1001), unless a
-  version 2 TPM key file already exists for the service - then the call fails.
+- Under `PreferTpm`, the KEK goes in the software key store instead (event 1001), as it
+  does for version 1.
 - Under `RequireTpm`, the call fails with `HKDFGUARD_ERR_PROVIDER_UNAVAILABLE` and event
   **2008** names the reason.
 
 Either way, nothing falls back to version 1. On a machine whose TPM can't do version 2 and
 that must keep using the TPM, set `ClassicalMode` to `1` before provisioning.
 
-If the TPM is cleared, its storage root key changes and every version 2 TPM key file made
-under the old one can no longer be used: `status` reports the KEK as `corrupt`. Key files
-wrapped under it can't be recovered. Retire it with `--corrupt`, provision again, and wrap
-new DEKs.
+If the TPM is cleared, every TPM KEK - of either version - is lost, and the key files
+wrapped under it can't be recovered. Retire it, provision again, and wrap new DEKs.
 
 ```powershell
 reg add HKLM\Software\Policies\HkdfGuard /v ClassicalMode /t REG_DWORD /d 1 /f   # classical (version 1) only
@@ -644,7 +613,7 @@ User field is the calling account.
 | 2005 | Error | The key store or cryptography layer failed. |
 | 2006 | Error | An application asked the library to read a key file that looks like an *unwrapped* key (32 raw bytes, or its hex or base64), so it may be a plaintext key on disk. The event names the file; none of its contents are logged. **Investigate**, remove the file and re-mint that DEK. |
 | 2007 | Warning | An application made more than 10 setup calls (`create_kek` / `kek_exists`) in one process. These should run once at startup; it is probably calling them per request. Logged once per process. |
-| 2008 | Error | Payload version 2 is unavailable: the TPM can't be used for it, and the `KeyStoragePolicy` (or an existing version 2 TPM key file) rules out the software key store. Names the reason - no TPM 2.0, no storage root key, a blocked TPM command, a failed known-answer test - and the fixes. See [ClassicalMode](#classicalmode). |
+| 2008 | Error | Payload version 2 is unavailable: the TPM can't be used for it, and the `KeyStoragePolicy` (or a TPM KEK or key file) rules out the software key store. Names the reason - the Platform Crypto Provider can't be opened, no TPM, or the TPM can't create the HMAC-SHA-256 key - and the fixes. See [ClassicalMode](#classicalmode). |
 
 Wrap and unwrap events include a SHA-256 of the wrapped payload, so each unwrap can be
 traced to the wrap that produced it. To compare against a key file:
@@ -677,8 +646,7 @@ msiexec /x hkdfguard-native-windows-0.9.0-win-x64.msi /qn /l*v uninstall.log
 You can also uninstall **HkdfGuard for Windows** from **Settings → Apps**. Uninstalling removes the files, the
 `InstallPath` value and the event source registration. It deliberately keeps:
 
-- **All KEKs**, including the version 2 TPM key files under
-  `C:\ProgramData\HkdfGuard\TpmKeys`. Deleting a KEK destroys every DEK wrapped under it.
+- **All KEKs.** Deleting a KEK destroys every DEK wrapped under it.
   To remove one on purpose, [retire](#check-or-retire-a-kek) it before you uninstall.
 - **The `HkdfGuardUsers` group.** A recreated group would get a new SID and lose access to
   existing KEKs.
@@ -699,12 +667,9 @@ was attempted) and `1` for an operational failure. On failure it prints an `erro
 | `hkdfguard_open_file would refuse to read a key file there` | `wrap`'s `--key-file-path` is in a folder that another account can create, delete or rename entries in (for example anywhere under `C:\ProgramData`), or that isn't owned by SYSTEM, Administrators, TrustedInstaller or you. Nothing was read or written. | Use a folder prepared as in [Where to keep key files](#where-to-keep-key-files); the message names the folder and account and prints the `icacls` commands. |
 | `this account may not persist key files` | Under the production model, `wrap` ran as an account that is neither an elevated administrator nor a member of `HkdfGuardDeployers` or a `DeployerGroups` group. Nothing was written. | Run `wrap` as a deployer: add the account to `HkdfGuardDeployers`, then sign in again. |
 | `invalid machine policy` | `KeyStoragePolicy` isn't a `REG_DWORD` of `0`, `1` or `2`, or `SecurityModel` or `ClassicalMode` isn't a `REG_DWORD` of `0` or `1`. | Correct or remove the value. |
-| `payload version 2 is unavailable on this host` | The TPM can't be used for version 2 and the `KeyStoragePolicy` (or an existing version 2 TPM key file) rules out the software key store. Event 2008 names the reason. | Fix what event 2008 names (for a blocked command, the Group Policy list of blocked TPM commands). Or set `KeyStoragePolicy` to allow the software key store, or set [ClassicalMode](#classicalmode) to `1` before provisioning. |
+| `payload version 2 is unavailable on this host` | The TPM can't be used for version 2 and the `KeyStoragePolicy` (or a TPM KEK or key file) rules out the software key store. Event 2008 names the reason. | Fix what event 2008 names. Or set `KeyStoragePolicy` to allow the software key store, or set [ClassicalMode](#classicalmode) to `1` before provisioning. |
 | `not the payload version this host uses` | The key file was wrapped while `ClassicalMode` had the other value. | Set `ClassicalMode` back to what it was when the file was wrapped, or provision this version's KEK and wrap the DEK again. |
-| `kek: corrupt` from `status`, for a TPM KEK | Often a TPM that was cleared since provisioning: the key file is pinned to a storage root key that no longer exists. | Everything wrapped under it is unrecoverable. Retire it with `--corrupt`, provision again and wrap new DEKs. |
-| `kek: access list invalid` from `status` | The ACL on a version 2 KEK, or on the `HkdfGuard\TpmKeys` folders, grants someone it shouldn't: write, ownership, or read for an over-broad group such as Users or Everyone. Group Policy file-permission settings and manual `icacls` changes are the usual causes. | Restore the access list; do not retire the key. If the over-broad grant was read access on a TPM key file, decide whether to treat the KEK as exposed (see [ClassicalMode](#classicalmode)). |
-| `provision` fails with `the existing TPM key file's ACL doesn't grant every principal the current policy names` | A group was added to `KeyUseGroups` or `DeployerGroups` (or `HkdfGuardUsers` or `HkdfGuardDeployers` was created) after the service's version 2 TPM KEK was provisioned. Provisioning doesn't change an existing key's access list. | Grant the group read access on the key file, `C:\ProgramData\HkdfGuard\TpmKeys\hkdfguardwin_<service>_v1.tpmkey`, and provision again. Removing a group from the policy doesn't remove its grant: take it off the key file yourself, and remember that a member who read the file may have kept a copy (see [ClassicalMode](#classicalmode)). |
-| The install fails, and the MSI log shows `preparing the TPM key store failed` | `C:\ProgramData\HkdfGuard`, or `TpmKeys` inside it, already exists and wasn't made with the store's access list: owned or writable by another account, or a link. On a machine that has never had HkdfGuard, that is most likely another user creating it first to block provisioning. | Investigate who created it. Then remove it and install again, or run `hkdfguard.exe prepare-store` from an elevated prompt. Never loosen the folder's access list to make it pass. |
+| `kek: access list invalid` from `status` | The ACL on a version 2 KEK grants someone it shouldn't, such as use for an over-broad group like Users or Everyone. | Restore the access list; do not retire the key. |
 | `a KeyUseGroups or DeployerGroups policy entry is ...` | An entry in either value is invalid, or a deployer group's members couldn't be read. | Fix the entry. See [KeyUseGroups](#keyusegroups) and [DeployerGroups](#deployergroups). |
 | `service name is missing or malformed` | The name uses characters other than ASCII letters, digits and `.`, starts with `.`, contains `..`, or is longer than 128. | Use a valid name. |
 

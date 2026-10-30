@@ -31,7 +31,7 @@ namespace hkdfguard {
         return Sp800108Block(counter, kFingerprintLabel, nullptr, 0);
     }
 
-    std::vector<uint8_t> WrapBlock(uint32_t counter, const std::string &service, const uint8_t *header, size_t header_len) {
+    std::vector<uint8_t> WrapContext(const std::string &service, const uint8_t *header, size_t header_len) {
         if (service.empty() || service.size() > 0xFFFF) {
             throw HkdfGuardError(HKDFGUARD_ERR_INTERNAL_ERROR, "service name can't be framed in the KDF context");
         }
@@ -43,6 +43,11 @@ namespace hkdfguard {
         context.push_back(static_cast<uint8_t>((service.size() >> 8) & 0xFF));
         context.insert(context.end(), service.begin(), service.end());
         context.insert(context.end(), header, header + header_len);
+        return context;
+    }
+
+    std::vector<uint8_t> WrapBlock(uint32_t counter, const std::string &service, const uint8_t *header, size_t header_len) {
+        const std::vector<uint8_t> context = WrapContext(service, header, header_len);
         return Sp800108Block(counter, kWrapLabel, context.data(), context.size());
     }
 } // namespace hkdfguard

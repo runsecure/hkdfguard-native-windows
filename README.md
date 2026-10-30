@@ -8,9 +8,9 @@ prefers the TPM and falls back to software when no TPM is available (bare server
 without a vTPM, containers).
 
 By default every payload is **version 2, post-quantum**: the KEK is a symmetric key the
-provider uses as a PRF - an HMAC-SHA-256 key in the TPM, used with raw TPM 2.0 commands
-through TBS, or an AES-256 key in the Software Key Storage Provider, used as AES-CMAC -
-so there is no public key for a quantum computer to break. The construction is the
+provider uses as an HMAC-SHA-256 PRF - an HMAC key in the TPM (Microsoft Platform Crypto
+Provider), or an SP 800-108 key in the Software Key Storage Provider, both persisted
+NCrypt machine keys - so there is no public key for a quantum computer to break. The construction is the
 Linux library's, byte for byte. **Version 1**, the classical construction (a P-256 ECDH
 KEK), is used only where an administrator sets `ClassicalMode` (below). See
 [docs/adr/0001-post-quantum-payload-version-2.md](docs/adr/0001-post-quantum-payload-version-2.md).
@@ -39,10 +39,9 @@ call with `HKDFGUARD_ERR_POLICY_INVALID`. A host uses exactly one: unwrap refuse
 payload of the other version with `HKDFGUARD_ERR_PAYLOAD_VERSION_REFUSED` before any key
 is opened, and nothing falls back from one version to the other. Each version has its
 own KEK, so `hkdfguard_create_kek` provisions the one for this host's setting. A TPM is
-usable for version 2 only if TBS reaches it, its storage root key is a SHA-256 storage
-key, no command it needs is blocked, and its HMAC passes a known-answer test. When it
-isn't, `PreferTpm` falls back to the software key store (event 1001) unless a version 2
-TPM KEK already exists, and `RequireTpm` fails with
+unusable for version 2 when the Platform Crypto Provider can't be opened, reports no TPM
+device, or can't create an HMAC-SHA-256 key. Then `PreferTpm` falls back to the software
+key store (event 1001), as it does for version 1, and `RequireTpm` fails with
 `HKDFGUARD_ERR_PROVIDER_UNAVAILABLE` and logs event 2008 with the reason - set
 `ClassicalMode` to `1` on such a host to keep using version 1.
 
@@ -427,11 +426,10 @@ away from other processes.
     the service's name must be a valid KEK with exactly that fingerprint.
   - `--corrupt`: for a key under the service's name that definitely fails its KEK
     checks, so has no fingerprint - for version 1, a key that is not a P-256 ECDH key;
-    for version 2, a TPM key file or AES key that fails them (a key file pinned to a
-    storage root key the TPM no longer has, after a TPM clear, among others). A key that
-    merely couldn't be checked is never treated as corrupt, and neither is a version 2 key
-    whose only fault is its access list (the owner or DACL of the key file, its folders or
-    the AES key): `status` reports that as `access list invalid`, and the fix is to restore
+    for version 2, a key that is not the TPM's HMAC-SHA-256 key or the software key
+    store's SP 800-108 key, or is exportable. A key that merely couldn't be checked is
+    never treated as corrupt, and neither is a version 2 key whose only fault is its
+    access list: `status` reports that as `access list invalid`, and the fix is to restore
     the ACL, not to retire the key.
 
   It retires the KEK of this host's payload version; `--version 1|2` picks the other's.
@@ -614,9 +612,8 @@ the `RequireTpm`/`PreferTpm`/`SoftwareOnly` policy paths - against:
 - The **Microsoft Software Key Storage Provider** (the software fallback
   path), which is vendor-independent
 
-Payload version 2's TPM path - raw TPM 2.0 commands through TBS rather than the
-Platform Crypto Provider - has run on the same two firmware TPMs: the AMD fTPM
-and an Intel PTT (manufacturer `INTC`, firmware 500.14.0.0).
+Payload version 2's TPM KEK - an HMAC-SHA-256 key in the Platform Crypto
+Provider - has so far run only on the AMD fTPM.
 
 It has **not yet been tested** against a discrete (dTPM) hardware TPM from
 **Infineon** or **Nuvoton**. Both are legitimate Microsoft Platform Crypto
@@ -652,7 +649,7 @@ including the impersonated client when a service acts on someone's behalf.
 | 2005 | Error | `PROVIDER_ERROR`, `CRYPTO_ERROR` or `INTERNAL_ERROR`: the key storage provider or crypto layer failed. |
 | 2006 | Error | `hkdfguard_open_file` refused a file that looks like an unwrapped DEK (32 raw bytes, or its hex or base64), so possibly a plaintext key on disk. Names the file; none of its contents are logged or returned. Investigate it. |
 | 2007 | Warning | A process made more than 10 `hkdfguard_create_kek` / `hkdfguard_kek_exists` calls. They are meant to run once at startup, so a caller is probably looping on them. Logged once per process. |
-| 2008 | Error | `PROVIDER_UNAVAILABLE`: payload version 2 is unavailable on this host. Names the reason: no TPM 2.0 reachable through TBS, no usable storage root key, a TPM command blocked by Group Policy, or a failed known-answer test - and the fixes. Logged on every failing call. |
+| 2008 | Error | `PROVIDER_UNAVAILABLE`: payload version 2 is unavailable on this host. Names the reason: the Platform Crypto Provider can't be opened, no TPM device, or the TPM can't create an HMAC-SHA-256 key - and the fixes. Logged on every failing call. |
 
 The wrap and unwrap events also record the KEK's fingerprint and a SHA-256 of the
 wrapped payload. Both are public values that reveal nothing about the DEK. Because the
@@ -728,16 +725,18 @@ It is read on every setup call.
   header || [256]_32)` and the KEK fingerprint the same over the label
   `"hkdfguard-kek-fingerprint-v1"` and an empty context - byte for byte the Linux
   library's construction, pinned by its known-answer values in `tests/test_v2_kek.cpp`.
-  In the TPM the PRF is HMAC-SHA-256: a TPM-generated, non-duplicable keyed-hash key under
-  the storage root key, used with raw TPM 2.0 commands through TBS (`src/tpm2_*.h`), the
-  HMAC's result encrypted on its way back in a session salted to the storage root key.
-  The key file (`src/tpm_key_file.h`, under `ProgramData\HkdfGuard\TpmKeys`) pins the
-  storage root key's Name, and its ACL is the KEK's access control, checked on every open.
-  In the Software Key Storage Provider the PRF is AES-256-CMAC over a non-exportable
-  AES-256 machine key (`src/aes_cmac.h`), two CMAC blocks per 32-byte output. Each
-  process checks the TPM's HMAC with a known-answer test before first using it. Wrapping
-  needs the KEK, as in version 1, so **only an account authorized to use the KEK can
-  create a payload**; and there is no public key at all. The AES-256-GCM step and the
+  The PRF is HMAC-SHA-256 keyed by the KEK, and both KEKs are persisted, non-exportable
+  NCrypt machine keys with version 1's ACL, so the provider checks the caller on every
+  use. In the TPM the KEK is an `HMAC-SHA256` key in the Platform Crypto Provider, with
+  the PCP's signature key usage; `NCryptSignHash` over the block returns its HMAC,
+  computed in the TPM. In the Software Key Storage Provider the KEK is an
+  `SP800_108_CTR_HMAC` key; `NCryptKeyDerivation` builds the same block from the label
+  and context and returns the same HMAC. Each process checks the software key store's
+  derivation against BCrypt's HMAC-SHA-256 with a throwaway key before first using it.
+  The TPM's HMAC can't be checked that way (the PCP won't import a known key); the KEK
+  fingerprint, itself a PRF output, pins it instead. Wrapping needs the KEK, as in
+  version 1, so **only an account authorized to use the KEK can create a payload**; and
+  there is no public key at all. The AES-256-GCM step and the
   fingerprint check are as for version 1, below.
 - **Crypto, version 1** (`ClassicalMode` = `1`): ECDH (P-256) between the KEK's private key and a point hashed from a
   random per-payload salt, then HKDF-SHA512 and AES-256-GCM. Each wrap draws a 32-byte
@@ -768,8 +767,8 @@ It is read on every setup call.
   C struct so the format has no dependency on compiler struct-packing rules.
 - **KEK lifecycle**: the version 2 KEK lives in `src/kek_v2.cpp`, with the same
   `KeyStoragePolicy` rules, ACL, creation-only and verify-on-every-open behavior as the
-  version 1 KEK described here; its own rule is that a TPM which can't do version 2 is
-  fallen back from under `PreferTpm` only while no version 2 TPM key file exists. For
+  version 1 KEK described here, under its own names (version 1's with `_hmac` for the
+  TPM key or `_kdf` for the software key). For
   version 1, `src/kek_store.cpp` creates the KEK (Platform Crypto Provider first,
   falling back to Software KSP under `PreferTpm`) only via `hkdfguard_create_kek`, which
   also applies the `KeyUseGroups`-driven ACL and is idempotent - safe to call again for
@@ -886,13 +885,6 @@ The MSI does four things:
   the MSI first. The MSI does not create the optional
   `HkdfGuardAdmins` group (full control of KEKs created while it exists); create it
   yourself, before provisioning, only if you want to delegate key administration.
-- **Creates the TPM key store**, `C:\ProgramData\HkdfGuard\TpmKeys`, with its access list,
-  by running `hkdfguard.exe prepare-store` as SYSTEM. `C:\ProgramData` lets every user
-  create folders, so without this a user could create `HkdfGuard` first and block every
-  later provisioning. `prepare-store` walks the path without following links and refuses
-  a folder it didn't make, which fails the install. A `CreateFolder` element isn't used
-  for this: Windows Installer would follow a junction planted in the folder's place and,
-  as SYSTEM, rewrite the access list of whatever it points at.
 
 Then, once per service, elevated:
 

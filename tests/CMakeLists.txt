@@ -46,74 +46,11 @@ set_tests_properties(roundtrip PROPERTIES
     ENVIRONMENT "PATH=$<TARGET_FILE_DIR:hkdfguard>\\;${HKDFGUARD_TEST_PATH}"
 )
 
-# test_tpm2_marshal checks src/tpm2_marshal.cpp, the TPM 2.0 command
-# encodings and response parsers of the version 2 TPM provider (see
-# docs/adr/0001-post-quantum-payload-version-2.md): golden command bytes, the
-# parsers on well-formed and malformed responses, and a mutation sweep. Pure
-# code - no TPM, no elevation, no machine state - so it needs neither the
-# DLL nor the resource lock below.
-add_executable(test_tpm2_marshal
-    test_tpm2_marshal.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/tpm2_marshal.cpp
-)
-target_include_directories(test_tpm2_marshal PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/../include
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src
-)
-if(MSVC)
-    target_compile_options(test_tpm2_marshal PRIVATE /W4)
-endif()
-add_test(NAME tpm2_marshal COMMAND test_tpm2_marshal)
-
-# test_tpm2_session checks the session cryptography (src/tpm2_session.cpp)
-# against independent references and, when TBS reaches a TPM 2.0, the whole
-# TPM path (src/tpm2_device.cpp) against the real TPM: a known-answer HMAC
-# through salted, encrypted sessions, a created key, and tampered responses.
-# Needs no elevation and leaves nothing in the TPM, so, like tpm2_marshal,
-# it takes no resource lock.
-add_executable(test_tpm2_session
-    test_tpm2_session.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/tpm2_marshal.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/tpm2_session.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/tpm2_device.cpp
-)
-target_include_directories(test_tpm2_session PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/../include
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src
-)
-target_link_libraries(test_tpm2_session PRIVATE bcrypt.lib tbs.lib)
-if(MSVC)
-    target_compile_options(test_tpm2_session PRIVATE /W4)
-endif()
-add_test(NAME tpm2_session COMMAND test_tpm2_session)
-
-# test_tpm_key_file checks the version 2 TPM KEK's key file and its store
-# (src/tpm_key_file.cpp): the format, the KEK template, the file's security
-# descriptor, and - elevated - writing, reading and deleting in a throwaway
-# store under a new C:\ folder, and every tampering the store must refuse.
-# Needs no TPM. Its store is its own folder, never ProgramData's, so it
-# takes no resource lock either.
-add_executable(test_tpm_key_file
-    test_tpm_key_file.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/tpm2_marshal.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/tpm_key_file.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/key_acl.cpp
-)
-target_include_directories(test_tpm_key_file PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/../include
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src
-)
-target_compile_definitions(test_tpm_key_file PRIVATE UNICODE _UNICODE)
-target_link_libraries(test_tpm_key_file PRIVATE bcrypt.lib ncrypt.lib advapi32.lib netapi32.lib shell32.lib ole32.lib ntdll.lib)
-if(MSVC)
-    target_compile_options(test_tpm_key_file PRIVATE /W4)
-endif()
-add_test(NAME tpm_key_file COMMAND test_tpm_key_file)
-
 # test_v2_kek checks payload version 2 end to end: the SP 800-108
-# construction against the Linux library's known answers, AES-CMAC, the
-# ClassicalMode rule, and - elevated - the DLL's TPM and software version 2
-# KEKs (create, wrap, unwrap, tampering, relabeling) and provider choice. It
+# construction against the Linux library's known answers, the Software KSP's
+# SP 800-108 derivation against it, the ClassicalMode rule, and - elevated -
+# the DLL's TPM and software version 2 KEKs (create, wrap, unwrap,
+# tampering, relabeling) and provider choice. It
 # compiles its own copies of the version 2 sources, with the test seams
 # enabled, for the provider-choice checks; everything else goes through
 # HkdfGuard.dll.
@@ -121,11 +58,6 @@ add_executable(test_v2_kek
     test_v2_kek.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/kek_v2.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/sp800_108.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/aes_cmac.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/tpm2_marshal.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/tpm2_session.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/tpm2_device.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/tpm_key_file.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/key_acl.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/policy.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/event_log.cpp
@@ -136,7 +68,7 @@ target_include_directories(test_v2_kek PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../src
 )
 target_compile_definitions(test_v2_kek PRIVATE HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE UNICODE _UNICODE)
-target_link_libraries(test_v2_kek PRIVATE hkdfguard ncrypt.lib bcrypt.lib advapi32.lib netapi32.lib tbs.lib shell32.lib ole32.lib ntdll.lib)
+target_link_libraries(test_v2_kek PRIVATE hkdfguard ncrypt.lib bcrypt.lib advapi32.lib netapi32.lib ntdll.lib)
 if(MSVC)
     target_compile_options(test_v2_kek PRIVATE /W4)
 endif()
@@ -180,33 +112,16 @@ if(HKDFGUARD_BUILD_FUZZERS AND MSVC)
                          ${CMAKE_CURRENT_SOURCE_DIR}/fuzz/corpus/${name})
     endfunction()
 
-    set(HKDFGUARD_FUZZ_WIN_LIBS bcrypt.lib ncrypt.lib advapi32.lib netapi32.lib shell32.lib ole32.lib ntdll.lib)
+    set(HKDFGUARD_FUZZ_WIN_LIBS bcrypt.lib ncrypt.lib advapi32.lib netapi32.lib ntdll.lib)
 
-    # TPM response parsers (tpm2_marshal.h).
-    hkdfguard_add_fuzzer(fuzz_tpm2_marshal 200000 4097 SOURCES tpm2_marshal.cpp)
-    # The version 2 TPM KEK's key file parser, and its one encoding.
-    hkdfguard_add_fuzzer(fuzz_tpm_key_file 200000 4097
-        SOURCES tpm_key_file.cpp tpm2_marshal.cpp key_acl.cpp
-        LIBS ${HKDFGUARD_FUZZ_WIN_LIBS})
-    # The storage root key rule, over every parsed public area.
-    hkdfguard_add_fuzzer(fuzz_srk_rule 50000 1025
-        SOURCES kek_v2.cpp sp800_108.cpp aes_cmac.cpp tpm2_marshal.cpp tpm2_session.cpp tpm2_device.cpp
-                tpm_key_file.cpp key_acl.cpp policy.cpp event_log.cpp wire_format.cpp
-        LIBS ${HKDFGUARD_FUZZ_WIN_LIBS} tbs.lib)
-    # A TPM2_HMAC response through the salted session: parse, verify,
-    # continueSession, decrypt.
-    hkdfguard_add_fuzzer(fuzz_tpm2_session 50000 4097
-        SOURCES tpm2_session.cpp tpm2_marshal.cpp
-        LIBS bcrypt.lib)
     # The DACL walks behind "access list invalid" and the provisioning
     # grant check.
     hkdfguard_add_fuzzer(fuzz_kek_dacl 20000 1025
-        SOURCES key_acl.cpp tpm_key_file.cpp tpm2_marshal.cpp
+        SOURCES key_acl.cpp
         LIBS ${HKDFGUARD_FUZZ_WIN_LIBS})
-    # The SP 800-108 framing's injectivity, and AES-CMAC against BCrypt's.
+    # The SP 800-108 framing's injectivity.
     hkdfguard_add_fuzzer(fuzz_v2_kdf 100000 1025
-        SOURCES sp800_108.cpp aes_cmac.cpp
-        LIBS bcrypt.lib)
+        SOURCES sp800_108.cpp)
 endif()
 
 # test_cli.ps1 exercises hkdfguard.exe's argument parsing, validation and

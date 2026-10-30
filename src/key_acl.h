@@ -83,34 +83,17 @@ namespace hkdfguard {
     void VerifyExistingKeyAcl(
         NCRYPT_KEY_HANDLE key);
 
-    // VerifyExistingKeyAcl's checks on a DACL already in hand - for a
-    // version 2 TPM key file, whose ACL is the access control to the key
-    // (see tpm_key_file.h). A NULL `acl` (no DACL) fails too. Throws
-    // HkdfGuardError(HKDFGUARD_ERR_KEK_INVALID) on a violation.
+    // VerifyExistingKeyAcl's checks on a DACL already in hand, so the walk
+    // can be fuzzed on its own (tests/fuzz/fuzz_kek_dacl.cpp). A NULL `acl`
+    // (no DACL) fails too. Throws HkdfGuardError(HKDFGUARD_ERR_KEK_INVALID)
+    // on a violation.
     void VerifyExistingKekDacl(
         PACL acl);
 
-    // The security descriptor for a version 2 TPM key file: the same DACL
-    // ApplyKeyAcl gives a KEK (full control for SYSTEM, Administrators and
-    // HkdfGuardAdmins; key use - here GENERIC_READ, read access to the file
-    // - for the key-use groups and `additionalGroups`, vetted the same way),
-    // marked protected so nothing is inherited, with BUILTIN\Administrators
-    // as owner. Self-relative, ready for SECURITY_ATTRIBUTES or NtCreateFile.
-    // Throws HkdfGuardError on failure.
-    std::vector<BYTE> BuildKekFileSecurityDescriptor(
-        const std::vector<std::wstring>& additionalGroups);
-
-    // Whether `sid` is one of the principals every KEK's ACL gives full
-    // control: SYSTEM, BUILTIN\Administrators, or HkdfGuardAdmins if it
-    // exists as a group in this host's own SAM. Only these may own or write
-    // a version 2 TPM key file or the folders it lives in.
-    bool IsKekAdministrator(
-        PSID sid);
-
-    // VerifyKeyAcl's checks on a DACL already in hand - for a version 2 TPM
-    // key file, whose ACL is the access control to the key. A NULL `acl`
-    // fails too. Throws HkdfGuardError(HKDFGUARD_ERR_PROVIDER_ERROR) when a
-    // principal is missing, as VerifyKeyAcl does.
+    // VerifyKeyAcl's checks on a DACL already in hand, fuzzed alongside
+    // VerifyExistingKekDacl. A NULL `acl` fails too. Throws
+    // HkdfGuardError(HKDFGUARD_ERR_PROVIDER_ERROR) when a principal is
+    // missing, as VerifyKeyAcl does.
     void VerifyKekDaclGrants(
         PACL acl,
         const std::vector<std::wstring> &additionalGroups);

@@ -1,12 +1,10 @@
-// libFuzzer target for payload version 2's key derivation inputs and its
-// software PRF: src/sp800_108.cpp's block framing and src/aes_cmac.cpp's
-// AES-CMAC composition. Built only with -DHKDFGUARD_BUILD_FUZZERS=ON, with
-// AddressSanitizer.
+// libFuzzer target for payload version 2's key derivation inputs:
+// src/sp800_108.cpp's block framing. Built only with
+// -DHKDFGUARD_BUILD_FUZZERS=ON, with AddressSanitizer.
 //
 // The input is read as: a service length byte, that service, a 40-byte
-// header, a second service length byte, a second service, a second header;
-// the remaining bytes are an AES-CMAC key (first 32, zero-padded) and
-// message.
+// header, a second service length byte, a second service, a second header.
+// Anything after that is ignored.
 //
 // Properties:
 //   - Framing is injective: two different (service, header) pairs never
@@ -14,19 +12,16 @@
 //     block - so no two payloads, and no payload and the fingerprint, share
 //     a wrapping key.
 //   - Every block is [i]_32 || label || 0x00 || context || [256]_32.
-//   - AesCmac, composed here from single-block and CBC operations, equals
-//     BCrypt's own AES-CMAC for every key and message.
+//   - The wrap block is exactly Sp800108Block over WrapContext, the label
+//     and context the software KSP's own SP 800-108 derivation is given
+//     (kek_v2.cpp's KspDerive) - so the TPM's HMAC over WrapBlock and the
+//     KSP's derivation see the same block.
 //
 // Seeds: tests/fuzz/corpus/fuzz_v2_kdf.
 #include "fuzz_common.h"
-#include "aes_cmac.h"
 #include "errors.h"
-#include "handle_traits.h" // ScopedBCryptKey
 #include "sp800_108.h"
 #include "wire_format.h"   // kHeaderLen
-
-#include <windows.h>
-#include <bcrypt.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -71,38 +66,6 @@ namespace {
         const uint8_t l256[4] = {0x00, 0x00, 0x01, 0x00};
         FUZZ_REQUIRE(std::memcmp(block.data() + block.size() - 4, l256, 4) == 0, "a block ends with [256]_32");
     }
-
-    void CheckCmac(const uint8_t *key_bytes, size_t key_len, const uint8_t *message, size_t len) {
-        uint8_t key[32] = {};
-        std::memcpy(key, key_bytes, key_len < 32 ? key_len : 32);
-        ScopedBCryptKey ecb;
-        FUZZ_REQUIRE(BCryptGenerateSymmetricKey(BCRYPT_AES_ECB_ALG_HANDLE, ecb.put(), nullptr, 0, key, 32, 0) == 0,
-                     "an AES-256 key can be made");
-        AesBlockOperations aes;
-        aes.encrypt_block = [&](const uint8_t *in, uint8_t *out) {
-            ULONG got = 0;
-            FUZZ_REQUIRE(BCryptEncrypt(ecb.get(), const_cast<PUCHAR>(in), kAesBlockSize, nullptr, nullptr, 0, out,
-                                       kAesBlockSize, &got, 0) == 0,
-                         "AES block encryption works");
-        };
-        aes.cbc_zero_iv = [&](const uint8_t *in, size_t n, uint8_t *out) {
-            FUZZ_REQUIRE(n % kAesBlockSize == 0 && n != 0, "CBC is asked only for whole blocks");
-            uint8_t chain[kAesBlockSize] = {};
-            for (size_t off = 0; off < n; off += kAesBlockSize) {
-                uint8_t x[kAesBlockSize];
-                for (size_t i = 0; i < kAesBlockSize; ++i) x[i] = static_cast<uint8_t>(chain[i] ^ in[off + i]);
-                aes.encrypt_block(x, out + off);
-                std::memcpy(chain, out + off, kAesBlockSize);
-            }
-        };
-        uint8_t mine[kAesBlockSize];
-        uint8_t reference[kAesBlockSize];
-        AesCmac(aes, message, len, mine);
-        FUZZ_REQUIRE(BCryptHash(BCRYPT_AES_CMAC_ALG_HANDLE, key, 32, const_cast<PUCHAR>(message),
-                                static_cast<ULONG>(len), reference, kAesBlockSize) == 0,
-                     "BCrypt AES-CMAC works");
-        FUZZ_REQUIRE(std::memcmp(mine, reference, kAesBlockSize) == 0, "AesCmac equals BCrypt AES-CMAC");
-    }
 } // namespace
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
@@ -118,16 +81,17 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         const std::vector<uint8_t> fingerprint = FingerprintBlock(1);
         CheckLayout(fingerprint, 1, kFingerprintLabel);
         if (have_a) {
-            for (uint32_t counter : {1u, 2u}) {
-                const std::vector<uint8_t> a = WrapBlock(counter, service_a, header_a, kHeaderLen);
-                CheckLayout(a, counter, kWrapLabel);
-                FUZZ_REQUIRE(a != FingerprintBlock(counter), "no wrap block is the fingerprint block");
-                if (have_b) {
-                    const std::vector<uint8_t> b = WrapBlock(counter, service_b, header_b, kHeaderLen);
-                    const bool same_input =
-                        service_a == service_b && std::memcmp(header_a, header_b, kHeaderLen) == 0;
-                    FUZZ_REQUIRE((a == b) == same_input, "two wrap blocks are equal only for the same service and header");
-                }
+            const std::vector<uint8_t> a = WrapBlock(1, service_a, header_a, kHeaderLen);
+            CheckLayout(a, 1, kWrapLabel);
+            FUZZ_REQUIRE(a != fingerprint, "no wrap block is the fingerprint block");
+            const std::vector<uint8_t> context = WrapContext(service_a, header_a, kHeaderLen);
+            FUZZ_REQUIRE(a == Sp800108Block(1, kWrapLabel, context.data(), context.size()),
+                         "the wrap block is the SP 800-108 block over WrapContext");
+            if (have_b) {
+                const std::vector<uint8_t> b = WrapBlock(1, service_b, header_b, kHeaderLen);
+                const bool same_input =
+                    service_a == service_b && std::memcmp(header_a, header_b, kHeaderLen) == 0;
+                FUZZ_REQUIRE((a == b) == same_input, "two wrap blocks are equal only for the same service and header");
             }
         }
     } catch (const HkdfGuardError &) {
@@ -136,8 +100,5 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         FUZZ_REQUIRE(false, "the KDF framing throws only HkdfGuardError");
     }
 
-    // The rest: a CMAC key and message (any length, including none).
-    const size_t key_len = in.n < 32 ? in.n : 32;
-    CheckCmac(in.p, key_len, in.p + key_len, in.n - key_len);
     return 0;
 }

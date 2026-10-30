@@ -58,10 +58,11 @@
 //                     calls (hkdfguard_create_kek / hkdfguard_kek_exists),
 //                     once per process - likely a caller looping on them.
 //   2008 Error        PROVIDER_UNAVAILABLE: this host can't do payload
-//                     version 2 - the TPM can't be used for it (named:
-//                     no TPM 2.0, no storage root key, a blocked command, a
-//                     failed known-answer test) and the KeyStoragePolicy,
-//                     or an existing TPM KEK, rules out the software KSP.
+//                     version 2 - the TPM can't be used for it (named: the
+//                     Platform Crypto Provider can't be opened, no TPM
+//                     device, or the TPM can't create an HMAC key) and the
+//                     KeyStoragePolicy, or a TPM KEK or payload, rules out
+//                     the software KSP.
 //                     Written by kek_v2.cpp, which knows the reason, on
 //                     every failing call.
 //
@@ -263,9 +264,9 @@ namespace hkdfguard {
         try {
             Write(EVENTLOG_ERROR_TYPE, kEvtVersion2Unavailable,
                   L"Payload version 2 is unavailable for service '" + service + L"': " + Widen(reason) +
-                  L". The call failed with HKDFGUARD_ERR_PROVIDER_UNAVAILABLE. Fix the TPM (or its Group Policy "
-                  L"list of blocked TPM commands), set KeyStoragePolicy to allow the software key store, or set "
-                  L"ClassicalMode to 1 to use payload version 1 on this host.");
+                  L". The call failed with HKDFGUARD_ERR_PROVIDER_UNAVAILABLE. Fix the TPM, set "
+                  L"KeyStoragePolicy to allow the software key store, or set ClassicalMode to 1 to use payload "
+                  L"version 1 on this host.");
         } catch (...) {
         }
     }
