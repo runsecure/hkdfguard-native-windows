@@ -509,12 +509,13 @@ use) are still granted by *name*, now restricted to local groups.
   hosted runner. ARM64 builds still get no shadow-stack or EH-continuation
   equivalent.
 - Only one TPM vendor/firmware has been exercised (section 4); other
-  Platform Crypto Provider backends may exhibit different quirks. The same
-  holds for payload version 2's TPM KEK (section 17), an HMAC-SHA-256 key in
-  the Platform Crypto Provider: it has run only on that AMD firmware TPM.
-  Intel PTT, a discrete TPM and a Hyper-V virtual TPM are untested, as is
-  Windows 11 24H2 (build 26100); the probes the ADR cites are the quick
-  check to run on each before relying on it there.
+  Platform Crypto Provider backends may exhibit different quirks. Payload
+  version 2's TPM KEK (section 17), an HMAC-SHA-256 key in the Platform
+  Crypto Provider, has run on that AMD firmware TPM and on Intel PTT
+  (firmware 500.14.0.0), the latter through the test suites only. A discrete
+  TPM and a Hyper-V virtual TPM are untested, as is Windows 11 24H2 (build
+  26100); the probes the ADR cites are the quick check to run on each before
+  relying on it there.
 - Release binaries and MSIs are Authenticode-signed through Azure Artifact
   Signing (`scripts/ArtifactSigning.ps1`), by a release-workflow job in the
   "release" environment that signs in to Azure over OIDC: no signing
@@ -1048,7 +1049,8 @@ rejected (a hybrid, ML-KEM, a DPAPI secret) are in
   another type under a version 2 name is `HKDFGUARD_ERR_KEK_INVALID`, never used,
   and `retire --corrupt` may remove it.
 
-**Verified how** (AMD firmware TPM, Windows 11 build 26300, 2026-10-30).
+**Verified how** (AMD firmware TPM, Windows 11 build 26300, 2026-10-30, except
+where Intel PTT is named).
 
 - Standalone probes, unelevated and elevated: both key types created, stored,
   reopened and used; private export, making the key exportable, widening its DACL
@@ -1058,6 +1060,11 @@ rejected (a hybrid, ML-KEM, a DPAPI secret) are in
   68 to 196 bytes); the TPM's output 32 bytes, deterministic, different for two keys
   and different from SHA-256 or an unkeyed HMAC of the same input, for inputs of 1 to
   1,024 bytes, with 1,025 refused.
+- On Intel PTT (firmware 500.14.0.0, Windows 11 build 26300, 2026-10-30), the full
+  `ctest` suite elevated in Release - including `test_v2_kek`, `test_cli_v2.ps1` and
+  `test_roles.ps1` below, with no TPM check skipped - and the end-to-end check of
+  `scripts/Build-Test-Verify.ps1` on the TPM KEK. The standalone probes above were
+  not rerun there.
 - `test_v2_kek`: the construction against the Linux known answers and the Software
   KSP's derivation against it, offline; and elevated, through the DLL, both KEKs end
   to end - tampering, relabeling, the version rule both ways, an invalid
