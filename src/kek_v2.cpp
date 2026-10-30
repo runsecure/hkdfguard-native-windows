@@ -691,16 +691,22 @@ namespace hkdfguard {
             throw HkdfGuardError(HKDFGUARD_ERR_INTERNAL_ERROR, "unknown provider type");
         }
         ScopedNCryptProv provider;
-        OpenProvider(provider_type, provider);
         const std::wstring name =
             IsTpm(provider_type) ? V2TpmKeyName(service, key_id) : V2SoftwareKeyName(service, key_id);
         ScopedNCryptKey key;
-        const SECURITY_STATUS status = OpenKey(provider.get(), name, key);
-        if (status == NTE_BAD_KEYSET) {
+        // A TPM that can't be used for version 2 at all (V2TpmUnusable) holds
+        // nothing to delete, as version 1's OpenKekDirect treats it.
+        try {
+            OpenProvider(provider_type, provider);
+            const SECURITY_STATUS status = OpenKey(provider.get(), name, key);
+            if (status == NTE_BAD_KEYSET) {
+                return false;
+            }
+            if (status != ERROR_SUCCESS) {
+                ThrowForNCryptFailure(status, provider_type, "NCryptOpenKey failed");
+            }
+        } catch (const V2TpmUnusable &) {
             return false;
-        }
-        if (status != ERROR_SUCCESS) {
-            ThrowForNCryptFailure(status, provider_type, "NCryptOpenKey failed");
         }
         // No NCRYPT_SILENT_FLAG: the PCP refuses it here (NTE_BAD_FLAGS), and
         // the key was opened silently already.
@@ -720,9 +726,19 @@ namespace hkdfguard {
         // Absent is definite; so are a key that fails a check of its own
         // (Invalid) and one that fails only on its ACL (AccessControlInvalid,
         // checked first: it is KEK_INVALID too, but must never be reported
-        // as corrupt - errors.h). Anything else - a TPM provider that can't
-        // be opened, access denied, a provider error - throws, unjudged.
-        if (!KekExistsOn(service, provider_type)) {
+        // as corrupt - errors.h). So is a TPM that can't be used for version
+        // 2 at all - the Platform Crypto Provider can't be opened, or there
+        // is no TPM device: it holds no KEK, as CreateV2Kek's fallback and
+        // version 1's OpenKekDirect assume, so it is Absent. Anything else -
+        // access denied, a TPM that is busy, a provider error - throws,
+        // unjudged.
+        bool exists = false;
+        try {
+            exists = KekExistsOn(service, provider_type);
+        } catch (const V2TpmUnusable &) {
+            return result;
+        }
+        if (!exists) {
             return result;
         }
         std::unique_ptr<V2Kek> kek;

@@ -461,6 +461,15 @@ void ElevatedChecks() {
         DeleteV2Kek(fb_service, hkdfguard::kProviderTypeSoftware, hkdfguard::kCurrentKeyId);
         hkdfguard::SetTestV2TpmUnusable(std::string("simulated by test_v2_kek"));
 
+        // A host with no usable TPM provider - a CI runner, a container -
+        // holds no TPM KEK, so the CLI's status and retire must get a
+        // definite answer there, as version 1's do.
+        Check(hkdfguard::InspectV2Kek(fb_service, hkdfguard::kProviderTypeTpm).state ==
+                  hkdfguard::V2KekInspection::State::Absent,
+              "TPM unusable: inspecting the TPM finds no KEK, rather than failing");
+        Check(!DeleteV2Kek(fb_service, hkdfguard::kProviderTypeTpm, hkdfguard::kCurrentKeyId),
+              "TPM unusable: deleting on the TPM deletes nothing, rather than failing");
+
         hkdfguard::SetTestPolicyOverride(hkdfguard::KeyStoragePolicy::RequireTpm);
         Check(CodeOf([&] { hkdfguard::CreateV2Kek(fb_service); }) == HKDFGUARD_ERR_PROVIDER_UNAVAILABLE,
               "RequireTpm, TPM unusable: create fails with PROVIDER_UNAVAILABLE (and logs event 2008)");

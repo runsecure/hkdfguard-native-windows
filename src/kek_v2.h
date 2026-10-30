@@ -83,7 +83,8 @@ namespace hkdfguard {
 
     // Deletes the service's version 2 KEK on `provider_type`, if present -
     // whether or not it would pass its checks, so a corrupt one can be
-    // removed too. Returns whether anything was deleted. For the CLI's
+    // removed too. Returns whether anything was deleted: false on a TPM that
+    // can't be used for version 2 at all, as InspectV2Kek. For the CLI's
     // retire and the tests; needs an elevated caller. Never compiled into
     // a path HkdfGuard.dll's ABI can reach: the library itself can't delete.
     bool DeleteV2Kek(const std::wstring &service, uint8_t provider_type, uint32_t key_id);
@@ -108,9 +109,11 @@ namespace hkdfguard {
 
     // Inspects the KEK on `provider_type` (kProviderTypeTpm or
     // kProviderTypeSoftware). Only a definite answer is returned: anything
-    // that leaves the state unknown - access denied, a TPM provider that
-    // can't be opened, a provider error - throws, so a KEK that merely can't
-    // be checked right now is never reported absent or corrupt.
+    // that leaves the state unknown - access denied, a TPM that is busy, a
+    // provider error - throws, so a KEK that merely can't be checked right
+    // now is never reported absent or corrupt. A TPM that can't be used for
+    // version 2 at all (no Platform Crypto Provider, no TPM device) is
+    // Absent: no KEK can be in use there, as CreateV2Kek's fallback assumes.
     V2KekInspection InspectV2Kek(const std::wstring &service, uint8_t provider_type);
 
     // The names of the service's version 2 KEKs: in the Platform Crypto

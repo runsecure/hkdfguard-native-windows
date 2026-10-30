@@ -2548,9 +2548,9 @@ namespace {
 
     // Every version 2 KEK under `service`'s name, on both providers in that
     // order; `only` restricts it to one. As FindKeks: only a definite answer
-    // is accepted - a provider that can't be judged (access denied, a TPM
-    // that can't be used for version 2) throws, so "can't tell" is never
-    // reported as "absent".
+    // is accepted - a provider that can't be judged (access denied, a busy
+    // TPM) throws, so "can't tell" is never reported as "absent". A host with
+    // no usable TPM provider holds no TPM KEK, so it is absent there.
     std::vector<FoundV2Kek> FindV2Keks(const std::string &service, std::optional<KekProvider> only = std::nullopt) {
         std::vector<FoundV2Kek> found;
         for (KekProvider p : {KekProvider::Tpm, KekProvider::Software}) {
