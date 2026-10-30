@@ -140,42 +140,7 @@ namespace hkdfguard {
                 if (owner == nullptr || !MayOwn(owner, installer_ok)) {
                     AccessControlInvalid(what + " is not owned by " + trusted);
                 }
-                // GetSecurityInfo reports a missing and a NULL DACL alike:
-                // unrestricted access either way.
-                if (dacl == nullptr) {
-                    AccessControlInvalid(what + " has no DACL, so everyone has full access to it");
-                }
-                for (DWORD i = 0; i < dacl->AceCount; ++i) {
-                    void *ace = nullptr;
-                    if (!GetAce(dacl, i, &ace)) {
-                        AccessControlInvalid(what + ": GetAce failed");
-                    }
-                    const ACE_HEADER *header = static_cast<const ACE_HEADER *>(ace);
-                    if (header->AceFlags & INHERIT_ONLY_ACE) {
-                        continue; // applies only to children, which are checked on their own
-                    }
-                    switch (header->AceType) {
-                        case ACCESS_DENIED_ACE_TYPE:
-                        case ACCESS_DENIED_OBJECT_ACE_TYPE:
-                        case ACCESS_DENIED_CALLBACK_ACE_TYPE:
-                        case ACCESS_DENIED_CALLBACK_OBJECT_ACE_TYPE:
-                            continue; // a deny only ever takes access away
-                        case ACCESS_ALLOWED_ACE_TYPE:
-                        case ACCESS_ALLOWED_CALLBACK_ACE_TYPE: {
-                            // The same layout up to the SID; a conditional
-                            // ACE is judged as if its condition held.
-                            const auto *allowed = static_cast<const ACCESS_ALLOWED_ACE *>(ace);
-                            PSID sid = const_cast<DWORD *>(&allowed->SidStart);
-                            if ((allowed->Mask & forbidden) != 0 && !MayWrite(sid, installer_ok)) {
-                                AccessControlInvalid(what + " grants write, delete, ownership or create rights to an account other than " +
-                                        trusted);
-                            }
-                            continue;
-                        }
-                        default:
-                            AccessControlInvalid(what + " has an access-allowed ACE of an unexpected type");
-                    }
-                }
+                CheckKeyStoreDacl(dacl, forbidden, installer_ok, what);
             } catch (...) {
                 LocalFree(sd);
                 throw;
@@ -311,13 +276,12 @@ namespace hkdfguard {
             }
         }
 
-        void RequireElevated() {
+        void RequireElevated(const char *what = "creating or deleting a TPM key file needs an elevated process") {
             TOKEN_ELEVATION elevation{};
             DWORD size = 0;
             if (!GetTokenInformation(GetCurrentProcessToken(), TokenElevation, &elevation, sizeof(elevation), &size) ||
                 elevation.TokenIsElevated == 0) {
-                throw HkdfGuardError(HKDFGUARD_ERR_KEK_ACCESS_DENIED,
-                                     "creating or deleting a TPM key file needs an elevated process");
+                throw HkdfGuardError(HKDFGUARD_ERR_KEK_ACCESS_DENIED, what);
             }
         }
 
@@ -334,6 +298,47 @@ namespace hkdfguard {
             return true;
         }
     } // namespace
+
+    void CheckKeyStoreDacl(PACL dacl, ACCESS_MASK forbidden, bool installer_ok, const std::string &what) {
+        const char *trusted = installer_ok ? "SYSTEM, Administrators, HkdfGuardAdmins or TrustedInstaller"
+                                           : "SYSTEM, Administrators or HkdfGuardAdmins";
+        // GetSecurityInfo reports a missing and a NULL DACL alike:
+        // unrestricted access either way.
+        if (dacl == nullptr) {
+            AccessControlInvalid(what + " has no DACL, so everyone has full access to it");
+        }
+        for (DWORD i = 0; i < dacl->AceCount; ++i) {
+            void *ace = nullptr;
+            if (!GetAce(dacl, i, &ace)) {
+                AccessControlInvalid(what + ": GetAce failed");
+            }
+            const ACE_HEADER *header = static_cast<const ACE_HEADER *>(ace);
+            if (header->AceFlags & INHERIT_ONLY_ACE) {
+                continue; // applies only to children, which are checked on their own
+            }
+            switch (header->AceType) {
+                case ACCESS_DENIED_ACE_TYPE:
+                case ACCESS_DENIED_OBJECT_ACE_TYPE:
+                case ACCESS_DENIED_CALLBACK_ACE_TYPE:
+                case ACCESS_DENIED_CALLBACK_OBJECT_ACE_TYPE:
+                    continue; // a deny only ever takes access away
+                case ACCESS_ALLOWED_ACE_TYPE:
+                case ACCESS_ALLOWED_CALLBACK_ACE_TYPE: {
+                    // The same layout up to the SID; a conditional
+                    // ACE is judged as if its condition held.
+                    const auto *allowed = static_cast<const ACCESS_ALLOWED_ACE *>(ace);
+                    PSID sid = const_cast<DWORD *>(&allowed->SidStart);
+                    if ((allowed->Mask & forbidden) != 0 && !MayWrite(sid, installer_ok)) {
+                        AccessControlInvalid(what + " grants write, delete, ownership or create rights to an account other than " +
+                                trusted);
+                    }
+                    continue;
+                }
+                default:
+                    AccessControlInvalid(what + " has an access-allowed ACE of an unexpected type");
+            }
+        }
+    }
 
     Bytes TpmKekTemplate() {
         return tpm2::KeyedHashPublicArea(kTpmKekAttributes, tpm2::kAlgSha256, {});
@@ -562,14 +567,22 @@ namespace hkdfguard {
         }
         temp_name += L".tmp";
 
+        // Created delete-on-close: if this process dies before the rename -
+        // killed, crashed, the machine losing power before the handle is
+        // closed - Windows removes the temporary file when the handle goes,
+        // so no copy of the KEK, readable by the key-use groups, is left
+        // under a name nothing looks for. The rename below keeps the mark;
+        // it is cleared only once the file has its final name.
+        constexpr ULONG kFileDeleteOnClose = 0x00001000; // NtCreateFile's FILE_DELETE_ON_CLOSE
         Handle temp;
         DWORD win32 = 0;
         if (!hkdfguard_nofollow::OpenRelative(opened.keys(), temp_name, GENERIC_WRITE | DELETE | READ_CONTROL, 0,
-                                              FILE_CREATE, FILE_NON_DIRECTORY_FILE,
+                                              FILE_CREATE, FILE_NON_DIRECTORY_FILE | kFileDeleteOnClose,
                                               const_cast<BYTE *>(file_sd.data()), temp, win32)) {
             ThrowOpenFailure(win32, "a temporary TPM key file");
         }
-        // Until it has its final name, the temporary file goes on any exit.
+        // Until it has its final name, the temporary file goes on any exit
+        // this process lives through, too.
         bool committed = false;
         struct DeleteUnlessCommitted {
             HANDLE file;
@@ -617,6 +630,17 @@ namespace hkdfguard {
         if (renamed < 0) {
             IoFailure("renaming the TPM key file into place failed", RtlNtStatusToDosError(renamed));
         }
+        // In place: clear delete-on-close (FILE_DISPOSITION_FLAG_ON_CLOSE
+        // without FILE_DISPOSITION_FLAG_DELETE) before the handle closes. If
+        // that fails, the file is still marked and goes with the handle, and
+        // the cleanup marks it too: nothing is left, and the write fails.
+        {
+            FILE_DISPOSITION_INFO_EX keep{};
+            keep.Flags = FILE_DISPOSITION_FLAG_ON_CLOSE;
+            if (!SetFileInformationByHandle(temp.get(), FileDispositionInfoEx, &keep, sizeof(keep))) {
+                IoFailure("clearing delete-on-close on the TPM key file failed");
+            }
+        }
         committed = true;
         temp.reset();
 
@@ -629,6 +653,13 @@ namespace hkdfguard {
             throw;
         }
         return true;
+    }
+
+    std::wstring PrepareTpmKeyStore(const TpmKeyStore &store) {
+        RequireElevated("preparing the TPM key store needs an elevated process");
+        OpenStore opened;
+        OpenStoreFolders(store, true, opened);
+        return opened.keys_path;
     }
 
     void VerifyTpmKeyFileGrants(const TpmKeyStore &store, const std::wstring &file_name,

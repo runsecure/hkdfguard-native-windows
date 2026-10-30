@@ -207,7 +207,12 @@ namespace hkdfguard::tpm2 {
                               encrypted_salt.data(), static_cast<ULONG>(encrypted_salt.size()), &got, BCRYPT_PAD_OAEP) != 0) {
                 CryptoFailure("RSA-OAEP encryption of the session salt failed");
             }
-            encrypted_salt.resize(got);
+            // OAEP output is exactly the modulus's length. Anything shorter
+            // means the modulus has leading zeros - a shorter key than its
+            // size claims - and is refused rather than sent.
+            if (got != encrypted_salt.size()) {
+                BadTpmData("session salt key's RSA modulus is shorter than its size");
+            }
             return;
         }
 
@@ -385,7 +390,12 @@ namespace hkdfguard::tpm2 {
 
         nonce_tpm_ = auth.nonce;
         verified_ = true;
-        if ((attributes_ & kSessionContinue) == 0) {
+        // Whether the session survives is the TPM's answer, not the request:
+        // the response's continueSession bit, which the HMAC just verified.
+        // So a session the TPM closed is never flushed by handle (the handle
+        // may by then name another session), and one it kept is never
+        // abandoned unflushed.
+        if ((auth.attributes & kSessionContinue) == 0) {
             open_ = false; // the TPM has closed it
         }
     }

@@ -151,17 +151,62 @@ set_tests_properties(v2_kek PROPERTIES
 # corpus folder, for a real fuzzing session.
 option(HKDFGUARD_BUILD_FUZZERS "Build the libFuzzer targets (MSVC, with AddressSanitizer)" OFF)
 if(HKDFGUARD_BUILD_FUZZERS AND MSVC)
-    add_executable(fuzz_tpm2_marshal
-        fuzz/fuzz_tpm2_marshal.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/../src/tpm2_marshal.cpp
-    )
-    target_include_directories(fuzz_tpm2_marshal PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/../include
-        ${CMAKE_CURRENT_SOURCE_DIR}/../src
-    )
-    target_compile_options(fuzz_tpm2_marshal PRIVATE /fsanitize=fuzzer /fsanitize=address /Zi)
-    target_link_options(fuzz_tpm2_marshal PRIVATE /INCREMENTAL:NO)
-    add_test(NAME fuzz_tpm2_marshal COMMAND fuzz_tpm2_marshal -runs=200000 -max_len=4097)
+    # One libFuzzer target: its .cpp in fuzz/, the src/ files it needs, and
+    # the system libraries those use. Each is registered as a ctest smoke
+    # run over its seed corpus (fuzz/corpus/<target>, read only: new inputs
+    # libFuzzer finds go to a scratch folder in the build tree).
+    function(hkdfguard_add_fuzzer name runs max_len)
+        cmake_parse_arguments(FUZZ "" "" "SOURCES;LIBS" ${ARGN})
+        set(sources fuzz/${name}.cpp)
+        foreach(src IN LISTS FUZZ_SOURCES)
+            list(APPEND sources ${CMAKE_CURRENT_SOURCE_DIR}/../src/${src})
+        endforeach()
+        add_executable(${name} ${sources})
+        target_include_directories(${name} PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/../include
+            ${CMAKE_CURRENT_SOURCE_DIR}/../src
+            ${CMAKE_CURRENT_SOURCE_DIR}/fuzz
+        )
+        target_compile_definitions(${name} PRIVATE UNICODE _UNICODE)
+        target_compile_options(${name} PRIVATE /fsanitize=fuzzer /fsanitize=address /Zi)
+        target_link_options(${name} PRIVATE /INCREMENTAL:NO)
+        if(FUZZ_LIBS)
+            target_link_libraries(${name} PRIVATE ${FUZZ_LIBS})
+        endif()
+        set(found ${CMAKE_CURRENT_BINARY_DIR}/fuzz-found/${name})
+        file(MAKE_DIRECTORY ${found})
+        add_test(NAME ${name}
+                 COMMAND ${name} -runs=${runs} -max_len=${max_len} ${found}
+                         ${CMAKE_CURRENT_SOURCE_DIR}/fuzz/corpus/${name})
+    endfunction()
+
+    set(HKDFGUARD_FUZZ_WIN_LIBS bcrypt.lib ncrypt.lib advapi32.lib netapi32.lib shell32.lib ole32.lib ntdll.lib)
+
+    # TPM response parsers (tpm2_marshal.h).
+    hkdfguard_add_fuzzer(fuzz_tpm2_marshal 200000 4097 SOURCES tpm2_marshal.cpp)
+    # The version 2 TPM KEK's key file parser, and its one encoding.
+    hkdfguard_add_fuzzer(fuzz_tpm_key_file 200000 4097
+        SOURCES tpm_key_file.cpp tpm2_marshal.cpp key_acl.cpp
+        LIBS ${HKDFGUARD_FUZZ_WIN_LIBS})
+    # The storage root key rule, over every parsed public area.
+    hkdfguard_add_fuzzer(fuzz_srk_rule 50000 1025
+        SOURCES kek_v2.cpp sp800_108.cpp aes_cmac.cpp tpm2_marshal.cpp tpm2_session.cpp tpm2_device.cpp
+                tpm_key_file.cpp key_acl.cpp policy.cpp event_log.cpp wire_format.cpp
+        LIBS ${HKDFGUARD_FUZZ_WIN_LIBS} tbs.lib)
+    # A TPM2_HMAC response through the salted session: parse, verify,
+    # continueSession, decrypt.
+    hkdfguard_add_fuzzer(fuzz_tpm2_session 50000 4097
+        SOURCES tpm2_session.cpp tpm2_marshal.cpp
+        LIBS bcrypt.lib)
+    # The DACL walks behind "access list invalid" and the provisioning
+    # grant check.
+    hkdfguard_add_fuzzer(fuzz_kek_dacl 20000 1025
+        SOURCES key_acl.cpp tpm_key_file.cpp tpm2_marshal.cpp
+        LIBS ${HKDFGUARD_FUZZ_WIN_LIBS})
+    # The SP 800-108 framing's injectivity, and AES-CMAC against BCrypt's.
+    hkdfguard_add_fuzzer(fuzz_v2_kdf 100000 1025
+        SOURCES sp800_108.cpp aes_cmac.cpp
+        LIBS bcrypt.lib)
 endif()
 
 # test_cli.ps1 exercises hkdfguard.exe's argument parsing, validation and

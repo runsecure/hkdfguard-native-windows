@@ -336,6 +336,70 @@ void OfflineChecks() {
               "after a refused response the session authorizes nothing more");
         Check(s.open(), "...but is still open, so its owner flushes it");
     }
+
+    // ---- 3a. Whether the session survives is the TPM's answer ----
+    // A response this side's own session key verifies - built here, since
+    // the key comes from values the test chooses (the salt and both initial
+    // nonces) - whose continueSession bit differs from the request's. The
+    // TPM's verified bit must decide open().
+    {
+        SecureBuffer<kSha256Len> salt;
+        const Bytes initial(kNonceLen, 0x01);
+        Bytes session_key(kSha256Len);
+        KdfaSha256(salt.data(), salt.size(), "ATH", initial, initial, session_key.data(), session_key.size());
+        const Bytes params = HmacParameters(Bytes(4, 0x09), kAlgSha256);
+
+        // A verified response to the command just authorized, with
+        // `attributes` as the TPM's session attributes.
+        auto verified_response = [&](const Bytes& command, uint8_t attributes) {
+            // The command's nonceCaller: after the 10-byte header, the one
+            // handle, authorizationSize, the session handle and nonce's size.
+            const Bytes nonce_caller(command.begin() + 24, command.begin() + 24 + kNonceLen);
+            Response r;
+            r.tag = kStSessions;
+            r.parameters = Bytes{0x00, 0x20};
+            r.parameters.insert(r.parameters.end(), 32, 0x00);
+            const Bytes nonce_tpm(kNonceLen, 0x07);
+            Bytes rp_input = {0, 0, 0, 0}; // responseCode
+            rp_input.insert(rp_input.end(), {0x00, 0x00, 0x01, 0x55}); // TPM_CC_HMAC
+            rp_input.insert(rp_input.end(), r.parameters.begin(), r.parameters.end());
+            uint8_t rp_hash[kSha256Len];
+            Sha256(rp_input.data(), rp_input.size(), rp_hash);
+            Bytes hmac_input(rp_hash, rp_hash + kSha256Len);
+            hmac_input.insert(hmac_input.end(), nonce_tpm.begin(), nonce_tpm.end());
+            hmac_input.insert(hmac_input.end(), nonce_caller.begin(), nonce_caller.end());
+            hmac_input.push_back(attributes);
+            Bytes hmac(kSha256Len);
+            HmacSha256(session_key.data(), session_key.size(), hmac_input.data(), hmac_input.size(), hmac.data());
+            r.auths.push_back(AuthResponse{nonce_tpm, attributes, hmac});
+            return r;
+        };
+
+        {
+            Session s(0x02000000, salt, initial, initial);
+            const Bytes command = s.Authorize(kCcHmac, {0x80000001}, {Bytes(34)}, params, true);
+            const Response r = verified_response(command, kSessionEncrypt);
+            Check(CodeOf([&] { s.Verify(r); }) == HKDFGUARD_OK && !s.open(),
+                  "continueSession asked for but the TPM's verified response clears it: the session is closed, so "
+                  "nothing flushes its handle");
+        }
+        {
+            Session s(0x02000000, salt, initial, initial);
+            const Bytes command = s.Authorize(kCcHmac, {0x80000001}, {Bytes(34)}, params, false);
+            const Response r = verified_response(command, static_cast<uint8_t>(kSessionEncrypt | kSessionContinue));
+            Check(CodeOf([&] { s.Verify(r); }) == HKDFGUARD_OK && s.open(),
+                  "continueSession not asked for but the TPM's verified response keeps it: the session stays open, "
+                  "so its owner flushes it");
+        }
+        {
+            Session s(0x02000000, salt, initial, initial);
+            const Bytes command = s.Authorize(kCcHmac, {0x80000001}, {Bytes(34)}, params, true);
+            Response r = verified_response(command, static_cast<uint8_t>(kSessionEncrypt | kSessionContinue));
+            r.auths[0].attributes = kSessionEncrypt; // flipped after the HMAC was computed
+            Check(CodeOf([&] { s.Verify(r); }) == HKDFGUARD_ERR_PROVIDER_ERROR && s.open(),
+                  "a continueSession bit changed in transit fails the response HMAC, and the session is kept open");
+        }
+    }
 }
 
 void LiveChecks() {

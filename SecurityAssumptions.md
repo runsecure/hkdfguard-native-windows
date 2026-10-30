@@ -1040,6 +1040,20 @@ Crypto Provider's undocumented HMAC key, a DPAPI secret) are in
 - `test_tpm2_marshal`: golden command bytes the TPM accepted; every response parser
   under truncation, bit flips and 20,000 random edits per response; and a libFuzzer
   target under AddressSanitizer (12.2 million inputs, no finding).
+- libFuzzer targets under AddressSanitizer for every input version 2 parses or judges
+  (`tests/fuzz`, seeds in `tests/fuzz/corpus`, built with `-DHKDFGUARD_BUILD_FUZZERS=ON`),
+  each checking properties, not only the absence of crashes: the key file parser (an
+  accepted file re-serializes to its own bytes, with the KEK template), the storage root
+  key rule (an accepted key has every property the rule promises), a `TPM2_HMAC` response
+  through the salted session (an unsigned response never verifies; after a verified one,
+  whether the session is open is the TPM's own continueSession bit), the three DACL walks
+  behind "access list invalid" and the provisioning grant check, and the SP 800-108
+  framing (injective, and never the fingerprint block) with AES-CMAC against BCrypt's.
+  Three minutes each on 2026-10-29. The storage root key rule's target found a gap:
+  it accepted a 256-byte RSA modulus with leading zero bytes - a much shorter key - as
+  RSA-2048, so a session salt could be encrypted to it. The rule now requires the
+  modulus's top bit, the salt is refused unless its ciphertext is the modulus's full
+  length, and the input is kept as a regression seed.
 - `test_tpm2_session`: KDFa, KDFe, AES-CFB and Names against independent references;
   salts round-trip through generated keys; and live, a known-answer HMAC through RSA-
   and ECC-salted sessions, and every single-bit flip of a response refused.

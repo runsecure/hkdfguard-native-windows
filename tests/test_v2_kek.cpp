@@ -386,6 +386,20 @@ void OfflineChecks() {
             refused(a, "its modulus is shorter than its stated size");
         }
         {
+            // Found by fuzz_srk_rule: 256 bytes, but leading zeros make the
+            // key itself far shorter than 2048 bits.
+            t2::PublicArea a = rsa;
+            for (size_t i = 0; i < 7; ++i) a.rsa_modulus[i] = 0x00;
+            a.rsa_modulus[7] = 0x02;
+            refused(a, "its 256-byte modulus starts with zero bytes, so the key is shorter than 2048 bits");
+            Check(CodeOf([&] {
+                      hkdfguard::SecureBuffer<32> s;
+                      t2::Bytes e;
+                      t2::MakeSessionSalt(a, s, e);
+                  }) == HKDFGUARD_ERR_PROVIDER_ERROR,
+                  "storage root key: a session salt is never encrypted to such a modulus");
+        }
+        {
             t2::PublicArea a = rsa;
             a.rsa_exponent = 3;
             refused(a, "its RSA exponent is 3");

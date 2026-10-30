@@ -1,6 +1,7 @@
 #pragma once
 
 #include "tpm2_marshal.h" // Bytes, PublicArea
+#include <windows.h>         // PACL, ACCESS_MASK (CheckKeyStoreDacl)
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -115,13 +116,39 @@ namespace hkdfguard {
     // ACL (key_acl.h's BuildKekFileSecurityDescriptor with
     // `additional_groups`), creating the store's folders first if they don't
     // exist - each with an ACL of its own - and checking them if they do. The
-    // file is written under a temporary name, flushed, renamed into place
-    // without replacing anything, and read back through ReadTpmKeyFile.
+    // file is written under a temporary name, created delete-on-close so a
+    // process that dies before the rename leaves nothing behind, flushed,
+    // renamed into place without replacing anything, kept (delete-on-close
+    // cleared), and read back through ReadTpmKeyFile.
     // Returns false, writing nothing, if `file_name` already exists. Needs an
     // elevated caller: HKDFGUARD_ERR_KEK_ACCESS_DENIED otherwise, checked
     // before anything is created.
     bool WriteTpmKeyFile(const TpmKeyStore &store, const std::wstring &file_name, const TpmKeyFile &file,
                          const std::vector<std::wstring> &additional_groups);
+
+    // The DACL rule every object of the store is held to, on a DACL in hand
+    // (the store applies it to each folder's and the file's live security,
+    // after checking the owner): a DACL present, and no allow ACE granting
+    // any right in `forbidden` to an account other than the KEK
+    // administrators (key_acl.h's IsKekAdministrator) - or, with
+    // `installer_ok`, TrustedInstaller. Inherit-only and deny ACEs are
+    // skipped; an allow ACE of any type other than plain or callback is
+    // refused. Throws errors.h's KekAccessControlError naming `what`.
+    // Public so it can be fuzzed (tests/fuzz/fuzz_kek_dacl.cpp).
+    void CheckKeyStoreDacl(PACL dacl, ACCESS_MASK forbidden, bool installer_ok, const std::string &what);
+
+    // Creates the store's folders (HkdfGuard, then TpmKeys) if they don't
+    // exist, each with the store folder ACL, and checks them - and every
+    // folder above them - exactly as a write does; returns the TpmKeys
+    // folder's path. For the installer, which runs it as SYSTEM before any
+    // user can create HkdfGuard under ProgramData (C:\ProgramData lets
+    // Users create folders) and so block provisioning. Walks without
+    // following links, so a folder planted in the way - or a junction in
+    // its place - is refused, never followed or re-ACL'd:
+    // HKDFGUARD_ERR_KEK_INVALID (as KekAccessControlError for a folder that
+    // someone else owns or may write). Idempotent. Needs an elevated
+    // caller.
+    std::wstring PrepareTpmKeyStore(const TpmKeyStore &store);
 
     // Checks that the existing `file_name` in `store` grants every principal
     // a KEK this library creates now would: SYSTEM, Administrators and

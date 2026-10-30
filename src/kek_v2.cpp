@@ -552,8 +552,13 @@ namespace hkdfguard {
             return "it has a scheme, which a storage key never has";
         }
         if (srk.type == tpm2::kAlgRsa) {
+            // The modulus must really be keyBits long: the buffer's size and
+            // its top bit set. Leading zero bytes would make a much shorter
+            // key - the one the session salt is then encrypted to - pass as
+            // RSA-2048 (found by tests/fuzz/fuzz_srk_rule.cpp).
             if (srk.rsa_key_bits < 2048 || srk.rsa_key_bits % 8 != 0 ||
-                srk.rsa_modulus.size() != static_cast<size_t>(srk.rsa_key_bits / 8)) {
+                srk.rsa_modulus.size() != static_cast<size_t>(srk.rsa_key_bits / 8) ||
+                (srk.rsa_modulus[0] & 0x80) == 0) {
                 return "its RSA key is shorter than 2048 bits, or its modulus does not match its size";
             }
             if (srk.rsa_exponent != 0 && srk.rsa_exponent != 65537) {

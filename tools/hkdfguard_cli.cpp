@@ -33,6 +33,13 @@
 //       every other key under the service's name - of either version.
 //       Read-only: never creates or deletes a key.
 //
+//   prepare-store
+//       Creates the payload version 2 TPM key store's folders
+//       (ProgramData\HkdfGuard\TpmKeys) with their ACL, or checks them if they
+//       exist. Run by the installer as SYSTEM, so no user can create
+//       ProgramData\HkdfGuard first and block provisioning; safe to run again
+//       from an elevated prompt. Never creates or deletes a key.
+//
 //   wrap --key-file-path|-kf <path> --service-name|-sn <name> \
 //        (--dek-stdin | --dek-file <path>) [--group|-g <name>] [--force|-f]
 //       Calls hkdfguard_wrap_dek against the service's *existing* KEK and
@@ -246,6 +253,7 @@ namespace {
             L"  %ls retire --service-name|-sn <name> (--fingerprint|-fp <hex> | --corrupt)\n"
             L"       [--provider tpm|software] [--version 1|2]\n"
             L"  %ls status --service-name|-sn <name>\n"
+            L"  %ls prepare-store\n"
             L"\n"
             L"provision  ensures a KEK exists for the service. Run once, at deployment time, from an\n"
             L"           elevated prompt; this is the only command that creates keys. Prints the\n"
@@ -266,6 +274,9 @@ namespace {
             L"status     reports the payload version, whether the service has a KEK, which provider\n"
             L"           holds it, and its fingerprint, and lists every other key under its name.\n"
             L"           Read-only: never creates or deletes anything.\n"
+            L"prepare-store  creates the TPM key store's folders (ProgramData\\HkdfGuard\\TpmKeys)\n"
+            L"           with their access list, or checks them; refuses a folder someone else\n"
+            L"           created there first. Run by the installer; needs an elevated prompt.\n"
             L"\n"
             L"The DEK is base64 of exactly 32 bytes, read from stdin or a file -- never\n"
             L"from a command-line argument or an environment variable, both of which are\n"
@@ -285,10 +296,12 @@ namespace {
             L"  %ls status -sn svc\n"
             L"  %ls retire -sn svc -fp <fingerprint printed by provision>\n",
             kProgramName, kProgramName, kProgramName, kProgramName, kProgramName, kProgramName, kProgramName,
-            kProgramName, kProgramName);
+            kProgramName, kProgramName, kProgramName);
     }
 
     // The subcommand list every "missing/unknown subcommand" error names.
+    // Matches the macOS tool's message (tests/test_cli.ps1), so it lists only the
+    // subcommands both share; prepare-store is the Windows installer's.
     constexpr char kSubcommandList[] = "`provision`, `wrap`, `retire` or `status`";
 
     // Stores a flag's value, refusing a second one rather than letting the
@@ -3247,6 +3260,34 @@ int wmain(int argc, wchar_t *wargv[]) {
     }
     if (command == "status") {
         return Dispatch<StatusArgs>(argc, argv.data(), ParseStatusArgs, RunStatus);
+    }
+    if (command == "prepare-store") {
+        // No arguments: the store's place is fixed (ProgramData, located
+        // through the known-folder API, never the environment).
+        if (argc != 2) {
+            Printf(stderr, "error: prepare-store takes no arguments\n");
+            PrintUsage();
+            return 2;
+        }
+        try {
+            const std::wstring path = hkdfguard::PrepareTpmKeyStore(hkdfguard::DefaultTpmKeyStore());
+            PrintfW(stdout, L"TPM key store ready: %ls\n", path.c_str());
+            return 0;
+        } catch (const hkdfguard::HkdfGuardError &e) {
+            // The library's own message: the status codes' generic text
+            // (DescribeStatus) is about KEKs, which this doesn't touch.
+            Printf(stderr, "error: preparing the TPM key store failed: %s\n", e.what());
+            if (e.code() == HKDFGUARD_ERR_KEK_ACCESS_DENIED) {
+                Printf(stderr, "hint: run it from an elevated prompt\n");
+            }
+            if (e.code() == HKDFGUARD_ERR_KEK_INVALID) {
+                Printf(stderr,
+                       "hint: something is already at ProgramData\\HkdfGuard or its TpmKeys folder that this "
+                       "account didn't create with the store's access list - possibly created by another user to "
+                       "block provisioning. Investigate it, remove it, and run prepare-store again.\n");
+            }
+            return 1;
+        }
     }
 
     Printf(stderr, "error: unknown subcommand \"%s\": expected %s\n", command.c_str(), kSubcommandList);

@@ -882,6 +882,13 @@ The MSI does four things:
   the MSI first. The MSI does not create the optional
   `HkdfGuardAdmins` group (full control of KEKs created while it exists); create it
   yourself, before provisioning, only if you want to delegate key administration.
+- **Creates the TPM key store**, `C:\ProgramData\HkdfGuard\TpmKeys`, with its access list,
+  by running `hkdfguard.exe prepare-store` as SYSTEM. `C:\ProgramData` lets every user
+  create folders, so without this a user could create `HkdfGuard` first and block every
+  later provisioning. `prepare-store` walks the path without following links and refuses
+  a folder it didn't make, which fails the install. A `CreateFolder` element isn't used
+  for this: Windows Installer would follow a junction planted in the folder's place and,
+  as SYSTEM, rewrite the access list of whatever it points at.
 
 Then, once per service, elevated:
 
