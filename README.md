@@ -614,6 +614,10 @@ the `RequireTpm`/`PreferTpm`/`SoftwareOnly` policy paths - against:
 - The **Microsoft Software Key Storage Provider** (the software fallback
   path), which is vendor-independent
 
+Payload version 2's TPM path - raw TPM 2.0 commands through TBS rather than the
+Platform Crypto Provider - has run on the same two firmware TPMs: the AMD fTPM
+and an Intel PTT (manufacturer `INTC`, firmware 500.14.0.0).
+
 It has **not yet been tested** against a discrete (dTPM) hardware TPM from
 **Infineon** or **Nuvoton**. Both are legitimate Microsoft Platform Crypto
 Provider backends and are expected to work, but neither has actually been

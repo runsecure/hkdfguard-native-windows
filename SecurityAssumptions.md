@@ -502,10 +502,14 @@ use) are still granted by *name*, now restricted to local groups.
   equivalent.
 - Only one TPM vendor/firmware has been exercised (section 4); other
   Platform Crypto Provider backends may exhibit different quirks. The same
-  holds for payload version 2's raw TPM path (section 17): it has run only on
-  that AMD firmware TPM. An Intel PTT firmware TPM, a discrete TPM and a
-  Hyper-V virtual TPM are untested; `tbs_probe` (the scratch probe the ADR
-  cites) is the quick check to run on each before relying on it there.
+  holds for payload version 2's raw TPM path (section 17): it has run on
+  that AMD firmware TPM and on an Intel PTT firmware TPM (manufacturer
+  `INTC`, firmware 500.14.0.0, Windows 11 26H2, the same build as the AMD
+  host - 26300.9711; reported working by the maintainer on 2026-10-29, the
+  exact checks run not recorded). A
+  discrete TPM and a Hyper-V virtual TPM are untested; `tbs_probe` (the
+  scratch probe the ADR cites) is the quick check to run on each before
+  relying on it there.
 - Release binaries and MSIs are Authenticode-signed through Azure Artifact
   Signing (`scripts/ArtifactSigning.ps1`), by a release-workflow job in the
   "release" environment that signs in to Azure over OIDC: no signing
@@ -1070,7 +1074,10 @@ Crypto Provider's undocumented HMAC key, a DPAPI secret) are in
 
 **Assumed / not verified.**
 
-- **Other TPMs.** Only the AMD firmware TPM above (section 12).
+- **Other TPMs.** The AMD firmware TPM above, and an Intel PTT firmware TPM
+  (`INTC`, firmware 500.14.0.0, Windows 11 26H2 build 26300.9711, 2026-10-29);
+  no discrete or virtual TPM yet
+  (section 12).
 - **The Software KSP's AES.** CMAC's composition is tested against NIST's vectors on
   a BCrypt key; the KSP's own AES encryption is trusted, as BCrypt's is.
 - **TBS's command filtering.** Observed, not documented: on this machine TBS blocked

@@ -317,8 +317,9 @@ key-use account in a new local group, and as an account outside it, on
 
 ## Follow-up
 
-- Run `tbs_probe` on an Intel PTT firmware TPM, a discrete TPM and a Hyper-V
-  virtual TPM before release.
+- Run `tbs_probe` on a discrete TPM and a Hyper-V virtual TPM before
+  release. Done for an Intel PTT firmware TPM (manufacturer `INTC`,
+  firmware 500.14.0.0): the version 2 TPM path worked there on 2026-10-29.
 - Reserve -13 (`PAYLOAD_VERSION_REFUSED`) in the Linux status table.
 - Document `ClassicalMode`, event 2008 and the TBS block list in
   `docs/admin-guide.md`.
