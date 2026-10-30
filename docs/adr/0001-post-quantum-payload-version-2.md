@@ -266,7 +266,8 @@ version 2 (`tests/test_roles.ps1`).
 
 ## Follow-up
 
-- Run the probes on an Intel PTT firmware TPM, a discrete TPM, a Hyper-V
-  virtual TPM, and Windows 11 24H2 (build 26100) before relying on version 2
-  there.
+- Run the probes on a discrete TPM before relying on version 2 there. (The
+  test suite has passed on an Intel PTT firmware TPM, 500.14.0.0, and on a
+  Hyper-V virtual TPM in Windows Server 2022 and 2025 guests, on
+  2026-10-30.)
 - Reserve -13 (`PAYLOAD_VERSION_REFUSED`) in the Linux status table.

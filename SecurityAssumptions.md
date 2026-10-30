@@ -511,11 +511,12 @@ use) are still granted by *name*, now restricted to local groups.
 - Only one TPM vendor/firmware has been exercised (section 4); other
   Platform Crypto Provider backends may exhibit different quirks. Payload
   version 2's TPM KEK (section 17), an HMAC-SHA-256 key in the Platform
-  Crypto Provider, has run on that AMD firmware TPM and on Intel PTT
-  (firmware 500.14.0.0), the latter through the test suites only. A discrete
-  TPM and a Hyper-V virtual TPM are untested, as is Windows 11 24H2 (build
-  26100); the probes the ADR cites are the quick check to run on each before
-  relying on it there.
+  Crypto Provider, has run on that AMD firmware TPM, on Intel PTT (firmware
+  500.14.0.0), and on a Hyper-V virtual TPM (manufacturer `MSFT`,
+  8213.275.21.18467) in Windows Server 2022 (build 20348.587) and Windows
+  Server 2025 (build 26100.32230) guests - the latter two through the test
+  suites only. A discrete TPM is untested; the probes the ADR cites are the
+  quick check to run on one before relying on it there.
 - Release binaries and MSIs are Authenticode-signed through Azure Artifact
   Signing (`scripts/ArtifactSigning.ps1`), by a release-workflow job in the
   "release" environment that signs in to Azure over OIDC: no signing
@@ -1050,7 +1051,7 @@ rejected (a hybrid, ML-KEM, a DPAPI secret) are in
   and `retire --corrupt` may remove it.
 
 **Verified how** (AMD firmware TPM, Windows 11 build 26300, 2026-10-30, except
-where Intel PTT is named).
+where Intel PTT or the Hyper-V virtual TPM is named).
 
 - Standalone probes, unelevated and elevated: both key types created, stored,
   reopened and used; private export, making the key exportable, widening its DACL
@@ -1065,6 +1066,12 @@ where Intel PTT is named).
   `test_roles.ps1` below, with no TPM check skipped - and the end-to-end check of
   `scripts/Build-Test-Verify.ps1` on the TPM KEK. The standalone probes above were
   not rerun there.
+- On a Hyper-V virtual TPM (manufacturer `MSFT`, 8213.275.21.18467), in Windows
+  Server 2022 (build 20348.587) and Windows Server 2025 (build 26100.32230) guests,
+  2026-10-30: the same suites elevated in Release, run from each VM's console -
+  `test_v2_kek`, `test_roundtrip`, `test_cli.ps1`, `test_cli_v2.ps1`,
+  `test_harden_process` and `test_roles.ps1` - all passing, with no check skipped.
+  The standalone probes above were not run there.
 - `test_v2_kek`: the construction against the Linux known answers and the Software
   KSP's derivation against it, offline; and elevated, through the DLL, both KEKs end
   to end - tampering, relabeling, the version rule both ways, an invalid

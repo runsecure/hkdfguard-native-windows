@@ -613,7 +613,10 @@ the `RequireTpm`/`PreferTpm`/`SoftwareOnly` policy paths - against:
   path), which is vendor-independent
 
 Payload version 2's TPM KEK - an HMAC-SHA-256 key in the Platform Crypto
-Provider - has run on both firmware TPMs above: the AMD fTPM and Intel PTT.
+Provider - has run on both firmware TPMs above: the AMD fTPM and Intel PTT. The
+full test suite has also passed on a **Hyper-V virtual TPM** (manufacturer
+`MSFT`, 8213.275.21.18467) in Windows Server 2022 (build 20348) and Windows
+Server 2025 (build 26100) guests.
 
 It has **not yet been tested** against a discrete (dTPM) hardware TPM from
 **Infineon** or **Nuvoton**. Both are legitimate Microsoft Platform Crypto

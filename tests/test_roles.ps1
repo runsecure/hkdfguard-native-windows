@@ -186,14 +186,13 @@ function Get-KeyFileAs($Credential, [string]$Path) {
     if ($r.StdOut -match "inspect=0 owner=(\S+) sha256=([0-9a-f]{64})") {
         return [pscustomobject]@{ Owner = $Matches[1]; Sha256 = $Matches[2] }
     }
-    Write-Host "    inspect: $($r.StdOut) $($r.StdErr)"
+    Write-Host ("    inspect: exit 0x{0:X8}: {1} {2}" -f $r.ExitCode, $r.StdOut, $r.StdErr)
     return $null
 }
 
 # The run tests payload version 2, the default, whatever this machine has
 # set: ClassicalMode is pinned to 0 and put back in the finally block. Set
-# inside the try, so it always is. On a version 2 TPM KEK, the key file's
-# ACL is the whole access control, so the accounts below are its real test.
+# inside the try, so it always is.
 $classicalKey = "HKLM:\Software\Policies\HkdfGuard"
 $priorClassical = $null
 try { $priorClassical = (Get-ItemProperty -Path $classicalKey -Name ClassicalMode -ErrorAction Stop).ClassicalMode } catch { }
@@ -252,7 +251,7 @@ try {
     # ---- Deployer. ----
     $r = Invoke-As $dep $probe @("model")
     Check ($r.StdOut -match "model=0 may_write=1 rc=0") "deployer: production model, and may persist key files"
-    if ($r.StdOut -notmatch "may_write=1") { Write-Host "    $($r.StdOut) $($r.StdErr)" }
+    if ($r.StdOut -notmatch "may_write=1") { Write-Host ("    exit 0x{0:X8}: {1} {2}" -f $r.ExitCode, $r.StdOut, $r.StdErr) }
 
     $dekBytes = New-Object byte[] 32
     [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($dekBytes)
