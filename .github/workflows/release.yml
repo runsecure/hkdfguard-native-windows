@@ -19,7 +19,7 @@
 # Before tagging: run the suite on a machine with a TPM (see README.md,
 # "TPM tests are the developer's and maintainer's responsibility") - this
 # workflow's runners have none, so it cannot cover the TPM-only checks.
-# To cut a release: git tag v0.9.0; git push origin v0.9.0
+# To cut a release: git tag v0.9.1; git push origin v0.9.1
 # Any v0.x.y tag is published as a GitHub pre-release (pre-release testing);
 # v1.0.0 and later as normal releases. The version must increase with every
 # release, or the MSI upgrade won't replace the installed one.

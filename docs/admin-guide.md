@@ -73,7 +73,7 @@ Before installing, check that the MSI is validly signed and timestamped, and tha
 checksum matches:
 
 ```powershell
-$msi = ".\hkdfguard-native-windows-0.9.0-win-x64.msi"
+$msi = ".\hkdfguard-native-windows-0.9.1-win-x64.msi"
 
 # Status must be "Valid", and TimeStamperCertificate must not be empty.
 Get-AuthenticodeSignature $msi | Format-List Status, SignerCertificate, TimeStamperCertificate
@@ -103,7 +103,7 @@ The MSI installs for the whole machine and must run elevated.
 **Silent:** from an elevated prompt.
 
 ```powershell
-msiexec /i hkdfguard-native-windows-0.9.0-win-x64.msi /qn /l*v install.log
+msiexec /i hkdfguard-native-windows-0.9.1-win-x64.msi /qn /l*v install.log
 ```
 
 You can deploy the same command as-is through Intune, Configuration Manager (SCCM) or
@@ -640,7 +640,7 @@ older version over a newer one is blocked.
 ## Uninstall
 
 ```powershell
-msiexec /x hkdfguard-native-windows-0.9.0-win-x64.msi /qn /l*v uninstall.log
+msiexec /x hkdfguard-native-windows-0.9.1-win-x64.msi /qn /l*v uninstall.log
 ```
 
 You can also uninstall **HkdfGuard for Windows** from **Settings → Apps**. Uninstalling removes the files, the

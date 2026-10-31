@@ -626,8 +626,10 @@ been tested**. They are legitimate Microsoft Platform Crypto Provider backends
 and are expected to work, but a TPM's own firmware could in principle report
 key properties or usage flags differently than the TPMs above do - see the
 accommodation table in `SecurityAssumptions.md` section 4 before assuming a new
-vendor behaves identically. If you do exercise this library against one,
-please fold the result (and any new quirks) back into that section. On any
+vendor behaves identically. `scripts/hardware-tests` (its README says how)
+bundles the test suites and a provider probe to run on such a machine; if you
+do exercise this library against one, please fold the result (and any new
+quirks) back into that section. On any
 discrete TPM, whether version 2's HMAC output is protected on the bus is still
 open (`SecurityAssumptions.md` section 17).
 
@@ -819,7 +821,7 @@ architectures, signs everything, and with `-Msi` also builds the signed installe
 
 ```
 scripts\build-dist-signed.bat
-scripts\build-dist-signed.bat -Msi -Version 0.9.0
+scripts\build-dist-signed.bat -Msi -Version 0.9.1
 ```
 
 `scripts\Build-Dist-Signed.ps1` checks the signing setup first, then runs `Build-Dist.ps1
@@ -853,7 +855,7 @@ leaves Microsoft's HSMs, so there is no certificate file or thumbprint to manage
 **Building the MSI on its own** (no elevation needed):
 
 ```
-scripts\build-msi.bat -Arch x64 -Version 0.9.0 -Sign
+scripts\build-msi.bat -Arch x64 -Version 0.9.1 -Sign
 ```
 
 `scripts\Build-Msi.ps1` clean-builds Release via `Build-Dist.ps1`, signs both binaries
@@ -868,7 +870,7 @@ pinned in `dotnet-tools.json` and restored automatically; only the .NET SDK is r
 **Installing** (elevated; deployable as-is through Intune, SCCM or Group Policy):
 
 ```
-msiexec /i hkdfguard-native-windows-0.9.0-win-x64.msi /qn /l*v install.log
+msiexec /i hkdfguard-native-windows-0.9.1-win-x64.msi /qn /l*v install.log
 ```
 
 The MSI does four things:

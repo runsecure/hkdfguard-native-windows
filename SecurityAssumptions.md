@@ -518,8 +518,9 @@ use) are still granted by *name*, now restricted to local groups.
   8213.275.21.18467) in Windows Server 2022 (build 20348.587) and Windows
   Server 2025 (build 26100.32230) guests - all but the AMD TPM through the
   test suites only. Discrete TPMs from other vendors (Infineon, Nuvoton) are
-  untested; the probes the ADR cites are the quick check to run on one before
-  relying on it there.
+  untested. `scripts/hardware-tests` runs the provider probe
+  (`tests/v2_provider_probe.cpp`) and the suites on one before relying on it
+  there.
 - Release binaries and MSIs are Authenticode-signed through Azure Artifact
   Signing (`scripts/ArtifactSigning.ps1`), by a release-workflow job in the
   "release" environment that signs in to Azure over OIDC: no signing
@@ -1064,7 +1065,10 @@ named).
   to a hand-built HMAC-SHA-256 block for service names of 0 to 128 bytes (inputs of
   68 to 196 bytes); the TPM's output 32 bytes, deterministic, different for two keys
   and different from SHA-256 or an unkeyed HMAC of the same input, for inputs of 1 to
-  1,024 bytes, with 1,025 refused.
+  1,024 bytes, with 1,025 refused. These probes are now one program,
+  `tests/v2_provider_probe.cpp`, which `scripts/hardware-tests` runs on each
+  machine it qualifies; its unelevated side is a copy of itself on this token
+  restricted as UAC restricts an administrator's.
 - On Intel PTT (firmware 500.14.0.0, Windows 11 build 26300, 2026-10-30), the full
   `ctest` suite elevated in Release - including `test_v2_kek`, `test_cli_v2.ps1` and
   `test_roles.ps1` below, with no TPM check skipped - and the end-to-end check of

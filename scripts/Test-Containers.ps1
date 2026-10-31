@@ -30,7 +30,7 @@
     Server Core tags to test: ltsc2022, ltsc2025, or both (default).
 
 .PARAMETER Version
-    MSI version to build and install. Default: 0.9.0.
+    MSI version to build and install. Default: 0.9.1.
 
 .PARAMETER SkipBuild
     Reuse build-release-x64\ and the MSI already in dist\ instead of
@@ -43,7 +43,7 @@ param(
     [ValidateSet("ltsc2022", "ltsc2025")]
     [string[]]$Image = @("ltsc2022", "ltsc2025"),
     [ValidatePattern('^\d{1,3}\.\d{1,3}\.\d{1,5}$')]
-    [string]$Version = "0.9.0",
+    [string]$Version = "0.9.1",
     [switch]$SkipBuild,
     [int]$MemoryGB = 2
 )
