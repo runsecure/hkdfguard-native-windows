@@ -626,8 +626,10 @@ been tested**. They are legitimate Microsoft Platform Crypto Provider backends
 and are expected to work, but a TPM's own firmware could in principle report
 key properties or usage flags differently than the TPMs above do - see the
 accommodation table in `SecurityAssumptions.md` section 4 before assuming a new
-vendor behaves identically. If you do exercise this library against one,
-please fold the result (and any new quirks) back into that section. On any
+vendor behaves identically. `scripts/hardware-tests` (its README says how)
+bundles the test suites and a provider probe to run on such a machine; if you
+do exercise this library against one, please fold the result (and any new
+quirks) back into that section. On any
 discrete TPM, whether version 2's HMAC output is protected on the bus is still
 open (`SecurityAssumptions.md` section 17).
 

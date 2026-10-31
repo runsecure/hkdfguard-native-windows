@@ -266,7 +266,9 @@ version 2 (`tests/test_roles.ps1`).
 
 ## Follow-up
 
-- Run the probes on a discrete TPM before relying on version 2 there. (The
+- Run the probes (`tests/v2_provider_probe.cpp`, through
+  `scripts/hardware-tests`) on a discrete TPM before relying on version 2
+  there. (The
   test suite has passed on an Intel PTT firmware TPM, 500.14.0.0, on an
   STMicroelectronics discrete TPM, 71.12.17568.4100, and on a Hyper-V virtual
   TPM in Windows Server 2022 and 2025 guests, on 2026-10-30; the probes were
