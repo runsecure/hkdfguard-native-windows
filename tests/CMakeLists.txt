@@ -77,6 +77,19 @@ set_tests_properties(v2_kek PROPERTIES
     ENVIRONMENT "PATH=$<TARGET_FILE_DIR:hkdfguard>\\;${HKDFGUARD_TEST_PATH}"
 )
 
+# v2_provider_probe checks the providers' own behavior that version 2
+# relies on - the Software KSP's SP 800-108 key and the PCP's HMAC key -
+# straight through NCrypt, without HkdfGuard.dll or src/, so it is
+# independent evidence for a new TPM or Windows build (SecurityAssumptions.md
+# section 17). Not a ctest test: it is run by scripts/hardware-tests, on the
+# machine being qualified, elevated.
+add_executable(v2_provider_probe v2_provider_probe.cpp)
+target_compile_definitions(v2_provider_probe PRIVATE UNICODE _UNICODE)
+target_link_libraries(v2_provider_probe PRIVATE ncrypt.lib bcrypt.lib advapi32.lib)
+if(MSVC)
+    target_compile_options(v2_provider_probe PRIVATE /W4)
+endif()
+
 # The same parsers under libFuzzer and AddressSanitizer, built only on
 # request: cmake -DHKDFGUARD_BUILD_FUZZERS=ON. Registered as a short ctest
 # smoke run (a fixed number of inputs); run the executable directly, with a

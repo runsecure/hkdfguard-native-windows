@@ -6,7 +6,7 @@ rem Needs no elevation, but does need an Azure sign-in (az login) for an
 rem account with the Artifact Signing Certificate Profile Signer role.
 rem Arguments are forwarded, e.g.:
 rem   build-dist-signed.bat
-rem   build-dist-signed.bat -Msi -Version 0.9.0
+rem   build-dist-signed.bat -Msi -Version 0.9.1
 rem   build-dist-signed.bat -Arch x64
 
 setlocal
