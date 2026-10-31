@@ -609,24 +609,27 @@ the `RequireTpm`/`PreferTpm`/`SoftwareOnly` policy paths - against:
 - **AMD fTPM** (firmware TPM), via the Microsoft Platform Crypto Provider -
   see `SecurityAssumptions.md` section 4 for the specific provider quirks
   found (and accommodated in `src/kek_store.cpp`) on this vendor
+- An **STMicroelectronics discrete TPM** (manufacturer `STM`, firmware
+  71.12.17568.4100, TPM 2.0 library revision 1.16), via the Microsoft Platform
+  Crypto Provider, on Windows 11 build 26200 - through the test suites
 - The **Microsoft Software Key Storage Provider** (the software fallback
   path), which is vendor-independent
 
 Payload version 2's TPM KEK - an HMAC-SHA-256 key in the Platform Crypto
-Provider - has run on both firmware TPMs above: the AMD fTPM and Intel PTT. The
-full test suite has also passed on a **Hyper-V virtual TPM** (manufacturer
-`MSFT`, 8213.275.21.18467) in Windows Server 2022 (build 20348) and Windows
-Server 2025 (build 26100) guests.
+Provider - has run on all three hardware TPMs above: the AMD fTPM, Intel PTT
+and the STMicroelectronics discrete TPM. The full test suite has also passed on
+a **Hyper-V virtual TPM** (manufacturer `MSFT`, 8213.275.21.18467) in Windows
+Server 2022 (build 20348) and Windows Server 2025 (build 26100) guests.
 
-It has **not yet been tested** against a discrete (dTPM) hardware TPM from
-**Infineon** or **Nuvoton**. Both are legitimate Microsoft Platform Crypto
-Provider backends and are expected to work, but neither has actually been
-run against this code. A discrete TPM's own firmware could in principle
-report key properties or usage flags differently than the two firmware TPMs
-above do - see the accommodation table in `SecurityAssumptions.md` section 4
-before assuming a new vendor behaves identically to AMD fTPM or Intel PTT.
-If you do exercise this library against either, please fold the result (and
-any new quirks) back into that section.
+Discrete TPMs from other vendors - **Infineon**, **Nuvoton** - have **not yet
+been tested**. They are legitimate Microsoft Platform Crypto Provider backends
+and are expected to work, but a TPM's own firmware could in principle report
+key properties or usage flags differently than the TPMs above do - see the
+accommodation table in `SecurityAssumptions.md` section 4 before assuming a new
+vendor behaves identically. If you do exercise this library against one,
+please fold the result (and any new quirks) back into that section. On any
+discrete TPM, whether version 2's HMAC output is protected on the bus is still
+open (`SecurityAssumptions.md` section 17).
 
 ## Audit logging
 
