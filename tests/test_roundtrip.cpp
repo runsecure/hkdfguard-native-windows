@@ -916,6 +916,15 @@ int main() {
     std::vector<uint8_t> dek = MakeDek();
     int32_t rc;
 
+    // Everything here tests payload version 1 (the ECDH construction), which
+    // HkdfGuard.dll uses only while ClassicalMode is 1 - so the run pins it
+    // there (elevated; restored at exit), whatever this machine has set.
+    // Version 2 is test_v2_kek's.
+    ScopedMachinePolicyDword classical_mode(L"ClassicalMode", 1);
+    if (g_elevated && !classical_mode.active()) {
+        std::printf("[WARN] could not pin ClassicalMode to 1 for this run\n");
+    }
+
     // ---- -2. The AuditUnwrapSuccess switch: only an explicit REG_DWORD 0 ----
     //           turns the unwrap-success event off; absent, non-zero, wrong
     //           type, or unreadable all keep it on. Tested on the pure rule
@@ -3787,9 +3796,10 @@ int main() {
         auto documented = [](int32_t code) {
             static const int32_t kCodes[] = {
                 HKDFGUARD_OK, HKDFGUARD_ERR_INVALID_ARGUMENT, HKDFGUARD_ERR_BUFFER_TOO_SMALL,
-                HKDFGUARD_ERR_PROVIDER_ERROR, HKDFGUARD_ERR_CRYPTO_ERROR, HKDFGUARD_ERR_INTERNAL_ERROR,
-                HKDFGUARD_ERR_INVALID_SERVICE_NAME, HKDFGUARD_ERR_POLICY_INVALID, HKDFGUARD_ERR_PAYLOAD_MALFORMED,
-                HKDFGUARD_ERR_PAYLOAD_AUTH_FAILED, HKDFGUARD_ERR_PAYLOAD_UNSUPPORTED,
+                HKDFGUARD_ERR_PROVIDER_UNAVAILABLE, HKDFGUARD_ERR_PROVIDER_ERROR, HKDFGUARD_ERR_CRYPTO_ERROR,
+                HKDFGUARD_ERR_INTERNAL_ERROR, HKDFGUARD_ERR_INVALID_SERVICE_NAME, HKDFGUARD_ERR_POLICY_INVALID,
+                HKDFGUARD_ERR_PAYLOAD_MALFORMED, HKDFGUARD_ERR_PAYLOAD_AUTH_FAILED, HKDFGUARD_ERR_PAYLOAD_UNSUPPORTED,
+                HKDFGUARD_ERR_PAYLOAD_VERSION_REFUSED,
                 HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH, HKDFGUARD_ERR_KEK_NOT_FOUND, HKDFGUARD_ERR_KEK_ACCESS_DENIED,
                 HKDFGUARD_ERR_KEK_INVALID, HKDFGUARD_ERR_PROCESS_HARDENING_FAILED, HKDFGUARD_ERR_FILE_NOT_FOUND,
                 HKDFGUARD_ERR_FILE_ACCESS_DENIED, HKDFGUARD_ERR_FILE_IO, HKDFGUARD_ERR_FILE_TOO_SHORT,
@@ -3812,10 +3822,16 @@ int main() {
 
         // A payload that parses - version, provider type, reserved bytes and
         // KeyId all valid - for a service that has no KEK, so every call on
-        // it gets exactly as far as the KEK lookup.
+        // it gets exactly as far as the KEK lookup. Its version is the one
+        // HkdfGuard.dll uses now (ClassicalMode, read from the same registry
+        // value): 1 when this run pinned it, 2 when it couldn't (unelevated).
+        // No single-bit flip of either makes the other, so the expectations
+        // below hold for both.
         std::vector<uint8_t> synthetic(HKDFGUARD_WRAPPED_MAX_LEN);
         for (size_t i = 0; i < synthetic.size(); ++i) synthetic[i] = static_cast<uint8_t>((i * 37 + 11) & 0xFF);
-        synthetic[0] = hkdfguard::kFormatVersion1;
+        synthetic[0] = hkdfguard::LoadPayloadVersionPolicy() == hkdfguard::PayloadVersionPolicy::Version1
+                           ? hkdfguard::kFormatVersion1
+                           : hkdfguard::kFormatVersion2;
         synthetic[1] = hkdfguard::kProviderTypeSoftware;
         synthetic[2] = synthetic[3] = 0;
         const uint32_t key_id = hkdfguard::kCurrentKeyId;

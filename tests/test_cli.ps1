@@ -148,6 +148,8 @@ try { $priorModel = (Get-ItemProperty -Path $policyKey -Name SecurityModel -Erro
 $isAdminRun = (New-Object System.Security.Principal.WindowsPrincipal(
     [System.Security.Principal.WindowsIdentity]::GetCurrent())).IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
 $pinnedModel = $false
+$pinnedClassical = $false
+$priorClassical = $null
 if ($priorModel -eq 1) {
     Write-Host "[WARN] SecurityModel is already 1 (developer) on this machine. If that isn't deliberate, an interrupted test run may have left it: remove HKLM\Software\Policies\HkdfGuard\SecurityModel." -ForegroundColor Yellow
 }
@@ -159,6 +161,11 @@ try {
         if (-not (Test-Path $policyKey)) { New-Item -Path $policyKey -Force | Out-Null }
         $pinnedModel = $true
         Set-ItemProperty -Path $policyKey -Name SecurityModel -Type DWord -Value 1
+        # The CLI still handles payload version 1 KEKs only, so the run also
+        # pins ClassicalMode to 1, put back in the finally block.
+        try { $priorClassical = (Get-ItemProperty -Path $policyKey -Name ClassicalMode -ErrorAction Stop).ClassicalMode } catch { $priorClassical = $null }
+        $pinnedClassical = $true
+        Set-ItemProperty -Path $policyKey -Name ClassicalMode -Type DWord -Value 1
     }
     $developerModel = $pinnedModel -or ($priorModel -eq 1)
 
@@ -1214,6 +1221,13 @@ finally {
             Remove-ItemProperty -Path $policyKey -Name SecurityModel -ErrorAction SilentlyContinue
         } else {
             Set-ItemProperty -Path $policyKey -Name SecurityModel -Type DWord -Value $priorModel
+        }
+    }
+    if ($pinnedClassical) {
+        if ($null -eq $priorClassical) {
+            Remove-ItemProperty -Path $policyKey -Name ClassicalMode -ErrorAction SilentlyContinue
+        } else {
+            Set-ItemProperty -Path $policyKey -Name ClassicalMode -Type DWord -Value $priorClassical
         }
     }
     # Links first, each removed as itself: Windows PowerShell's recursive

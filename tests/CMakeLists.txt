@@ -46,6 +46,84 @@ set_tests_properties(roundtrip PROPERTIES
     ENVIRONMENT "PATH=$<TARGET_FILE_DIR:hkdfguard>\\;${HKDFGUARD_TEST_PATH}"
 )
 
+# test_v2_kek checks payload version 2 end to end: the SP 800-108
+# construction against the Linux library's known answers, the Software KSP's
+# SP 800-108 derivation against it, the ClassicalMode rule, and - elevated -
+# the DLL's TPM and software version 2 KEKs (create, wrap, unwrap,
+# tampering, relabeling) and provider choice. It
+# compiles its own copies of the version 2 sources, with the test seams
+# enabled, for the provider-choice checks; everything else goes through
+# HkdfGuard.dll.
+add_executable(test_v2_kek
+    test_v2_kek.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/kek_v2.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/sp800_108.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/key_acl.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/policy.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/event_log.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/wire_format.cpp
+)
+target_include_directories(test_v2_kek PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src
+)
+target_compile_definitions(test_v2_kek PRIVATE HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE UNICODE _UNICODE)
+target_link_libraries(test_v2_kek PRIVATE hkdfguard ncrypt.lib bcrypt.lib advapi32.lib netapi32.lib ntdll.lib)
+if(MSVC)
+    target_compile_options(test_v2_kek PRIVATE /W4)
+endif()
+add_test(NAME v2_kek COMMAND test_v2_kek)
+set_tests_properties(v2_kek PROPERTIES
+    ENVIRONMENT "PATH=$<TARGET_FILE_DIR:hkdfguard>\\;${HKDFGUARD_TEST_PATH}"
+)
+
+# The same parsers under libFuzzer and AddressSanitizer, built only on
+# request: cmake -DHKDFGUARD_BUILD_FUZZERS=ON. Registered as a short ctest
+# smoke run (a fixed number of inputs); run the executable directly, with a
+# corpus folder, for a real fuzzing session.
+option(HKDFGUARD_BUILD_FUZZERS "Build the libFuzzer targets (MSVC, with AddressSanitizer)" OFF)
+if(HKDFGUARD_BUILD_FUZZERS AND MSVC)
+    # One libFuzzer target: its .cpp in fuzz/, the src/ files it needs, and
+    # the system libraries those use. Each is registered as a ctest smoke
+    # run over its seed corpus (fuzz/corpus/<target>, read only: new inputs
+    # libFuzzer finds go to a scratch folder in the build tree).
+    function(hkdfguard_add_fuzzer name runs max_len)
+        cmake_parse_arguments(FUZZ "" "" "SOURCES;LIBS" ${ARGN})
+        set(sources fuzz/${name}.cpp)
+        foreach(src IN LISTS FUZZ_SOURCES)
+            list(APPEND sources ${CMAKE_CURRENT_SOURCE_DIR}/../src/${src})
+        endforeach()
+        add_executable(${name} ${sources})
+        target_include_directories(${name} PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/../include
+            ${CMAKE_CURRENT_SOURCE_DIR}/../src
+            ${CMAKE_CURRENT_SOURCE_DIR}/fuzz
+        )
+        target_compile_definitions(${name} PRIVATE UNICODE _UNICODE)
+        target_compile_options(${name} PRIVATE /fsanitize=fuzzer /fsanitize=address /Zi)
+        target_link_options(${name} PRIVATE /INCREMENTAL:NO)
+        if(FUZZ_LIBS)
+            target_link_libraries(${name} PRIVATE ${FUZZ_LIBS})
+        endif()
+        set(found ${CMAKE_CURRENT_BINARY_DIR}/fuzz-found/${name})
+        file(MAKE_DIRECTORY ${found})
+        add_test(NAME ${name}
+                 COMMAND ${name} -runs=${runs} -max_len=${max_len} ${found}
+                         ${CMAKE_CURRENT_SOURCE_DIR}/fuzz/corpus/${name})
+    endfunction()
+
+    set(HKDFGUARD_FUZZ_WIN_LIBS bcrypt.lib ncrypt.lib advapi32.lib netapi32.lib ntdll.lib)
+
+    # The DACL walks behind "access list invalid" and the provisioning
+    # grant check.
+    hkdfguard_add_fuzzer(fuzz_kek_dacl 20000 1025
+        SOURCES key_acl.cpp
+        LIBS ${HKDFGUARD_FUZZ_WIN_LIBS})
+    # The SP 800-108 framing's injectivity.
+    hkdfguard_add_fuzzer(fuzz_v2_kdf 100000 1025
+        SOURCES sp800_108.cpp)
+endif()
+
 # test_cli.ps1 exercises hkdfguard.exe's argument parsing, validation and
 # file handling, which test_roundtrip (DLL calls only) doesn't cover. It
 # gets the built CLI's path as -CliExePath and the same PATH as roundtrip.
@@ -56,6 +134,21 @@ add_test(
             -CliExePath "$<TARGET_FILE:hkdfguard-cli>"
 )
 set_tests_properties(cli PROPERTIES
+    ENVIRONMENT "PATH=$<TARGET_FILE_DIR:hkdfguard>\\;${HKDFGUARD_TEST_PATH}"
+)
+
+# test_cli_v2.ps1: the CLI's provision, status and retire for payload
+# version 2 KEKs, on the software key store and the TPM, including a
+# corrupted TPM key file and a version 1 KEK beside them. test_cli.ps1 keeps
+# testing everything else under version 1. Needs elevation; skipped
+# otherwise.
+add_test(
+    NAME cli_v2
+    COMMAND powershell.exe -NoProfile -ExecutionPolicy Bypass
+            -File "${CMAKE_CURRENT_SOURCE_DIR}/test_cli_v2.ps1"
+            -CliExePath "$<TARGET_FILE:hkdfguard-cli>"
+)
+set_tests_properties(cli_v2 PROPERTIES
     ENVIRONMENT "PATH=$<TARGET_FILE_DIR:hkdfguard>\\;${HKDFGUARD_TEST_PATH}"
 )
 
@@ -99,4 +192,4 @@ set_tests_properties(roles PROPERTIES
 # could save the other's temporary value and "restore" it, leaving the
 # machine in the developer model. A shared lock makes ctest run them one at
 # a time, whatever -j says; harden_process touches none of it.
-set_tests_properties(roundtrip cli roles PROPERTIES RESOURCE_LOCK HkdfGuardMachineState)
+set_tests_properties(roundtrip cli cli_v2 roles v2_kek PROPERTIES RESOURCE_LOCK HkdfGuardMachineState)

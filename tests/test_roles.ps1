@@ -69,6 +69,7 @@ $keys = Join-Path $root "keys"
 $keyFile = Join-Path $keys "service.key"
 $depName = "hkdfgdep$tag"
 $appName = "hkdfgapp$tag"
+$outName = "hkdfgout$tag"
 $createdGroups = @()
 $createdUsers = @()
 $fingerprint = $null
@@ -185,11 +186,23 @@ function Get-KeyFileAs($Credential, [string]$Path) {
     if ($r.StdOut -match "inspect=0 owner=(\S+) sha256=([0-9a-f]{64})") {
         return [pscustomobject]@{ Owner = $Matches[1]; Sha256 = $Matches[2] }
     }
-    Write-Host "    inspect: $($r.StdOut) $($r.StdErr)"
+    Write-Host ("    inspect: exit 0x{0:X8}: {1} {2}" -f $r.ExitCode, $r.StdOut, $r.StdErr)
     return $null
 }
 
+# The run tests payload version 2, the default, whatever this machine has
+# set: ClassicalMode is pinned to 0 and put back in the finally block. Set
+# inside the try, so it always is.
+$classicalKey = "HKLM:\Software\Policies\HkdfGuard"
+$priorClassical = $null
+try { $priorClassical = (Get-ItemProperty -Path $classicalKey -Name ClassicalMode -ErrorAction Stop).ClassicalMode } catch { }
+$pinnedClassical = $false
+
 try {
+    if (-not (Test-Path $classicalKey)) { New-Item -Path $classicalKey -Force | Out-Null }
+    $pinnedClassical = $true
+    Set-ItemProperty -Path $classicalKey -Name ClassicalMode -Type DWord -Value 0
+
     # ---- Groups and accounts. ----
     foreach ($group in "HkdfGuardUsers", "HkdfGuardDeployers") {
         if (-not (Test-LocalGroupExists $group)) {
@@ -199,17 +212,23 @@ try {
     }
     $depPlain = New-Password
     $appPlain = New-Password
+    $outPlain = New-Password
     $depPassword = ConvertTo-Secure $depPlain
     $appPassword = ConvertTo-Secure $appPlain
+    $outPassword = ConvertTo-Secure $outPlain
     New-TestLocalUser $depName $depPlain "hkdfguard role test: deployer"
     $createdUsers += $depName
     New-TestLocalUser $appName $appPlain "hkdfguard role test: application"
-    $depPlain = $null; $appPlain = $null
     $createdUsers += $appName
+    # An account in neither group: it must get no use of the KEK at all.
+    New-TestLocalUser $outName $outPlain "hkdfguard role test: outsider"
+    $createdUsers += $outName
+    $depPlain = $null; $appPlain = $null; $outPlain = $null
     Add-TestGroupMember "HkdfGuardDeployers" $depName
     Add-TestGroupMember "HkdfGuardUsers" $appName
     $dep = New-Object System.Management.Automation.PSCredential("$env:COMPUTERNAME\$depName", $depPassword)
     $app = New-Object System.Management.Automation.PSCredential("$env:COMPUTERNAME\$appName", $appPassword)
+    $out = New-Object System.Management.Automation.PSCredential("$env:COMPUTERNAME\$outName", $outPassword)
 
     # ---- Folders: binaries everyone may run, and the key folder. ----
     New-Item -ItemType Directory -Path $root, $bin, $keys | Out-Null
@@ -232,7 +251,7 @@ try {
     # ---- Deployer. ----
     $r = Invoke-As $dep $probe @("model")
     Check ($r.StdOut -match "model=0 may_write=1 rc=0") "deployer: production model, and may persist key files"
-    if ($r.StdOut -notmatch "may_write=1") { Write-Host "    $($r.StdOut) $($r.StdErr)" }
+    if ($r.StdOut -notmatch "may_write=1") { Write-Host ("    exit 0x{0:X8}: {1} {2}" -f $r.ExitCode, $r.StdOut, $r.StdErr) }
 
     $dekBytes = New-Object byte[] 32
     [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($dekBytes)
@@ -286,6 +305,19 @@ try {
     Check ($r.StdOut -match "open=-39") "application: hkdfguard_open_file refuses the key file it persisted itself (FILE_UNTRUSTED)"
     if ($r.StdOut -notmatch "open=-39") { Write-Host "    $($r.StdOut) $($r.StdErr)" }
 
+    # ---- Outsider: in neither group, so no use of the KEK at all. ----
+    #      A TPM KEK's key file refuses it read access (KEK_ACCESS_DENIED,
+    #      -18); a software KEK isn't even visible to it (KEK_NOT_FOUND,
+    #      -17, as the Software KSP reports a key it may not open).
+    $r = Invoke-As $out $probe @("ephemeral", $service)
+    Check ($r.StdOut -match "generate=-1[78] ") "outsider: can't wrap under the KEK (KEK_ACCESS_DENIED or KEK_NOT_FOUND)"
+    if ($r.StdOut -notmatch "generate=-1[78] ") { Write-Host "    $($r.StdOut) $($r.StdErr)" }
+
+    # The run used payload version 2, as pinned.
+    $st = & $cli status --service-name $service 2>&1 | Out-String
+    Check (($st -match "payload version: 2") -and ($st -match "kek: present") -and ($st -match "fingerprint: $fingerprint")) "security admin: status reports the payload version 2 KEK and its fingerprint"
+    if ($st -notmatch "payload version: 2") { Write-Host "    $st" }
+
     # Membership is read when the file is opened: once its author leaves
     # HkdfGuardDeployers, the author's files aren't trusted.
     Remove-TestGroupMember "HkdfGuardDeployers" $depName
@@ -316,6 +348,18 @@ finally {
         }
     } catch {
         Write-Host "[WARN] could not retire the test KEK for ${service}: $($_.Exception.Message)"
+    }
+    # After the retire above, which needed version 1.
+    if ($pinnedClassical) {
+        try {
+            if ($null -eq $priorClassical) {
+                Remove-ItemProperty -Path $classicalKey -Name ClassicalMode -ErrorAction SilentlyContinue
+            } else {
+                Set-ItemProperty -Path $classicalKey -Name ClassicalMode -Type DWord -Value $priorClassical
+            }
+        } catch {
+            Write-Host "[WARN] could not restore ClassicalMode: $($_.Exception.Message)"
+        }
     }
     foreach ($user in $createdUsers) { try { $computer.Delete("user", $user) } catch { Write-Host "[WARN] could not remove test account ${user}: $($_.Exception.Message)" } }
     foreach ($group in $createdGroups) { try { $computer.Delete("group", $group) } catch { Write-Host "[WARN] could not remove group ${group}: $($_.Exception.Message)" } }

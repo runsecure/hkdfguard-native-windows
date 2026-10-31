@@ -122,7 +122,7 @@ extern "C" {
 // ---- General (-1..-7) ----
 #define HKDFGUARD_ERR_INVALID_ARGUMENT           (-1) /* null pointer, wrong dek length, bad path argument, etc. */
 #define HKDFGUARD_ERR_BUFFER_TOO_SMALL           (-2) /* *out_len on input is too small for the result */
-#define HKDFGUARD_ERR_PROVIDER_UNAVAILABLE       (-3) /* no key storage provider could be used at all; not returned on Windows (a KSP failure is HKDFGUARD_ERR_PROVIDER_ERROR) */
+#define HKDFGUARD_ERR_PROVIDER_UNAVAILABLE       (-3) /* no key storage provider could be used at all; on Windows, payload version 2 is unavailable on this host: the TPM can't be used for it and KeyStoragePolicy, or an existing TPM KEK, rules out the software key store (event 2008 names the reason) */
 #define HKDFGUARD_ERR_PROVIDER_ERROR             (-4) /* KEK provider/key open or create failed */
 #define HKDFGUARD_ERR_CRYPTO_ERROR               (-5) /* ECDH/HKDF/AES/RNG operation failed (not an authentication failure) */
 #define HKDFGUARD_ERR_INTERNAL_ERROR             (-6) /* unexpected internal failure */
@@ -131,10 +131,11 @@ extern "C" {
 #define HKDFGUARD_ERR_INVALID_SERVICE_NAME       (-8) /* service is null, empty, too long, not valid UTF-8, or contains a disallowed character */
 #define HKDFGUARD_ERR_POLICY_INVALID             (-9) /* a machine policy value (HKLM\Software\Policies\HkdfGuard) is invalid */
 // ---- Wrapped payload (-10..-15) ----
-#define HKDFGUARD_ERR_PAYLOAD_MALFORMED         (-10) /* wrapped payload is not a valid WrappedDekV1: wrong length, nonzero reserved bytes, or unknown provider type or key id */
+#define HKDFGUARD_ERR_PAYLOAD_MALFORMED         (-10) /* wrapped payload is not a valid payload: wrong length, nonzero reserved bytes, or unknown provider type or key id */
 #define HKDFGUARD_ERR_PAYLOAD_AUTH_FAILED       (-11) /* AES-GCM authentication tag verification failed */
 #define HKDFGUARD_ERR_PAYLOAD_UNSUPPORTED       (-12) /* wrapped payload's version (or suite) is not one this build understands */
-/* -13..-15 reserved */
+#define HKDFGUARD_ERR_PAYLOAD_VERSION_REFUSED   (-13) /* wrapped payload is a version this build understands but this host's policy doesn't use (on Windows: version 1 while ClassicalMode is absent or 0, or version 2 while it is 1); refused before any key is opened */
+/* -14..-15 reserved */
 // ---- KEK and process (-16..-31) ----
 #define HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH  (-16) /* payload's KEK fingerprint does not match the KEK it routes to */
 #define HKDFGUARD_ERR_KEK_NOT_FOUND             (-17) /* no KEK is provisioned for this service (call hkdfguard_create_kek first) */

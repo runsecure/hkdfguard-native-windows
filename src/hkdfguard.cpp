@@ -8,9 +8,10 @@
 #include "ecdh_hkdf.h"
 #include "errors.h"
 #include "event_log.h"
-#include "policy.h" // LoadAuditUnwrapSuccess, SecurityModel
+#include "policy.h" // LoadAuditUnwrapSuccess, LoadPayloadVersionPolicy, SecurityModel
 #include "process_hardening.h" // HardenProcess - hkdfguard_harden_process's implementation
-#include "kek_store.h"
+#include "kek_store.h" // the version 1 KEK
+#include "kek_v2.h"    // the version 2 KEK
 #include "key_file.h" // ReadWrappedKeyFile - hkdfguard_open_file's implementation
 #include "secure_buffer.h"
 #include "wire_format.h"
@@ -23,7 +24,9 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 
 using namespace hkdfguard;
@@ -196,6 +199,21 @@ namespace {
         return ServiceToWide(NormalizeService(service));
     }
 
+    // The one payload version this host writes and accepts, from the
+    // ClassicalMode policy (policy.h), read on every call; an invalid value
+    // fails closed. Every KEK operation below takes its path from this, and
+    // nothing else: there is no fallback from one version to the other.
+    uint8_t RequirePayloadVersion() {
+        switch (LoadPayloadVersionPolicy()) {
+            case PayloadVersionPolicy::Version2:
+                return kFormatVersion2;
+            case PayloadVersionPolicy::Version1:
+                return kFormatVersion1;
+            default:
+                throw HkdfGuardError(HKDFGUARD_ERR_POLICY_INVALID, "invalid ClassicalMode policy");
+        }
+    }
+
     // The wrap sequence shared by hkdfguard_wrap_dek (caller-supplied DEK)
     // and hkdfguard_generate_and_wrap_dek (freshly generated DEK). Returns
     // argument/buffer status codes directly and throws HkdfGuardError for
@@ -235,20 +253,34 @@ namespace {
 
         std::wstring service_name = ServiceToWide(normalized_service);
 
-        // Opens this service's machine-wide persistent KEK, preferring the
-        // TPM/vTPM-backed Platform Crypto Provider and falling back to the
-        // Software Key Storage Provider automatically. Never creates one -
-        // hkdfguard_create_kek must have already provisioned it (see
-        // kek_store.h/.cpp) - so this fails with HKDFGUARD_ERR_KEK_NOT_FOUND
-        // if the service has no KEK yet.
-        ResolvedKek kek = OpenKekForWrap(service_name);
+        // The payload version this host writes (ClassicalMode), and with it
+        // which KEK: version 2's (kek_v2.h) or version 1's (kek_store.h).
+        // Either is opened per KeyStoragePolicy, the TPM preferred, and never
+        // created - hkdfguard_create_kek must have already provisioned it -
+        // so this fails with HKDFGUARD_ERR_KEK_NOT_FOUND if the service has
+        // no KEK of this version yet.
+        const uint8_t version = RequirePayloadVersion();
+        std::optional<ResolvedKek> v1_kek;
+        std::unique_ptr<V2Kek> v2_kek;
+        uint8_t provider_type = 0;
+        uint32_t key_id = 0;
 
         // Fingerprint of the KEK this payload is being wrapped under: stamped
         // into the payload and bound into the key and the AAD below, so unwrap can both
-        // check it explicitly (before any ECDH) and authenticate it (see
+        // check it explicitly (before any key derivation) and authenticate it (see
         // wire_format.h's layout comment).
         uint8_t fingerprint[kFingerprintLen];
-        ComputeKekFingerprint(kek.key.get(), fingerprint);
+        if (version == kFormatVersion2) {
+            v2_kek = OpenV2KekForWrap(service_name);
+            v2_kek->Fingerprint(fingerprint);
+            provider_type = v2_kek->provider_type();
+            key_id = v2_kek->key_id();
+        } else {
+            v1_kek.emplace(OpenKekForWrap(service_name));
+            ComputeKekFingerprint(v1_kek->key.get(), fingerprint);
+            provider_type = v1_kek->provider_type;
+            key_id = v1_kek->key_id;
+        }
 
         // A fresh random salt for this payload: it selects the point H(salt)
         // the KEK's private key is combined with, and is HKDF's salt, so
@@ -269,7 +301,7 @@ namespace {
         // the payload carries are the ones bound into the key and the tag.
         // None of it is secret; unwrap rebuilds it from the received bytes.
         uint8_t header[kHeaderLen];
-        SerializeWrappedDekHeader(kek.provider_type, kek.key_id, salt, header);
+        SerializeWrappedDekHeader(version, provider_type, key_id, salt, header);
         std::vector<uint8_t> authenticated = BuildWrappedDekAuthenticated(header, fingerprint);
         // Public parts of the payload, needed after the key's scope ends.
         uint8_t nonce[kNonceLen];
@@ -279,15 +311,23 @@ namespace {
             // Scoped to this block so the wrapping key is wiped (SecureBuffer,
             // see secure_buffer.h) as soon as AesGcmEncrypt is done with it.
             SecureBuffer<32> wrapping_key;
-            // ECDH(KEK private key, H(salt)) + HKDF-SHA512 - the same
-            // derivation unwrap runs. Wrapping uses the KEK's *private* key
-            // (inside the TPM for a TPM-backed KEK), which is what makes a
-            // payload impossible to forge from the public key alone.
-            // HKDF's info binds `normalized_service` (not the caller's
-            // original-case `service`), so the key is tied to the
-            // case-insensitive service name and wrap/unwrap agree regardless
-            // of casing (see NormalizeService).
-            DeriveWrappingKey(kek.provider.get(), kek.key.get(), normalized_service, authenticated, wrapping_key);
+            // The same derivation unwrap runs, and in both versions one that
+            // needs the KEK itself (inside the TPM for a TPM-backed KEK), so
+            // nobody without access to it can forge a payload:
+            //   version 2: PRF(KEK, the SP 800-108 block over the service
+            //     name and the header) - sp800_108.h;
+            //   version 1: ECDH(KEK private key, H(salt)) + HKDF-SHA512 -
+            //     ecdh_hkdf.h.
+            // Both bind `normalized_service` (not the caller's original-case
+            // `service`), so the key is tied to the case-insensitive service
+            // name and wrap/unwrap agree regardless of casing (see
+            // NormalizeService).
+            if (version == kFormatVersion2) {
+                v2_kek->WrappingKey(normalized_service, header, wrapping_key);
+            } else {
+                DeriveWrappingKey(v1_kek->provider.get(), v1_kek->key.get(), normalized_service, authenticated,
+                                  wrapping_key);
+            }
 
             // AES-256-GCM directly from the caller's dek pointer - no
             // intermediate plaintext staging buffer. The AAD is the
@@ -303,12 +343,13 @@ namespace {
         } // wrapping_key is zeroed here.
 
         // Assemble the 132-byte payload directly into the caller's buffer.
-        SerializeWrappedDek(kek.provider_type, kek.key_id, salt, nonce, ciphertext, tag, fingerprint, out);
+        SerializeWrappedDek(version, provider_type, key_id, salt, nonce, ciphertext, tag, fingerprint, out);
         *out_len = static_cast<int32_t>(kTotalLen);
 
-        // Audit: who wrapped, for which service, under which KEK, and a hash
-        // of the exact payload produced (public bytes only - see event_log.h).
-        LogDekOperation(op, normalized_service, kek.provider_type, fingerprint, out, kTotalLen);
+        // Audit: who wrapped, for which service, in which version, under
+        // which KEK, and a hash of the exact payload produced (public bytes
+        // only - see event_log.h).
+        LogDekOperation(op, normalized_service, provider_type, version, fingerprint, out, kTotalLen);
         return HKDFGUARD_OK;
     }
 
@@ -347,7 +388,11 @@ extern "C" HKDFGUARD_API int hkdfguard_kek_exists(
 
         // Slow on purpose - see GatedSetup. "Exists" and "doesn't exist"
         // take the same time.
-        GatedSetup([&] { *out_exists = KekExists(service_name) ? 1 : 0; });
+        GatedSetup([&] {
+            const bool exists = RequirePayloadVersion() == kFormatVersion2 ? V2KekExists(service_name)
+                                                                           : KekExists(service_name);
+            *out_exists = exists ? 1 : 0;
+        });
 
         return HKDFGUARD_OK;
     } catch (const HkdfGuardError &e) {
@@ -383,8 +428,12 @@ extern "C" HKDFGUARD_API int hkdfguard_kek_fingerprint(
         // Exactly the KEK a wrap would use, verified the same way - so the
         // value printed after provisioning is the one stamped into every
         // payload. Not gated: like wrap, it only opens an existing key.
-        ResolvedKek kek = OpenKekForWrap(ServiceToWide(normalized_service));
-        ComputeKekFingerprint(kek.key.get(), out);
+        if (RequirePayloadVersion() == kFormatVersion2) {
+            OpenV2KekForWrap(ServiceToWide(normalized_service))->Fingerprint(out);
+        } else {
+            ResolvedKek kek = OpenKekForWrap(ServiceToWide(normalized_service));
+            ComputeKekFingerprint(kek.key.get(), out);
+        }
         *out_len = static_cast<int32_t>(kFingerprintLen);
         return HKDFGUARD_OK;
     } catch (const HkdfGuardError &e) {
@@ -403,8 +452,15 @@ extern "C" HKDFGUARD_API int hkdfguard_create_kek(
         // Who may use the resulting KEK comes from machine policy (see
         // hkdfguard.h and policy.h's LoadKeyUseGroupsPolicy), read and
         // validated inside CreateKek - nothing about access is caller-chosen.
+        // The KEK provisioned is the one for this host's payload version.
         // Slow on purpose - see GatedSetup.
-        GatedSetup([&] { CreateKek(service_name); });
+        GatedSetup([&] {
+            if (RequirePayloadVersion() == kFormatVersion2) {
+                CreateV2Kek(service_name);
+            } else {
+                CreateKek(service_name);
+            }
+        });
 
         return HKDFGUARD_OK;
     } catch (const HkdfGuardError &e) {
@@ -490,22 +546,45 @@ extern "C" HKDFGUARD_API int hkdfguard_unwrap_dek(
         // Validates the payload's shape/version and hands back pointers
         // into `wrapped` for each field (see wire_format.h/.cpp) - throws
         // HKDFGUARD_ERR_PAYLOAD_MALFORMED on anything that doesn't look like a
-        // genuine WrappedDekV1 payload.
+        // genuine payload of either version.
         ParsedWrappedDek parsed = ParseWrappedDek(wrapped, wrapped_len);
 
-        // Open (never create) the KEK the payload's routing fields select.
-        ResolvedKek kek = OpenKekForUnwrap(service_name, parsed.provider_type, parsed.key_id);
+        // The one version this host accepts (ClassicalMode), checked before
+        // any key is opened: a payload of the other version is refused
+        // outright, never tried. The version byte is also bound into each
+        // version's key derivation and AAD, so rewriting it gains nothing.
+        const uint8_t version = RequirePayloadVersion();
+        if (parsed.version != version) {
+            throw HkdfGuardError(HKDFGUARD_ERR_PAYLOAD_VERSION_REFUSED,
+                                 "payload version is not the one this host's ClassicalMode policy uses");
+        }
+
+        // Open (never create) the KEK the payload's routing fields select,
+        // of this version.
+        std::optional<ResolvedKek> v1_kek;
+        std::unique_ptr<V2Kek> v2_kek;
+        if (version == kFormatVersion2) {
+            v2_kek = OpenV2KekForUnwrap(service_name, parsed.provider_type, parsed.key_id);
+        } else {
+            v1_kek.emplace(OpenKekForUnwrap(service_name, parsed.provider_type, parsed.key_id));
+        }
 
         // Is that actually the KEK this payload was wrapped under? Compared
-        // before any ECDH so a payload for a different/rotated KEK fails
-        // fast and precisely (HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH), costing no TPM
-        // operation, rather than surfacing later as an authentication
-        // failure that looks identical to tampering. Not constant-time, and
-        // needn't be: both sides of the comparison are hashes of public
-        // keys. This is a check on the key the routing fields chose, never a
-        // search for a key that matches - see wire_format.h.
+        // before deriving the wrapping key so a payload for a different or
+        // rotated KEK fails precisely (HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH),
+        // rather than surfacing later as an authentication failure that
+        // looks identical to tampering. (Version 1 spends no TPM operation on
+        // it; version 2's fingerprint is itself a PRF output, computed in the
+        // same TPM session as the wrapping key.) Not constant-time, and
+        // needn't be: both fingerprints are public. This is a check on the
+        // key the routing fields chose, never a search for a key that
+        // matches - see wire_format.h.
         uint8_t expected_fingerprint[kFingerprintLen];
-        ComputeKekFingerprint(kek.key.get(), expected_fingerprint);
+        if (version == kFormatVersion2) {
+            v2_kek->Fingerprint(expected_fingerprint);
+        } else {
+            ComputeKekFingerprint(v1_kek->key.get(), expected_fingerprint);
+        }
         if (std::memcmp(expected_fingerprint, parsed.fingerprint, kFingerprintLen) != 0) {
             throw HkdfGuardError(HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH, "payload was not wrapped under this KEK");
         }
@@ -521,10 +600,16 @@ extern "C" HKDFGUARD_API int hkdfguard_unwrap_dek(
         {
             // Scoped so the key is wiped as soon as AesGcmDecrypt is done.
             SecureBuffer<32> wrapping_key;
-            // ECDH(KEK private key, H(salt)) (may execute inside a
-            // TPM/vTPM) + HKDF-SHA512 -> the same 32-byte wrapping key
-            // derived at wrap time, from the payload's salt.
-            DeriveWrappingKey(kek.provider.get(), kek.key.get(), normalized_service, authenticated, wrapping_key);
+            // The same 32-byte wrapping key derived at wrap time, from the
+            // header as received: version 2's PRF over the SP 800-108
+            // block, or version 1's ECDH(KEK private key, H(salt)) +
+            // HKDF-SHA512 - either possibly inside a TPM/vTPM.
+            if (version == kFormatVersion2) {
+                v2_kek->WrappingKey(normalized_service, parsed.header, wrapping_key);
+            } else {
+                DeriveWrappingKey(v1_kek->provider.get(), v1_kek->key.get(), normalized_service, authenticated,
+                                  wrapping_key);
+            }
 
             // Decrypt directly into the caller's buffer - no intermediate
             // plaintext staging buffer. The AAD must match what
@@ -549,7 +634,7 @@ extern "C" HKDFGUARD_API int hkdfguard_unwrap_dek(
         // regardless, in the catch blocks below.
         if (LoadAuditUnwrapSuccess()) {
             LogDekOperation(
-                AuditOp::Unwrap, normalized_service, parsed.provider_type, parsed.fingerprint,
+                AuditOp::Unwrap, normalized_service, parsed.provider_type, parsed.version, parsed.fingerprint,
                 wrapped, static_cast<size_t>(wrapped_len));
         }
         return HKDFGUARD_OK;

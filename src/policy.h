@@ -179,4 +179,40 @@ namespace hkdfguard {
     void SetTestDeployerGroupsOverride(std::optional<std::vector<std::wstring>> groups);
 #endif
 
+    // Which payload version this host writes and accepts (wire_format.h;
+    // docs/adr/0001-post-quantum-payload-version-2.md):
+    //
+    //   Version2: the default - the symmetric, post-quantum construction
+    //     (kek_v2.h). Wrap writes version 2; unwrap accepts version 2 only.
+    //   Version1: classical - the ECDH construction (ecdh_hkdf.h). Wrap
+    //     writes version 1; unwrap accepts version 1 only.
+    //
+    // A host uses exactly one: there is no fallback from one to the other
+    // and no migration between them. Each has its own KEK, so the setting
+    // also decides which one hkdfguard_create_kek provisions.
+    enum class PayloadVersionPolicy : uint32_t {
+        Version2 = 0, // ClassicalMode absent or 0
+        Version1 = 1, // ClassicalMode 1
+
+        // Present but not 0 or 1 (or not a REG_DWORD), or a policy key that
+        // exists but can't be opened: fails closed with
+        // HKDFGUARD_ERR_POLICY_INVALID, as KeyStoragePolicy::Invalid does.
+        Invalid = 0xFFFFFFFFu,
+    };
+
+    // The value-to-setting rule LoadPayloadVersionPolicy applies, with no
+    // registry I/O, so it can be tested directly. Absent means Version2.
+    PayloadVersionPolicy ParsePayloadVersionPolicy(bool found, unsigned long type, unsigned long value) noexcept;
+
+    // The REG_DWORD value HKLM\Software\Policies\HkdfGuard\ClassicalMode:
+    // absent or 0 = Version2, 1 = Version1, anything else = Invalid. Read
+    // on every call that depends on it. Never throws.
+    PayloadVersionPolicy LoadPayloadVersionPolicy() noexcept;
+
+#if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
+    // Test-only seam for LoadPayloadVersionPolicy, with the same scope and
+    // caveats as SetTestPolicyOverride. std::nullopt clears it.
+    void SetTestPayloadVersionOverride(std::optional<PayloadVersionPolicy> version) noexcept;
+#endif
+
 } // namespace hkdfguard
