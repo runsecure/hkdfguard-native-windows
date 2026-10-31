@@ -45,6 +45,11 @@ add_library(hkdfguard SHARED
     src/key_file.cpp
     src/hash_to_curve.cpp
     src/process_hardening.cpp
+    # Payload version 2 (docs/adr/0001-post-quantum-payload-version-2.md):
+    # the KEK store (NCrypt HMAC keys in the TPM and the Software KSP) and
+    # its SP 800-108 derivation.
+    src/kek_v2.cpp
+    src/sp800_108.cpp
 )
 
 # Event log message table: mc.exe (Windows SDK) compiles

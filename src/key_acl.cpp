@@ -731,6 +731,16 @@ namespace hkdfguard {
         NCRYPT_KEY_HANDLE key) {
         std::vector<BYTE> descriptor;
         PACL acl = ReadKeyDacl(key, descriptor, HKDFGUARD_ERR_KEK_INVALID);
+        VerifyExistingKekDacl(acl);
+    }
+
+    void VerifyExistingKekDacl(
+        PACL acl) {
+        if (acl == nullptr) {
+            throw HkdfGuardError(
+                HKDFGUARD_ERR_KEK_INVALID,
+                "key ACL missing or NULL (grants everyone full access)");
+        }
 
         // The two principals every KEK this library creates grants, whatever
         // the policy was at the time.
@@ -800,6 +810,17 @@ namespace hkdfguard {
         const std::vector<std::wstring> &additionalGroups) {
         std::vector<BYTE> descriptor;
         PACL acl = ReadKeyDacl(key, descriptor, HKDFGUARD_ERR_PROVIDER_ERROR);
+        VerifyKekDaclGrants(acl, additionalGroups);
+    }
+
+    void VerifyKekDaclGrants(
+        PACL acl,
+        const std::vector<std::wstring> &additionalGroups) {
+        if (acl == nullptr) {
+            throw HkdfGuardError(
+                HKDFGUARD_ERR_PROVIDER_ERROR,
+                "key ACL missing or NULL");
+        }
 
         VerifyPrincipalPresent(
             acl,

@@ -83,6 +83,21 @@ namespace hkdfguard {
     void VerifyExistingKeyAcl(
         NCRYPT_KEY_HANDLE key);
 
+    // VerifyExistingKeyAcl's checks on a DACL already in hand, so the walk
+    // can be fuzzed on its own (tests/fuzz/fuzz_kek_dacl.cpp). A NULL `acl`
+    // (no DACL) fails too. Throws HkdfGuardError(HKDFGUARD_ERR_KEK_INVALID)
+    // on a violation.
+    void VerifyExistingKekDacl(
+        PACL acl);
+
+    // VerifyKeyAcl's checks on a DACL already in hand, fuzzed alongside
+    // VerifyExistingKekDacl. A NULL `acl` fails too. Throws
+    // HkdfGuardError(HKDFGUARD_ERR_PROVIDER_ERROR) when a principal is
+    // missing, as VerifyKeyAcl does.
+    void VerifyKekDaclGrants(
+        PACL acl,
+        const std::vector<std::wstring> &additionalGroups);
+
     // Verifies that the expected principals exist on the key ACL.
     //
     // Intended to be called when opening a KEK to ensure the key

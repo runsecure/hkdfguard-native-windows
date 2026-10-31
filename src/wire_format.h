@@ -5,11 +5,12 @@
 #include <vector> // std::vector (BuildWrappedDekAuthenticated's result)
 
 namespace hkdfguard {
-    // WrappedDekV1 layout (all integers little-endian; total 132 bytes,
-    // identical regardless of which KEK provider produced it):
+    // Wrapped payload layout, shared by both versions (all integers
+    // little-endian; total 132 bytes, identical regardless of which KEK
+    // provider produced it):
     //
     //   offset  size  field
-    //   0       1     Version            (= kFormatVersion1)
+    //   0       1     Version            (kFormatVersion1 or kFormatVersion2)
     //   1       1     ProviderType       (1 = Platform Crypto Provider, 2 = Software KSP)
     //   2       2     Reserved           (must be 0; rejected otherwise)
     //   4       4     KeyId              (little-endian; = 1 for this format version)
@@ -17,9 +18,18 @@ namespace hkdfguard {
     //   40      12    Nonce              (AES-GCM IV)
     //   52      32    Ciphertext         (AES-256-GCM ciphertext of the 32-byte DEK)
     //   84      16    Tag                (AES-GCM authentication tag)
-    //   100     32    KekFingerprint     (SHA-256 of the KEK's public key, raw X || Y)
+    //   100     32    KekFingerprint     (version 1: SHA-256 of the KEK's public key, raw X || Y;
+    //                                     version 2: a fixed PRF output of the KEK - see kek_v2.h)
     //
-    // The wrapping key is Z = ECDH(KEK private key, H(Salt)), where H hashes
+    // The two versions differ only in how the wrapping key and the
+    // fingerprint are derived. Version 2 (the default; see policy.h's
+    // LoadPayloadVersionPolicy) derives both with the KEK as a symmetric PRF
+    // key (sp800_108.h), so there is no public key for a quantum computer to
+    // work on. Version 1 is described here. Which one a host writes and
+    // accepts is policy alone: a host uses exactly one, and the version byte
+    // - authenticated like every header field - is checked against it.
+    //
+    // In version 1, the wrapping key is Z = ECDH(KEK private key, H(Salt)), where H hashes
     // the salt to a P-256 point (hash_to_curve.h). Nobody knows the discrete
     // log of H(Salt), so computing Z needs the KEK's *private* key: only an
     // account authorized to use the KEK can create a payload, and knowing
@@ -66,7 +76,8 @@ namespace hkdfguard {
     // Serialized field-by-field rather than via a packed C struct, so the
     // wire format has no dependency on compiler struct-packing rules.
 
-    constexpr uint8_t kFormatVersion1 = 1;
+    constexpr uint8_t kFormatVersion1 = 1; // ECDH P-256 + HKDF-SHA512 (ecdh_hkdf.h)
+    constexpr uint8_t kFormatVersion2 = 2; // SP 800-108 KDF keyed by a symmetric KEK (kek_v2.h)
 
     // The only KeyId value this format version ever produces or accepts.
     // HkdfGuard has no key-rotation mechanism by design: a KEK is meant to
@@ -117,6 +128,7 @@ namespace hkdfguard {
     // The pointer fields do not own memory: they point into the caller's
     // `wrapped` buffer and are valid only as long as it is.
     struct ParsedWrappedDek {
+        uint8_t version; // kFormatVersion1 or kFormatVersion2
         uint8_t provider_type;
         uint32_t key_id;
         const uint8_t *header; // kHeaderLen bytes, as received - the AAD's first part
@@ -127,9 +139,11 @@ namespace hkdfguard {
         const uint8_t *fingerprint; // kFingerprintLen bytes
     };
 
-    // Writes a kTotalLen-byte WrappedDekV1 payload into out. Array-parameter
-    // sizes document the expected byte counts; they are not enforced.
+    // Writes a kTotalLen-byte payload of format `version` into out.
+    // Array-parameter sizes document the expected byte counts; they are not
+    // enforced.
     void SerializeWrappedDek(
+        uint8_t version,
         uint8_t provider_type,
         uint32_t key_id,
         const uint8_t salt[kSaltLen],
@@ -144,6 +158,7 @@ namespace hkdfguard {
     // since that function writes its header through this one. Wrap needs the
     // header before the payload exists, to build the AAD it encrypts under.
     void SerializeWrappedDekHeader(
+        uint8_t version,
         uint8_t provider_type,
         uint32_t key_id,
         const uint8_t salt[kSaltLen],
@@ -158,7 +173,9 @@ namespace hkdfguard {
         const uint8_t header[kHeaderLen],
         const uint8_t fingerprint[kFingerprintLen]);
 
-    // Validates and parses a wrapped payload. Throws HkdfGuardError with
+    // Validates and parses a wrapped payload of either version - whether the
+    // host's policy accepts that version is hkdfguard.cpp's check, not this
+    // one's. Throws HkdfGuardError with
     // HKDFGUARD_ERR_PAYLOAD_UNSUPPORTED if the version is not recognized,
     // and with HKDFGUARD_ERR_PAYLOAD_MALFORMED if wrapped_len != kTotalLen,
     // the reserved bytes are not zero, the provider type is not

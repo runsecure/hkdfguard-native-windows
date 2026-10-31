@@ -26,7 +26,9 @@ see the [README](../README.md).
 hkdfguard-native-windows protects a 32-byte data encryption key (DEK) by wrapping it with a
 key encryption key (KEK) that never leaves the machine. Each KEK is a non-exportable
 machine key, held by the TPM when one is available, or by the Windows software key store
-otherwise.
+otherwise. By default the KEK is a symmetric, post-quantum key (payload version 2); a
+machine can be set to use the classical P-256 KEK (version 1) instead - see
+[ClassicalMode](#classicalmode).
 
 You install two files:
 
@@ -50,6 +52,9 @@ The usual flow is:
 - Administrator rights to install, and to provision each service's KEK.
 - A TPM is optional. Without one, keys are held by the Microsoft Software Key Storage
   Provider, unless policy requires a TPM (see [`KeyStoragePolicy`](#keystoragepolicy)).
+  For the default, post-quantum payload version 2, the TPM must be able to hold an
+  HMAC-SHA-256 key through the Microsoft Platform Crypto Provider; see
+  [ClassicalMode](#classicalmode).
 
 ## Download and verify
 
@@ -388,11 +393,13 @@ To see a service's KEK, run `status` from any account that can use the key:
 & "C:\Program Files\HkdfGuard\v1\hkdfguard.exe" status --service-name myapp
 ```
 
-It prints whether the KEK is `present`, `absent`, `corrupt` or `unusable`. It also prints
-which key store holds the KEK (TPM or software) and its fingerprint. It also lists any other
-key under the service's name in the key store the `KeyStoragePolicy` doesn't select. It
-never changes anything. It exits `0` when it got an answer and `1` when it couldn't tell,
-for example because access was denied.
+It prints the payload version this machine uses (see [ClassicalMode](#classicalmode)), and
+whether the KEK of that version is `present`, `absent`, `corrupt`, `unusable`, or, for a
+version 2 KEK, `access list invalid`. It also
+prints which key store holds the KEK (TPM or software) and its fingerprint. It also lists
+any other key under the service's name: in the key store the `KeyStoragePolicy` doesn't
+select, or of the other payload version. It never changes anything. It exits `0` when it
+got an answer and `1` when it couldn't tell, for example because access was denied.
 
 **Retiring a KEK deletes it, and every DEK wrapped under it becomes permanently
 unrecoverable.** Retire a KEK only after every application has moved to a new, versioned
@@ -407,11 +414,21 @@ name is still needed. From an elevated prompt:
 deletes nothing. It is the only way this product deletes a KEK. Applications can't delete
 one: the library has no delete function.
 
-- If a key under the service's name isn't a valid P-256 key at all, it has no fingerprint.
-  `status` reports it as `corrupt`. Retire it with `--corrupt` instead of `--fingerprint`.
-  `--corrupt` refuses a valid KEK, and refuses any key whose properties it couldn't read.
+- If a key under the service's name fails its KEK checks, it has no fingerprint. `status`
+  reports it as `corrupt`. Retire it with `--corrupt` instead of `--fingerprint`. For a
+  version 1 KEK that means a key that isn't a valid P-256 key; for a version 2 KEK, a key
+  that isn't the TPM's HMAC-SHA-256 key or the software key store's SP 800-108 key, or that
+  is exportable. `--corrupt` refuses a valid KEK, and refuses any key it couldn't check.
+- If a version 2 KEK fails only because of its access list - someone widened its ACL -
+  `status` reports `access list invalid`, not `corrupt`. The key itself may be fine, so
+  `retire --corrupt` refuses it: deleting it would destroy every DEK wrapped under it for a
+  problem you can fix. Restore the access list instead (SYSTEM, Administrators and
+  `HkdfGuardAdmins` full control, the key-use groups read, nothing else) and run `status`
+  again.
 - If the service has a key in both the TPM and the software key store, `retire` won't
   choose between them. Run `status`, then add `--provider tpm` or `--provider software`.
+- `retire` acts on the KEK of this machine's payload version. Add `--version 1` or
+  `--version 2` to retire the other version's KEK, which `status` lists as unused.
 
 Each retirement is logged as event **1004**, with the service, key store, fingerprint and
 the account that ran it. Afterwards the service name can be provisioned again, which
@@ -419,9 +436,56 @@ creates a new KEK with a new fingerprint.
 
 ## Machine policy settings
 
-All six settings are values under `HKLM\Software\Policies\HkdfGuard`. Set them with Group
+All seven settings are values under `HKLM\Software\Policies\HkdfGuard`. Set them with Group
 Policy, Intune or SCCM, or with `reg add` for testing. They're read on every call, so a
 change takes effect without a restart.
+
+### ClassicalMode
+
+`REG_DWORD`. Selects the payload version - the cryptography - this machine uses for every
+KEK, wrap and unwrap.
+
+| Value | Payload version | KEK |
+|---|---|---|
+| absent or `0` | **2, post-quantum** (the default) | A symmetric key used as an HMAC-SHA-256 PRF: an HMAC key in the TPM, or an SP 800-108 key in the software key store. No public key, so nothing a quantum computer could break. |
+| `1` | 1, classical | A P-256 ECDH key in the TPM or the software key store. |
+
+Anything else, or a value of the wrong type, makes every call fail with
+`invalid machine policy`.
+
+**Set it before the first `provision` and leave it.** A machine uses exactly one version.
+Each version has its own KEK, and a key file wraps under one: unwrap refuses a key file of
+the other version (`HKDFGUARD_ERR_PAYLOAD_VERSION_REFUSED`) before it opens any key, and
+nothing falls back from one version to the other. Changing the setting later makes every
+existing key file unreadable until it is changed back. To move a service to the other
+version, set the value, provision the service (which creates that version's KEK, with a
+new fingerprint) and wrap its DEKs again.
+
+Where a version 2 KEK lives - like every KEK, a non-exportable machine key with the usual
+KEK access list, which the key store checks on every use:
+
+| Key store | Version 2 KEK |
+|---|---|
+| TPM | An HMAC-SHA-256 key named `hkdfguardwin_<service>_v1_hmac` in the Microsoft Platform Crypto Provider. The TPM made the key and only it can use it. |
+| Software | An SP 800-108 HMAC key named `hkdfguardwin_<service>_v1_kdf` in the Microsoft Software Key Storage Provider. |
+
+A TPM is used for version 2 only if the Microsoft Platform Crypto Provider can be opened,
+reports a TPM, and can create the HMAC-SHA-256 key. If not:
+
+- Under `PreferTpm`, the KEK goes in the software key store instead (event 1001), as it
+  does for version 1.
+- Under `RequireTpm`, the call fails with `HKDFGUARD_ERR_PROVIDER_UNAVAILABLE` and event
+  **2008** names the reason.
+
+Either way, nothing falls back to version 1. On a machine whose TPM can't do version 2 and
+that must keep using the TPM, set `ClassicalMode` to `1` before provisioning.
+
+If the TPM is cleared, every TPM KEK - of either version - is lost, and the key files
+wrapped under it can't be recovered. Retire it, provision again, and wrap new DEKs.
+
+```powershell
+reg add HKLM\Software\Policies\HkdfGuard /v ClassicalMode /t REG_DWORD /d 1 /f   # classical (version 1) only
+```
 
 ### KeyStoragePolicy
 
@@ -539,16 +603,17 @@ User field is the calling account.
 | 1000 | Information | A KEK was created. |
 | 1001 | Warning | A KEK was created in the software key store because the TPM couldn't be used under `PreferTpm`. It isn't hardware-protected. |
 | 1002 | Information | A DEK was wrapped. |
-| 1003 | Information | A DEK was unwrapped. |
+| 1003 | Information | A DEK was unwrapped. Wrap and unwrap events record the payload version. |
 | 1004 | Warning | A KEK was retired (deleted) with `hkdfguard.exe retire`. Every DEK wrapped under it is now unrecoverable. Names the service, key store, fingerprint and account. |
 | 1005 | Warning | A process read a key file under the **developer** security model, which trusts the caller's own key files. Logged once per process. **Investigate** on any production machine and remove `SecurityModel`. |
 | 2000 | Warning | Access denied: an unauthorized account used a KEK, or provisioning ran without elevation. |
 | 2002 | Error | An existing KEK has an access list this library would never create. **Investigate.** |
-| 2003 | Warning | Unwrap rejected a tampered, corrupted or misdirected payload. |
-| 2004 | Error | Policy is misconfigured (`KeyStoragePolicy` or `KeyUseGroups`), so calls fail. |
+| 2003 | Warning | Unwrap rejected a tampered, corrupted or misdirected payload, or one of the payload version this machine doesn't use. |
+| 2004 | Error | Policy is misconfigured (`KeyStoragePolicy`, `ClassicalMode`, `SecurityModel` or `KeyUseGroups`), so calls fail. |
 | 2005 | Error | The key store or cryptography layer failed. |
 | 2006 | Error | An application asked the library to read a key file that looks like an *unwrapped* key (32 raw bytes, or its hex or base64), so it may be a plaintext key on disk. The event names the file; none of its contents are logged. **Investigate**, remove the file and re-mint that DEK. |
 | 2007 | Warning | An application made more than 10 setup calls (`create_kek` / `kek_exists`) in one process. These should run once at startup; it is probably calling them per request. Logged once per process. |
+| 2008 | Error | Payload version 2 is unavailable: the TPM can't be used for it, and the `KeyStoragePolicy` (or a TPM KEK or key file) rules out the software key store. Names the reason - the Platform Crypto Provider can't be opened, no TPM, or the TPM can't create the HMAC-SHA-256 key - and the fixes. See [ClassicalMode](#classicalmode). |
 
 Wrap and unwrap events include a SHA-256 of the wrapped payload, so each unwrap can be
 traced to the wrap that produced it. To compare against a key file:
@@ -561,7 +626,7 @@ Get-WinEvent -LogName Application -FilterXPath "*[System[Provider[@Name='hkdfgua
 
 Any local user can write to the Application log, so treat these events as an operational
 aid, not tamper-proof evidence. Forward them to your SIEM for retention and alerting. Events
-2002, 2006, 2003, 1005, 1004 and 1001 are good candidates for alerts.
+2002, 2006, 2003, 2008, 1005, 1004 and 1001 are good candidates for alerts.
 
 ## Upgrade
 
@@ -581,8 +646,8 @@ msiexec /x hkdfguard-native-windows-0.9.0-win-x64.msi /qn /l*v uninstall.log
 You can also uninstall **HkdfGuard for Windows** from **Settings → Apps**. Uninstalling removes the files, the
 `InstallPath` value and the event source registration. It deliberately keeps:
 
-- **All KEKs.** Deleting a KEK destroys every DEK wrapped under it. To remove one on
-  purpose, [retire](#check-or-retire-a-kek) it before you uninstall.
+- **All KEKs.** Deleting a KEK destroys every DEK wrapped under it.
+  To remove one on purpose, [retire](#check-or-retire-a-kek) it before you uninstall.
 - **The `HkdfGuardUsers` group.** A recreated group would get a new SID and lose access to
   existing KEKs.
 - **Policy values** under `HKLM\Software\Policies\HkdfGuard`.
@@ -601,7 +666,10 @@ was attempted) and `1` for an operational failure. On failure it prints an `erro
 | `wrapped payload was not produced under this service's current KEK` | The key file belongs to a different service or a different KEK. | Check the service name, and that the file was wrapped on this machine. |
 | `hkdfguard_open_file would refuse to read a key file there` | `wrap`'s `--key-file-path` is in a folder that another account can create, delete or rename entries in (for example anywhere under `C:\ProgramData`), or that isn't owned by SYSTEM, Administrators, TrustedInstaller or you. Nothing was read or written. | Use a folder prepared as in [Where to keep key files](#where-to-keep-key-files); the message names the folder and account and prints the `icacls` commands. |
 | `this account may not persist key files` | Under the production model, `wrap` ran as an account that is neither an elevated administrator nor a member of `HkdfGuardDeployers` or a `DeployerGroups` group. Nothing was written. | Run `wrap` as a deployer: add the account to `HkdfGuardDeployers`, then sign in again. |
-| `invalid machine policy` | `KeyStoragePolicy` isn't a `REG_DWORD` of `0`, `1` or `2`, or `SecurityModel` isn't a `REG_DWORD` of `0` or `1`. | Correct or remove the value. |
+| `invalid machine policy` | `KeyStoragePolicy` isn't a `REG_DWORD` of `0`, `1` or `2`, or `SecurityModel` or `ClassicalMode` isn't a `REG_DWORD` of `0` or `1`. | Correct or remove the value. |
+| `payload version 2 is unavailable on this host` | The TPM can't be used for version 2 and the `KeyStoragePolicy` (or a TPM KEK or key file) rules out the software key store. Event 2008 names the reason. | Fix what event 2008 names. Or set `KeyStoragePolicy` to allow the software key store, or set [ClassicalMode](#classicalmode) to `1` before provisioning. |
+| `not the payload version this host uses` | The key file was wrapped while `ClassicalMode` had the other value. | Set `ClassicalMode` back to what it was when the file was wrapped, or provision this version's KEK and wrap the DEK again. |
+| `kek: access list invalid` from `status` | The ACL on a version 2 KEK grants someone it shouldn't, such as use for an over-broad group like Users or Everyone. | Restore the access list; do not retire the key. |
 | `a KeyUseGroups or DeployerGroups policy entry is ...` | An entry in either value is invalid, or a deployer group's members couldn't be read. | Fix the entry. See [KeyUseGroups](#keyusegroups) and [DeployerGroups](#deployergroups). |
 | `service name is missing or malformed` | The name uses characters other than ASCII letters, digits and `.`, starts with `.`, contains `..`, or is longer than 128. | Use a valid name. |
 

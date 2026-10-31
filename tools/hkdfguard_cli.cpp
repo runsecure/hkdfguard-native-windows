@@ -13,11 +13,14 @@
 //       This is the *only* subcommand that may create a KEK.
 //
 //   retire --service-name|-sn <name> (--fingerprint|-fp <hex> | --corrupt)
-//          [--provider tpm|software]
-//       Deletes the service's KEK, after the operator proves which KEK they
-//       mean by supplying its fingerprint - or, with --corrupt, only if the
-//       key under the service's name is not a P-256 ECDH key at all, so has
-//       no fingerprint. The *only* subcommand that deletes keys, and
+//          [--provider tpm|software] [--version 1|2]
+//       Deletes the service's KEK of this host's payload version (or
+//       --version's), after the operator proves which KEK they mean by
+//       supplying its fingerprint - or, with --corrupt, only if the key
+//       under the service's name definitely fails its KEK checks (version
+//       1: not a P-256 ECDH key; version 2: not the TPM's HMAC key or the
+//       software KSP's SP 800-108 key), so has no fingerprint. The *only*
+//       subcommand that deletes keys, and
 //       deliberately implemented here rather than in the library: the DLL's
 //       C ABI offers no delete, so no application that loads it gets a
 //       one-call wipe. Requires an elevated process. Every payload wrapped
@@ -26,8 +29,10 @@
 //       each of two providers.
 //
 //   status --service-name|-sn <name>
-//       Reports whether the service has a KEK, which provider holds it, and
-//       its fingerprint. Read-only: never creates or deletes a key.
+//       Reports the payload version this host uses, whether the service has
+//       a KEK of it, which provider holds it, and its fingerprint, and lists
+//       every other key under the service's name - of either version.
+//       Read-only: never creates or deletes a key.
 //
 //   wrap --key-file-path|-kf <path> --service-name|-sn <name> \
 //        (--dek-stdin | --dek-file <path>) [--group|-g <name>] [--force|-f]
@@ -40,12 +45,16 @@
 //       (e.g. a WMI query).
 //
 // Calls into HkdfGuard.dll through its stable C ABI - hkdfguard_kek_exists,
-// hkdfguard_create_kek, hkdfguard_kek_fingerprint and hkdfguard_wrap_dek;
-// this tool links only
-// against include/hkdfguard.h and the hkdfguard import library, nothing from
-// src/. The one exception is retire/status's direct NCrypt access to the
-// KEK's persisted key (see "KEK inspection and retirement" below): the ABI
-// deliberately has no way to delete a key or address one provider's copy.
+// hkdfguard_create_kek, hkdfguard_kek_fingerprint and hkdfguard_wrap_dek -
+// for everything it does with the KEK the policy selects. retire and status
+// need more than the ABI gives - one provider's key, and a delete - because
+// the ABI deliberately has no way to delete a key or address one provider's
+// copy. For a payload version 1 KEK they open the persisted key directly
+// with NCrypt (see "KEK inspection and retirement" below). A payload
+// version 2 KEK can't be inspected that way - its fingerprint needs the KEK
+// itself - so for it they use the library's own version 2 key code,
+// compiled into this tool (see "Payload version 2 KEKs" below, and
+// tools/CMakeLists.txt). Nothing else from src/ is compiled in.
 //
 // The KEK's `service` identity is exactly --service-name's value, passed
 // straight through to the hkdfguard_* calls, so every subcommand given the
@@ -90,6 +99,11 @@
 
 #include "hkdfguard.h"
 #include "no_follow_open.h" // the path walk shared with hkdfguard_open_file - see tools/CMakeLists.txt
+// The library's version 2 key code, compiled into this tool for retire and
+// status only (see "Payload version 2 KEKs" below, and tools/CMakeLists.txt).
+#include "errors.h"  // hkdfguard::HkdfGuardError
+#include "kek_v2.h"  // InspectV2Kek, DeleteV2Kek
+#include "policy.h"  // LoadPayloadVersionPolicy
 
 #include <windows.h>
 #include <aclapi.h> // SetSecurityInfo - protecting the key file's DACL on its handle
@@ -141,8 +155,10 @@ namespace {
     constexpr size_t kSecureOverwritePassCount = 8;
 
     // This tool's operational-error type. Not the DLL's HkdfGuardError
-    // (src/errors.h): this tool depends only on the public C ABI. The message
-    // is narrow, so every fprintf of it uses %s, never %ls.
+    // (src/errors.h): apart from the version 2 key code compiled in for
+    // retire and status, whose HkdfGuardErrors are turned into CliErrors
+    // where they are caught, this tool depends only on the public C ABI. The
+    // message is narrow, so every fprintf of it uses %s, never %ls.
     struct CliError {
         std::string message;
 
@@ -208,8 +224,9 @@ namespace {
     struct RetireArgs {
         std::string serviceName;
         std::optional<Fingerprint> fingerprint; // --fingerprint: a valid KEK, by its fingerprint
-        bool corrupt = false;                   // --corrupt: a key under the name that isn't a P-256 ECDH key
+        bool corrupt = false;                   // --corrupt: a key under the name that fails its KEK checks
         std::optional<KekProvider> provider;    // --provider: which provider's key, when both have one
+        std::optional<int> version;             // --version: which payload version's KEK (default: this host's)
     };
 
     struct StatusArgs {
@@ -228,12 +245,13 @@ namespace {
             L"  %ls wrap --key-file-path|-kf <path> --service-name|-sn <name> (--dek-stdin | --dek-file <path>)\n"
             L"       [--group|-g <name>] [--force|-f]\n"
             L"  %ls retire --service-name|-sn <name> (--fingerprint|-fp <hex> | --corrupt)\n"
-            L"       [--provider tpm|software]\n"
+            L"       [--provider tpm|software] [--version 1|2]\n"
             L"  %ls status --service-name|-sn <name>\n"
             L"\n"
             L"provision  ensures a KEK exists for the service. Run once, at deployment time, from an\n"
             L"           elevated prompt; this is the only command that creates keys. Prints the\n"
-            L"           KEK's fingerprint -- record it.\n"
+            L"           KEK's fingerprint -- record it. The KEK is the one for this host's payload\n"
+            L"           version: 2 (post-quantum) unless ClassicalMode is 1.\n"
             L"wrap       wraps a DEK under the service's existing KEK and writes the payload to\n"
             L"           --key-file-path, readable by its owner only, or also by --group's\n"
             L"           members (read-only). Fails if the KEK has not been provisioned.\n"
@@ -241,10 +259,14 @@ namespace {
             L"           characters, as printed by provision). The only command that deletes keys;\n"
             L"           needs an elevated prompt. Everything wrapped under that KEK becomes\n"
             L"           permanently unrecoverable: migrate to a new service name first. With\n"
-            L"           --corrupt instead, deletes the key only if it is not a P-256 ECDH key at\n"
-            L"           all. --provider picks the key when both providers hold one.\n"
-            L"status     reports whether the service has a KEK, which provider holds it, and its\n"
-            L"           fingerprint. Read-only: never creates or deletes anything.\n"
+            L"           --corrupt instead, deletes the key only if it fails its KEK checks (version\n"
+            L"           1: not a P-256 ECDH key; version 2: not the expected HMAC or SP 800-108\n"
+            L"           key, but never one whose only fault is its access list - fix that instead).\n"
+            L"           --provider picks the key when both providers hold one; --version picks\n"
+            L"           the payload version's KEK, by default this host's.\n"
+            L"status     reports the payload version, whether the service has a KEK, which provider\n"
+            L"           holds it, and its fingerprint, and lists every other key under its name.\n"
+            L"           Read-only: never creates or deletes anything.\n"
             L"\n"
             L"The DEK is base64 of exactly 32 bytes, read from stdin or a file -- never\n"
             L"from a command-line argument or an environment variable, both of which are\n"
@@ -268,6 +290,7 @@ namespace {
     }
 
     // The subcommand list every "missing/unknown subcommand" error names.
+    // Matches the macOS tool's message (tests/test_cli.ps1).
     constexpr char kSubcommandList[] = "`provision`, `wrap`, `retire` or `status`";
 
     // Stores a flag's value, refusing a second one rather than letting the
@@ -445,6 +468,7 @@ namespace {
         std::optional<std::string> serviceName;
         std::optional<std::string> fingerprintText;
         std::optional<std::string> providerText;
+        std::optional<std::string> versionText;
         bool corrupt = false;
 
         for (int i = 2; i < argc; ++i) {
@@ -457,6 +481,8 @@ namespace {
                 SetOnce(fingerprintText, "--fingerprint", FlagValue(argc, argv, i, arg, "--fingerprint"));
             } else if (arg == "--provider") {
                 SetOnce(providerText, "--provider", FlagValue(argc, argv, i, arg, "--provider"));
+            } else if (arg == "--version") {
+                SetOnce(versionText, "--version", FlagValue(argc, argv, i, arg, "--version"));
             } else if (arg == "--corrupt") {
                 if (corrupt) {
                     throw CliError("give --corrupt at most once");
@@ -476,7 +502,7 @@ namespace {
         if (!fingerprintText && !corrupt) {
             throw CliError(
                 "retire: missing required --fingerprint|-fp (the 64-hex-character value printed by provision), or "
-                "--corrupt for a key that is not a P-256 ECDH key");
+                "--corrupt for a key under the service's name that fails its KEK checks");
         }
 
         out.serviceName = *serviceName;
@@ -491,6 +517,15 @@ namespace {
                 out.provider = KekProvider::Software;
             } else {
                 throw CliError("--provider must be `tpm` or `software`, got \"" + *providerText + "\"");
+            }
+        }
+        if (versionText) {
+            if (*versionText == "1") {
+                out.version = 1;
+            } else if (*versionText == "2") {
+                out.version = 2;
+            } else {
+                throw CliError("--version must be `1` or `2`, got \"" + *versionText + "\"");
             }
         }
         return ParseOutcome::Run;
@@ -776,16 +811,17 @@ namespace {
             case HKDFGUARD_OK: return "success";
             case HKDFGUARD_ERR_INVALID_ARGUMENT: return "invalid argument (null pointer or wrong DEK length)";
             case HKDFGUARD_ERR_BUFFER_TOO_SMALL: return "output buffer too small";
-            case HKDFGUARD_ERR_PROVIDER_UNAVAILABLE: return "no KEK provider is available on this host";
+            case HKDFGUARD_ERR_PROVIDER_UNAVAILABLE: return "payload version 2 is unavailable on this host: the TPM can't be used for it, and the KeyStoragePolicy (or an existing TPM KEK) rules out the software key store -- event 2008 in the Application log names the reason";
             case HKDFGUARD_ERR_PROVIDER_ERROR: return "KEK provider/key open or create failed";
             case HKDFGUARD_ERR_CRYPTO_ERROR: return "a cryptographic operation failed";
             case HKDFGUARD_ERR_PAYLOAD_AUTH_FAILED: return "AES-GCM authentication failed";
             case HKDFGUARD_ERR_PAYLOAD_MALFORMED: return "wrapped payload is not valid";
             case HKDFGUARD_ERR_PAYLOAD_UNSUPPORTED: return "wrapped payload uses a format version this build does not understand";
+            case HKDFGUARD_ERR_PAYLOAD_VERSION_REFUSED: return "wrapped payload is not the payload version this host uses (version 2 unless ClassicalMode is 1): it was wrapped under the other setting, and this host accepts one version only";
             case HKDFGUARD_ERR_INTERNAL_ERROR: return "an internal error occurred in HkdfGuard.dll";
             case HKDFGUARD_ERR_PROCESS_HARDENING_FAILED: return "could not harden this process against memory disclosure (crash-report heap, same-user debugging and code injection)";
             case HKDFGUARD_ERR_INVALID_SERVICE_NAME: return "service name is missing or malformed (ASCII letters, digits and '.' only, 1-128 bytes, not starting with '.', no \"..\")";
-            case HKDFGUARD_ERR_POLICY_INVALID: return "invalid machine policy: HKLM\\Software\\Policies\\HkdfGuard\\KeyStoragePolicy is not 0, 1 or 2, or SecurityModel is not 0 or 1";
+            case HKDFGUARD_ERR_POLICY_INVALID: return "invalid machine policy: HKLM\\Software\\Policies\\HkdfGuard\\KeyStoragePolicy is not 0, 1 or 2, or SecurityModel or ClassicalMode is not 0 or 1";
             case HKDFGUARD_ERR_WIN_GROUP_INVALID: return "a KeyUseGroups or DeployerGroups policy entry is unresolvable, not a group, over-broad, or not host-local (or a deployer group's members could not be read)";
             case HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH: return "wrapped payload was not produced under this service's current KEK";
             case HKDFGUARD_ERR_KEK_NOT_FOUND: return "no KEK is provisioned for this service";
@@ -2190,8 +2226,9 @@ namespace {
     // kek_store.cpp does (machine scope, silent), and nothing here ever
     // creates or modifies a key.
 
-    // Owns an NCrypt provider or key handle (a copy of src/handle_traits.h's,
-    // since this tool compiles nothing from src/).
+    // Owns an NCrypt provider or key handle (a copy of src/handle_traits.h's:
+    // this version 1 code predates the version 2 key code compiled in from
+    // src/, and keeps to the ABI and NCrypt alone).
     class ScopedNCryptHandle {
     public:
         ScopedNCryptHandle() = default;
@@ -2466,6 +2503,104 @@ namespace {
         return out;
     }
 
+    // MARK: - Payload version 2 KEKs (retire and status only)
+    //
+    // A version 2 KEK can't be inspected from outside the way a version 1
+    // KEK can: it has no public key, and its fingerprint is a PRF output of
+    // the KEK itself - an HMAC computed with the TPM's or the Software
+    // KSP's key. So for these two
+    // subcommands this tool compiles the library's own version 2 key code
+    // (src/kek_v2.h and what it needs; see tools/CMakeLists.txt) rather
+    // than a second copy of it. It is used only to inspect and delete; the
+    // DLL that applications load still has no delete.
+
+    // The payload version this host uses (ClassicalMode), read as the
+    // library reads it.
+    int HostPayloadVersion() {
+        switch (hkdfguard::LoadPayloadVersionPolicy()) {
+            case hkdfguard::PayloadVersionPolicy::Version2:
+                return 2;
+            case hkdfguard::PayloadVersionPolicy::Version1:
+                return 1;
+            default:
+                throw CliError(DescribeStatus(HKDFGUARD_ERR_POLICY_INVALID));
+        }
+    }
+
+    const char *PayloadVersionDescription(int version) {
+        return version == 2 ? "2 (post-quantum; ClassicalMode absent or 0)" : "1 (classical; ClassicalMode 1)";
+    }
+
+    uint8_t V2ProviderType(KekProvider p) {
+        return p == KekProvider::Tpm ? hkdfguard::kProviderTypeTpm : hkdfguard::kProviderTypeSoftware;
+    }
+
+    // Where each provider keeps a version 2 KEK.
+    const char *V2ProviderLabel(KekProvider p) {
+        return p == KekProvider::Tpm ? "TPM (Microsoft Platform Crypto Provider, an HMAC-SHA-256 key)"
+                                     : "Microsoft Software Key Storage Provider (an SP 800-108 HMAC key)";
+    }
+
+    struct FoundV2Kek {
+        KekProvider provider;
+        hkdfguard::V2KekInspection inspection;
+    };
+
+    // Every version 2 KEK under `service`'s name, on both providers in that
+    // order; `only` restricts it to one. As FindKeks: only a definite answer
+    // is accepted - a provider that can't be judged (access denied, a busy
+    // TPM) throws, so "can't tell" is never reported as "absent". A host with
+    // no usable TPM provider holds no TPM KEK, so it is absent there.
+    std::vector<FoundV2Kek> FindV2Keks(const std::string &service, std::optional<KekProvider> only = std::nullopt) {
+        std::vector<FoundV2Kek> found;
+        for (KekProvider p : {KekProvider::Tpm, KekProvider::Software}) {
+            if (only && *only != p) {
+                continue;
+            }
+            hkdfguard::V2KekInspection inspection;
+            try {
+                inspection = hkdfguard::InspectV2Kek(Utf8ToWide(service), V2ProviderType(p));
+            } catch (const hkdfguard::HkdfGuardError &e) {
+                throw CliError(
+                    "cannot inspect the payload version 2 KEK for service \"" + service + "\" on the " +
+                    V2ProviderLabel(p) + ": " + e.what() + " (" + DescribeStatus(e.code()) + ")");
+            }
+            if (inspection.state != hkdfguard::V2KekInspection::State::Absent) {
+                found.push_back(FoundV2Kek{p, std::move(inspection)});
+            }
+        }
+        return found;
+    }
+
+    Fingerprint ToFingerprint(const uint8_t *bytes) {
+        Fingerprint fp{};
+        std::copy(bytes, bytes + kFingerprintLen, fp.begin());
+        return fp;
+    }
+
+    bool IsValidV2(const FoundV2Kek &k) {
+        return k.inspection.state == hkdfguard::V2KekInspection::State::Valid;
+    }
+
+    // Fails only on its access control (owner or DACL): not corrupt, and
+    // never retired as such - fixing the ACL is the remedy.
+    bool IsAccessControlInvalidV2(const FoundV2Kek &k) {
+        return k.inspection.state == hkdfguard::V2KekInspection::State::AccessControlInvalid;
+    }
+
+    std::string DescribeFoundV2(const FoundV2Kek &k) {
+        std::string state;
+        if (IsValidV2(k)) {
+            state = "fingerprint " + HexString(k.inspection.fingerprint, kFingerprintLen);
+        } else if (IsAccessControlInvalidV2(k)) {
+            state = "access list invalid (" + k.inspection.problem +
+                    "); fix the access list, do not retire it - every DEK wrapped under it would be lost";
+        } else {
+            state = "invalid (" + k.inspection.problem + ")";
+        }
+        return std::string(ProviderFlag(k.provider)) + ": " + state;
+    }
+
     // MARK: - Security model
 
     // The security model in force, and whether this account may persist key
@@ -2506,16 +2641,9 @@ namespace {
     // Read-only. Exits 0 whenever there was a definite answer (present,
     // absent, corrupt or unusable) and 1 when there wasn't (access denied, a
     // provider error), so scripts can tell "no key" from "can't tell".
-    void RunStatus(const StatusArgs &args) {
-        ValidateServiceCharset(args.serviceName);
-        const std::string service = LowercaseService(args.serviceName);
-        Printf(stdout, "service: %s\n", service.c_str());
-        {
-            const SecurityModelInfo info = ReadSecurityModel();
-            Printf(stdout, "security model: %s (this account %s persist key files)\n",
-                    SecurityModelName(info.model), info.mayWriteKeyFiles ? "may" : "may not");
-        }
-
+    // The version 1 part of status: the KEK the KeyStoragePolicy selects,
+    // and any other version 1 key under the service's name.
+    void RunStatusV1(const std::string &service) {
         int32_t exists = 0;
         int32_t rc = hkdfguard_kek_exists(service.c_str(), &exists);
         if (rc != HKDFGUARD_OK) {
@@ -2571,6 +2699,116 @@ namespace {
         }
     }
 
+    // The version 2 part of status, in the same shape: the KEK the
+    // KeyStoragePolicy selects (through the library's ABI), then every other
+    // version 2 KEK under the service's name.
+    void RunStatusV2(const std::string &service) {
+        int32_t exists = 0;
+        int32_t rc = hkdfguard_kek_exists(service.c_str(), &exists);
+        if (rc == HKDFGUARD_ERR_KEK_INVALID) {
+            // A key under the name that fails its checks:
+            // the library won't even say whether a KEK exists. Show what is
+            // there - as version 1's status does for a corrupt key - but a
+            // key whose only fault is its access list is not corrupt, and
+            // its remedy is the opposite one.
+            const std::vector<FoundV2Kek> found = FindV2Keks(service);
+            const bool any_corrupt = std::any_of(found.begin(), found.end(), [](const FoundV2Kek &k) {
+                return k.inspection.state == hkdfguard::V2KekInspection::State::Invalid;
+            });
+            const bool any_access = std::any_of(found.begin(), found.end(), IsAccessControlInvalidV2);
+            if (any_access && !any_corrupt) {
+                Printf(stdout, "kek: access list invalid (%s; fix the key's access list - do not retire it)\n",
+                        DescribeStatus(rc).c_str());
+            } else {
+                Printf(stdout, "kek: corrupt (%s; see retire --corrupt)\n", DescribeStatus(rc).c_str());
+            }
+            for (const FoundV2Kek &k : found) {
+                Printf(stdout, "key under this name: %s\n", DescribeFoundV2(k).c_str());
+            }
+            return;
+        }
+        if (rc != HKDFGUARD_OK) {
+            throw CliError("could not determine the KEK state for service \"" + service + "\": " + DescribeStatus(rc));
+        }
+        std::vector<FoundV2Kek> found = FindV2Keks(service);
+
+        if (exists == 0) {
+            Printf(stdout, "kek: absent\n");
+        } else {
+            Fingerprint fp{};
+            rc = ReadKekFingerprint(service, fp);
+            if (rc != HKDFGUARD_OK && !found.empty()) {
+                // The library won't use what is there; list it instead of
+                // guessing which one it would have selected.
+                Printf(stdout, "kek: unusable (%s)\n", DescribeStatus(rc).c_str());
+                for (const FoundV2Kek &k : found) {
+                    Printf(stdout, "key under this name: %s\n", DescribeFoundV2(k).c_str());
+                }
+                return;
+            }
+            if (rc != HKDFGUARD_OK) {
+                throw CliError(
+                    "a KEK exists for service \"" + service + "\" but its fingerprint could not be read: " +
+                    DescribeStatus(rc));
+            }
+
+            Printf(stdout, "kek: present\n");
+            for (auto it = found.begin(); it != found.end(); ++it) {
+                if (IsValidV2(*it) && ToFingerprint(it->inspection.fingerprint) == fp) {
+                    Printf(stdout, "provider: %s\n", V2ProviderLabel(it->provider));
+                    found.erase(it);
+                    break;
+                }
+            }
+            Printf(stdout, "fingerprint: %s\n", HexString(fp).c_str());
+        }
+
+        for (const FoundV2Kek &k : found) {
+            Printf(stdout, "other key under this name (not selected by the KeyStoragePolicy): %s\n",
+                    DescribeFoundV2(k).c_str());
+        }
+    }
+
+    void RunStatus(const StatusArgs &args) {
+        ValidateServiceCharset(args.serviceName);
+        const std::string service = LowercaseService(args.serviceName);
+        Printf(stdout, "service: %s\n", service.c_str());
+        {
+            const SecurityModelInfo info = ReadSecurityModel();
+            Printf(stdout, "security model: %s (this account %s persist key files)\n",
+                    SecurityModelName(info.model), info.mayWriteKeyFiles ? "may" : "may not");
+        }
+        const int version = HostPayloadVersion();
+        Printf(stdout, "payload version: %s\n", PayloadVersionDescription(version));
+
+        if (version == 2) {
+            RunStatusV2(service);
+        } else {
+            RunStatusV1(service);
+        }
+
+        // A KEK of the other payload version is never used on this host -
+        // wrap and unwrap take only this host's version - but would be if
+        // ClassicalMode changed. Shown, but its absence or a failure to look
+        // is only a note.
+        try {
+            if (version == 2) {
+                for (const FoundKek &k : FindKeks(service)) {
+                    Printf(stdout, "other key under this name (payload version 1, unused while ClassicalMode is absent or 0): %s\n",
+                            DescribeFound(k).c_str());
+                }
+            } else {
+                for (const FoundV2Kek &k : FindV2Keks(service)) {
+                    Printf(stdout, "other key under this name (payload version 2, unused while ClassicalMode is 1): %s\n",
+                            DescribeFoundV2(k).c_str());
+                }
+            }
+        } catch (const CliError &e) {
+            Printf(stdout, "note: could not check for payload version %d keys under this name: %s\n",
+                    version == 2 ? 1 : 2, e.message.c_str());
+        }
+    }
+
     // MARK: - Run: retire
 
     // Deletes `service`'s KEK on one provider, only after confirming it is
@@ -2581,6 +2819,110 @@ namespace {
     // and the delete takes administrator rights, which retire's caller has
     // anyway.) Afterwards the name is re-opened on that provider to confirm
     // the key is gone.
+    // retire for a payload version 2 KEK, with the same rules as version 1:
+    // exactly one candidate, confirmed by fingerprint - or, with --corrupt,
+    // only one that definitely fails its KEK checks - then deleted, logged,
+    // and confirmed gone. The checks and the delete are the library's own
+    // (InspectV2Kek, DeleteV2Kek). Between them the key is looked up by name
+    // again; replacing it in that window takes administrator rights, which
+    // retire's caller has anyway.
+    void RunRetireV2(const RetireArgs &args, const std::string &service) {
+        std::vector<FoundV2Kek> found = FindV2Keks(service, args.provider);
+        if (found.empty()) {
+            throw CliError(
+                "no payload version 2 KEK exists for service \"" + service + "\"" +
+                (args.provider ? std::string(" on the ") + V2ProviderLabel(*args.provider) : std::string()) +
+                "; nothing to retire");
+        }
+        if (found.size() > 1) {
+            throw CliError(
+                "found a payload version 2 KEK for service \"" + service + "\" on both providers (" +
+                DescribeFoundV2(found[0]) + "; " + DescribeFoundV2(found[1]) +
+                "); refusing to choose which one to delete -- nothing was deleted. Run `" + kProgramNameNarrow +
+                " status` to see which one the KeyStoragePolicy selects, then pass --provider tpm or --provider "
+                "software");
+        }
+        const FoundV2Kek &target = found.front();
+        const KekProvider provider = target.provider;
+        const std::string where =
+            std::string("the payload version 2 KEK for service \"") + service + "\" on the " + V2ProviderLabel(provider);
+        const Fingerprint target_fp = ToFingerprint(target.inspection.fingerprint);
+
+        // A key whose only fault is its access list is never deleted: its
+        // material may be intact, and deleting it would destroy every DEK
+        // wrapped under it. Fixing the ACL is the remedy; once fixed, it has
+        // a fingerprint again and can be retired with --fingerprint if that
+        // is really wanted.
+        if (IsAccessControlInvalidV2(target)) {
+            throw CliError(
+                where + " fails only its access-list checks (" + target.inspection.problem +
+                "), which is not corruption; nothing was deleted. Restore its access list (SYSTEM, Administrators "
+                "and HkdfGuardAdmins full control, the key-use groups read, nothing else), then run `" + kProgramNameNarrow + " status` again");
+        }
+        if (args.fingerprint) {
+            if (!IsValidV2(target)) {
+                throw CliError(
+                    where + " fails its KEK checks (" + target.inspection.problem +
+                    "), so it has no fingerprint to confirm; if it is genuinely corrupt, retire it with --corrupt");
+            }
+            if (target_fp != *args.fingerprint) {
+                throw CliError(
+                    "fingerprint mismatch for service \"" + service + "\": " + where + " has fingerprint " +
+                    HexString(target_fp) + ", not " + HexString(*args.fingerprint) + "; nothing was deleted");
+            }
+        } else if (IsValidV2(target)) {
+            throw CliError(
+                where + " is a valid KEK (fingerprint " + HexString(target_fp) +
+                "), not corrupt; nothing was deleted -- retire a valid KEK with --fingerprint");
+        }
+
+        bool deleted = false;
+        try {
+            deleted = hkdfguard::DeleteV2Kek(Utf8ToWide(service), V2ProviderType(provider), 1);
+        } catch (const hkdfguard::HkdfGuardError &e) {
+            throw CliError("deleting " + where + " failed: " + e.what() + "; run `" + kProgramNameNarrow +
+                           " status` to see whether it remains");
+        }
+        if (!deleted) {
+            throw CliError(where + " disappeared before it could be deleted; run `" + kProgramNameNarrow + " status`");
+        }
+
+        // Recorded the moment the delete succeeds, as for version 1.
+        const std::string identity =
+            args.fingerprint ? "fingerprint " + HexString(*args.fingerprint)
+                             : "corrupt: " + target.inspection.problem;
+        const bool logged = LogKekRetired(
+            "Payload version 2 KEK retired for service '" + service + "' on the " + V2ProviderLabel(provider) + " (" +
+            identity + ") by " + kProgramNameNarrow +
+            " retire. Every DEK wrapped under it is permanently unrecoverable.");
+        if (!logged) {
+            Printf(stderr, "warning: the retirement could not be recorded in the Application event log (event 1004)\n");
+        }
+
+        if (!FindV2Keks(service, provider).empty()) {
+            throw CliError(where + " was deleted, but a key under its name is still found; investigate before relying on it being gone");
+        }
+
+        Printf(stdout, "retired KEK for service \"%s\" (payload version 2, %s, %s)\n", service.c_str(), identity.c_str(),
+                V2ProviderLabel(provider));
+        if (args.fingerprint) {
+            Printf(stdout, "every payload wrapped under it is now permanently unrecoverable\n");
+        }
+
+        try {
+            std::vector<FoundV2Kek> remaining = FindV2Keks(service);
+            if (!remaining.empty()) {
+                Printf(stdout, "note: service \"%s\" still has a payload version 2 KEK on the other provider (%s); run `%s status`\n",
+                        service.c_str(), DescribeFoundV2(remaining.front()).c_str(), kProgramNameNarrow);
+            } else if (!args.fingerprint) {
+                Printf(stdout, "service \"%s\" can now be provisioned again\n", service.c_str());
+            }
+        } catch (const CliError &e) {
+            Printf(stdout, "note: could not check the other provider for a key under this name: %s\n",
+                    e.message.c_str());
+        }
+    }
+
     void RunRetire(const RetireArgs &args) {
         ValidateServiceCharset(args.serviceName);
         const std::string service = LowercaseService(args.serviceName);
@@ -2590,6 +2932,14 @@ namespace {
         // act, so it refuses up front rather than failing part-way.
         if (!ProcessIsElevated()) {
             throw CliError("retire must run from an elevated prompt (Run as administrator); nothing was deleted");
+        }
+
+        // Which version's KEK: --version, or this host's. Each version's KEK
+        // is its own key, with its own fingerprint.
+        const int version = args.version ? *args.version : HostPayloadVersion();
+        if (version == 2) {
+            RunRetireV2(args, service);
+            return;
         }
 
         std::vector<FoundKek> found = FindKeks(service, args.provider);
@@ -2701,6 +3051,9 @@ namespace {
             Printf(stdout, "fingerprint: %s -- confirm it matches the one recorded when this service was provisioned\n",
                     HexString(fp).c_str());
         }
+        // Which version's KEK that was: the one this host's ClassicalMode
+        // selects. Each version has its own KEK and fingerprint.
+        Printf(stdout, "payload version: %s\n", PayloadVersionDescription(HostPayloadVersion()));
     }
 
     // MARK: - Run: wrap
