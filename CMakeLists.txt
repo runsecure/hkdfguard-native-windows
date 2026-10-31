@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.20)
 # HkdfGuard.dll's and hkdfguard.exe's version resources (src/version.rc.in),
 # Build-Msi.ps1 reads it as the MSI's default ProductVersion, and the release
 # workflow refuses a tag that doesn't match it. Bump it for every release.
-project(hkdfguard-native-windows VERSION 0.9.0 LANGUAGES CXX)
+project(hkdfguard-native-windows VERSION 0.9.1 LANGUAGES CXX)
 
 # The ProductName and CompanyName in both binaries' version resources.
 set(HKDFGUARD_PRODUCT_NAME "HkdfGuard for Windows")
