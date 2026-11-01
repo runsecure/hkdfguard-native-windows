@@ -223,8 +223,8 @@ Keep key files in a folder of their own prepared with `icacls /inheritance:r` - 
 It checks the file's size before reading anything, and fails with
 `HKDFGUARD_ERR_FILE_PLAINTEXT_KEY` for a file of exactly 32 bytes (the size of an
 *unwrapped* DEK, so probably a plaintext key written to disk - treat it as exposed; its
-contents are never read). It also fails with `HKDFGUARD_ERR_FILE_PLAINTEXT_KEY` for a DEK
-written as text: 64 hex digits, or base64 (standard or URL-safe, padded or not), with any
+contents are never read). It also fails with `HKDFGUARD_ERR_FILE_PLAINTEXT_KEY` for 32 raw
+bytes followed by one line ending (LF or CRLF), and for a DEK written as text: 64 hex digits, or base64 (standard or URL-safe, padded or not), with any
 surrounding whitespace. A file of 96 bytes or fewer is read into a wiped buffer to tell, and
 none of it is returned. Any other size under 132 is `HKDFGUARD_ERR_FILE_TOO_SHORT`, and
 anything over is `HKDFGUARD_ERR_FILE_TOO_LONG`. A 132-byte file must also pass the same
@@ -655,7 +655,7 @@ including the impersonated client when a service acts on someone's behalf.
 | 2003 | Warning | `PAYLOAD_AUTH_FAILED`, `KEK_FINGERPRINT_MISMATCH`, `PAYLOAD_MALFORMED`, `PAYLOAD_UNSUPPORTED` or `PAYLOAD_VERSION_REFUSED` on unwrap: a tampered, corrupted, misdirected or unknown-version payload, or one of the payload version this host doesn't use. |
 | 2004 | Error | `POLICY_INVALID` or `WIN_GROUP_INVALID`: the registry policy is misconfigured, so calls fail closed. |
 | 2005 | Error | `PROVIDER_ERROR`, `CRYPTO_ERROR` or `INTERNAL_ERROR`: the key storage provider or crypto layer failed. |
-| 2006 | Error | `hkdfguard_open_file` refused a file that looks like an unwrapped DEK (32 raw bytes, or its hex or base64), so possibly a plaintext key on disk. Names the file; none of its contents are logged or returned. Investigate it. |
+| 2006 | Error | `hkdfguard_open_file` refused a file that looks like an unwrapped DEK (32 raw bytes, optionally followed by one line ending (LF or CRLF), or its hex or base64), so possibly a plaintext key on disk. Names the file; none of its contents are logged or returned. Investigate it. |
 | 2007 | Warning | A process made more than 10 `hkdfguard_create_kek` / `hkdfguard_kek_exists` calls. They are meant to run once at startup, so a caller is probably looping on them. Logged once per process. |
 | 2008 | Error | `PROVIDER_UNAVAILABLE`: payload version 2 is unavailable on this host. Names the reason: the Platform Crypto Provider can't be opened, no TPM device, or the TPM can't create an HMAC-SHA-256 key - and the fixes. Logged on every failing call. |
 

@@ -421,8 +421,12 @@ namespace hkdfguard {
         // included. Every length up to it is below a payload's, so no
         // payload can be mistaken for one.
         constexpr size_t kMaxPlaintextTextLen = 96;
+        // Longest raw DEK recognised: 32 bytes and a CRLF line ending.
+        constexpr size_t kMaxPlaintextRawLen = HKDFGUARD_DEK_LEN + 2;
         static_assert(kMaxPlaintextTextLen < kTotalLen && HKDFGUARD_DEK_LEN < kTotalLen,
                       "plaintext detection must never be able to refuse a real payload");
+        static_assert(kMaxPlaintextRawLen < kMaxPlaintextTextLen && kMaxPlaintextRawLen < kTotalLen,
+                      "a raw DEK with its line ending must be read, and never be a real payload");
 
         // Branch-free byte classification for LooksLikePlaintextDek. Every
         // helper returns 0 or 1 and is straight-line arithmetic on uint32_t,
@@ -466,13 +470,17 @@ namespace hkdfguard {
             return upper | lower | digit | s62 | s63;
         }
 
-        // 32 raw bytes, or 32 bytes written as text: hex (either case, 64
-        // digits) or base64 (standard or URL-safe, with or without its one
-        // '=' of padding - the CLI's own DEK input is standard, padded),
+        // 32 raw bytes, optionally followed by one line ending (LF or CRLF),
+        // or 32 bytes written as text: hex (either case, 64 digits) or
+        // base64 (standard or URL-safe, with or without its one '=' of
+        // padding - the CLI's own DEK input is standard, padded),
         // with any leading or trailing whitespace an editor or `echo` adds.
         // Every one of these is too short to be a payload anyway;
         // recognising them is what turns "wrong file" into "this key is
-        // exposed".
+        // exposed". The line ending after raw bytes (`echo`, an editor,
+        // `> file`) is decided by the total length and the trailing bytes
+        // alone, never by trimming: the key's own last bytes may be
+        // whitespace values. The 32 key bytes themselves are not examined.
         //
         // Constant-time in the contents: the only
         // branches are on the length, which the file's size already gives
@@ -492,6 +500,16 @@ namespace hkdfguard {
                 return false;
             }
             const uint32_t n = static_cast<uint32_t>(len);
+
+            // 32 raw bytes and one line ending: 33 ending LF, or 34 ending
+            // CR LF. The branch is on the length; the bytes are compared
+            // without one.
+            uint32_t raw_line_end = 0;
+            if (len == HKDFGUARD_DEK_LEN + 1) {
+                raw_line_end = CtEq(bytes[HKDFGUARD_DEK_LEN], 0x0A);
+            } else if (len == kMaxPlaintextRawLen) {
+                raw_line_end = CtEq(bytes[HKDFGUARD_DEK_LEN], 0x0D) & CtEq(bytes[HKDFGUARD_DEK_LEN + 1], 0x0A);
+            }
 
             // Pass 1: the first and last non-whitespace positions.
             uint32_t seen = 0, start = 0, end = 0;
@@ -532,7 +550,7 @@ namespace hkdfguard {
             const uint32_t url_canonical = CtEq(CtSelect(padded, url_prev, url_last) & 3u, 0);
             const uint32_t hex = hex_ok & CtEq(text_len, 2 * HKDFGUARD_DEK_LEN);
             const uint32_t base64 = shape & ((std_ok & std_canonical) | (url_ok & url_canonical));
-            return (seen & (hex | base64)) == 1u;
+            return ((seen & (hex | base64)) | raw_line_end) == 1u;
         }
 
         // Reads a file already known to be no longer than
@@ -721,8 +739,9 @@ namespace hkdfguard {
         // Decided on the size first. A DEK-sized file is never read at all:
         // if it really is a plaintext key, it never enters this process's
         // memory. A file too short to be a payload but short enough to be a
-        // DEK written as text (hex or base64) is read into a wiped buffer to
-        // tell which; its bytes are never copied to the caller.
+        // DEK written as text (hex or base64), or raw with a line ending, is
+        // read into a wiped buffer to tell which; its bytes are never copied
+        // to the caller.
         LARGE_INTEGER size_field{};
         if (!GetFileSizeEx(file, &size_field)) {
             throw HkdfGuardError(HKDFGUARD_ERR_FILE_IO, "GetFileSizeEx failed");
@@ -734,7 +753,7 @@ namespace hkdfguard {
         if (size < static_cast<LONGLONG>(kTotalLen)) {
             if (size <= static_cast<LONGLONG>(kMaxPlaintextTextLen) &&
                 SmallFileLooksLikePlaintextDek(file)) {
-                throw HkdfGuardError(HKDFGUARD_ERR_FILE_PLAINTEXT_KEY, "file holds a DEK written as hex or base64");
+                throw HkdfGuardError(HKDFGUARD_ERR_FILE_PLAINTEXT_KEY, "file holds a DEK as text, or raw with a line ending");
             }
             throw HkdfGuardError(HKDFGUARD_ERR_FILE_TOO_SHORT, "file is shorter than a wrapped payload");
         }

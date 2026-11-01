@@ -845,7 +845,11 @@ file that is read:
   with zero trailing bits, optionally followed by one `=`). That matches what
   the Rust base64 decoders the Linux build uses accept. It is decided without
   decoding, so the key is never rebuilt. None of it reaches the caller. A
-  32-byte file is still refused unread.
+  32-byte file is still refused unread. 32 raw bytes followed by one line
+  ending (LF or CRLF) are a plaintext key too: 33 bytes ending LF, or 34
+  ending CR LF, decided by the length and those trailing bytes alone - never
+  by trimming, since a raw key's own last bytes may be whitespace values -
+  and compared branch-free like the rest.
 
 **Verified how.** Test sections 24c and 24d:
 

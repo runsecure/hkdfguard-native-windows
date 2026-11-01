@@ -384,7 +384,7 @@ namespace hkdfguard {
                   L"hkdfguard_open_file refused '" + path + L"': " + CodeName(HKDFGUARD_ERR_FILE_PLAINTEXT_KEY) +
                   L" (" + std::to_wstring(HKDFGUARD_ERR_FILE_PLAINTEXT_KEY) + L") - the file holds what looks "
                   L"like an unwrapped DEK (" + std::to_wstring(HKDFGUARD_DEK_LEN) +
-                  L" raw bytes, or its hex or base64), so it may be a plaintext key written to disk by "
+                  L" raw bytes, optionally followed by one line ending (LF or CRLF), or its hex or base64), so it may be a plaintext key written to disk by "
                   L"mistake. None of its contents were returned. Treat that key as exposed: find out how the "
                   L"file was written, remove it, and re-mint the DEK.");
         } catch (...) {

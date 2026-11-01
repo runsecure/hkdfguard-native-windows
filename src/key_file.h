@@ -35,7 +35,8 @@ namespace hkdfguard {
     void CheckKeyFileSecurity(PSECURITY_DESCRIPTOR sd, KeyFileObject object);
 
     // Whether `len` bytes would be refused as HKDFGUARD_ERR_FILE_PLAINTEXT_KEY
-    // by content: 32 raw bytes, or a DEK as hex or base64 with surrounding
+    // by content: 32 raw bytes, optionally followed by one line ending (LF
+    // or CRLF), or a DEK as hex or base64 with surrounding
     // whitespace. Exposed for tests.
     bool LooksLikePlaintextKeyForTest(const uint8_t *bytes, size_t len);
 
