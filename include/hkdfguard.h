@@ -149,7 +149,7 @@ extern "C" {
 #define HKDFGUARD_ERR_FILE_IO                   (-34) /* hkdfguard_open_file: not a regular file, in use by a writer, or a read failed */
 #define HKDFGUARD_ERR_FILE_TOO_SHORT            (-35) /* hkdfguard_open_file: file is shorter than HKDFGUARD_WRAPPED_MAX_LEN */
 #define HKDFGUARD_ERR_FILE_TOO_LONG             (-36) /* hkdfguard_open_file: file is longer than HKDFGUARD_WRAPPED_MAX_LEN */
-#define HKDFGUARD_ERR_FILE_PLAINTEXT_KEY        (-37) /* hkdfguard_open_file: file holds what looks like an unwrapped key - HKDFGUARD_DEK_LEN raw bytes, or its hex or base64 */
+#define HKDFGUARD_ERR_FILE_PLAINTEXT_KEY        (-37) /* hkdfguard_open_file: file holds what looks like an unwrapped key - HKDFGUARD_DEK_LEN raw bytes, optionally followed by one line ending (LF or CRLF), or its hex or base64 */
 #define HKDFGUARD_ERR_FILE_MALFORMED            (-38) /* hkdfguard_open_file: file is the right size but its contents are not a valid WrappedDekV1 payload (including an unknown version) */
 #define HKDFGUARD_ERR_FILE_UNTRUSTED            (-39) /* hkdfguard_open_file: path is, or passes through, a symbolic link, junction or other reparse point, uses an 8.3 short name, or is not on a local drive (UNC, mapped or SUBST drive, device); or the file or a folder above it is owned by, or lets, an untrusted account write or replace it - trusted are SYSTEM, Administrators and TrustedInstaller, plus the deployer groups and their members under the production security model or the calling account under the developer model (see hkdfguard_security_model); or a folder above it other than the drive root lets such an account create files or folders in it (C:\ProgramData, C:\Windows\Temp) */
 /* -40..-63 reserved for future common codes */
@@ -553,7 +553,9 @@ HKDFGUARD_API int hkdfguard_key_file_principal_trusted(
  *       the size of an *unwrapped* DEK, so most likely a plaintext key
  *       written to disk by mistake. Treat it as a key exposure. The file's
  *       contents are never read, so the possible key never enters this
- *       process. Also returned for a DEK written as text: 64 hex digits
+ *       process. Also returned for 32 raw bytes followed by one line
+ *       ending (LF or CRLF: 33 bytes ending 0x0A, or 34 ending 0x0D 0x0A),
+ *       and for a DEK written as text: 64 hex digits
  *       (either case) or base64 (standard or URL-safe, with or without its
  *       '=' padding), with any leading or trailing whitespace. To tell, a
  *       file of 96 bytes or fewer is read into a buffer that is wiped

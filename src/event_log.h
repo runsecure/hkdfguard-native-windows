@@ -60,7 +60,8 @@ namespace hkdfguard {
     void LogOperationFailure(AuditOp op, const std::string &service, int32_t code) noexcept;
 
     // hkdfguard_open_file refused `path` because it holds what looks like an
-    // unwrapped DEK - 32 raw bytes, or its hex or base64
+    // unwrapped DEK - 32 raw bytes, optionally followed by one line ending
+    // (LF or CRLF), or its hex or base64
     // (HKDFGUARD_ERR_FILE_PLAINTEXT_KEY): possibly a plaintext key on disk.
     // The only event that call writes - its other failures concern no KEK
     // and are reported to the caller alone. The path is logged so an
