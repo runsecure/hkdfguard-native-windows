@@ -2325,6 +2325,41 @@ int main() {
                       HKDFGUARD_ERR_FILE_TOO_SHORT, "a 31-byte file is too short (not a plaintext key)");
         expectFailure(fileFor(L"len33.key", std::vector<uint8_t>(33, 0x42)),
                       HKDFGUARD_ERR_FILE_TOO_SHORT, "a 33-byte file is too short (not a plaintext key)");
+
+        // 32 raw bytes followed by one line ending (`echo`, an editor,
+        // `> file`) are a plaintext key: 33 bytes ending LF, 34 ending CR LF.
+        // Decided by length and the trailing bytes, never by trimming - so a
+        // key whose own last byte is LF or space still counts - and only
+        // exactly one line ending.
+        {
+            std::vector<uint8_t> raw_dek(HKDFGUARD_DEK_LEN);
+            BCryptGenRandom(nullptr, raw_dek.data(), static_cast<ULONG>(raw_dek.size()), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+            auto with = [](std::vector<uint8_t> key, std::initializer_list<uint8_t> tail) {
+                key.insert(key.end(), tail);
+                return key;
+            };
+            std::vector<uint8_t> ends_lf = raw_dek, ends_space = raw_dek;
+            ends_lf.back() = 0x0A;
+            ends_space.back() = 0x20;
+            expectFailure(fileFor(L"rawlf.key", with(raw_dek, {0x0A})), HKDFGUARD_ERR_FILE_PLAINTEXT_KEY,
+                          "32 random bytes + LF are a plaintext key");
+            expectFailure(fileFor(L"rawcrlf.key", with(raw_dek, {0x0D, 0x0A})), HKDFGUARD_ERR_FILE_PLAINTEXT_KEY,
+                          "32 random bytes + CRLF are a plaintext key");
+            expectFailure(fileFor(L"rawlflf1.key", with(ends_lf, {0x0A})), HKDFGUARD_ERR_FILE_PLAINTEXT_KEY,
+                          "32 bytes ending in LF, + LF, are a plaintext key (no trimming)");
+            expectFailure(fileFor(L"rawsplf.key", with(ends_space, {0x0A})), HKDFGUARD_ERR_FILE_PLAINTEXT_KEY,
+                          "32 bytes ending in a space, + LF, are a plaintext key (no trimming)");
+            expectFailure(fileFor(L"rawcr.key", with(raw_dek, {0x0D})), HKDFGUARD_ERR_FILE_TOO_SHORT,
+                          "32 bytes + CR alone (33 bytes) are just too short");
+            expectFailure(fileFor(L"rawlflf.key", with(raw_dek, {0x0A, 0x0A})), HKDFGUARD_ERR_FILE_TOO_SHORT,
+                          "32 bytes + LF LF (34 bytes) are just too short");
+            // Short of a raw key plus its line ending (31 bytes in all; 31 + LF
+            // would be 32, which the exact-size rule already refuses).
+            expectFailure(fileFor(L"raw30lf.key", with(std::vector<uint8_t>(raw_dek.begin(), raw_dek.end() - 2), {0x0A})),
+                          HKDFGUARD_ERR_FILE_TOO_SHORT, "30 bytes + LF (31 bytes) are just too short");
+            expectFailure(fileFor(L"raw29crlf.key", with(std::vector<uint8_t>(raw_dek.begin(), raw_dek.end() - 3), {0x0D, 0x0A})),
+                          HKDFGUARD_ERR_FILE_TOO_SHORT, "29 bytes + CRLF (31 bytes) are just too short");
+        }
         expectFailure(fileFor(L"empty.key", {}), HKDFGUARD_ERR_FILE_TOO_SHORT, "an empty file is too short");
         expectFailure(fileFor(L"len163.key", std::vector<uint8_t>(wrapped.begin(), wrapped.end() - 1)),
                       HKDFGUARD_ERR_FILE_TOO_SHORT, "a file one byte short of a payload is too short");
@@ -3181,6 +3216,27 @@ int main() {
         Check(!plain(b64 + "="), "detector: an extra '=' is not a DEK");
         Check(!plain("\v" + b64), "detector: vertical tab is not trimmed (as Rust's trim_ascii)");
         Check(plain(std::string(HKDFGUARD_DEK_LEN, '\0')), "detector: any 32 raw bytes");
+        // 32 raw bytes and one line ending, by length and trailing bytes only.
+        {
+            std::string raw(HKDFGUARD_DEK_LEN, '\0');
+            BCryptGenRandom(nullptr, reinterpret_cast<PUCHAR>(raw.data()), static_cast<ULONG>(raw.size()),
+                            BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+            std::string ends_lf = raw, ends_space = raw;
+            ends_lf.back() = '\n';
+            ends_space.back() = ' ';
+            Check(plain(raw + "\n"), "detector: 32 random bytes + LF");
+            Check(plain(raw + "\r\n"), "detector: 32 random bytes + CRLF");
+            Check(plain(ends_lf + "\n"), "detector: 32 bytes ending LF, + LF (no trimming)");
+            Check(plain(ends_space + "\n"), "detector: 32 bytes ending in a space, + LF (no trimming)");
+            Check(plain(ends_lf + "\r\n"), "detector: 32 bytes ending LF, + CRLF (no trimming)");
+            Check(plain(std::string(HKDFGUARD_DEK_LEN, '\n') + "\n"), "detector: 32 LF bytes + LF (no trimming)");
+            Check(!plain(raw + "\r"), "detector: 32 bytes + CR alone is not a DEK");
+            Check(!plain(raw + "\n\n"), "detector: 32 bytes + LF LF is not a DEK");
+            Check(!plain(raw + "\n\r"), "detector: 32 bytes + LF CR is not a DEK");
+            Check(!plain(raw.substr(2) + "\n"), "detector: 30 bytes + LF (31 in all) is not a DEK");
+            Check(!plain(raw.substr(3) + "\r\n"), "detector: 29 bytes + CRLF (31 in all) is not a DEK");
+            Check(!plain(raw + " \n"), "detector: 32 bytes + space LF is not a DEK");
+        }
         // Further edge cases: trimming, empty input, alphabets, hex.
         Check(plain("\f" + b64 + "\f"), "detector: form feed is trimmed");
         Check(!plain(""), "detector: empty is not a DEK");
