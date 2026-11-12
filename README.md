@@ -599,6 +599,38 @@ on a machine with an active TPM and confirm `TPM provider available: yes` and no
 `[SKIP]` lines for the TPM sections (`PreferTpm, TPM probe error` and
 `PreferTpm, existing TPM KEK fails verification`) in the roundtrip output.
 
+### Benchmarks
+
+`tests/bench_hkdfguard.cpp` measures latency (min, median, p95, p99, mean) and
+throughput. It is built only on request, and only a Release build gives meaningful
+numbers:
+
+```powershell
+cmake -S . -B build-bench -G Ninja -DCMAKE_BUILD_TYPE=Release -DHKDFGUARD_BUILD_BENCHMARKS=ON
+cmake --build build-bench
+$env:PATH = "$PWD\build-bench;$env:PATH"
+build-bench\tests\bench_hkdfguard.exe --csv bench.csv
+```
+
+Not elevated, it times the CPU-only internals (hash-to-curve, the SP 800-108 framing,
+AES-GCM, the wire format), plus `hkdfguard_open_file` if the machine is already in the
+developer security model. Elevated, it also creates throwaway KEKs for payload versions 1
+and 2 on the Software KSP and the TPM, and times `wrap_dek`, `unwrap_dek`,
+`generate_and_wrap_dek` and `kek_fingerprint`, single-threaded and from 1/2/4/8 threads.
+It then deletes those KEKs and restores the policy values it set (`ClassicalMode`,
+`KeyStoragePolicy`, `SetupMinDelayMs`, `SecurityModel`).
+
+`--service NAME` measures an existing KEK unelevated, under the machine's own policy.
+`--filter TEXT` limits the run to matching rows. `--tpm-iterations`, `--iterations` and
+`--threads` control how long the run takes.
+
+`hkdfguard_create_kek` and `hkdfguard_kek_exists` are never timed, because their
+deliberate setup floor would dominate the result. Each run records the CPU, the OS build
+and the TPM's vendor and firmware, so results can be compared across machines.
+
+`ctest` registers a `bench_smoke` run (`--quick`) when the option is on. It fails only if
+an operation errors; timings are never pass/fail.
+
 ## Testing and compatibility
 
 This library has been exercised end to end - KEK creation, wrap, unwrap, and

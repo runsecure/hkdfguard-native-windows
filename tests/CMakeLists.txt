@@ -137,6 +137,46 @@ if(HKDFGUARD_BUILD_FUZZERS AND MSVC)
         SOURCES sp800_108.cpp)
 endif()
 
+# bench_hkdfguard: latency and throughput benchmarks, built only on request:
+# cmake -DHKDFGUARD_BUILD_BENCHMARKS=ON (use a Release build for real
+# numbers). It times the CPU-only internals through its own copy of src/,
+# hkdfguard_open_file, and - elevated - wrap/unwrap through HkdfGuard.dll for
+# payload versions 1 and 2 on the Software KSP and the TPM, using throwaway
+# KEKs it deletes afterwards. See the comment at the top of the .cpp for its
+# options. Built with the DLL's hardening flags so its copy of src/ costs
+# what the DLL's does. Registered as a ctest smoke run (--quick), which only
+# fails if an operation errors; timings are never a pass/fail criterion.
+option(HKDFGUARD_BUILD_BENCHMARKS "Build the bench_hkdfguard benchmark executable" OFF)
+if(HKDFGUARD_BUILD_BENCHMARKS)
+    add_executable(bench_hkdfguard
+        bench_hkdfguard.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/aes_gcm.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/ecdh_hkdf.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/event_log.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/hash_to_curve.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/kek_store.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/kek_v2.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/key_acl.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/policy.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/sp800_108.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/wire_format.cpp
+    )
+    target_include_directories(bench_hkdfguard PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../include
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src
+    )
+    target_compile_definitions(bench_hkdfguard PRIVATE UNICODE _UNICODE NOMINMAX)
+    target_link_libraries(bench_hkdfguard PRIVATE hkdfguard ncrypt.lib bcrypt.lib advapi32.lib netapi32.lib ntdll.lib)
+    hkdfguard_apply_hardening(bench_hkdfguard)
+    add_test(NAME bench_smoke COMMAND bench_hkdfguard --quick)
+    # Elevated, it sets machine policy values and creates KEKs, like
+    # roundtrip and v2_kek, so it shares their lock.
+    set_tests_properties(bench_smoke PROPERTIES
+        ENVIRONMENT "PATH=$<TARGET_FILE_DIR:hkdfguard>\\;${HKDFGUARD_TEST_PATH}"
+        RESOURCE_LOCK HkdfGuardMachineState
+    )
+endif()
+
 # test_cli.ps1 exercises hkdfguard.exe's argument parsing, validation and
 # file handling, which test_roundtrip (DLL calls only) doesn't cover. It
 # gets the built CLI's path as -CliExePath and the same PATH as roundtrip.
