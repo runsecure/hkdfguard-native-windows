@@ -91,10 +91,6 @@ namespace hkdfguard {
             WinDigestAuthenticationSid,   // S-1-5-64-21 "Digest Authentication"
         };
 
-        // tools/hkdfguard_cli.cpp keeps a copy of both lists and of
-        // IsDomainUsersRid for its --group check (it depends only on the
-        // public ABI); keep them in sync.
-        //
         // Over-broad principals with no WELL_KNOWN_SID_TYPE constant of their
         // own, given as SID strings instead.
         constexpr const wchar_t *kOverBroadSidStrings[] = {
@@ -131,41 +127,42 @@ namespace hkdfguard {
             return *GetSidSubAuthority(sid, 0) == SECURITY_NT_NON_UNIQUE &&
                    *GetSidSubAuthority(sid, 4) == DOMAIN_GROUP_RID_USERS;
         }
+    } // namespace
 
-        // Whether `sid` is any principal on the two lists above, or a
-        // domain's "Domain Users"/"None" group. The single implementation
-        // behind both policy validation (ResolveKeyUseGroupSid) and the
-        // existing-key ACL check (VerifyExistingKeyAcl), so the two can never
-        // disagree about what counts as over-broad.
-        bool IsOverBroadSid(PSID sid) {
-            if (IsDomainUsersRid(sid)) {
-                return true;
-            }
-
-            for (WELL_KNOWN_SID_TYPE overBroad: kOverBroadSids) {
-                SidBuffer known = CreateWellKnownSidBuffer(overBroad);
-                if (EqualSid(sid, known.data())) {
-                    return true;
-                }
-            }
-
-            for (const wchar_t *sidString: kOverBroadSidStrings) {
-                PSID known = nullptr;
-                if (!ConvertStringSidToSidW(sidString, &known)) {
-                    throw HkdfGuardError(
-                        HKDFGUARD_ERR_PROVIDER_ERROR,
-                        "ConvertStringSidToSidW failed for a built-in over-broad SID");
-                }
-                const bool match = EqualSid(sid, known) != FALSE;
-                LocalFree(known);
-                if (match) {
-                    return true;
-                }
-            }
-
-            return false;
+    // The single implementation behind policy validation
+    // (ResolveKeyUseGroupSid), the existing-key ACL check
+    // (VerifyExistingKeyAcl) and hkdfguard.exe's --group check, so none of
+    // them can disagree about what counts as over-broad.
+    bool IsOverBroadSid(PSID sid) {
+        if (IsDomainUsersRid(sid)) {
+            return true;
         }
 
+        for (WELL_KNOWN_SID_TYPE overBroad: kOverBroadSids) {
+            SidBuffer known = CreateWellKnownSidBuffer(overBroad);
+            if (EqualSid(sid, known.data())) {
+                return true;
+            }
+        }
+
+        for (const wchar_t *sidString: kOverBroadSidStrings) {
+            PSID known = nullptr;
+            if (!ConvertStringSidToSidW(sidString, &known)) {
+                throw HkdfGuardError(
+                    HKDFGUARD_ERR_PROVIDER_ERROR,
+                    "ConvertStringSidToSidW failed for a built-in over-broad SID");
+            }
+            const bool match = EqualSid(sid, known) != FALSE;
+            LocalFree(known);
+            if (match) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    namespace {
         // The NetBIOS name of this machine - what LookupAccountName* report
         // as ReferencedDomainName for accounts in the local SAM.
         std::wstring LocalComputerName() {
@@ -180,10 +177,13 @@ namespace hkdfguard {
         // Resolves an account NAME to its SID, SID type, and the domain
         // Windows says it belongs to (ReferencedDomainName - the local
         // computer name for SAM accounts, "BUILTIN", "NT AUTHORITY", or a
-        // real domain's NetBIOS name). Throws HKDFGUARD_ERR_WIN_GROUP_INVALID if
-        // the name doesn't resolve at all.
-        SidBuffer ResolveAccountSid(
+        // real domain's NetBIOS name). False if the name doesn't resolve at
+        // all, with `sid` and `domain` then unspecified. The one lookup
+        // behind ResolveAccountSid (which throws instead) and
+        // TryResolveAccountSid.
+        bool TryLookupAccountName(
             const std::wstring &accountName,
+            SidBuffer &sid,
             SID_NAME_USE &sidType,
             std::wstring &domain) {
             DWORD sidSize = 0;
@@ -199,12 +199,10 @@ namespace hkdfguard {
                 &sidType);
 
             if (sidSize == 0) {
-                throw HkdfGuardError(
-                    HKDFGUARD_ERR_WIN_GROUP_INVALID,
-                    "key-use policy entry does not resolve to any account");
+                return false;
             }
 
-            SidBuffer sid(sidSize);
+            sid.assign(sidSize, 0);
 
             // The size query counts the terminating NUL; the real call then
             // reports the length without it, so `domain` is trimmed to that
@@ -220,14 +218,27 @@ namespace hkdfguard {
                 domain.data(),
                 &domainSize,
                 &sidType)) {
-                throw HkdfGuardError(
-                    HKDFGUARD_ERR_WIN_GROUP_INVALID,
-                    "key-use policy entry does not resolve to any account");
+                return false;
             }
 
             sid.resize(sidSize);
             domain.resize(domainSize);
 
+            return true;
+        }
+
+        // TryLookupAccountName, throwing HKDFGUARD_ERR_WIN_GROUP_INVALID if
+        // the name doesn't resolve.
+        SidBuffer ResolveAccountSid(
+            const std::wstring &accountName,
+            SID_NAME_USE &sidType,
+            std::wstring &domain) {
+            SidBuffer sid;
+            if (!TryLookupAccountName(accountName, sid, sidType, domain)) {
+                throw HkdfGuardError(
+                    HKDFGUARD_ERR_WIN_GROUP_INVALID,
+                    "key-use policy entry does not resolve to any account");
+            }
             return sid;
         }
 
@@ -339,48 +350,15 @@ namespace hkdfguard {
         // by having that name.
         std::optional<SidBuffer> TryResolveAccountSid(
             const std::wstring &accountName) {
-            DWORD sidSize = 0;
-            DWORD domainSize = 0;
-            SID_NAME_USE sidType;
+            SidBuffer sid;
+            SID_NAME_USE sidType = SidTypeUnknown;
+            std::wstring domain;
 
-            LookupAccountNameW(
-                nullptr,
-                accountName.c_str(),
-                nullptr,
-                &sidSize,
-                nullptr,
-                &domainSize,
-                &sidType);
-
-            if (sidSize == 0) {
-                return std::nullopt;
-            }
-
-            SidBuffer sid(sidSize);
-
-            std::wstring domain(
-                domainSize,
-                L'\0');
-
-            if (!LookupAccountNameW(
-                nullptr,
-                accountName.c_str(),
-                sid.data(),
-                &sidSize,
-                domain.data(),
-                &domainSize,
-                &sidType)) {
-                return std::nullopt;
-            }
-
-            domain.resize(domainSize);
-
-            if (!IsGroupSidType(sidType) ||
+            if (!TryLookupAccountName(accountName, sid, sidType, domain) ||
+                !IsGroupSidType(sidType) ||
                 !IsHostLocalAccountDomain(domain)) {
                 return std::nullopt;
             }
-
-            sid.resize(sidSize);
 
             return sid;
         }

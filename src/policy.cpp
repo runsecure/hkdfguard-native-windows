@@ -123,6 +123,73 @@ namespace hkdfguard {
 #endif
 
     namespace {
+        // Opens the policy key for reading; the RegOpenKeyExW status.
+        //
+        // KEY_WOW64_64KEY: read the 64-bit view of HKLM whether this process
+        // is 32- or 64-bit, so 32-bit and 64-bit HkdfGuard.dll on one
+        // machine see the same policy, never a WOW6432Node copy.
+        // Software\Policies is documented as excluded from WOW64
+        // redirection; the flag is defense in depth against relying on that.
+        LONG OpenPolicyKey(HKEY &key) noexcept
+        {
+            return RegOpenKeyExW(
+                HKEY_LOCAL_MACHINE,
+                kPolicyKey,
+                0,
+                KEY_QUERY_VALUE | KEY_WOW64_64KEY,
+                &key);
+        }
+
+        // One REG_DWORD policy value, as read. The loaders differ in what an
+        // unopenable key, a missing value or a malformed one means - some
+        // fail closed, some keep a default - so this only reports, and each
+        // loader decides.
+        struct PolicyDword
+        {
+            LONG openStatus = ERROR_SUCCESS;          // RegOpenKeyExW on the policy key
+            LONG queryStatus = ERROR_FILE_NOT_FOUND;  // RegQueryValueExW, if the key opened
+            DWORD type = 0;
+            DWORD value = 0;
+            DWORD size = 0;
+
+            bool opened() const noexcept
+            {
+                return openStatus == ERROR_SUCCESS;
+            }
+
+            // The key opened, the value exists, and it was read as exactly
+            // one DWORD - of whatever REG_* type, which the loader checks.
+            // A value too large for a DWORD fails here (ERROR_MORE_DATA).
+            bool readable() const noexcept
+            {
+                return opened() && queryStatus == ERROR_SUCCESS && size == sizeof(value);
+            }
+        };
+
+        PolicyDword ReadPolicyDword(const wchar_t *valueName) noexcept
+        {
+            PolicyDword result;
+            HKEY key = nullptr;
+
+            result.openStatus = OpenPolicyKey(key);
+            if (!result.opened())
+            {
+                return result;
+            }
+
+            result.size = sizeof(result.value);
+            result.queryStatus = RegQueryValueExW(
+                key,
+                valueName,
+                nullptr,
+                &result.type,
+                reinterpret_cast<LPBYTE>(&result.value),
+                &result.size);
+
+            RegCloseKey(key);
+            return result;
+        }
+
         // Reads one REG_MULTI_SZ policy value of group entries - KeyUseGroups
         // or DeployerGroups - normalized (trimmed, empties dropped). A
         // missing value, a value of the wrong type, or any read failure
@@ -134,18 +201,7 @@ namespace hkdfguard {
 
             HKEY key = nullptr;
 
-            // KEY_WOW64_64KEY: read the 64-bit view of HKLM whether this
-            // process is 32- or 64-bit, so 32-bit and 64-bit HkdfGuard.dll on
-            // one machine see the same policy, never a WOW6432Node copy.
-            // Software\Policies is documented as excluded from WOW64
-            // redirection; the flag is defense in depth against relying on
-            // that.
-            if (RegOpenKeyExW(
-                    HKEY_LOCAL_MACHINE,
-                    kPolicyKey,
-                    0,
-                    KEY_QUERY_VALUE | KEY_WOW64_64KEY,
-                    &key) != ERROR_SUCCESS)
+            if (OpenPolicyKey(key) != ERROR_SUCCESS)
             {
                 return result;
             }
@@ -254,44 +310,19 @@ namespace hkdfguard {
             return *g_testSecurityModelOverride;
         }
 #endif
-        HKEY key = nullptr;
+        const PolicyDword read = ReadPolicyDword(kSecurityModelValue);
 
-        // KEY_WOW64_64KEY: see LoadGroupListValue.
-        if (RegOpenKeyExW(
-                HKEY_LOCAL_MACHINE,
-                kPolicyKey,
-                0,
-                KEY_QUERY_VALUE | KEY_WOW64_64KEY,
-                &key) != ERROR_SUCCESS)
-        {
-            return ParseSecurityModel(false, 0, 0);
-        }
-
-        DWORD value = 0;
-        DWORD type = 0;
-        DWORD size = sizeof(value);
-
-        LONG status = RegQueryValueExW(
-            key,
-            kSecurityModelValue,
-            nullptr,
-            &type,
-            reinterpret_cast<LPBYTE>(&value),
-            &size);
-
-        RegCloseKey(key);
-
-        if (status == ERROR_FILE_NOT_FOUND)
+        if (!read.opened() || read.queryStatus == ERROR_FILE_NOT_FOUND)
         {
             return ParseSecurityModel(false, 0, 0);
         }
         // Present but unreadable as a DWORD (too large: ERROR_MORE_DATA, or
         // any other failure): never a silent default.
-        if (status != ERROR_SUCCESS || size != sizeof(value))
+        if (!read.readable())
         {
             return SecurityModel::Invalid;
         }
-        return ParseSecurityModel(true, type, value);
+        return ParseSecurityModel(true, read.type, read.value);
     }
 
 #if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
@@ -316,41 +347,17 @@ namespace hkdfguard {
 
     bool LoadAuditUnwrapSuccess() noexcept
     {
-        HKEY key = nullptr;
+        const PolicyDword read = ReadPolicyDword(kAuditUnwrapSuccessValue);
 
-        // KEY_WOW64_64KEY: see LoadGroupListValue.
-        if (RegOpenKeyExW(
-                HKEY_LOCAL_MACHINE,
-                kPolicyKey,
-                0,
-                KEY_QUERY_VALUE | KEY_WOW64_64KEY,
-                &key) != ERROR_SUCCESS)
+        // An unopenable key, a value too large for a DWORD (ERROR_MORE_DATA)
+        // or any other read failure is "not found" here, i.e. auditing stays
+        // on.
+        if (!read.readable())
         {
             return ParseAuditUnwrapSuccess(false, 0, 0);
         }
 
-        DWORD value = 0;
-        DWORD type = 0;
-        DWORD size = sizeof(value);
-
-        LONG status = RegQueryValueExW(
-            key,
-            kAuditUnwrapSuccessValue,
-            nullptr,
-            &type,
-            reinterpret_cast<LPBYTE>(&value),
-            &size);
-
-        RegCloseKey(key);
-
-        // A value too large for a DWORD (ERROR_MORE_DATA) or any other read
-        // failure is "not found" here, i.e. auditing stays on.
-        if (status != ERROR_SUCCESS || size != sizeof(value))
-        {
-            return ParseAuditUnwrapSuccess(false, 0, 0);
-        }
-
-        return ParseAuditUnwrapSuccess(true, type, value);
+        return ParseAuditUnwrapSuccess(true, read.type, read.value);
     }
 
     unsigned long ParseSetupMinDelayMs(bool found, unsigned long type, unsigned long value) noexcept
@@ -367,41 +374,17 @@ namespace hkdfguard {
 
     unsigned long LoadSetupMinDelayMs() noexcept
     {
-        HKEY key = nullptr;
+        const PolicyDword read = ReadPolicyDword(kSetupMinDelayMsValue);
 
-        // KEY_WOW64_64KEY: see LoadGroupListValue.
-        if (RegOpenKeyExW(
-                HKEY_LOCAL_MACHINE,
-                kPolicyKey,
-                0,
-                KEY_QUERY_VALUE | KEY_WOW64_64KEY,
-                &key) != ERROR_SUCCESS)
+        // An unopenable key, a value too large for a DWORD (ERROR_MORE_DATA)
+        // or any other read failure is "not found" here, i.e. the default
+        // floor.
+        if (!read.readable())
         {
             return ParseSetupMinDelayMs(false, 0, 0);
         }
 
-        DWORD value = 0;
-        DWORD type = 0;
-        DWORD size = sizeof(value);
-
-        LONG status = RegQueryValueExW(
-            key,
-            kSetupMinDelayMsValue,
-            nullptr,
-            &type,
-            reinterpret_cast<LPBYTE>(&value),
-            &size);
-
-        RegCloseKey(key);
-
-        // A value too large for a DWORD (ERROR_MORE_DATA) or any other read
-        // failure is "not found" here, i.e. the default floor.
-        if (status != ERROR_SUCCESS || size != sizeof(value))
-        {
-            return ParseSetupMinDelayMs(false, 0, 0);
-        }
-
-        return ParseSetupMinDelayMs(true, type, value);
+        return ParseSetupMinDelayMs(true, read.type, read.value);
     }
 
 #if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
@@ -420,48 +403,26 @@ namespace hkdfguard {
         }
 #endif
 
-        HKEY key = nullptr;
-
-        // KEY_WOW64_64KEY: see LoadGroupListValue.
-        LONG status = RegOpenKeyExW(
-            HKEY_LOCAL_MACHINE,
-            kPolicyKey,
-            0,
-            KEY_QUERY_VALUE | KEY_WOW64_64KEY,
-            &key);
+        const PolicyDword read = ReadPolicyDword(kPolicyValue);
 
         // A missing key means the policy was never configured, so the
         // default applies. Any other failure to open it (access denied by a
         // hardened registry ACL, say) leaves a possibly configured policy -
         // maybe RequireTpm - unread, so it fails closed rather than running
         // under PreferTpm.
-        if (status != ERROR_SUCCESS) {
-            return KeyStoragePolicyForUnopenedKey(status);
+        if (!read.opened()) {
+            return KeyStoragePolicyForUnopenedKey(read.openStatus);
         }
-
-        DWORD value = 0;
-        DWORD type = 0;
-        DWORD size = sizeof(value);
-
-        status = RegQueryValueExW(
-            key,
-            kPolicyValue,
-            nullptr,
-            &type,
-            reinterpret_cast<LPBYTE>(&value),
-            &size);
-
-        RegCloseKey(key);
 
         // Likewise only a missing *value* is "never configured". Any other
         // failure - e.g. a REG_QWORD or long REG_SZ that doesn't fit a DWORD
         // (ERROR_MORE_DATA) - is a value set to *something*, so it is
         // "present but invalid", never the default.
         return ParseKeyStoragePolicy(
-            status != ERROR_FILE_NOT_FOUND,
-            status == ERROR_SUCCESS && size == sizeof(value),
-            type,
-            value);
+            read.queryStatus != ERROR_FILE_NOT_FOUND,
+            read.readable(),
+            read.type,
+            read.value);
     }
 
     KeyStoragePolicy KeyStoragePolicyForUnopenedKey(long openStatus) noexcept
@@ -517,50 +478,28 @@ namespace hkdfguard {
             return *g_testPayloadVersionOverride;
         }
 #endif
-        HKEY key = nullptr;
-
-        // KEY_WOW64_64KEY: see LoadGroupListValue.
-        const LONG open = RegOpenKeyExW(
-            HKEY_LOCAL_MACHINE,
-            kPolicyKey,
-            0,
-            KEY_QUERY_VALUE | KEY_WOW64_64KEY,
-            &key);
+        const PolicyDword read = ReadPolicyDword(kClassicalModeValue);
 
         // As KeyStoragePolicyForUnopenedKey: a missing policy key is "never
         // configured"; one that exists but can't be opened may hold
         // ClassicalMode, so it fails closed.
-        if (open != ERROR_SUCCESS)
+        if (!read.opened())
         {
-            return open == ERROR_FILE_NOT_FOUND || open == ERROR_PATH_NOT_FOUND
+            return read.openStatus == ERROR_FILE_NOT_FOUND || read.openStatus == ERROR_PATH_NOT_FOUND
                 ? PayloadVersionPolicy::Version2
                 : PayloadVersionPolicy::Invalid;
         }
 
-        DWORD value = 0;
-        DWORD type = 0;
-        DWORD size = sizeof(value);
-
-        const LONG status = RegQueryValueExW(
-            key,
-            kClassicalModeValue,
-            nullptr,
-            &type,
-            reinterpret_cast<LPBYTE>(&value),
-            &size);
-
-        RegCloseKey(key);
-
-        if (status == ERROR_FILE_NOT_FOUND)
+        if (read.queryStatus == ERROR_FILE_NOT_FOUND)
         {
             return ParsePayloadVersionPolicy(false, 0, 0);
         }
         // Present but unreadable as a DWORD: never a silent default.
-        if (status != ERROR_SUCCESS || size != sizeof(value))
+        if (!read.readable())
         {
             return PayloadVersionPolicy::Invalid;
         }
-        return ParsePayloadVersionPolicy(true, type, value);
+        return ParsePayloadVersionPolicy(true, read.type, read.value);
     }
 
 #if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
