@@ -31,6 +31,9 @@
 //      medium integrity), must open and use both - with the same output -
 //      and be refused export, making them exportable, widening their DACL
 //      and deleting them.
+
+#include "test_support.h" // IsElevated
+
 #include <windows.h>
 #include <bcrypt.h>
 #include <ncrypt.h>
@@ -87,13 +90,6 @@ Bytes FromHex(const std::wstring& hex) {
         out.push_back(static_cast<uint8_t>(std::stoi(std::wstring(hex, i, 2), nullptr, 16)));
     }
     return out;
-}
-
-bool IsElevated() {
-    TOKEN_ELEVATION elevation{};
-    DWORD size = 0;
-    return GetTokenInformation(GetCurrentProcessToken(), TokenElevation, &elevation, sizeof(elevation), &size) &&
-           elevation.TokenIsElevated != 0;
 }
 
 class Provider {
