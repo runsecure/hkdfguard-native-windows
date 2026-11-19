@@ -133,6 +133,7 @@ jobs:
       # AddressSanitizer runtime, and the code linted is the same on both.
       - name: clang-tidy + AddressSanitizer build and tests (Debug, x64)
         if: matrix.arch == 'x64'
+        timeout-minutes: 60
         shell: powershell
         run: .\scripts\Build-Analysis.ps1
 

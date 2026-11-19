@@ -244,6 +244,10 @@ add_test(
 )
 set_tests_properties(roles PROPERTIES
     ENVIRONMENT "PATH=$<TARGET_FILE_DIR:hkdfguard>\\;${HKDFGUARD_TEST_PATH}"
+    # A backstop over test_roles.ps1's own per-process timeout: ctest has no
+    # default, and this test starts processes as other accounts, where a
+    # stuck one would otherwise hang the CI job until GitHub cancels it.
+    TIMEOUT 1200
 )
 
 # roundtrip, cli and roles each change machine-wide state while they run -
