@@ -42,7 +42,7 @@ namespace hkdfguard {
                 : HkdfGuardError(HKDFGUARD_ERR_PROVIDER_UNAVAILABLE,
                                  ("the TPM can't be used for version 2: " + reason).c_str()),
                   reason_(reason) {}
-            const std::string &reason() const { return reason_; }
+            [[nodiscard]] const std::string &reason() const { return reason_; }
 
         private:
             std::string reason_;
@@ -497,12 +497,6 @@ namespace hkdfguard {
                 ReportUnusable(service, e);
             }
         }
-
-        // RAII wipe of a buffer that held key material.
-        struct Wiped {
-            std::vector<uint8_t> &bytes;
-            ~Wiped() { SecureZeroMemory(bytes.data(), bytes.size()); }
-        };
     } // namespace
 
     std::wstring V2TpmKeyName(const std::wstring &service, uint32_t key_id) {
@@ -533,7 +527,7 @@ namespace hkdfguard {
         }
 
         std::vector<uint8_t> blob(sizeof(BCRYPT_KEY_DATA_BLOB_HEADER) + 64);
-        Wiped wipe_blob{blob};
+        const ScopedSecureZero wipe_blob(blob.data(), blob.size()); // it holds key material
         DWORD got = 0;
         if (NCryptExportKey(key.get(), 0, BCRYPT_KEY_DATA_BLOB, nullptr, blob.data(), static_cast<DWORD>(blob.size()), &got,
                             0) != ERROR_SUCCESS ||
@@ -596,6 +590,7 @@ namespace hkdfguard {
                         return true;
                     }
                 } catch (const V2TpmUnusable &) {
+                    // best-effort: the TPM is unusable, so look in the software KSP.
                 }
                 return KekExistsOn(service, kProviderTypeSoftware);
             default:
@@ -659,6 +654,7 @@ namespace hkdfguard {
                 try {
                     return OpenKek(service, kProviderTypeTpm);
                 } catch (const V2TpmUnusable &) {
+                    // best-effort: the TPM is unusable, so use the software KEK below.
                 } catch (const HkdfGuardError &e) {
                     if (e.code() != HKDFGUARD_ERR_KEK_NOT_FOUND) {
                         throw;

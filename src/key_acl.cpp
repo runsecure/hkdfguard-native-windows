@@ -116,11 +116,11 @@ namespace hkdfguard {
             if (!IsValidSid(sid)) {
                 return false;
             }
-            const PSID_IDENTIFIER_AUTHORITY authority = GetSidIdentifierAuthority(sid);
+            const SID_IDENTIFIER_AUTHORITY *authority = GetSidIdentifierAuthority(sid);
             if (memcmp(authority->Value, nt.Value, sizeof(nt.Value)) != 0) {
                 return false;
             }
-            const PUCHAR count = GetSidSubAuthorityCount(sid);
+            const UCHAR *count = GetSidSubAuthorityCount(sid);
             if (*count != 5) {
                 return false;
             }
@@ -171,7 +171,7 @@ namespace hkdfguard {
             if (!GetComputerNameW(name, &size)) {
                 return L"";
             }
-            return std::wstring(name, size);
+            return {name, size};
         }
 
         // Resolves an account NAME to its SID, SID type, and the domain
@@ -313,7 +313,7 @@ namespace hkdfguard {
             std::wstring domain;
 
             SidBuffer sid =
-                    (entry.rfind(L"S-1-", 0) == 0)
+                    (entry.starts_with(L"S-1-"))
                         ? ResolveSidString(entry, sidType, domain)
                         : ResolveAccountSid(entry, sidType, domain);
 
@@ -862,7 +862,7 @@ namespace hkdfguard {
                 return true;
             }
             const SID_IDENTIFIER_AUTHORITY nt = SECURITY_NT_AUTHORITY;
-            const PSID_IDENTIFIER_AUTHORITY authority = GetSidIdentifierAuthority(member);
+            const SID_IDENTIFIER_AUTHORITY *authority = GetSidIdentifierAuthority(member);
             return std::memcmp(authority, &nt, sizeof(nt)) == 0 && *GetSidSubAuthorityCount(member) >= 2 &&
                    *GetSidSubAuthority(member, 0) == SECURITY_SERVICE_ID_BASE_RID;
         }

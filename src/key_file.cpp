@@ -17,6 +17,7 @@
 
 #include <windows.h>
 #include <aclapi.h> // GetSecurityInfo
+#include <algorithm> // std::ranges::any_of
 #include <bit>     // std::bit_cast - LARGE_INTEGER to LONGLONG
 #include <cstring>
 #include <string>
@@ -28,7 +29,7 @@ namespace hkdfguard {
         // bytes: the Win32 limit of 32,767 UTF-16 code units, each at most three
         // UTF-8 bytes. Bounds the strnlen below the same way kMaxServiceLen does
         // for a service name.
-        constexpr size_t kMaxPathBytes = 32767 * 3;
+        constexpr size_t kMaxPathBytes = size_t{32767} * 3;
 
         // UTF-8 path -> UTF-16 for CreateFileW. Unlike a service name, a path may
         // legitimately contain any Unicode character, so it is converted rather
@@ -72,10 +73,10 @@ namespace hkdfguard {
         // prefixed form GetFinalPathNameByHandle always returns both compare
         // against the plain spelling.
         std::wstring StripExtendedPrefix(std::wstring p) {
-            if (p.rfind(L"\\\\?\\UNC\\", 0) == 0) {
+            if (p.starts_with(L"\\\\?\\UNC\\")) {
                 return L"\\\\" + p.substr(8);
             }
-            if (p.rfind(L"\\\\?\\", 0) == 0) {
+            if (p.starts_with(L"\\\\?\\")) {
                 return p.substr(4);
             }
             return p;
@@ -196,7 +197,11 @@ namespace hkdfguard {
 
             TrustedInstallerSid &operator=(const TrustedInstallerSid &) = delete;
 
-            PSID get() const { return sid_; }
+            TrustedInstallerSid(TrustedInstallerSid &&) = delete;
+
+            TrustedInstallerSid &operator=(TrustedInstallerSid &&) = delete;
+
+            [[nodiscard]] PSID get() const { return sid_; }
 
         private:
             PSID sid_ = nullptr;
@@ -215,7 +220,7 @@ namespace hkdfguard {
             PSID sid = which == TokenOwner ? reinterpret_cast<const TOKEN_OWNER *>(info.data())->Owner
                                            : reinterpret_cast<const TOKEN_USER *>(info.data())->User.Sid;
             const auto *bytes = static_cast<const BYTE *>(sid);
-            return std::vector<BYTE>(bytes, bytes + GetLengthSid(sid));
+            return {bytes, bytes + GetLengthSid(sid)};
         }
 
         // The principals a key file and its folders may be owned by, and
@@ -255,19 +260,16 @@ namespace hkdfguard {
                 }
             }
 
-            SecurityModel model() const { return model_; }
+            [[nodiscard]] SecurityModel model() const { return model_; }
 
             bool MayOwn(PSID sid) const {
                 if (IsWellKnownSid(sid, WinLocalSystemSid) || IsWellKnownSid(sid, WinBuiltinAdministratorsSid) ||
                     EqualSid(sid, trusted_installer_.get())) {
                     return true;
                 }
-                for (const std::vector<BYTE> &extra: extra_) {
-                    if (EqualSid(sid, const_cast<BYTE *>(extra.data()))) {
-                        return true;
-                    }
-                }
-                return false;
+                return std::ranges::any_of(extra_, [sid](const std::vector<BYTE> &extra) {
+                    return EqualSid(sid, const_cast<BYTE *>(extra.data())) != FALSE;
+                });
             }
 
             bool MayWrite(PSID sid) const {
@@ -277,7 +279,7 @@ namespace hkdfguard {
 
             // Who, besides SYSTEM, Administrators and TrustedInstaller, is
             // trusted - for error messages.
-            const char *Others() const {
+            [[nodiscard]] const char *Others() const {
                 return model_ == SecurityModel::Developer ? "this account" : "a deployer group or its member";
             }
 

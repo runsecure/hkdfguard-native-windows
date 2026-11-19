@@ -126,6 +126,16 @@ jobs:
         shell: powershell
         run: .\scripts\Build-Test-Verify.ps1 -Configuration Release
 
+      # Static analysis and AddressSanitizer: every target built with
+      # clang-tidy (.clang-tidy) and /fsanitize=address in build-analysis\,
+      # then the ctest suite run against those instrumented binaries. Its
+      # binaries are never shipped or uploaded. x64 only: MSVC has no ARM64
+      # AddressSanitizer runtime, and the code linted is the same on both.
+      - name: clang-tidy + AddressSanitizer build and tests (Debug, x64)
+        if: matrix.arch == 'x64'
+        shell: powershell
+        run: .\scripts\Build-Analysis.ps1
+
       # Unsigned here on purpose: signing happens once, in release.yml's
       # sign job, so build jobs never hold signing access and the ARM64
       # runner never has to run the x64 signing plugin under emulation.

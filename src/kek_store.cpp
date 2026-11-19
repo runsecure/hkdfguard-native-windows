@@ -747,7 +747,7 @@ namespace hkdfguard {
             // The security guarantee comes from VerifyKeyProperties below:
             // VerifyUsage re-reads the key's actual usage after
             // NCryptFinalizeKey and fails closed if neither flag is set.
-            NCryptSetProperty(
+            (void)NCryptSetProperty(
                 key.get(),
                 NCRYPT_KEY_USAGE_PROPERTY,
                 reinterpret_cast<PBYTE>(&keyUsage),

@@ -152,7 +152,7 @@ namespace hkdfguard {
             DWORD value = 0;
             DWORD size = 0;
 
-            bool opened() const noexcept
+            [[nodiscard]] bool opened() const noexcept
             {
                 return openStatus == ERROR_SUCCESS;
             }
@@ -160,7 +160,7 @@ namespace hkdfguard {
             // The key opened, the value exists, and it was read as exactly
             // one DWORD - of whatever REG_* type, which the loader checks.
             // A value too large for a DWORD fails here (ERROR_MORE_DATA).
-            bool readable() const noexcept
+            [[nodiscard]] bool readable() const noexcept
             {
                 return opened() && queryStatus == ERROR_SUCCESS && size == sizeof(value);
             }
@@ -342,7 +342,7 @@ namespace hkdfguard {
         // Off only for an unambiguous, deliberate REG_DWORD 0. Everything
         // else - including a value that's present but malformed - keeps
         // auditing on, the direction that can't hide activity.
-        return !(found && type == REG_DWORD && value == 0);
+        return !found || type != REG_DWORD || value != 0;
     }
 
     bool LoadAuditUnwrapSuccess() noexcept

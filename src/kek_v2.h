@@ -44,9 +44,14 @@ namespace hkdfguard {
     class V2Kek {
     public:
         virtual ~V2Kek() = default;
+        // Held through std::unique_ptr; a copy would duplicate key handles.
+        V2Kek(const V2Kek &) = delete;
+        V2Kek &operator=(const V2Kek &) = delete;
+        V2Kek(V2Kek &&) = delete;
+        V2Kek &operator=(V2Kek &&) = delete;
 
-        uint8_t provider_type() const { return provider_type_; }
-        uint32_t key_id() const { return key_id_; }
+        [[nodiscard]] uint8_t provider_type() const { return provider_type_; }
+        [[nodiscard]] uint32_t key_id() const { return key_id_; }
 
         // The KEK's fingerprint: PRF(KEK, the fingerprint block). Public:
         // it reveals nothing about the KEK.

@@ -32,6 +32,58 @@ if(MSVC)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
+# AddressSanitizer test builds: cmake -DHKDFGUARD_ENABLE_ASAN=ON. Every target
+# (the DLL, the CLI and the tests) is instrumented, so ctest checks every
+# memory access the tests drive for out-of-bounds, use-after-free and
+# similar errors. For testing only - never ship these binaries: they need
+# the ASan runtime DLL (copied next to HkdfGuard.dll below) and are slower.
+# MSVC ships the ASan runtime for x86 and x64 only, so not for ARM64.
+option(HKDFGUARD_ENABLE_ASAN "Instrument every target with AddressSanitizer (test builds only, x64)" OFF)
+if(HKDFGUARD_ENABLE_ASAN)
+    if(NOT MSVC OR NOT CMAKE_CXX_COMPILER_ARCHITECTURE_ID STREQUAL "x64")
+        message(FATAL_ERROR "HKDFGUARD_ENABLE_ASAN needs MSVC targeting x64 (MSVC has no ARM64 ASan runtime).")
+    endif()
+    # /RTC (CMake's Debug default) cannot be combined with /fsanitize=address.
+    foreach(_flags_var CMAKE_CXX_FLAGS_DEBUG CMAKE_C_FLAGS_DEBUG)
+        string(REGEX REPLACE "/RTC[1csu]+" "" ${_flags_var} "${${_flags_var}}")
+    endforeach()
+    add_compile_options(/fsanitize=address /Zi)
+    # Incremental linking is incompatible with ASan; /DEBUG keeps symbols for
+    # ASan's stack traces in every configuration.
+    add_link_options(/INCREMENTAL:NO /DEBUG)
+endif()
+
+# clang-tidy, run on every C++ source as it compiles: cmake
+# -DHKDFGUARD_CLANG_TIDY=ON. The checks live in .clang-tidy at the repo
+# root, where every finding is an error. CMake runs clang-tidy only with the
+# Ninja and Makefile generators (the scripts in scripts/ use Ninja). The
+# clang-tidy that ships with Visual Studio's C++ Clang tools is used unless
+# HKDFGUARD_CLANG_TIDY_EXE points at another.
+option(HKDFGUARD_CLANG_TIDY "Run clang-tidy (.clang-tidy) on every source while building" OFF)
+if(HKDFGUARD_CLANG_TIDY)
+    if(CMAKE_GENERATOR MATCHES "Visual Studio")
+        message(FATAL_ERROR "HKDFGUARD_CLANG_TIDY needs the Ninja or a Makefile generator; "
+                            "CMake does not run clang-tidy under ${CMAKE_GENERATOR}.")
+    endif()
+    get_filename_component(_hkdfguard_cl_bin "${CMAKE_CXX_COMPILER}" DIRECTORY)
+    find_program(HKDFGUARD_CLANG_TIDY_EXE NAMES clang-tidy REQUIRED
+        HINTS "${_hkdfguard_cl_bin}/../../../../../Llvm/x64/bin"
+              "${_hkdfguard_cl_bin}/../../../../../Llvm/ARM64/bin"
+              "${_hkdfguard_cl_bin}/../../../../../Llvm/bin")
+    message(STATUS "clang-tidy: ${HKDFGUARD_CLANG_TIDY_EXE}")
+    # clang-tidy parses the cl.exe command line in clang-cl mode, which
+    # ignores (and warns about) the MSVC-only flags it does not implement,
+    # such as /analyze, /Qspectre and /guard:ehcont; those warnings are
+    # about the command line, not the code. /EHsc is repeated as an extra
+    # argument because clang-tidy 19, run with checks enabled from a Visual
+    # Studio developer environment, otherwise parses with C++ exceptions
+    # disabled and rejects every throw and try.
+    set(CMAKE_CXX_CLANG_TIDY "${HKDFGUARD_CLANG_TIDY_EXE}"
+        "--extra-arg=/EHsc"
+        "--extra-arg=-Wno-unused-command-line-argument"
+        "--extra-arg=-Wno-unknown-argument")
+endif()
+
 # The library: HkdfGuard.dll plus its HkdfGuard.lib import library.
 add_library(hkdfguard SHARED
     src/hkdfguard.cpp
@@ -119,7 +171,7 @@ target_link_libraries(hkdfguard PRIVATE ncrypt.lib bcrypt.lib wer.lib ntdll.lib 
 # (tools/CMakeLists.txt) always get the identical set. The linker's own defaults (/DYNAMICBASE,
 # /HIGHENTROPYVA, /NXCOMPAT - ASLR and DEP) are left on and not repeated.
 #
-#   /W4               High warning level (catches e.g. signed/unsigned mixups).
+#   (warnings)        hkdfguard_apply_warnings, below.
 #   /guard:cf         Control Flow Guard (compile and /GUARD:CF link halves):
 #                     indirect calls may only target validated functions.
 #   /GS               Stack-buffer-overrun detection (stack cookies).
@@ -191,11 +243,36 @@ if(MSVC)
     endif()
 endif()
 
+# The project's warning flags, applied to every target it builds - the
+# shipped binaries (through hkdfguard_apply_hardening below) and every test,
+# probe, benchmark and fuzzer - so no code is compiled to a lower standard.
+#
+#   /W4               High warning level (catches e.g. signed/unsigned mixups).
+#   /permissive-      Standards conformance: rejects MSVC's non-standard
+#                     extensions, as other compilers would.
+#   /WX               Warnings are errors, so none accumulate.
+#   /analyze          The compiler's static analysis (C6xxx/C26xxx warnings:
+#                     null dereferences, buffer overruns, uninitialized
+#                     memory, SAL annotation violations), as errors too.
+#   /external:anglebrackets /external:W0 /analyze:external-
+#                     Headers included with <...> (the Windows SDK and the
+#                     standard library) are not this project's code: no
+#                     warnings, and no analysis, from them.
+function(hkdfguard_apply_warnings target)
+    if(NOT MSVC)
+        return()
+    endif()
+    target_compile_options(${target} PRIVATE
+        /W4 /permissive- /WX /analyze
+        /external:anglebrackets /external:W0 /analyze:external-)
+endfunction()
+
 function(hkdfguard_apply_hardening target)
     if(NOT MSVC)
         return()
     endif()
-    target_compile_options(${target} PRIVATE /W4 /guard:cf /GS /sdl /Qspectre)
+    hkdfguard_apply_warnings(${target})
+    target_compile_options(${target} PRIVATE /guard:cf /GS /sdl /Qspectre)
     target_link_options(${target} PRIVATE /GUARD:CF)
     if(CMAKE_CXX_COMPILER_ARCHITECTURE_ID STREQUAL "x64")
         target_compile_options(${target} PRIVATE /guard:ehcont)
@@ -207,6 +284,20 @@ function(hkdfguard_apply_hardening target)
 endfunction()
 
 hkdfguard_apply_hardening(hkdfguard)
+
+# An ASan build's binaries load the ASan runtime DLL from the toolset. It is
+# copied next to HkdfGuard.dll, whose folder every test puts on PATH, so the
+# tests and the CLI find it without the developer environment.
+if(HKDFGUARD_ENABLE_ASAN)
+    get_filename_component(_hkdfguard_asan_dir "${CMAKE_CXX_COMPILER}" DIRECTORY)
+    set(HKDFGUARD_ASAN_RUNTIME "${_hkdfguard_asan_dir}/clang_rt.asan_dynamic-x86_64.dll")
+    if(NOT EXISTS "${HKDFGUARD_ASAN_RUNTIME}")
+        message(FATAL_ERROR "ASan runtime not found at ${HKDFGUARD_ASAN_RUNTIME}")
+    endif()
+    add_custom_command(TARGET hkdfguard POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${HKDFGUARD_ASAN_RUNTIME}" "$<TARGET_FILE_DIR:hkdfguard>"
+        VERBATIM)
+endif()
 
 # tools/: hkdfguard-cli (hkdfguard.exe), the command-line tool.
 add_subdirectory(tools)

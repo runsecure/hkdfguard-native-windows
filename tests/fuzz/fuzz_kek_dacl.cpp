@@ -56,6 +56,8 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     try {
         VerifyKekDaclGrants(acl, {});
     } catch (const HkdfGuardError &) {
+        // best-effort: refusing a DACL is an expected outcome; only the
+        // exception's type is the property under test here.
     } catch (...) {
         FUZZ_REQUIRE(false, "VerifyKekDaclGrants throws only HkdfGuardError");
     }

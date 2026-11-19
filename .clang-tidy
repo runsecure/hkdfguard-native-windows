@@ -1,0 +1,106 @@
+# clang-tidy configuration, run by `cmake -DHKDFGUARD_CLANG_TIDY=ON` (see
+# CMakeLists.txt) and in CI. Every enabled check is an error.
+#
+# Broad families are enabled, then the checks below are turned off - each
+# for a stated reason, most because they conflict with the Win32/CNG C API
+# this project is built on rather than pointing at a defect:
+#
+#   bugprone-easily-swappable-parameters          Win32-style (ptr, len, ptr, len) signatures trip it everywhere.
+#   cert-err33-c                                  Unchecked return values are /analyze's C6031, which is
+#                                                 SAL-aware and already an error; this one also flags printf.
+#   cppcoreguidelines-avoid-c-arrays,
+#   modernize-avoid-c-arrays                      Fixed-size key and nonce buffers are passed to CNG.
+#   cppcoreguidelines-avoid-do-while              No defect class behind it.
+#   cppcoreguidelines-avoid-magic-numbers,
+#   readability-magic-numbers                     Byte layouts and test vectors are numbers by nature.
+#   cppcoreguidelines-avoid-non-const-global-variables
+#                                                 The few globals are deliberate: the test-only seams and
+#                                                 process-wide setup state, each in an anonymous namespace.
+#   cppcoreguidelines-pro-bounds-array-to-pointer-decay,
+#   cppcoreguidelines-pro-bounds-constant-array-index,
+#   cppcoreguidelines-pro-bounds-pointer-arithmetic
+#                                                 Win32 and CNG take pointer + length; AddressSanitizer
+#                                                 test builds check the actual accesses.
+#   cppcoreguidelines-pro-type-const-cast,
+#   cppcoreguidelines-pro-type-reinterpret-cast   CNG takes PUCHAR/PBYTE for read-only input; each cast is commented.
+#   cppcoreguidelines-pro-type-vararg,
+#   cert-dcl50-cpp                                printf-family output (and the CLI's printf-style
+#                                                 helpers) in the tests and CLI.
+#   cppcoreguidelines-macro-usage                 include/hkdfguard.h is a C header: its constants must be macros.
+#   cppcoreguidelines-owning-memory               Assumes the GSL's gsl::owner<>, which this project does not use.
+#   cppcoreguidelines-non-private-member-variables-in-classes
+#                                                 Alias of the misc- check below.
+#   performance-enum-size                         An enum's storage size is not a cost here.
+#   misc-const-correctness                        Stylistic; hundreds of locals, no defect class behind it.
+#   misc-include-cleaner                          Does not understand windows.h's umbrella headers.
+#   misc-non-private-member-variables-in-classes  Plain structs (e.g. ParsedWrappedDek) are intended.
+#   modernize-raw-string-literal,
+#   modernize-use-auto,
+#   modernize-use-designated-initializers,
+#   modernize-use-trailing-return-type,
+#   readability-avoid-nested-conditional-operator,
+#   readability-braces-around-statements,
+#   readability-identifier-length,
+#   readability-implicit-bool-conversion,
+#   readability-isolate-declaration,
+#   readability-math-missing-parentheses,
+#   readability-uppercase-literal-suffix          Formatting and spelling preferences, not defects.
+#                                                 (implicit-bool-conversion also fights Win32's BOOL.)
+#   readability-function-cognitive-complexity,
+#   readability-function-size                     The test drivers are long sequential scripts by design.
+---
+Checks: >
+  -*,
+  bugprone-*,
+  cert-*,
+  clang-analyzer-*,
+  concurrency-*,
+  cppcoreguidelines-*,
+  misc-*,
+  modernize-*,
+  performance-*,
+  portability-*,
+  readability-*,
+  -bugprone-easily-swappable-parameters,
+  -cert-dcl50-cpp,
+  -cert-err33-c,
+  -cppcoreguidelines-avoid-c-arrays,
+  -cppcoreguidelines-avoid-do-while,
+  -cppcoreguidelines-avoid-magic-numbers,
+  -cppcoreguidelines-avoid-non-const-global-variables,
+  -cppcoreguidelines-macro-usage,
+  -cppcoreguidelines-non-private-member-variables-in-classes,
+  -cppcoreguidelines-owning-memory,
+  -cppcoreguidelines-pro-bounds-array-to-pointer-decay,
+  -cppcoreguidelines-pro-bounds-constant-array-index,
+  -cppcoreguidelines-pro-bounds-pointer-arithmetic,
+  -cppcoreguidelines-pro-type-const-cast,
+  -cppcoreguidelines-pro-type-reinterpret-cast,
+  -cppcoreguidelines-pro-type-vararg,
+  -misc-const-correctness,
+  -misc-include-cleaner,
+  -misc-non-private-member-variables-in-classes,
+  -modernize-avoid-c-arrays,
+  -modernize-raw-string-literal,
+  -modernize-use-auto,
+  -modernize-use-designated-initializers,
+  -modernize-use-trailing-return-type,
+  -performance-enum-size,
+  -readability-avoid-nested-conditional-operator,
+  -readability-braces-around-statements,
+  -readability-function-cognitive-complexity,
+  -readability-function-size,
+  -readability-identifier-length,
+  -readability-implicit-bool-conversion,
+  -readability-isolate-declaration,
+  -readability-magic-numbers,
+  -readability-math-missing-parentheses,
+  -readability-uppercase-literal-suffix
+WarningsAsErrors: '*'
+HeaderFilterRegex: '.*[\\/](src|include|tests|tools)[\\/].*'
+FormatStyle: none
+CheckOptions:
+  # An empty catch is allowed only with a comment saying why swallowing the
+  # exception is right there, e.g. "// best-effort: ...".
+  bugprone-empty-catch.IgnoreCatchWithKeywords: '@TODO;@FIXME;best-effort'
+...

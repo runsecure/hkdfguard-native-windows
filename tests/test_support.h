@@ -3,8 +3,21 @@
 // Helpers shared by the test, probe and benchmark executables.
 
 #include <windows.h>
+#include <bcrypt.h>
 
+#include <cstddef>
+#include <stdexcept>
 #include <vector>
+
+// Fills `len` bytes at `out` from the system RNG. A test that cannot get
+// random bytes cannot mean anything, so a failure throws, ending the test
+// through main's handler.
+inline void FillRandom(void* out, std::size_t len) {
+    if (!BCRYPT_SUCCESS(BCryptGenRandom(nullptr, static_cast<PUCHAR>(out), static_cast<ULONG>(len),
+                                        BCRYPT_USE_SYSTEM_PREFERRED_RNG))) {
+        throw std::runtime_error("BCryptGenRandom failed");
+    }
+}
 
 // Whether this process runs elevated. Creating a machine-scoped KEK, and
 // setting machine policy, both need it.
@@ -39,8 +52,10 @@ public:
     ~ScopedMachinePolicyDword() { restore(); }
     ScopedMachinePolicyDword(const ScopedMachinePolicyDword&) = delete;
     ScopedMachinePolicyDword& operator=(const ScopedMachinePolicyDword&) = delete;
+    ScopedMachinePolicyDword(ScopedMachinePolicyDword&&) = delete;
+    ScopedMachinePolicyDword& operator=(ScopedMachinePolicyDword&&) = delete;
 
-    bool active() const { return active_; }
+    [[nodiscard]] bool active() const { return active_; }
 
     void restore() {
         if (key_ == nullptr) return;

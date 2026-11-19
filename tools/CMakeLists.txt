@@ -22,6 +22,10 @@ add_executable(hkdfguard-cli
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/event_log.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/wire_format.cpp
 )
+# The src/ files above are linted in HkdfGuard.dll's build (see
+# HKDFGUARD_CLANG_TIDY); this directory's copies need not be again.
+file(GLOB HKDFGUARD_SRC_COPIES ${CMAKE_CURRENT_SOURCE_DIR}/../src/*.cpp)
+set_source_files_properties(${HKDFGUARD_SRC_COPIES} PROPERTIES SKIP_LINTING ON)
 target_link_libraries(hkdfguard-cli PRIVATE hkdfguard bcrypt.lib ncrypt.lib advapi32.lib ntdll.lib
     netapi32.lib)
 # src/ for no_follow_open.h and dacl_walk.h - header-only and exception-free:

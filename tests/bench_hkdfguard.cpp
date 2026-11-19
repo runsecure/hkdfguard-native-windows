@@ -58,11 +58,13 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -81,7 +83,13 @@ struct Options {
     bool quick = false;
 };
 
-Options g_opt;
+// The parsed command line. A function-local static rather than a global, so
+// constructing it (which allocates) happens on first use, not at static
+// initialization where an exception could not be caught.
+Options& Opt() {
+    static Options options;
+    return options;
+}
 FILE* g_csv = nullptr;
 int g_failures = 0;
 std::string g_machine; // CPU name, for the CSV
@@ -98,14 +106,14 @@ struct Stats {
 
 double Percentile(const std::vector<double>& sorted, double p) {
     if (sorted.empty()) return 0;
-    const size_t index = static_cast<size_t>(p * static_cast<double>(sorted.size() - 1) + 0.5);
+    const auto index = static_cast<size_t>(std::llround(p * static_cast<double>(sorted.size() - 1)));
     return sorted[std::min(index, sorted.size() - 1)];
 }
 
 Stats Summarize(std::vector<double> latencies_us, double wall_seconds) {
     Stats s;
     if (latencies_us.empty()) return s;
-    std::sort(latencies_us.begin(), latencies_us.end());
+    std::ranges::sort(latencies_us);
     double total = 0;
     for (double v : latencies_us) total += v;
     s.min_us = latencies_us.front();
@@ -147,7 +155,7 @@ void Report(const std::string& name, int threads, int iterations, const Stats& s
 }
 
 bool Selected(const std::string& name) {
-    return g_opt.filter.empty() || name.find(g_opt.filter) != std::string::npos;
+    return Opt().filter.empty() || name.find(Opt().filter) != std::string::npos;
 }
 
 int Warmup(int iterations) { return std::max(1, std::min(50, iterations / 10)); }
@@ -183,6 +191,7 @@ void BenchThreads(const std::string& name, int threads, int total,
     std::atomic<int> ready{0};
     std::atomic<bool> go{false};
     std::vector<std::thread> pool;
+    pool.reserve(static_cast<size_t>(threads));
     for (int t = 0; t < threads; ++t) {
         pool.emplace_back([&, t] {
             std::function<bool()> op = make_op();
@@ -292,7 +301,9 @@ void PrintEnvironment(bool elevated) {
 }
 
 void Random(uint8_t* out, size_t len) {
-    BCryptGenRandom(nullptr, out, static_cast<ULONG>(len), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    if (!BCRYPT_SUCCESS(BCryptGenRandom(nullptr, out, static_cast<ULONG>(len), BCRYPT_USE_SYSTEM_PREFERRED_RNG))) {
+        throw std::runtime_error("BCryptGenRandom failed");
+    }
 }
 
 // A structurally valid version 2 payload, for the parser and open_file -
@@ -326,7 +337,7 @@ bool NoThrow(const std::function<void()>& f) {
 
 void CpuSection() {
     Section("1. CPU only (this binary's copy of src/, no KEK)");
-    const int n = g_opt.quick ? 5 : (g_opt.iterations > 0 ? g_opt.iterations : 2000);
+    const int n = Opt().quick ? 5 : (Opt().iterations > 0 ? Opt().iterations : 2000);
 
     uint8_t salt[hkdfguard::kSaltLen];
     Random(salt, sizeof(salt));
@@ -374,14 +385,14 @@ void CpuSection() {
     uint8_t nonce[hkdfguard::kNonceLen], ct[hkdfguard::kCiphertextLen], tag[hkdfguard::kTagLen], back[sizeof(dek)];
     Bench("AES-256-GCM encrypt, 32-byte DEK", n, [&] {
         return NoThrow([&] {
-            hkdfguard::AesGcmEncrypt(key, dek, sizeof(dek), aad, sizeof(aad), nonce, ct, tag);
+            hkdfguard::AesGcmEncrypt(key, dek, aad, nonce, ct, tag);
             g_sink = static_cast<uint8_t>(g_sink ^ tag[0]);
         });
     });
-    hkdfguard::AesGcmEncrypt(key, dek, sizeof(dek), aad, sizeof(aad), nonce, ct, tag);
+    hkdfguard::AesGcmEncrypt(key, dek, aad, nonce, ct, tag);
     Bench("AES-256-GCM decrypt, 32-byte DEK", n, [&] {
         return NoThrow([&] {
-            hkdfguard::AesGcmDecrypt(key, nonce, ct, sizeof(ct), aad, sizeof(aad), tag, back);
+            hkdfguard::AesGcmDecrypt(key, nonce, ct, aad, tag, back);
             g_sink = static_cast<uint8_t>(g_sink ^ back[0]);
         });
     });
@@ -434,7 +445,7 @@ void OpenFileSection(bool elevated) {
 
     if (wrote) {
         const std::string utf8 = Narrow(path);
-        const int n = g_opt.quick ? 5 : (g_opt.iterations > 0 ? g_opt.iterations : 500);
+        const int n = Opt().quick ? 5 : (Opt().iterations > 0 ? Opt().iterations : 500);
         Bench(name, n, [&] {
             uint8_t out[HKDFGUARD_WRAPPED_MAX_LEN];
             int len = sizeof(out);
@@ -489,7 +500,7 @@ void DllRows(const char* service, const std::string& label, int iterations) {
     // Thread scaling: the same total work spread over more threads. Flat
     // ops/s means the provider serializes the calls.
     const std::vector<uint8_t> wrapped_copy(wrapped, wrapped + wrapped_len);
-    for (int threads : g_opt.threads) {
+    for (int threads : Opt().threads) {
         BenchThreads(label + " wrap_dek (threads)", threads, iterations, [&] {
             return std::function<bool()>([service, dek_copy = std::vector<uint8_t>(dek, dek + sizeof(dek))] {
                 uint8_t out[HKDFGUARD_WRAPPED_MAX_LEN];
@@ -498,7 +509,7 @@ void DllRows(const char* service, const std::string& label, int iterations) {
             });
         });
     }
-    for (int threads : g_opt.threads) {
+    for (int threads : Opt().threads) {
         BenchThreads(label + " unwrap_dek (threads)", threads, iterations, [&] {
             return std::function<bool()>([service, &wrapped_copy] {
                 uint8_t out[HKDFGUARD_DEK_LEN];
@@ -520,6 +531,8 @@ void DeleteBenchKek(const std::wstring& service, int version, uint8_t provider_t
             hkdfguard::DeleteV2Kek(service, provider_type, hkdfguard::kCurrentKeyId);
         }
     } catch (...) {
+        // best-effort: cleanup of a throwaway KEK that may well not exist;
+        // a failure here must not stop the measurements.
     }
 }
 
@@ -578,17 +591,17 @@ void ElevatedDllSection() {
             }
             continue;
         }
-        const int n = g_opt.quick ? 5 : (tpm ? g_opt.tpm_iterations : (g_opt.iterations > 0 ? g_opt.iterations : 500));
+        const int n = Opt().quick ? 5 : (tpm ? Opt().tpm_iterations : (Opt().iterations > 0 ? Opt().iterations : 500));
         DllRows(c.service, c.label, n);
         DeleteBenchKek(service_w, c.version, c.provider);
     }
 }
 
 void ExistingKekSection() {
-    Section(("3. HkdfGuard.dll, existing KEK \"" + g_opt.service + "\" under this machine's policy").c_str());
-    const int n = g_opt.quick ? 5 : (g_opt.iterations > 0 ? g_opt.iterations : 200);
+    Section(("3. HkdfGuard.dll, existing KEK \"" + Opt().service + "\" under this machine's policy").c_str());
+    const int n = Opt().quick ? 5 : (Opt().iterations > 0 ? Opt().iterations : 200);
     Note("KeyStoragePolicy and ClassicalMode are whatever the machine has; see the policy line above.");
-    DllRows(g_opt.service.c_str(), "existing", n);
+    DllRows(Opt().service.c_str(), "existing", n);
 }
 
 // ---------------------------------------------------------------------------
@@ -604,42 +617,45 @@ bool ParseInt(const char* s, int& out) {
 bool ParseArgs(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
-        auto next = [&]() -> const char* { return i + 1 < argc ? argv[++i] : nullptr; };
-        const char* value = nullptr;
         if (arg == "--quick") {
-            g_opt.quick = true;
-        } else if (arg == "--iterations" && (value = next()) != nullptr) {
-            if (!ParseInt(value, g_opt.iterations)) return false;
-        } else if (arg == "--tpm-iterations" && (value = next()) != nullptr) {
-            if (!ParseInt(value, g_opt.tpm_iterations)) return false;
-        } else if (arg == "--threads" && (value = next()) != nullptr) {
-            g_opt.threads.clear();
+            Opt().quick = true;
+            continue;
+        }
+        // Every other option takes a value: the next argument.
+        const bool takes_value = arg == "--iterations" || arg == "--tpm-iterations" || arg == "--threads" ||
+                                 arg == "--filter" || arg == "--csv" || arg == "--service";
+        const char* value = (takes_value && i + 1 < argc) ? argv[++i] : nullptr;
+        if (value == nullptr) {
+            return false; // an unknown option, or one missing its value
+        }
+        if (arg == "--iterations") {
+            if (!ParseInt(value, Opt().iterations)) return false;
+        } else if (arg == "--tpm-iterations") {
+            if (!ParseInt(value, Opt().tpm_iterations)) return false;
+        } else if (arg == "--threads") {
+            Opt().threads.clear();
             std::string list = value;
             size_t start = 0;
             while (start <= list.size()) {
                 const size_t comma = std::min(list.find(',', start), list.size());
                 int t = 0;
                 if (!ParseInt(list.substr(start, comma - start).c_str(), t) || t > 256) return false;
-                g_opt.threads.push_back(t);
+                Opt().threads.push_back(t);
                 start = comma + 1;
             }
-        } else if (arg == "--filter" && (value = next()) != nullptr) {
-            g_opt.filter = value;
-        } else if (arg == "--csv" && (value = next()) != nullptr) {
-            g_opt.csv = value;
-        } else if (arg == "--service" && (value = next()) != nullptr) {
-            g_opt.service = value;
+        } else if (arg == "--filter") {
+            Opt().filter = value;
+        } else if (arg == "--csv") {
+            Opt().csv = value;
         } else {
-            return false;
+            Opt().service = value;
         }
     }
-    if (g_opt.quick) g_opt.threads = {1, 2};
+    if (Opt().quick) Opt().threads = {1, 2};
     return true;
 }
 
-} // namespace
-
-int main(int argc, char** argv) {
+int RunBench(int argc, char** argv) {
     if (!ParseArgs(argc, argv)) {
         std::fprintf(stderr,
                      "usage: bench_hkdfguard [--quick] [--iterations N] [--tpm-iterations N] [--threads 1,2,4,8]\n"
@@ -649,10 +665,10 @@ int main(int argc, char** argv) {
     const bool elevated = IsElevated();
     PrintEnvironment(elevated);
 
-    if (!g_opt.csv.empty()) {
-        const bool fresh = GetFileAttributesW(Widen(g_opt.csv).c_str()) == INVALID_FILE_ATTRIBUTES;
-        if (fopen_s(&g_csv, g_opt.csv.c_str(), "a") != 0 || g_csv == nullptr) {
-            std::fprintf(stderr, "cannot open %s for writing\n", g_opt.csv.c_str());
+    if (!Opt().csv.empty()) {
+        const bool fresh = GetFileAttributesW(Widen(Opt().csv).c_str()) == INVALID_FILE_ATTRIBUTES;
+        if (fopen_s(&g_csv, Opt().csv.c_str(), "a") != 0 || g_csv == nullptr) {
+            std::fprintf(stderr, "cannot open %s for writing\n", Opt().csv.c_str());
             return 2;
         }
         if (fresh) {
@@ -662,7 +678,7 @@ int main(int argc, char** argv) {
 
     CpuSection();
     OpenFileSection(elevated);
-    if (!g_opt.service.empty()) {
+    if (!Opt().service.empty()) {
         ExistingKekSection();
     } else if (elevated) {
         ElevatedDllSection();
@@ -674,4 +690,18 @@ int main(int argc, char** argv) {
     if (g_csv != nullptr) std::fclose(g_csv);
     std::printf("\n%s\n", g_failures == 0 ? "done" : "done, with failures (see FAILED / [fail] above)");
     return g_failures == 0 ? 0 : 1;
+}
+
+} // namespace
+
+int main(int argc, char** argv) {
+    try {
+        return RunBench(argc, argv);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "unhandled exception: %s\n", e.what());
+        return 1;
+    } catch (...) {
+        std::fprintf(stderr, "unhandled exception\n");
+        return 1;
+    }
 }

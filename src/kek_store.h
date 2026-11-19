@@ -56,8 +56,8 @@ namespace hkdfguard {
     struct ResolvedKek {
         ScopedNCryptProv provider;
         ScopedNCryptKey key;
-        uint8_t provider_type;
-        uint32_t key_id;
+        uint8_t provider_type = 0;
+        uint32_t key_id = 0;
     };
 
     //

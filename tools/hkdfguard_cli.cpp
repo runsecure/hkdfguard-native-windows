@@ -319,7 +319,8 @@ namespace {
             std::string arg = argv[i];
             if (arg == "--help" || arg == "-h") {
                 return ParseOutcome::Help;
-            } else if (arg == "--service-name" || arg == "-sn") {
+            }
+            if (arg == "--service-name" || arg == "-sn") {
                 if (i + 1 >= argc) {
                     throw CliError(arg + " requires a value");
                 }
@@ -363,7 +364,8 @@ namespace {
             std::string arg = argv[i];
             if (arg == "--help" || arg == "-h") {
                 return ParseOutcome::Help;
-            } else if (arg == "--force" || arg == "-f") {
+            }
+            if (arg == "--force" || arg == "-f") {
                 if (force) {
                     throw CliError("give --force at most once");
                 }
@@ -477,7 +479,8 @@ namespace {
             std::string arg = argv[i];
             if (arg == "--help" || arg == "-h") {
                 return ParseOutcome::Help;
-            } else if (arg == "--service-name" || arg == "-sn") {
+            }
+            if (arg == "--service-name" || arg == "-sn") {
                 SetOnce(serviceName, "--service-name", FlagValue(argc, argv, i, arg, "--service-name"));
             } else if (arg == "--fingerprint" || arg == "-fp") {
                 SetOnce(fingerprintText, "--fingerprint", FlagValue(argc, argv, i, arg, "--fingerprint"));
@@ -540,7 +543,8 @@ namespace {
             std::string arg = argv[i];
             if (arg == "--help" || arg == "-h") {
                 return ParseOutcome::Help;
-            } else if (arg == "--service-name" || arg == "-sn") {
+            }
+            if (arg == "--service-name" || arg == "-sn") {
                 SetOnce(serviceName, "--service-name", FlagValue(argc, argv, i, arg, "--service-name"));
             } else {
                 throw CliError("unrecognized argument for `status`: " + arg);
@@ -595,8 +599,8 @@ namespace {
         // Enough for any base64 decoding of kMaxDekStdinLen characters.
         static constexpr size_t kDecodedCapacity = (kMaxDekStdinLen / 4) * 3 + 3;
 
-        DekScratch() {
-            base_ = static_cast<BYTE *>(VirtualAlloc(nullptr, kSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+        DekScratch()
+            : base_(static_cast<BYTE *>(VirtualAlloc(nullptr, kSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE))) {
             if (base_ == nullptr) {
                 throw CliError("could not allocate the DEK's buffer: " + FormatWin32Error(GetLastError()));
             }
@@ -619,6 +623,8 @@ namespace {
 
         DekScratch(const DekScratch &) = delete;
         DekScratch &operator=(const DekScratch &) = delete;
+        DekScratch(DekScratch &&) = delete;
+        DekScratch &operator=(DekScratch &&) = delete;
 
         char *text() { return reinterpret_cast<char *>(base_); }
         BYTE *decoded() { return base_ + kTextCapacity; }
@@ -793,8 +799,8 @@ namespace {
                 bad |= (group & unusedBits);
             }
             out[written++] = static_cast<BYTE>(group >> 16);
-            if (!(last && padding == 2)) out[written++] = static_cast<BYTE>(group >> 8);
-            if (!(last && padding >= 1)) out[written++] = static_cast<BYTE>(group);
+            if (!last || padding != 2) out[written++] = static_cast<BYTE>(group >> 8);
+            if (!last || padding < 1) out[written++] = static_cast<BYTE>(group);
         }
         SecureZeroMemory(v, sizeof(v));
         SecureZeroMemory(&group, sizeof(group));
@@ -1025,7 +1031,7 @@ namespace {
     std::vector<BYTE> ResolveGroupSid(const std::string &groupName) {
         DWORD sidSize = 0;
         DWORD domainSize = 0;
-        SID_NAME_USE sidType;
+        SID_NAME_USE sidType = SidTypeUnknown;
         // First call: size query. LookupAccountNameW returns FALSE here even
         // on the expected path (buffers too small); the real signal is that
         // sidSize/domainSize come back non-zero.
@@ -1094,6 +1100,10 @@ namespace {
             // recommended folder grant, has Modify on the key folder but not
             // "delete subfolders and files" - couldn't, since this DACL is
             // protected and inherits nothing from the folder.
+            // FILE_GENERIC_READ and FILE_GENERIC_WRITE both include
+            // STANDARD_RIGHTS_* and SYNCHRONIZE, so their expansions overlap;
+            // the mask is intended.
+            // NOLINTNEXTLINE(misc-redundant-expression)
             if (!AddAccessAllowedAce(acl, ACL_REVISION, FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE, owner)) {
                 throw CliError("AddAccessAllowedAce(owner) failed: " + FormatWin32Error(GetLastError()));
             }
@@ -1118,11 +1128,11 @@ namespace {
         }
 
         // The DACL itself, for re-applying it as protected on the open file.
-        PACL Dacl() const { return reinterpret_cast<PACL>(const_cast<BYTE *>(aclBuf_.data())); }
+        [[nodiscard]] PACL Dacl() const { return reinterpret_cast<PACL>(const_cast<BYTE *>(aclBuf_.data())); }
 
         // Valid only while this object is alive: lpSecurityDescriptor points
         // at sd_, which points into ownerSid_/groupSid_/aclBuf_.
-        SECURITY_ATTRIBUTES attributes() const {
+        [[nodiscard]] SECURITY_ATTRIBUTES attributes() const {
             SECURITY_ATTRIBUTES sa{};
             sa.nLength = sizeof(sa);
             sa.lpSecurityDescriptor = const_cast<SECURITY_DESCRIPTOR *>(&sd_);
@@ -1249,7 +1259,8 @@ namespace {
     // file or pipe it is UTF-8 bytes.
     void Print(FILE *stream, const std::string &utf8) {
         fflush(stream);
-        HANDLE console = reinterpret_cast<HANDLE>(_get_osfhandle(_fileno(stream)));
+        // _get_osfhandle returns the OS handle as an intptr_t by design.
+        HANDLE console = reinterpret_cast<HANDLE>(_get_osfhandle(_fileno(stream))); // NOLINT(performance-no-int-to-ptr)
         DWORD mode = 0;
         if (console != INVALID_HANDLE_VALUE && GetConsoleMode(console, &mode)) {
             // Not Utf8ToWide: output must never throw, so an invalid byte
@@ -1274,9 +1285,9 @@ namespace {
     }
 
     void Printf(FILE *stream, const char *format, ...) {
-        va_list args;
+        va_list args = nullptr;
         va_start(args, format);
-        va_list sizing;
+        va_list sizing = nullptr;
         va_copy(sizing, args);
         const int len = vsnprintf(nullptr, 0, format, sizing);
         va_end(sizing);
@@ -1287,9 +1298,9 @@ namespace {
     }
 
     void PrintfW(FILE *stream, const wchar_t *format, ...) {
-        va_list args;
+        va_list args = nullptr;
         va_start(args, format);
-        va_list sizing;
+        va_list sizing = nullptr;
         va_copy(sizing, args);
         const int len = _vscwprintf(format, sizing);
         va_end(sizing);
@@ -1371,9 +1382,9 @@ namespace {
         wide.resize(written);
 
         std::string final_path = WideToUtf8(wide);
-        if (final_path.rfind("\\\\?\\UNC\\", 0) == 0) {
+        if (final_path.starts_with("\\\\?\\UNC\\")) {
             final_path = "\\\\" + final_path.substr(8);
-        } else if (final_path.rfind("\\\\?\\", 0) == 0) {
+        } else if (final_path.starts_with("\\\\?\\")) {
             final_path = final_path.substr(4);
         }
         return final_path;
@@ -1460,8 +1471,11 @@ namespace {
                 continue;
             }
             if (part.back() == '.' || part.back() == ' ') {
-                throw CliError(what + ": \"" + part + "\" ends in a " + (part.back() == '.' ? "dot" : "space") +
-                               ", which Windows drops from the name; remove it");
+                std::string message = what;
+                message.append(": \"").append(part).append("\" ends in a ")
+                    .append(part.back() == '.' ? "dot" : "space")
+                    .append(", which Windows drops from the name; remove it");
+                throw CliError(std::move(message));
             }
             // The device name is the part before the first dot, without
             // trailing spaces: "nul.txt" and "COM1 .key" are devices too.
@@ -1482,8 +1496,11 @@ namespace {
                 reserved = reserved || (comOrLpt && deviceDigit);
             }
             if (reserved) {
-                throw CliError(what + ": \"" + part + "\" is a reserved Windows device name; Windows programs would "
-                               "open the device rather than a file, so choose another name");
+                std::string message = what;
+                message.append(": \"").append(part).append(
+                    "\" is a reserved Windows device name; Windows programs would "
+                    "open the device rather than a file, so choose another name");
+                throw CliError(std::move(message));
             }
         }
     }
@@ -1588,7 +1605,7 @@ namespace {
     std::string IcaclsSid(PSID sid) {
         LPWSTR text = nullptr;
         if (!ConvertSidToStringSidW(sid, &text)) {
-            return std::string();
+            return {};
         }
         std::string s = "*" + WideToUtf8(text);
         LocalFree(text);
@@ -1646,8 +1663,9 @@ namespace {
         for (size_t i = 0; i < chain.handles.size(); ++i) {
             const bool driveRoot = i == 0;
             const std::string folder = TrimTrailingSeparators(WideToUtf8(chain.paths[i]));
-            const std::string what = "--key-file-path " + path + ": " + (driveRoot ? "the drive root " : "the folder ") +
-                                     "\"" + folder + "\"";
+            std::string what = "--key-file-path ";
+            what.append(path).append(": ").append(driveRoot ? "the drive root " : "the folder ")
+                .append("\"").append(folder).append("\"");
             PSID owner = nullptr;
             PACL dacl = nullptr;
             PSECURITY_DESCRIPTOR sd = nullptr;
@@ -1660,18 +1678,28 @@ namespace {
             }
             struct FreeSd {
                 PSECURITY_DESCRIPTOR p;
+                explicit FreeSd(PSECURITY_DESCRIPTOR sd) : p(sd) {}
                 ~FreeSd() { LocalFree(p); }
+                FreeSd(const FreeSd &) = delete;
+                FreeSd &operator=(const FreeSd &) = delete;
+                FreeSd(FreeSd &&) = delete;
+                FreeSd &operator=(FreeSd &&) = delete;
             } freeSd{sd};
             const std::string fix = driveRoot ? std::string("; keep the key file on a drive whose root is not open "
                                                             "to other accounts")
                                               : KeyFolderFix(folder);
             if (owner == nullptr || !mayOwn(owner)) {
-                throw CliError(what + " is owned by " + (owner ? AccountNameOf(owner) : std::string("no one")) +
-                               ", which is neither SYSTEM, Administrators, TrustedInstaller nor " + others + "; " +
-                               why + fix);
+                std::string message = what;
+                message.append(" is owned by ")
+                    .append(owner ? AccountNameOf(owner) : std::string("no one"))
+                    .append(", which is neither SYSTEM, Administrators, TrustedInstaller nor ")
+                    .append(others).append("; ").append(why).append(fix);
+                throw CliError(std::move(message));
             }
             if (dacl == nullptr) {
-                throw CliError(what + " has no DACL, so every account has full access to it; " + why + fix);
+                std::string message = what;
+                message.append(" has no DACL, so every account has full access to it; ").append(why).append(fix);
+                throw CliError(std::move(message));
             }
             const ACCESS_MASK forbidden = driveRoot ? kFolderReplaceRights : (kFolderReplaceRights | kFolderCreateRights);
             const hkdfguard::DaclWalkResult walk =
@@ -1682,17 +1710,21 @@ namespace {
                     }
                     const bool createOnly = (granted & ~kFolderCreateRights) == 0;
                     const bool inherited = (aceFlags & INHERITED_ACE) != 0;
-                    throw CliError(what + " lets " + AccountNameOf(sid) +
-                                   (createOnly ? " create files or folders in it"
-                                               : " delete, rename or replace its entries, or change its permissions") +
-                                   (inherited ? " (an inherited permission)" : "") + "; " + why +
-                                   (driveRoot || inherited ? fix : KeyFolderFix(folder, IcaclsSid(sid))));
+                    std::string message = what;
+                    message.append(" lets ").append(AccountNameOf(sid))
+                        .append(createOnly ? " create files or folders in it"
+                                           : " delete, rename or replace its entries, or change its permissions")
+                        .append(inherited ? " (an inherited permission)" : "").append("; ").append(why)
+                        .append(driveRoot || inherited ? fix : KeyFolderFix(folder, IcaclsSid(sid)));
+                    throw CliError(std::move(message));
                 });
             if (walk == hkdfguard::DaclWalkResult::UnreadableAce) {
                 throw CliError(what + ": its ACL could not be read: " + FormatWin32Error(GetLastError()));
             }
             if (walk != hkdfguard::DaclWalkResult::Complete) {
-                throw CliError(what + " has an access-allowed ACE of an unexpected type; " + why + fix);
+                std::string message = what;
+                message.append(" has an access-allowed ACE of an unexpected type; ").append(why).append(fix);
+                throw CliError(std::move(message));
             }
         }
     }
@@ -1816,7 +1848,7 @@ namespace {
 
             for (size_t pass = 0; pass < kSecureOverwritePassCount; ++pass) {
                 if (pass % 2 == 0) {
-                    std::fill(buffer.begin(), buffer.end(), static_cast<BYTE>(0)); // all-zero pass
+                    std::ranges::fill(buffer, static_cast<BYTE>(0)); // all-zero pass
                 } else {
                     FillRandom(buffer); // random pass, via the OS CSPRNG
                 }
@@ -1977,7 +2009,7 @@ namespace {
     std::string AccountNameOf(PSID sid) {
         wchar_t name[256], domain[256];
         DWORD nameLen = static_cast<DWORD>(std::size(name)), domainLen = static_cast<DWORD>(std::size(domain));
-        SID_NAME_USE use;
+        SID_NAME_USE use = SidTypeUnknown;
         if (LookupAccountSidW(nullptr, sid, name, &nameLen, domain, &domainLen, &use)) {
             return domainLen > 0 ? WideToUtf8(domain) + "\\" + WideToUtf8(name) : WideToUtf8(name);
         }
@@ -2012,7 +2044,12 @@ namespace {
         }
         struct FreeSd {
             PSECURITY_DESCRIPTOR p;
+            explicit FreeSd(PSECURITY_DESCRIPTOR sd) : p(sd) {}
             ~FreeSd() { LocalFree(p); }
+            FreeSd(const FreeSd &) = delete;
+            FreeSd &operator=(const FreeSd &) = delete;
+            FreeSd(FreeSd &&) = delete;
+            FreeSd &operator=(FreeSd &&) = delete;
         } freeSd{sd};
 
         std::vector<BYTE> user = GetProcessUserSid();
@@ -2137,7 +2174,7 @@ namespace {
             handle_ = 0;
             return h;
         }
-        NCRYPT_HANDLE get() const { return handle_; }
+        [[nodiscard]] NCRYPT_HANDLE get() const { return handle_; }
         NCRYPT_HANDLE *put() {
             reset();
             return &handle_;
@@ -2207,7 +2244,7 @@ namespace {
             reinterpret_cast<NCRYPT_KEY_HANDLE *>(result.key.put()), name.c_str(), 0,
             NCRYPT_MACHINE_KEY_FLAG | NCRYPT_SILENT_FLAG);
         if (status == ERROR_SUCCESS) {
-            return std::optional<OpenedKek>(std::move(result));
+            return std::move(result);
         }
         if (status == NTE_BAD_KEYSET) {
             return std::nullopt;
@@ -2591,10 +2628,10 @@ namespace {
             // key whose only fault is its access list is not corrupt, and
             // its remedy is the opposite one.
             const std::vector<FoundV2Kek> found = FindV2Keks(service);
-            const bool any_corrupt = std::any_of(found.begin(), found.end(), [](const FoundV2Kek &k) {
+            const bool any_corrupt = std::ranges::any_of(found, [](const FoundV2Kek &k) {
                 return k.inspection.state == hkdfguard::V2KekInspection::State::Invalid;
             });
-            const bool any_access = std::any_of(found.begin(), found.end(), IsAccessControlInvalidV2);
+            const bool any_access = std::ranges::any_of(found, IsAccessControlInvalidV2);
             if (any_access && !any_corrupt) {
                 Printf(stdout, "kek: access list invalid (%s; fix the key's access list - do not retire it)\n",
                         DescribeStatus(rc).c_str());
@@ -3070,7 +3107,7 @@ namespace {
     }
 } // namespace
 
-int wmain(int argc, wchar_t *wargv[]) {
+int wmain(int argc, wchar_t *wargv[]) { // NOLINT(misc-use-internal-linkage): process entry point
     // Before anything is read: this process holds a plaintext DEK, so it
     // must not be dumpable, debuggable or injectable by other processes of
     // the same user - including through threads the key storage provider
@@ -3102,6 +3139,7 @@ int wmain(int argc, wchar_t *wargv[]) {
         utf8Args.push_back(std::move(arg));
     }
     std::vector<char *> argv;
+    argv.reserve(utf8Args.size() + 1);
     for (std::string &arg : utf8Args) {
         argv.push_back(arg.data());
     }
