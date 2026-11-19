@@ -2,11 +2,12 @@
 #include "../include/hkdfguard.h"
 #include "hkdf_errors.h"
 
+// windows.h first: the headers below use its types and don't all include it.
+#include <windows.h>
 #include <aclapi.h>   // SetSecurityInfo
 #include <sddl.h>     // ConvertStringSecurityDescriptorToSecurityDescriptorW, ConvertSidToStringSidW
 #include <tlhelp32.h> // CreateToolhelp32Snapshot - enumerating this process's threads
 #include <werapi.h>   // WerSetFlags
-#include <windows.h>
 
 #include <string>
 #include <vector>
