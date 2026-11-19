@@ -34,9 +34,11 @@ namespace hkdfguard {
     };
 
     // Calls visit(PSID sid, ACCESS_MASK mask, BYTE aceFlags) for each
-    // applicable allow ACE of `dacl`, which must not be null.
+    // applicable allow ACE of `dacl`, which must not be null. `visit` is
+    // taken by value, as the standard algorithms take callables: it is called
+    // once per ACE, so it must not be forwarded (moved from).
     template <typename Visit>
-    [[nodiscard]] DaclWalkResult WalkAllowAces(PACL dacl, Visit &&visit) {
+    [[nodiscard]] DaclWalkResult WalkAllowAces(PACL dacl, Visit visit) {
         for (DWORD i = 0; i < dacl->AceCount; ++i) {
             void *ace = nullptr;
             if (!GetAce(dacl, i, &ace)) {

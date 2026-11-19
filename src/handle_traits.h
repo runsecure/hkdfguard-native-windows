@@ -13,10 +13,9 @@ namespace hkdfguard {
     template<typename Handle, typename Closer>
     class ScopedHandle {
     public:
-        ScopedHandle() : handle_(0) {
-        }
+        ScopedHandle() noexcept = default;
 
-        explicit ScopedHandle(Handle h) : handle_(h) {
+        explicit ScopedHandle(Handle h) noexcept : handle_(h) {
         }
 
         // Not copyable (two owners would double-close); movable, the source
@@ -60,20 +59,19 @@ namespace hkdfguard {
         // Releases ownership without closing the handle - for the rare case
         // where an API call (e.g. NCryptDeleteKey) itself invalidates the
         // handle, so it must not also be passed to Closer.
-        Handle release() {
-            Handle h = handle_;
-            handle_ = 0;
-            return h;
+        // Not [[nodiscard]]: discarding the result is the common case.
+        Handle release() noexcept {
+            return std::exchange(handle_, Handle{});
         }
 
         // The raw handle, for calls that use it without taking ownership.
-        Handle get() const { return handle_; }
+        [[nodiscard]] Handle get() const noexcept { return handle_; }
 
         // True if a handle is owned.
-        explicit operator bool() const { return handle_ != 0; }
+        [[nodiscard]] explicit operator bool() const noexcept { return handle_ != 0; }
 
     private:
-        Handle handle_;
+        Handle handle_{};
     };
 
     // One closer per handle type, forwarding to that type's close API.

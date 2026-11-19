@@ -6,7 +6,7 @@
 
 #include "aes_gcm.h"
 #include "ecdh_hkdf.h"
-#include "errors.h"
+#include "hkdf_errors.h"
 #include "event_log.h"
 #include "policy.h" // LoadAuditUnwrapSuccess, LoadPayloadVersionPolicy, SecurityModel
 #include "process_hardening.h" // HardenProcess - hkdfguard_harden_process's implementation
@@ -28,6 +28,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <utility> // std::forward
 
 using namespace hkdfguard;
 
@@ -72,6 +73,11 @@ namespace {
         // Waits out the rest of the floor on every way out of this
         // function, a throw from `f` included.
         struct Floor {
+            explicit Floor(std::chrono::steady_clock::time_point u) : until(u) {}
+            Floor(const Floor &) = delete;
+            Floor &operator=(const Floor &) = delete;
+            Floor(Floor &&) = delete;
+            Floor &operator=(Floor &&) = delete;
             std::chrono::steady_clock::time_point until;
             ~Floor() {
                 for (auto now = std::chrono::steady_clock::now(); now < until;
@@ -87,7 +93,18 @@ namespace {
             LogSetupCallsExceeded(kSetupCallsWarnAt, floor_ms);
         }
 
-        f();
+        std::forward<F>(f)();
+    }
+
+    // The version 1 KEK that WrapDekCore / hkdfguard_unwrap_dek opened. It is
+    // opened exactly when the payload version is not 2, so it is always
+    // present where this is called; should that ever not hold, this fails
+    // the call instead of reading an empty optional.
+    const ResolvedKek &OpenedV1Kek(const std::optional<ResolvedKek> &kek) {
+        if (!kek.has_value()) {
+            throw HkdfGuardError(HKDFGUARD_ERR_INTERNAL_ERROR, "no version 1 KEK is open");
+        }
+        return *kek;
     }
 
     // Allowed service-name characters: ASCII letters, digits and '.'.
@@ -325,8 +342,8 @@ namespace {
             if (version == kFormatVersion2) {
                 v2_kek->WrappingKey(normalized_service, header, wrapping_key);
             } else {
-                DeriveWrappingKey(v1_kek->provider.get(), v1_kek->key.get(), normalized_service, authenticated,
-                                  wrapping_key);
+                const ResolvedKek &kek = OpenedV1Kek(v1_kek);
+                DeriveWrappingKey(kek.provider.get(), kek.key.get(), normalized_service, authenticated, wrapping_key);
             }
 
             // AES-256-GCM directly from the caller's dek pointer - no
@@ -337,8 +354,7 @@ namespace {
             // the key) nor the routing nor the format can be swapped
             // undetected.
             AesGcmEncrypt(
-                wrapping_key.data(), dek, static_cast<unsigned long>(dek_len),
-                authenticated.data(), static_cast<unsigned long>(authenticated.size()),
+                wrapping_key.span(), std::span(dek, static_cast<size_t>(dek_len)), authenticated,
                 nonce, ciphertext, tag);
         } // wrapping_key is zeroed here.
 
@@ -583,7 +599,7 @@ extern "C" HKDFGUARD_API int hkdfguard_unwrap_dek(
         if (version == kFormatVersion2) {
             v2_kek->Fingerprint(expected_fingerprint);
         } else {
-            ComputeKekFingerprint(v1_kek->key.get(), expected_fingerprint);
+            ComputeKekFingerprint(OpenedV1Kek(v1_kek).key.get(), expected_fingerprint);
         }
         if (std::memcmp(expected_fingerprint, parsed.fingerprint, kFingerprintLen) != 0) {
             throw HkdfGuardError(HKDFGUARD_ERR_KEK_FINGERPRINT_MISMATCH, "payload was not wrapped under this KEK");
@@ -607,19 +623,23 @@ extern "C" HKDFGUARD_API int hkdfguard_unwrap_dek(
             if (version == kFormatVersion2) {
                 v2_kek->WrappingKey(normalized_service, parsed.header, wrapping_key);
             } else {
-                DeriveWrappingKey(v1_kek->provider.get(), v1_kek->key.get(), normalized_service, authenticated,
-                                  wrapping_key);
+                const ResolvedKek &kek = OpenedV1Kek(v1_kek);
+                DeriveWrappingKey(kek.provider.get(), kek.key.get(), normalized_service, authenticated, wrapping_key);
             }
 
             // Decrypt directly into the caller's buffer - no intermediate
             // plaintext staging buffer. The AAD must match what
             // AesGcmEncrypt used at wrap time, and the key binds the
             // normalized service name, as in WrapDekCore.
+            // ParsedWrappedDek holds raw pointers into the received payload;
+            // the fixed extents restate the sizes ParseWrappedDek checked.
             AesGcmDecrypt(
-                wrapping_key.data(), parsed.nonce, parsed.ciphertext,
-                static_cast<unsigned long>(kCiphertextLen),
-                authenticated.data(), static_cast<unsigned long>(authenticated.size()),
-                parsed.tag, out);
+                wrapping_key.span(),
+                std::span<const uint8_t, kNonceLen>(parsed.nonce, kNonceLen),
+                std::span(parsed.ciphertext, kCiphertextLen),
+                authenticated,
+                std::span<const uint8_t, kTagLen>(parsed.tag, kTagLen),
+                std::span(out, static_cast<size_t>(HKDFGUARD_DEK_LEN)));
         } // wrapping_key is zeroed here.
 
         // `out` holds the only copy of the recovered plaintext DEK.

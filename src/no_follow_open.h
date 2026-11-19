@@ -26,11 +26,12 @@
 #include <windows.h>
 #include <winternl.h> // NtCreateFile, OBJECT_ATTRIBUTES, IO_STATUS_BLOCK, RtlNtStatusToDosError
 
+#include <algorithm> // std::ranges::none_of
 #include <string>
 #include <utility>
 #include <vector>
 
-#if defined(_MSC_VER)
+#ifdef _MSC_VER
 #pragma comment(lib, "ntdll.lib")
 #endif
 
@@ -86,8 +87,8 @@ namespace hkdfguard_nofollow {
             }
             handle_ = nullptr;
         }
-        bool valid() const { return handle_ != nullptr && handle_ != INVALID_HANDLE_VALUE; }
-        HANDLE get() const { return handle_; }
+        [[nodiscard]] bool valid() const { return handle_ != nullptr && handle_ != INVALID_HANDLE_VALUE; }
+        [[nodiscard]] HANDLE get() const { return handle_; }
 
     private:
         HANDLE handle_ = nullptr;
@@ -130,12 +131,11 @@ namespace hkdfguard_nofollow {
         }
         std::wstring upper = name;
         CharUpperBuffW(upper.data(), static_cast<DWORD>(upper.size()));
-        for (const wchar_t *network : {L"MUP", L"REDIRECTOR", L"RDPDR", L"WEBDAV", L"NAMEDPIPE", L"MAILSLOT", L"NFS"}) {
-            if (upper.find(network) != std::wstring::npos) {
-                return false;
-            }
-        }
-        return true;
+        static constexpr const wchar_t *kNetworkDevices[] = {L"MUP",       L"REDIRECTOR", L"RDPDR", L"WEBDAV",
+                                                             L"NAMEDPIPE", L"MAILSLOT",   L"NFS"};
+        return std::ranges::none_of(kNetworkDevices, [&upper](const wchar_t *network) {
+            return upper.find(network) != std::wstring::npos;
+        });
     }
 
     // Whether `full` - a fully-qualified path, as GetFullPathNameW returns it -
@@ -215,8 +215,8 @@ namespace hkdfguard_nofollow {
         std::vector<std::wstring> paths; // "C:\", "C:\a", "C:\a\b", ... - one per handle
         std::wstring leaf;               // the last component's name
 
-        HANDLE parent() const { return handles.back().get(); }
-        const std::wstring &parentPath() const { return paths.back(); }
+        [[nodiscard]] HANDLE parent() const { return handles.back().get(); }
+        [[nodiscard]] const std::wstring &parentPath() const { return paths.back(); }
     };
 
     // Access each folder is opened with: enough to read its attributes and

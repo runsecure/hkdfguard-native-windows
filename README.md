@@ -520,6 +520,20 @@ an external caller, not just by the CLI itself. Parameters:
 - **`-NoCleanup`** - skip deleting the verification KEK and wrapped-key file
   afterward, if you want to inspect them.
 
+Every build compiles with `/W4 /permissive- /WX /analyze`: any compiler warning or
+static-analysis finding fails it. **`scripts\Build-Analysis.ps1`** (x64, elevated
+for the full suite) goes further, in its own `build-analysis\` folder: it builds
+every target - tests, fuzzers and benchmark included - with clang-tidy (the checks in
+`.clang-tidy`, every finding an error) and AddressSanitizer, then runs `ctest`
+against those instrumented binaries. CI runs it on every push. The same switches are
+CMake options, for a build of your own: `-DHKDFGUARD_CLANG_TIDY=ON` (Ninja or
+Makefile generators only) and `-DHKDFGUARD_ENABLE_ASAN=ON` (x64 only; test builds,
+never ship them).
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\Build-Analysis.ps1
+```
+
 Or build and test manually, from an already-elevated shell:
 
 ```

@@ -44,9 +44,14 @@ namespace hkdfguard {
     class V2Kek {
     public:
         virtual ~V2Kek() = default;
+        // Held through std::unique_ptr; a copy would duplicate key handles.
+        V2Kek(const V2Kek &) = delete;
+        V2Kek &operator=(const V2Kek &) = delete;
+        V2Kek(V2Kek &&) = delete;
+        V2Kek &operator=(V2Kek &&) = delete;
 
-        uint8_t provider_type() const { return provider_type_; }
-        uint32_t key_id() const { return key_id_; }
+        [[nodiscard]] uint8_t provider_type() const { return provider_type_; }
+        [[nodiscard]] uint32_t key_id() const { return key_id_; }
 
         // The KEK's fingerprint: PRF(KEK, the fingerprint block). Public:
         // it reveals nothing about the KEK.
@@ -97,7 +102,7 @@ namespace hkdfguard {
             Absent,  // no KEK of this version on that provider
             Valid,   // present, passes every check; `fingerprint` is set
             Invalid, // present, but fails a check of the key itself; `problem` says which
-            // Present, and fails only on its DACL (errors.h's
+            // Present, and fails only on its DACL (hkdf_errors.h's
             // KekAccessControlError). The key may be fine: the remedy is to
             // fix the ACL, never to retire it. `problem` says which check.
             AccessControlInvalid,
@@ -131,7 +136,7 @@ namespace hkdfguard {
     // HKDFGUARD_ERR_PROVIDER_ERROR if the check can't run.
     void CheckSoftwareKdfImplementation();
 
-#if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
+#ifdef HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE
     // Test-only seam, compiled in only with
     // HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE (never in HkdfGuard.dll); not
     // thread-safe. A TPM that reports itself unusable for version 2, with

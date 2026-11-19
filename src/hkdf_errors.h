@@ -21,7 +21,7 @@ namespace hkdfguard {
         }
 
         // The HKDFGUARD_ERR_* status code to return across the ABI.
-        int code() const { return code_; }
+        [[nodiscard]] int code() const noexcept { return code_; }
 
     private:
         int code_;

@@ -1,5 +1,5 @@
 #include "kek_store.h"
-#include "errors.h"
+#include "hkdf_errors.h"
 #include "event_log.h"
 #include <optional>
 #include <string>
@@ -8,7 +8,7 @@
 
 namespace hkdfguard {
     namespace {
-#if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
+#ifdef HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE
         // See SetTestTpmProviderNameOverride in kek_store.h. Empty by
         // default, so a test binary that never sets it behaves exactly like
         // the DLL.
@@ -24,7 +24,7 @@ namespace hkdfguard {
         // this machine" paths deterministically on hardware that has one.
         LPCWSTR TpmProviderName()
         {
-#if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
+#ifdef HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE
             if (g_testTpmProviderNameOverride.has_value())
             {
                 return g_testTpmProviderNameOverride->c_str();
@@ -39,7 +39,7 @@ namespace hkdfguard {
         // them.
         SECURITY_STATUS ApplyTestTpmOpenStatus(LPCWSTR providerName, SECURITY_STATUS actual)
         {
-#if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
+#ifdef HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE
             if (g_testTpmFaults.openKeyStatus.has_value() &&
                 wcscmp(providerName, TpmProviderName()) == 0)
             {
@@ -52,7 +52,7 @@ namespace hkdfguard {
 
         bool TestTpmVerificationFails(uint8_t providerType)
         {
-#if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
+#ifdef HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE
             return g_testTpmFaults.failVerification && providerType == kProviderTypeTpm;
 #else
             (void)providerType;
@@ -747,7 +747,7 @@ namespace hkdfguard {
             // The security guarantee comes from VerifyKeyProperties below:
             // VerifyUsage re-reads the key's actual usage after
             // NCryptFinalizeKey and fails closed if neither flag is set.
-            NCryptSetProperty(
+            (void)NCryptSetProperty(
                 key.get(),
                 NCRYPT_KEY_USAGE_PROPERTY,
                 reinterpret_cast<PBYTE>(&keyUsage),
@@ -936,7 +936,7 @@ namespace hkdfguard {
             "invalid key storage policy");
     }
 
-#if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
+#ifdef HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE
     void SetTestTpmProviderNameOverride(std::optional<std::wstring> providerName)
     {
         g_testTpmProviderNameOverride = std::move(providerName);

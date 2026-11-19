@@ -26,6 +26,7 @@
 #include <sddl.h>
 
 #include <cstdio>
+#include <exception>
 #include <string>
 #include <vector>
 
@@ -110,7 +111,8 @@ namespace {
     }
 } // namespace
 
-int main(int argc, char *argv[]) {
+namespace {
+int RunProbe(int argc, char *argv[]) {
     if (argc < 2) {
         std::fprintf(stderr, "usage: role_probe model | open <path> | unwrap <service> <path> | ephemeral <service> | "
                              "plant <src> <dir> <name> | overwrite <path> | inspect <path>\n");
@@ -146,7 +148,10 @@ int main(int argc, char *argv[]) {
         int unwrap = generate == HKDFGUARD_OK ? Unwrap(argv[2], payload) : generate;
 
         uint8_t dek[HKDFGUARD_DEK_LEN] = {};
-        BCryptGenRandom(nullptr, dek, sizeof(dek), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+        if (!BCRYPT_SUCCESS(BCryptGenRandom(nullptr, dek, sizeof(dek), BCRYPT_USE_SYSTEM_PREFERRED_RNG))) {
+            std::fprintf(stderr, "BCryptGenRandom failed\n");
+            return 1;
+        }
         std::vector<uint8_t> wrapped(HKDFGUARD_WRAPPED_MAX_LEN);
         int wrapped_len = static_cast<int>(wrapped.size());
         int wrap = hkdfguard_wrap_dek(argv[2], dek, sizeof(dek), wrapped.data(), &wrapped_len);
@@ -177,4 +182,17 @@ int main(int argc, char *argv[]) {
     }
     std::fprintf(stderr, "role_probe: unknown command or wrong argument count\n");
     return 2;
+}
+} // namespace
+
+int main(int argc, char *argv[]) {
+    try {
+        return RunProbe(argc, argv);
+    } catch (const std::exception &e) {
+        std::fprintf(stderr, "unhandled exception: %s\n", e.what());
+        return 1;
+    } catch (...) {
+        std::fprintf(stderr, "unhandled exception\n");
+        return 1;
+    }
 }

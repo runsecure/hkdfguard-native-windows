@@ -156,7 +156,7 @@ namespace hkdfguard {
         // letters, digits and '.', so a byte-for-byte widen is exact - and
         // there is no way to smuggle formatting or newlines into an event.
         std::wstring Widen(const std::string &s) {
-            return std::wstring(s.begin(), s.end());
+            return {s.begin(), s.end()};
         }
 
         std::wstring Hex(const uint8_t *bytes, size_t len) {
@@ -239,7 +239,7 @@ namespace hkdfguard {
                     1, 0, strings, nullptr);
                 DeregisterEventSource(source);
             } catch (...) {
-                // Logging must never affect the operation being logged.
+                // best-effort: logging must never affect the operation being logged.
             }
         }
     } // namespace
@@ -257,6 +257,7 @@ namespace hkdfguard {
                       L"). This KEK is not hardware-protected.");
             }
         } catch (...) {
+            // best-effort: logging must never affect the operation being logged.
         }
     }
 
@@ -268,6 +269,7 @@ namespace hkdfguard {
                   L"KeyStoragePolicy to allow the software key store, or set ClassicalMode to 1 to use payload "
                   L"version 1 on this host.");
         } catch (...) {
+            // best-effort: logging must never affect the operation being logged.
         }
     }
 
@@ -291,6 +293,7 @@ namespace hkdfguard {
                     L". Wrapped payload SHA-256: " + Sha256Hex(payload, payloadLen) + L".";
             Write(EVENTLOG_INFORMATION_TYPE, unwrap ? kEvtDekUnwrapped : kEvtDekWrapped, text);
         } catch (...) {
+            // best-effort: logging must never affect the operation being logged.
         }
     }
 
@@ -298,7 +301,7 @@ namespace hkdfguard {
         try {
             DWORD eventId = 0;
             WORD type = EVENTLOG_ERROR_TYPE;
-            const wchar_t *meaning = L"";
+            const wchar_t *meaning = nullptr; // set by every case that logs
 
             switch (code) {
                 case HKDFGUARD_ERR_KEK_ACCESS_DENIED:
@@ -373,6 +376,7 @@ namespace hkdfguard {
                   std::wstring(OpName(op)) + L" failed for service " + serviceText + L": " + CodeName(code) +
                   L" (" + std::to_wstring(code) + L") - " + meaning + L".");
         } catch (...) {
+            // best-effort: logging must never affect the operation being logged.
         }
     }
 
@@ -388,6 +392,7 @@ namespace hkdfguard {
                   L"mistake. None of its contents were returned. Treat that key as exposed: find out how the "
                   L"file was written, remove it, and re-mint the DEK.");
         } catch (...) {
+            // best-effort: logging must never affect the operation being logged.
         }
     }
 
@@ -404,6 +409,7 @@ namespace hkdfguard {
                   L"service accepts. Remove the value (or set it to 0) on any production machine. Logged once per "
                   L"process.");
         } catch (...) {
+            // best-effort: logging must never affect the operation being logged.
         }
     }
 
@@ -417,6 +423,7 @@ namespace hkdfguard {
                   L" ms, and they run one at a time. A caller is probably calling them per request or in a "
                   L"loop: call them once at startup, then use hkdfguard_wrap_dek / hkdfguard_unwrap_dek.");
         } catch (...) {
+            // best-effort: logging must never affect the operation being logged.
         }
     }
 } // namespace hkdfguard

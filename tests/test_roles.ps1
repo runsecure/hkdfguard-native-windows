@@ -28,7 +28,10 @@ had to create, the folders, and the KEK (retired by fingerprint).
 param(
     [Parameter(Mandatory = $true)][string]$CliExePath,
     [Parameter(Mandatory = $true)][string]$ProbeExePath,
-    [Parameter(Mandatory = $true)][string]$DllPath
+    [Parameter(Mandatory = $true)][string]$DllPath,
+    # How long one process run as a test account may take before it is
+    # killed and its check fails. Generous: an ASan build or a TPM is slow.
+    [int]$ChildTimeoutMs = 180000
 )
 
 # No PowerShell module is used - neither LocalAccounts nor Security
@@ -119,7 +122,18 @@ function Invoke-As {
             $p.StandardInput.Write($StdIn)
             $p.StandardInput.Close()
         } catch [System.IO.IOException] { }
-        $p.WaitForExit()
+        # Bounded: a child that never exits (e.g. stopped by the loader on a
+        # modal "DLL not found" error, which nobody can dismiss on a CI
+        # runner) fails the check instead of hanging the whole run.
+        if (-not $p.WaitForExit($ChildTimeoutMs)) {
+            try { $p.Kill() } catch { }
+            return [PSCustomObject]@{
+                ExitCode = -1
+                StdOut   = ""
+                StdErr   = "timed out after $($ChildTimeoutMs / 1000) s running $FilePath as $($network.UserName) - killed"
+            }
+        }
+        $p.WaitForExit() # also waits for the redirected streams to drain
         return [PSCustomObject]@{
             ExitCode = $p.ExitCode
             StdOut   = $stdout.GetAwaiter().GetResult() + ""
@@ -237,6 +251,12 @@ try {
     $users = Get-AccountSid "HkdfGuardUsers"
     Set-ProtectedAcl $keys "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1301bf;;;$deployers)(A;OICI;0x1200a9;;;$users)"
     foreach ($file in $CliExePath, $ProbeExePath, $DllPath) { Copy-Item -LiteralPath $file -Destination $bin }
+    # An AddressSanitizer build (HKDFGUARD_ENABLE_ASAN) also needs the ASan
+    # runtime, which CMake puts next to HkdfGuard.dll. The test accounts
+    # find DLLs only in $bin (their own PATH doesn't reach the build tree),
+    # and a missing one stops the process at load time on a modal error.
+    Get-ChildItem -LiteralPath (Split-Path -Parent $DllPath) -Filter "clang_rt.asan*.dll" |
+        ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination $bin }
     $cli = Join-Path $bin (Split-Path -Leaf $CliExePath)
     $probe = Join-Path $bin (Split-Path -Leaf $ProbeExePath)
 

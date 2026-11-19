@@ -1,6 +1,6 @@
 #include "process_hardening.h"
 #include "../include/hkdfguard.h"
-#include "errors.h"
+#include "hkdf_errors.h"
 
 #include <aclapi.h>   // SetSecurityInfo
 #include <sddl.h>     // ConvertStringSecurityDescriptorToSecurityDescriptorW, ConvertSidToStringSidW
@@ -30,8 +30,10 @@ namespace hkdfguard {
             ~LocalSecurityDescriptor() { LocalFree(sd_); }
             LocalSecurityDescriptor(const LocalSecurityDescriptor &) = delete;
             LocalSecurityDescriptor &operator=(const LocalSecurityDescriptor &) = delete;
+            LocalSecurityDescriptor(LocalSecurityDescriptor &&) = delete;
+            LocalSecurityDescriptor &operator=(LocalSecurityDescriptor &&) = delete;
 
-            PACL Dacl() const {
+            [[nodiscard]] PACL Dacl() const {
                 BOOL present = FALSE;
                 BOOL defaulted = FALSE;
                 PACL dacl = nullptr;

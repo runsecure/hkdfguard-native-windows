@@ -26,7 +26,7 @@
 // Unelevated:
 //   7. Creating a version 2 KEK is refused (KEK_ACCESS_DENIED).
 #include "hkdfguard.h"
-#include "errors.h"
+#include "hkdf_errors.h"
 #include "kek_v2.h"
 #include "policy.h"
 #include "sp800_108.h"
@@ -130,7 +130,8 @@ std::wstring KeyDaclSddl(LPCWSTR provider_name, const std::wstring& name) {
     if (NCryptOpenStorageProvider(&provider, provider_name, 0) == ERROR_SUCCESS &&
         NCryptOpenKey(provider, &key, name.c_str(), 0, NCRYPT_MACHINE_KEY_FLAG | NCRYPT_SILENT_FLAG) == ERROR_SUCCESS) {
         DWORD size = 0;
-        NCryptGetProperty(key, NCRYPT_SECURITY_DESCR_PROPERTY, nullptr, 0, &size, DACL_SECURITY_INFORMATION);
+        // Size query: a failure leaves size 0, which the check below handles.
+        (void)NCryptGetProperty(key, NCRYPT_SECURITY_DESCR_PROPERTY, nullptr, 0, &size, DACL_SECURITY_INFORMATION);
         std::vector<BYTE> sd(size);
         if (size != 0 && NCryptGetProperty(key, NCRYPT_SECURITY_DESCR_PROPERTY, sd.data(), size, &size,
                                            DACL_SECURITY_INFORMATION) == ERROR_SUCCESS) {
@@ -265,7 +266,7 @@ void RoundTrip(const char* service, uint8_t expected_provider, const std::string
     Check(std::memcmp(fp1, fp2, 32) == 0, label + ": the fingerprint is stable");
 
     std::vector<uint8_t> dek(HKDFGUARD_DEK_LEN);
-    BCryptGenRandom(nullptr, dek.data(), static_cast<ULONG>(dek.size()), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    FillRandom(dek.data(), dek.size());
     std::vector<uint8_t> wrapped(HKDFGUARD_WRAPPED_MAX_LEN), again(HKDFGUARD_WRAPPED_MAX_LEN);
     int len = HKDFGUARD_WRAPPED_MAX_LEN;
     int rc = hkdfguard_wrap_dek(service, dek.data(), HKDFGUARD_DEK_LEN, wrapped.data(), &len);

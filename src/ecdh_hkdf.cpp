@@ -1,5 +1,5 @@
 #include "ecdh_hkdf.h"
-#include "errors.h"
+#include "hkdf_errors.h"
 #include "hash_to_curve.h" // PayloadEcdhPoint - H(salt)
 #include <windows.h>
 #include <bcrypt.h>
@@ -213,7 +213,7 @@ namespace hkdfguard {
         }
     } // namespace
 
-#if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
+#ifdef HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE
     namespace {
         // See SetTestEcdhProviderFault in ecdh_hkdf.h. Off by default, so a
         // test binary that never sets it behaves exactly like the DLL.
@@ -228,7 +228,7 @@ namespace hkdfguard {
     bool IsValidP256Point(const uint8_t pub[kPublicPointLen]) {
         ScopedBCryptAlg ecdh_alg;
         NTSTATUS status = BCryptOpenAlgorithmProvider(ecdh_alg.put(), BCRYPT_ECDH_P256_ALGORITHM, nullptr, 0);
-#if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
+#ifdef HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE
         if (g_testEcdhProviderFault) {
             // As if the open had failed. The real handle (if any) is
             // released by ecdh_alg's destructor as usual.
