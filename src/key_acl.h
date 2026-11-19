@@ -30,6 +30,16 @@ namespace hkdfguard {
     bool IsHostLocalAccountDomain(
         const std::wstring& domain);
 
+    // Whether `sid` is a principal that must never be granted key use or
+    // key-file read access: one that is effectively "everybody" on this host
+    // (Everyone, Authenticated Users, BUILTIN\Users, Local account, the
+    // logon-type and authentication-package groups, NT SERVICE\ALL SERVICES,
+    // IIS's shared identities, ...) or a domain's "Domain Users"/"None"
+    // group. key_acl.cpp holds the full list. Throws HkdfGuardError
+    // (HKDFGUARD_ERR_PROVIDER_ERROR) only if a built-in SID can't be built.
+    bool IsOverBroadSid(
+        PSID sid);
+
     // Resolves and vets every key-use principal in `groups` (as read from
     // machine policy by policy.h's LoadKeyUseGroupsPolicy: group names or
     // "S-1-..." SID strings) without touching any key. Each must resolve,

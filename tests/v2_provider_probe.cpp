@@ -31,6 +31,9 @@
 //      medium integrity), must open and use both - with the same output -
 //      and be refused export, making them exportable, widening their DACL
 //      and deleting them.
+
+#include "test_support.h" // IsElevated
+
 #include <windows.h>
 #include <bcrypt.h>
 #include <ncrypt.h>
@@ -89,20 +92,18 @@ Bytes FromHex(const std::wstring& hex) {
     return out;
 }
 
-bool IsElevated() {
-    TOKEN_ELEVATION elevation{};
-    DWORD size = 0;
-    return GetTokenInformation(GetCurrentProcessToken(), TokenElevation, &elevation, sizeof(elevation), &size) &&
-           elevation.TokenIsElevated != 0;
-}
-
 class Provider {
 public:
+    Provider() = default;
+    Provider(const Provider&) = delete;
+    Provider& operator=(const Provider&) = delete;
+    Provider(Provider&&) = delete;
+    Provider& operator=(Provider&&) = delete;
     ~Provider() {
         if (handle_ != 0) NCryptFreeObject(handle_);
     }
     SECURITY_STATUS Open(LPCWSTR name) { return NCryptOpenStorageProvider(&handle_, name, 0); }
-    NCRYPT_PROV_HANDLE get() const { return handle_; }
+    [[nodiscard]] NCRYPT_PROV_HANDLE get() const { return handle_; }
 
 private:
     NCRYPT_PROV_HANDLE handle_ = 0;
@@ -113,6 +114,8 @@ public:
     Key() = default;
     Key(const Key&) = delete;
     Key& operator=(const Key&) = delete;
+    Key(Key&&) = delete;
+    Key& operator=(Key&&) = delete;
     ~Key() { reset(); }
     void reset() {
         if (handle_ != 0) NCryptFreeObject(handle_);
@@ -122,7 +125,7 @@ public:
         reset();
         return &handle_;
     }
-    NCRYPT_KEY_HANDLE get() const { return handle_; }
+    [[nodiscard]] NCRYPT_KEY_HANDLE get() const { return handle_; }
     // NCryptDeleteKey frees the handle even when it fails.
     SECURITY_STATUS Delete(DWORD flags = 0) {
         const SECURITY_STATUS status = NCryptDeleteKey(handle_, flags);
@@ -680,7 +683,7 @@ void MachineScope() {
 
 }  // namespace
 
-int wmain(int argc, wchar_t** argv) {
+int wmain(int argc, wchar_t** argv) {  // NOLINT(misc-use-internal-linkage): process entry point
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     if (argc == 4 && std::wcscmp(argv[1], L"--machine-use") == 0) {
         // The unelevated copy MachineScope starts; its exit code is its result.

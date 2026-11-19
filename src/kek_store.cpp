@@ -1,5 +1,5 @@
 #include "kek_store.h"
-#include "errors.h"
+#include "hkdf_errors.h"
 #include "event_log.h"
 #include <optional>
 #include <string>
@@ -8,7 +8,7 @@
 
 namespace hkdfguard {
     namespace {
-#if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
+#ifdef HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE
         // See SetTestTpmProviderNameOverride in kek_store.h. Empty by
         // default, so a test binary that never sets it behaves exactly like
         // the DLL.
@@ -24,7 +24,7 @@ namespace hkdfguard {
         // this machine" paths deterministically on hardware that has one.
         LPCWSTR TpmProviderName()
         {
-#if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
+#ifdef HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE
             if (g_testTpmProviderNameOverride.has_value())
             {
                 return g_testTpmProviderNameOverride->c_str();
@@ -39,7 +39,7 @@ namespace hkdfguard {
         // them.
         SECURITY_STATUS ApplyTestTpmOpenStatus(LPCWSTR providerName, SECURITY_STATUS actual)
         {
-#if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
+#ifdef HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE
             if (g_testTpmFaults.openKeyStatus.has_value() &&
                 wcscmp(providerName, TpmProviderName()) == 0)
             {
@@ -52,7 +52,7 @@ namespace hkdfguard {
 
         bool TestTpmVerificationFails(uint8_t providerType)
         {
-#if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
+#ifdef HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE
             return g_testTpmFaults.failVerification && providerType == kProviderTypeTpm;
 #else
             (void)providerType;
@@ -202,6 +202,75 @@ namespace hkdfguard {
                 genericMessage);
         }
 
+        // Opens `providerName`, throwing ThrowProviderOpenFailure's error if
+        // it can't be.
+        void OpenStorageProvider(
+            LPCWSTR providerName,
+            ScopedNCryptProv& provider)
+        {
+            if (NCryptOpenStorageProvider(provider.put(), providerName, 0) != ERROR_SUCCESS)
+            {
+                ThrowProviderOpenFailure();
+            }
+        }
+
+        // Opens the machine-scoped key `name` on `provider`; the
+        // NCryptOpenKey status, for the caller to judge.
+        //
+        // NCRYPT_MACHINE_KEY_FLAG matches creation (see CreateKekOnProvider)
+        // and is what lets an account other than the creating one find the
+        // key: without it NCrypt searches the caller's per-user store and
+        // fails with NTE_BAD_KEYSET regardless of privileges.
+        // NCRYPT_SILENT_FLAG: fail instead of showing UI (or blocking waiting
+        // for it) if the key carries a UI-requiring protection policy.
+        // Empirically accepted (not NTE_BAD_FLAGS) by NCryptOpenKey.
+        SECURITY_STATUS OpenMachineKey(
+            NCRYPT_PROV_HANDLE provider,
+            const std::wstring& name,
+            ScopedNCryptKey& key)
+        {
+            return NCryptOpenKey(
+                provider,
+                key.put(),
+                name.c_str(),
+                0,
+                NCRYPT_MACHINE_KEY_FLAG | NCRYPT_SILENT_FLAG);
+        }
+
+        // Reads a DWORD property of a key or provider handle; the
+        // NCryptGetProperty status, for the caller to judge.
+        SECURITY_STATUS GetDwordProperty(
+            NCRYPT_HANDLE object,
+            LPCWSTR property,
+            DWORD& value)
+        {
+            DWORD cbResult = 0;
+            return NCryptGetProperty(
+                object,
+                property,
+                reinterpret_cast<PBYTE>(&value),
+                sizeof(value),
+                &cbResult,
+                0);
+        }
+
+        // GetDwordProperty, throwing HKDFGUARD_ERR_PROVIDER_ERROR
+        // (`failureMessage`) if the property can't be read.
+        DWORD RequireDwordProperty(
+            NCRYPT_HANDLE object,
+            LPCWSTR property,
+            const char* failureMessage)
+        {
+            DWORD value = 0;
+            if (GetDwordProperty(object, property, value) != ERROR_SUCCESS)
+            {
+                throw HkdfGuardError(
+                    HKDFGUARD_ERR_PROVIDER_ERROR,
+                    failureMessage);
+            }
+            return value;
+        }
+
         // Verifies the key is an ECDH key. Checks NCRYPT_ALGORITHM_GROUP_PROPERTY
         // ("Algorithm Group", e.g. "ECDH") rather than NCRYPT_ALGORITHM_PROPERTY
         // ("Algorithm Name", the curve-qualified AlgId passed to
@@ -249,24 +318,8 @@ namespace hkdfguard {
         void VerifyKeyLength(
             NCRYPT_KEY_HANDLE key)
         {
-            DWORD length = 0;
-            DWORD cbResult = 0;
-
-            SECURITY_STATUS status =
-                NCryptGetProperty(
-                    key,
-                    NCRYPT_LENGTH_PROPERTY,
-                    reinterpret_cast<PBYTE>(&length),
-                    sizeof(length),
-                    &cbResult,
-                    0);
-
-            if (status != ERROR_SUCCESS)
-            {
-                throw HkdfGuardError(
-                    HKDFGUARD_ERR_PROVIDER_ERROR,
-                    "cannot query key length");
-            }
+            const DWORD length =
+                RequireDwordProperty(key, NCRYPT_LENGTH_PROPERTY, "cannot query key length");
 
             if (length != 256)
             {
@@ -377,24 +430,8 @@ namespace hkdfguard {
         void VerifyUsage(
             NCRYPT_KEY_HANDLE key)
         {
-            DWORD usage = 0;
-            DWORD cbResult = 0;
-
-            SECURITY_STATUS status =
-                NCryptGetProperty(
-                    key,
-                    NCRYPT_KEY_USAGE_PROPERTY,
-                    reinterpret_cast<PBYTE>(&usage),
-                    sizeof(usage),
-                    &cbResult,
-                    0);
-
-            if (status != ERROR_SUCCESS)
-            {
-                throw HkdfGuardError(
-                    HKDFGUARD_ERR_PROVIDER_ERROR,
-                    "cannot query key usage");
-            }
+            const DWORD usage =
+                RequireDwordProperty(key, NCRYPT_KEY_USAGE_PROPERTY, "cannot query key usage");
 
             if ((usage &
                  (NCRYPT_ALLOW_KEY_AGREEMENT_FLAG | NCRYPT_ALLOW_DECRYPT_FLAG)) == 0)
@@ -409,24 +446,8 @@ namespace hkdfguard {
         void VerifyExportPolicy(
             NCRYPT_KEY_HANDLE key)
         {
-            DWORD policy = 0;
-            DWORD cbResult = 0;
-
-            SECURITY_STATUS status =
-                NCryptGetProperty(
-                    key,
-                    NCRYPT_EXPORT_POLICY_PROPERTY,
-                    reinterpret_cast<PBYTE>(&policy),
-                    sizeof(policy),
-                    &cbResult,
-                    0);
-
-            if (status != ERROR_SUCCESS)
-            {
-                throw HkdfGuardError(
-                    HKDFGUARD_ERR_PROVIDER_ERROR,
-                    "cannot query export policy");
-            }
+            const DWORD policy =
+                RequireDwordProperty(key, NCRYPT_EXPORT_POLICY_PROPERTY, "cannot query export policy");
 
             if (policy &
                 (NCRYPT_ALLOW_EXPORT_FLAG |
@@ -454,27 +475,13 @@ namespace hkdfguard {
             NCRYPT_PROV_HANDLE provider)
         {
             DWORD implType = 0;
-            DWORD cbResult = 0;
 
             SECURITY_STATUS status =
-                NCryptGetProperty(
-                    key,
-                    NCRYPT_IMPL_TYPE_PROPERTY,
-                    reinterpret_cast<PBYTE>(&implType),
-                    sizeof(implType),
-                    &cbResult,
-                    0);
+                GetDwordProperty(key, NCRYPT_IMPL_TYPE_PROPERTY, implType);
 
             if (status == NTE_NOT_SUPPORTED)
             {
-                status =
-                    NCryptGetProperty(
-                        provider,
-                        NCRYPT_IMPL_TYPE_PROPERTY,
-                        reinterpret_cast<PBYTE>(&implType),
-                        sizeof(implType),
-                        &cbResult,
-                        0);
+                status = GetDwordProperty(provider, NCRYPT_IMPL_TYPE_PROPERTY, implType);
             }
 
             if (status != ERROR_SUCCESS)
@@ -559,33 +566,11 @@ namespace hkdfguard {
             result.provider_type = provider_type;
             result.key_id = key_id;
 
-            SECURITY_STATUS status =
-                NCryptOpenStorageProvider(
-                    result.provider.put(),
-                    provider_name,
-                    0);
+            OpenStorageProvider(provider_name, result.provider);
 
-            if (status != ERROR_SUCCESS)
-            {
-                ThrowProviderOpenFailure();
-            }
-
-            std::wstring name =
-                KeyName(service, key_id);
-
-            status =
-                NCryptOpenKey(
-                    result.provider.get(),
-                    result.key.put(),
-                    name.c_str(),
-                    0,
-                    // NCRYPT_SILENT_FLAG: fail instead of showing UI (or
-                    // blocking waiting for it) if the key carries a
-                    // UI-requiring protection policy. Empirically accepted
-                    // (not NTE_BAD_FLAGS) by NCryptOpenKey.
-                    NCRYPT_MACHINE_KEY_FLAG | NCRYPT_SILENT_FLAG);
-
-            status = ApplyTestTpmOpenStatus(provider_name, status);
+            const SECURITY_STATUS status = ApplyTestTpmOpenStatus(
+                provider_name,
+                OpenMachineKey(result.provider.get(), KeyName(service, key_id), result.key));
 
             if (status != ERROR_SUCCESS)
             {
@@ -613,33 +598,12 @@ namespace hkdfguard {
             uint32_t key_id)
         {
             ScopedNCryptProv provider;
-
-            SECURITY_STATUS status =
-                NCryptOpenStorageProvider(
-                    provider.put(),
-                    providerName,
-                    0);
-
-            if (status != ERROR_SUCCESS)
-            {
-                ThrowProviderOpenFailure();
-            }
-
-            std::wstring name =
-                KeyName(service, key_id);
+            OpenStorageProvider(providerName, provider);
 
             ScopedNCryptKey key;
-
-            status =
-                NCryptOpenKey(
-                    provider.get(),
-                    key.put(),
-                    name.c_str(),
-                    0,
-                    // NCRYPT_SILENT_FLAG: see OpenKekOnProvider.
-                    NCRYPT_MACHINE_KEY_FLAG | NCRYPT_SILENT_FLAG);
-
-            status = ApplyTestTpmOpenStatus(providerName, status);
+            const SECURITY_STATUS status = ApplyTestTpmOpenStatus(
+                providerName,
+                OpenMachineKey(provider.get(), KeyName(service, key_id), key));
 
             if (status == ERROR_SUCCESS)
             {
@@ -672,39 +636,22 @@ namespace hkdfguard {
             //
 
             ScopedNCryptProv provider;
-
-            SECURITY_STATUS status =
-                NCryptOpenStorageProvider(
-                    provider.put(),
-                    providerName,
-                    0);
-
-            if (status != ERROR_SUCCESS)
-            {
-                ThrowProviderOpenFailure();
-            }
+            OpenStorageProvider(providerName, provider);
 
             //
             // Open existing key.
             //
 
-            std::wstring name =
+            const std::wstring name =
                 KeyName(
                     service,
                     kCurrentKeyId);
 
             ScopedNCryptKey key;
 
-            status =
-                NCryptOpenKey(
-                    provider.get(),
-                    key.put(),
-                    name.c_str(),
-                    0,
-                    // NCRYPT_SILENT_FLAG: see OpenKekOnProvider.
-                    NCRYPT_MACHINE_KEY_FLAG | NCRYPT_SILENT_FLAG);
-
-            status = ApplyTestTpmOpenStatus(providerName, status);
+            SECURITY_STATUS status = ApplyTestTpmOpenStatus(
+                providerName,
+                OpenMachineKey(provider.get(), name, key));
 
             if (status == ERROR_SUCCESS)
             {
@@ -753,7 +700,7 @@ namespace hkdfguard {
                     NCRYPT_ECDH_P256_ALGORITHM,
                     name.c_str(),
                     0,
-                    // NCRYPT_SILENT_FLAG: see OpenKekOnProvider. Empirically
+                    // NCRYPT_SILENT_FLAG: see OpenMachineKey. Empirically
                     // accepted by NCryptCreatePersistedKey too.
                     NCRYPT_MACHINE_KEY_FLAG | NCRYPT_SILENT_FLAG);
 
@@ -800,7 +747,7 @@ namespace hkdfguard {
             // The security guarantee comes from VerifyKeyProperties below:
             // VerifyUsage re-reads the key's actual usage after
             // NCryptFinalizeKey and fails closed if neither flag is set.
-            NCryptSetProperty(
+            (void)NCryptSetProperty(
                 key.get(),
                 NCRYPT_KEY_USAGE_PROPERTY,
                 reinterpret_cast<PBYTE>(&keyUsage),
@@ -835,7 +782,7 @@ namespace hkdfguard {
             status =
                 NCryptFinalizeKey(
                     key.get(),
-                    // NCRYPT_SILENT_FLAG: see OpenKekOnProvider. Empirically
+                    // NCRYPT_SILENT_FLAG: see OpenMachineKey. Empirically
                     // accepted by NCryptFinalizeKey.
                     NCRYPT_SILENT_FLAG);
 
@@ -882,14 +829,7 @@ namespace hkdfguard {
                 // The Software KSP is accurate either way.
                 ScopedNCryptKey verifyKey;
 
-                status =
-                    NCryptOpenKey(
-                        provider.get(),
-                        verifyKey.put(),
-                        name.c_str(),
-                        0,
-                        // NCRYPT_SILENT_FLAG: see OpenKekOnProvider.
-                        NCRYPT_MACHINE_KEY_FLAG | NCRYPT_SILENT_FLAG);
+                status = OpenMachineKey(provider.get(), name, verifyKey);
 
                 if (status != ERROR_SUCCESS)
                 {
@@ -996,7 +936,7 @@ namespace hkdfguard {
             "invalid key storage policy");
     }
 
-#if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
+#ifdef HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE
     void SetTestTpmProviderNameOverride(std::optional<std::wstring> providerName)
     {
         g_testTpmProviderNameOverride = std::move(providerName);
@@ -1211,23 +1151,13 @@ namespace hkdfguard {
         result.provider_type = provider_type;
         result.key_id = key_id;
 
-        SECURITY_STATUS status = NCryptOpenStorageProvider(result.provider.put(), ProviderName(provider_type), 0);
-        if (status != ERROR_SUCCESS) {
-            throw HkdfGuardError(HKDFGUARD_ERR_PROVIDER_ERROR, "NCryptOpenStorageProvider failed");
-        }
+        OpenStorageProvider(ProviderName(provider_type), result.provider);
 
         // Only ever opens: any NCryptOpenKey failure (including "doesn't
         // exist") is final. Unwrap must never create a KEK, since a new key
         // could never decrypt a payload wrapped under the original one.
-        // NCRYPT_MACHINE_KEY_FLAG matches creation (see CreateKekOnProvider)
-        // and is what lets an account other than the wrapping one find the
-        // key: without it NCrypt searches the caller's per-user store and
-        // fails with NTE_BAD_KEYSET regardless of privileges.
-        std::wstring name = KeyName(service, key_id);
-        // NCRYPT_SILENT_FLAG: see OpenKekOnProvider.
-        status = NCryptOpenKey(
-            result.provider.get(), result.key.put(), name.c_str(), 0,
-            NCRYPT_MACHINE_KEY_FLAG | NCRYPT_SILENT_FLAG);
+        const SECURITY_STATUS status =
+            OpenMachineKey(result.provider.get(), KeyName(service, key_id), result.key);
         if (status != ERROR_SUCCESS) {
             ThrowForNCryptFailure(status, "NCryptOpenKey failed");
         }
@@ -1254,18 +1184,12 @@ namespace hkdfguard {
 
     void DeleteKek(const std::wstring &service, uint8_t provider_type, uint32_t key_id) {
         ScopedNCryptProv provider;
-        SECURITY_STATUS status = NCryptOpenStorageProvider(provider.put(), ProviderName(provider_type), 0);
-        if (status != ERROR_SUCCESS) {
-            throw HkdfGuardError(HKDFGUARD_ERR_PROVIDER_ERROR, "NCryptOpenStorageProvider failed");
-        }
+        OpenStorageProvider(ProviderName(provider_type), provider);
 
-        std::wstring name = KeyName(service, key_id);
+        // Machine-scoped like every KEK; silent, so test cleanup cannot
+        // block on a UI prompt (see OpenMachineKey).
         ScopedNCryptKey key;
-        // Machine-scoped like every KEK (see OpenKekForUnwrap);
-        // NCRYPT_SILENT_FLAG so test cleanup cannot block on a UI prompt.
-        status = NCryptOpenKey(
-            provider.get(), key.put(), name.c_str(), 0,
-            NCRYPT_MACHINE_KEY_FLAG | NCRYPT_SILENT_FLAG);
+        SECURITY_STATUS status = OpenMachineKey(provider.get(), KeyName(service, key_id), key);
         if (status != ERROR_SUCCESS) {
             throw HkdfGuardError(HKDFGUARD_ERR_PROVIDER_ERROR, "NCryptOpenKey failed");
         }

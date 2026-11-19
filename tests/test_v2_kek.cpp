@@ -26,11 +26,12 @@
 // Unelevated:
 //   7. Creating a version 2 KEK is refused (KEK_ACCESS_DENIED).
 #include "hkdfguard.h"
-#include "errors.h"
+#include "hkdf_errors.h"
 #include "kek_v2.h"
 #include "policy.h"
 #include "sp800_108.h"
 #include "wire_format.h"
+#include "test_support.h" // IsElevated, ScopedMachinePolicyDword
 
 #include <windows.h>
 #include <bcrypt.h>
@@ -103,13 +104,6 @@ std::string ToHex(const uint8_t* p, size_t n) {
     return s;
 }
 
-bool IsElevated() {
-    TOKEN_ELEVATION elevation{};
-    DWORD size = 0;
-    return GetTokenInformation(GetCurrentProcessToken(), TokenElevation, &elevation, sizeof(elevation), &size) &&
-           elevation.TokenIsElevated != 0;
-}
-
 // Whether the Platform Crypto Provider is here and offers HMAC-SHA-256 keys.
 bool HasTpm() {
     NCRYPT_PROV_HANDLE provider = 0;
@@ -120,54 +114,6 @@ bool HasTpm() {
     NCryptFreeObject(provider);
     return supported;
 }
-
-// Sets a REG_DWORD under HKLM\Software\Policies\HkdfGuard for as long as the
-// object lives, then puts back whatever was there - as test_roundtrip's
-// helper of the same name. Needs elevation; active() says whether it took.
-class ScopedMachinePolicyDword {
-public:
-    ScopedMachinePolicyDword(const wchar_t* name, DWORD value) : name_(name) {
-        if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, L"Software\\Policies\\HkdfGuard", 0, nullptr, 0,
-                            KEY_QUERY_VALUE | KEY_SET_VALUE | KEY_WOW64_64KEY, nullptr, &key_, nullptr) != ERROR_SUCCESS) {
-            key_ = nullptr;
-            return;
-        }
-        DWORD size = 0;
-        if (RegQueryValueExW(key_, name_, nullptr, &old_type_, nullptr, &size) == ERROR_SUCCESS) {
-            old_.resize(size);
-            had_old_ = RegQueryValueExW(key_, name_, nullptr, &old_type_, old_.data(), &size) == ERROR_SUCCESS;
-        }
-        active_ = RegSetValueExW(key_, name_, 0, REG_DWORD, reinterpret_cast<const BYTE*>(&value), sizeof(value)) ==
-                  ERROR_SUCCESS;
-    }
-    ~ScopedMachinePolicyDword() { restore(); }
-    ScopedMachinePolicyDword(const ScopedMachinePolicyDword&) = delete;
-    ScopedMachinePolicyDword& operator=(const ScopedMachinePolicyDword&) = delete;
-
-    bool active() const { return active_; }
-
-    void restore() {
-        if (key_ == nullptr) return;
-        if (active_) {
-            if (had_old_) {
-                RegSetValueExW(key_, name_, 0, old_type_, old_.data(), static_cast<DWORD>(old_.size()));
-            } else {
-                RegDeleteValueW(key_, name_);
-            }
-        }
-        RegCloseKey(key_);
-        key_ = nullptr;
-        active_ = false;
-    }
-
-private:
-    const wchar_t* name_;
-    HKEY key_ = nullptr;
-    bool active_ = false;
-    bool had_old_ = false;
-    DWORD old_type_ = 0;
-    std::vector<BYTE> old_;
-};
 
 std::vector<uint8_t> BcryptHmac(const std::vector<uint8_t>& key, const std::vector<uint8_t>& data) {
     std::vector<uint8_t> out(32);
@@ -184,7 +130,8 @@ std::wstring KeyDaclSddl(LPCWSTR provider_name, const std::wstring& name) {
     if (NCryptOpenStorageProvider(&provider, provider_name, 0) == ERROR_SUCCESS &&
         NCryptOpenKey(provider, &key, name.c_str(), 0, NCRYPT_MACHINE_KEY_FLAG | NCRYPT_SILENT_FLAG) == ERROR_SUCCESS) {
         DWORD size = 0;
-        NCryptGetProperty(key, NCRYPT_SECURITY_DESCR_PROPERTY, nullptr, 0, &size, DACL_SECURITY_INFORMATION);
+        // Size query: a failure leaves size 0, which the check below handles.
+        (void)NCryptGetProperty(key, NCRYPT_SECURITY_DESCR_PROPERTY, nullptr, 0, &size, DACL_SECURITY_INFORMATION);
         std::vector<BYTE> sd(size);
         if (size != 0 && NCryptGetProperty(key, NCRYPT_SECURITY_DESCR_PROPERTY, sd.data(), size, &size,
                                            DACL_SECURITY_INFORMATION) == ERROR_SUCCESS) {
@@ -319,7 +266,7 @@ void RoundTrip(const char* service, uint8_t expected_provider, const std::string
     Check(std::memcmp(fp1, fp2, 32) == 0, label + ": the fingerprint is stable");
 
     std::vector<uint8_t> dek(HKDFGUARD_DEK_LEN);
-    BCryptGenRandom(nullptr, dek.data(), static_cast<ULONG>(dek.size()), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    FillRandom(dek.data(), dek.size());
     std::vector<uint8_t> wrapped(HKDFGUARD_WRAPPED_MAX_LEN), again(HKDFGUARD_WRAPPED_MAX_LEN);
     int len = HKDFGUARD_WRAPPED_MAX_LEN;
     int rc = hkdfguard_wrap_dek(service, dek.data(), HKDFGUARD_DEK_LEN, wrapped.data(), &len);

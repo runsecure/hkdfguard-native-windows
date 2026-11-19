@@ -56,7 +56,7 @@ namespace hkdfguard {
     // only if the provider itself can't be opened.
     bool IsValidP256Point(const uint8_t pub[kPublicPointLen]);
 
-#if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
+#ifdef HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE
     // Test-only fault injection: while set, IsValidP256Point acts as if the
     // software ECDH provider could not be opened (BCryptOpenAlgorithmProvider
     // failing), so the resulting HKDFGUARD_ERR_CRYPTO_ERROR path of

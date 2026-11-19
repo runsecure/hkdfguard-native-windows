@@ -1,12 +1,12 @@
 #include "process_hardening.h"
 #include "../include/hkdfguard.h"
-#include "errors.h"
+#include "hkdf_errors.h"
 
-#include <windows.h>
 #include <aclapi.h>   // SetSecurityInfo
 #include <sddl.h>     // ConvertStringSecurityDescriptorToSecurityDescriptorW, ConvertSidToStringSidW
 #include <tlhelp32.h> // CreateToolhelp32Snapshot - enumerating this process's threads
 #include <werapi.h>   // WerSetFlags
+#include <windows.h>
 
 #include <string>
 #include <vector>
@@ -30,9 +30,12 @@ namespace hkdfguard {
             ~LocalSecurityDescriptor() { LocalFree(sd_); }
             LocalSecurityDescriptor(const LocalSecurityDescriptor &) = delete;
             LocalSecurityDescriptor &operator=(const LocalSecurityDescriptor &) = delete;
+            LocalSecurityDescriptor(LocalSecurityDescriptor &&) = delete;
+            LocalSecurityDescriptor &operator=(LocalSecurityDescriptor &&) = delete;
 
-            PACL Dacl() const {
-                BOOL present = FALSE, defaulted = FALSE;
+            [[nodiscard]] PACL Dacl() const {
+                BOOL present = FALSE;
+                BOOL defaulted = FALSE;
                 PACL dacl = nullptr;
                 if (!GetSecurityDescriptorDacl(sd_, &present, &dacl, &defaulted) || !present || dacl == nullptr) {
                     Fail("security descriptor has no DACL");

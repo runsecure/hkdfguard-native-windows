@@ -1,5 +1,5 @@
 #include "hash_to_curve.h"
-#include "errors.h"
+#include "hkdf_errors.h"
 
 #include <windows.h>
 #include <bcrypt.h>
@@ -23,7 +23,7 @@ namespace hkdfguard {
     namespace {
         // A field element mod p: little-endian 64-bit limbs, v[0] least significant.
         struct Fe {
-            uint64_t v[4];
+            uint64_t v[4] = {};
         };
 
         // p = 2^256 - 2^224 + 2^192 + 2^96 - 1
@@ -230,7 +230,7 @@ namespace hkdfguard {
                 input.push_back(i);
                 input.insert(input.end(), dst_prime.begin(), dst_prime.end());
                 Sha256(input, b_prev);
-                memcpy(out + (i - 1) * 32, b_prev, 32);
+                memcpy(out + static_cast<size_t>(i - 1) * 32, b_prev, 32);
             }
         }
 

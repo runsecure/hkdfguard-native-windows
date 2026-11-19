@@ -29,6 +29,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <string>
 
 namespace {
@@ -50,7 +51,7 @@ constexpr int kSkip = 77;
 
 HANDLE g_release = nullptr; // set by the child when its stdin closes; ends the threads below
 
-DWORD WINAPI Park(LPVOID) {
+DWORD WINAPI Park(LPVOID /*unused*/) {
     WaitForSingleObject(g_release, INFINITE);
     return 0;
 }
@@ -381,7 +382,7 @@ void RunChildAndProbe(bool strict) {
     }
 
     unsigned long mainTid = 0, workerTid = 0, lateTid = 0, midTid = 0;
-    bool ready = std::sscanf(line.c_str(), "READY %lu %lu %lu %lu", &mainTid, &workerTid, &lateTid, &midTid) == 4;
+    bool ready = sscanf_s(line.c_str(), "READY %lu %lu %lu %lu", &mainTid, &workerTid, &lateTid, &midTid) == 4;
     Check(ready, ("child refused unknown flags, hardened itself repeatedly, has WER NOHEAP set and still works (\"" +
                   line + "\")").c_str());
     if (ready) {
@@ -418,9 +419,7 @@ int RunParent() {
     return g_failures == 0 ? 0 : 1;
 }
 
-} // namespace
-
-int main(int argc, char **argv) {
+int Run(int argc, char **argv) {
     if (argc == 2 && std::strcmp(argv[1], "child") == 0) {
         return RunChild(false);
     }
@@ -428,4 +427,18 @@ int main(int argc, char **argv) {
         return RunChild(true);
     }
     return RunParent();
+}
+
+} // namespace
+
+int main(int argc, char **argv) {
+    try {
+        return Run(argc, argv);
+    } catch (const std::exception &e) {
+        std::fprintf(stderr, "unhandled exception: %s\n", e.what());
+        return 1;
+    } catch (...) {
+        std::fprintf(stderr, "unhandled exception\n");
+        return 1;
+    }
 }

@@ -1,3 +1,10 @@
+# The tests compile copies of src/ files that HkdfGuard.dll's build already
+# runs clang-tidy on (HKDFGUARD_CLANG_TIDY); linting each copy again would
+# only repeat the same findings. Source properties are per directory, so
+# this affects only the targets defined here.
+file(GLOB HKDFGUARD_SRC_COPIES ${CMAKE_CURRENT_SOURCE_DIR}/../src/*.cpp)
+set_source_files_properties(${HKDFGUARD_SRC_COPIES} PROPERTIES SKIP_LINTING ON)
+
 # test_roundtrip exercises the public DLL ABI (HkdfGuard.dll) for wrap/unwrap,
 # and also compiles some of src/ directly so it can call internal helpers
 # such as DeleteKek() to remove the KEKs it creates. Those sources are
@@ -32,6 +39,7 @@ target_include_directories(test_roundtrip PRIVATE
 # policy.cpp only. The DLL target never defines this macro, so the seam does
 # not exist in shipped code.
 target_compile_definitions(test_roundtrip PRIVATE HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
+hkdfguard_apply_warnings(test_roundtrip)
 
 add_test(NAME roundtrip COMMAND test_roundtrip)
 # HkdfGuard.dll's output directory goes on the front of PATH for each test
@@ -69,9 +77,7 @@ target_include_directories(test_v2_kek PRIVATE
 )
 target_compile_definitions(test_v2_kek PRIVATE HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE UNICODE _UNICODE)
 target_link_libraries(test_v2_kek PRIVATE hkdfguard ncrypt.lib bcrypt.lib advapi32.lib netapi32.lib ntdll.lib)
-if(MSVC)
-    target_compile_options(test_v2_kek PRIVATE /W4)
-endif()
+hkdfguard_apply_warnings(test_v2_kek)
 add_test(NAME v2_kek COMMAND test_v2_kek)
 set_tests_properties(v2_kek PROPERTIES
     ENVIRONMENT "PATH=$<TARGET_FILE_DIR:hkdfguard>\\;${HKDFGUARD_TEST_PATH}"
@@ -86,9 +92,7 @@ set_tests_properties(v2_kek PROPERTIES
 add_executable(v2_provider_probe v2_provider_probe.cpp)
 target_compile_definitions(v2_provider_probe PRIVATE UNICODE _UNICODE)
 target_link_libraries(v2_provider_probe PRIVATE ncrypt.lib bcrypt.lib advapi32.lib)
-if(MSVC)
-    target_compile_options(v2_provider_probe PRIVATE /W4)
-endif()
+hkdfguard_apply_warnings(v2_provider_probe)
 
 # The same parsers under libFuzzer and AddressSanitizer, built only on
 # request: cmake -DHKDFGUARD_BUILD_FUZZERS=ON. Registered as a short ctest
@@ -115,6 +119,7 @@ if(HKDFGUARD_BUILD_FUZZERS AND MSVC)
         target_compile_definitions(${name} PRIVATE UNICODE _UNICODE)
         target_compile_options(${name} PRIVATE /fsanitize=fuzzer /fsanitize=address /Zi)
         target_link_options(${name} PRIVATE /INCREMENTAL:NO)
+        hkdfguard_apply_warnings(${name})
         if(FUZZ_LIBS)
             target_link_libraries(${name} PRIVATE ${FUZZ_LIBS})
         endif()
@@ -135,6 +140,46 @@ if(HKDFGUARD_BUILD_FUZZERS AND MSVC)
     # The SP 800-108 framing's injectivity.
     hkdfguard_add_fuzzer(fuzz_v2_kdf 100000 1025
         SOURCES sp800_108.cpp)
+endif()
+
+# bench_hkdfguard: latency and throughput benchmarks, built only on request:
+# cmake -DHKDFGUARD_BUILD_BENCHMARKS=ON (use a Release build for real
+# numbers). It times the CPU-only internals through its own copy of src/,
+# hkdfguard_open_file, and - elevated - wrap/unwrap through HkdfGuard.dll for
+# payload versions 1 and 2 on the Software KSP and the TPM, using throwaway
+# KEKs it deletes afterwards. See the comment at the top of the .cpp for its
+# options. Built with the DLL's hardening flags so its copy of src/ costs
+# what the DLL's does. Registered as a ctest smoke run (--quick), which only
+# fails if an operation errors; timings are never a pass/fail criterion.
+option(HKDFGUARD_BUILD_BENCHMARKS "Build the bench_hkdfguard benchmark executable" OFF)
+if(HKDFGUARD_BUILD_BENCHMARKS)
+    add_executable(bench_hkdfguard
+        bench_hkdfguard.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/aes_gcm.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/ecdh_hkdf.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/event_log.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/hash_to_curve.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/kek_store.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/kek_v2.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/key_acl.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/policy.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/sp800_108.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/wire_format.cpp
+    )
+    target_include_directories(bench_hkdfguard PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../include
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src
+    )
+    target_compile_definitions(bench_hkdfguard PRIVATE UNICODE _UNICODE NOMINMAX)
+    target_link_libraries(bench_hkdfguard PRIVATE hkdfguard ncrypt.lib bcrypt.lib advapi32.lib netapi32.lib ntdll.lib)
+    hkdfguard_apply_hardening(bench_hkdfguard)
+    add_test(NAME bench_smoke COMMAND bench_hkdfguard --quick)
+    # Elevated, it sets machine policy values and creates KEKs, like
+    # roundtrip and v2_kek, so it shares their lock.
+    set_tests_properties(bench_smoke PROPERTIES
+        ENVIRONMENT "PATH=$<TARGET_FILE_DIR:hkdfguard>\\;${HKDFGUARD_TEST_PATH}"
+        RESOURCE_LOCK HkdfGuardMachineState
+    )
 endif()
 
 # test_cli.ps1 exercises hkdfguard.exe's argument parsing, validation and
@@ -174,6 +219,7 @@ set_tests_properties(cli_v2 PROPERTIES
 # so there is nothing to test.
 add_executable(test_harden_process test_harden_process.cpp)
 target_link_libraries(test_harden_process PRIVATE hkdfguard dbghelp.lib wer.lib)
+hkdfguard_apply_warnings(test_harden_process)
 add_test(NAME harden_process COMMAND test_harden_process)
 set_tests_properties(harden_process PROPERTIES
     ENVIRONMENT "PATH=$<TARGET_FILE_DIR:hkdfguard>\\;${HKDFGUARD_TEST_PATH}"
@@ -187,6 +233,7 @@ set_tests_properties(harden_process PROPERTIES
 # hkdfguard import library, like the CLI.
 add_executable(role_probe role_probe.cpp)
 target_link_libraries(role_probe PRIVATE hkdfguard bcrypt.lib)
+hkdfguard_apply_warnings(role_probe)
 add_test(
     NAME roles
     COMMAND powershell.exe -NoProfile -ExecutionPolicy Bypass
@@ -197,6 +244,10 @@ add_test(
 )
 set_tests_properties(roles PROPERTIES
     ENVIRONMENT "PATH=$<TARGET_FILE_DIR:hkdfguard>\\;${HKDFGUARD_TEST_PATH}"
+    # A backstop over test_roles.ps1's own per-process timeout: ctest has no
+    # default, and this test starts processes as other accounts, where a
+    # stuck one would otherwise hang the CI job until GitHub cancels it.
+    TIMEOUT 1200
 )
 
 # roundtrip, cli and roles each change machine-wide state while they run -

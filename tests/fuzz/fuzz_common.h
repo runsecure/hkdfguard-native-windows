@@ -9,7 +9,7 @@
 
 #define FUZZ_REQUIRE(condition, what)                                                   \
     do {                                                                                \
-        if (!(condition)) {                                                             \
+        if (!static_cast<bool>(condition)) {                                            \
             std::fprintf(stderr, "fuzz property violated: %s (%s:%d)\n", what, __FILE__, \
                          __LINE__);                                                     \
             std::abort();                                                               \

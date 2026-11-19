@@ -22,12 +22,18 @@ add_executable(hkdfguard-cli
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/event_log.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/wire_format.cpp
 )
+# The src/ files above are linted in HkdfGuard.dll's build (see
+# HKDFGUARD_CLANG_TIDY); this directory's copies need not be again.
+file(GLOB HKDFGUARD_SRC_COPIES ${CMAKE_CURRENT_SOURCE_DIR}/../src/*.cpp)
+set_source_files_properties(${HKDFGUARD_SRC_COPIES} PROPERTIES SKIP_LINTING ON)
 target_link_libraries(hkdfguard-cli PRIVATE hkdfguard bcrypt.lib ncrypt.lib advapi32.lib ntdll.lib
     netapi32.lib)
-# src/ for no_follow_open.h - header-only and exception-free, the path walk
-# that never follows a link, which the wrapped-key and --dek-file paths must
-# use exactly as hkdfguard_open_file does - and for the version 2 key code's
-# headers.
+# src/ for no_follow_open.h and dacl_walk.h - header-only and exception-free:
+# the path walk that never follows a link and the ACE walk behind every
+# owner/DACL trust check, which the wrapped-key and --dek-file paths must use
+# exactly as hkdfguard_open_file does - for key_acl.h, so --group refuses
+# exactly the over-broad and non-local groups the library refuses as
+# key-use groups, and for the version 2 key code's headers.
 target_include_directories(hkdfguard-cli PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 # The version 2 sources expect the wide (UTF-16) Windows APIs, as the DLL
 # builds them.

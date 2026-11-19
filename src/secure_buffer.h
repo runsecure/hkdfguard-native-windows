@@ -3,6 +3,7 @@
 #include <windows.h> // SecureZeroMemory
 #include <cstddef> // size_t
 #include <cstdint> // uint8_t
+#include <span>
 
 namespace hkdfguard {
     // A fixed-size, in-place N-byte buffer for key material or plaintext,
@@ -19,6 +20,11 @@ namespace hkdfguard {
 
         SecureBuffer &operator=(const SecureBuffer &) = delete;
 
+        // Not movable either: moving an in-place buffer is a copy.
+        SecureBuffer(SecureBuffer &&) = delete;
+
+        SecureBuffer &operator=(SecureBuffer &&) = delete;
+
         // SecureZeroMemory rather than memset: the optimizer may remove a
         // memset of memory that is never read again as a dead store, but
         // never removes SecureZeroMemory.
@@ -28,9 +34,13 @@ namespace hkdfguard {
 
         // Raw pointers, as CNG takes buffers (PUCHAR + length).
         uint8_t *data() { return data_; }
-        const uint8_t *data() const { return data_; }
+        [[nodiscard]] const uint8_t *data() const { return data_; }
 
-        constexpr size_t size() const { return N; }
+        [[nodiscard]] constexpr size_t size() const { return N; }
+
+        // Fixed-extent views, for APIs that take std::span.
+        std::span<uint8_t, N> span() noexcept { return std::span<uint8_t, N>(data_); }
+        [[nodiscard]] std::span<const uint8_t, N> span() const noexcept { return std::span<const uint8_t, N>(data_); }
 
     private:
         uint8_t data_[N] = {}; // zero from construction
@@ -56,6 +66,8 @@ namespace hkdfguard {
         ScopedSecureZero(void *p, size_t len) noexcept : p_(p), len_(len) {}
         ScopedSecureZero(const ScopedSecureZero &) = delete;
         ScopedSecureZero &operator=(const ScopedSecureZero &) = delete;
+        ScopedSecureZero(ScopedSecureZero &&) = delete;
+        ScopedSecureZero &operator=(ScopedSecureZero &&) = delete;
         ~ScopedSecureZero() { SecureZero(p_, len_); }
 
     private:

@@ -8,9 +8,10 @@
 #include "ecdh_hkdf.h"  // IsValidP256Point, DeriveWrappingKey - the point gate and the derivation, tested directly below
 #include "hash_to_curve.h" // HashToCurveP256, PayloadEcdhPoint - checked against RFC 9380's vectors below
 #include "key_file.h"   // ReadWrappedKeyFile - hkdfguard_open_file's implementation, called directly in section 24c
-#include "errors.h"     // HkdfGuardError - caught by PointGateResult and CodeOf below to read error codes
+#include "hkdf_errors.h" // HkdfGuardError - caught by PointGateResult and CodeOf below to read error codes
 #include "key_acl.h"    // ValidateKeyUseGroups - vets the key-use policy list without touching any key
 #include "no_follow_open.h" // IsLocalDrivePath / IsLocalVolumeDeviceTarget - section -2d
+#include "test_support.h" // IsElevated, ScopedMachinePolicyDword
 
 #include <aclapi.h>  // SetEntriesInAclW - section 25d widens an existing KEK's ACL
 #include <psapi.h>   // GetProcessMemoryInfo - section 30's leak probe
@@ -26,6 +27,7 @@
 #include <stdexcept> // std::exception, caught in CleanupKek and CheckPolicyCreatesKek
 #include <vector>
 #include <string>
+#include <utility>   // std::forward - CodeOf
 
 namespace {
 
@@ -45,17 +47,6 @@ void Check(bool condition, const char* what) {
 
 void Skip(const char* what) {
     std::printf("[SKIP] %s\n", what);
-}
-
-bool IsElevated() {
-    HANDLE token = nullptr;
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return false;
-    TOKEN_ELEVATION elevation{};
-    DWORD size = 0;
-    bool elevated = GetTokenInformation(token, TokenElevation, &elevation, sizeof(elevation), &size) &&
-                    elevation.TokenIsElevated != 0;
-    CloseHandle(token);
-    return elevated;
 }
 
 // Set once at the start of main. Creating a machine-scope KEK needs
@@ -207,9 +198,8 @@ std::vector<uint8_t> MakeValidP256Point() {
     std::vector<uint8_t> blob(cb);
     if (!BCRYPT_SUCCESS(BCryptExportKey(key.get(), nullptr, BCRYPT_ECCPUBLIC_BLOB, blob.data(), cb, &cb, 0))) return {};
     if (blob.size() < sizeof(BCRYPT_ECCKEY_BLOB) + hkdfguard::kPublicPointLen) return {};
-    return std::vector<uint8_t>(
-        blob.begin() + sizeof(BCRYPT_ECCKEY_BLOB),
-        blob.begin() + sizeof(BCRYPT_ECCKEY_BLOB) + hkdfguard::kPublicPointLen);
+    return {blob.begin() + sizeof(BCRYPT_ECCKEY_BLOB),
+            blob.begin() + sizeof(BCRYPT_ECCKEY_BLOB) + hkdfguard::kPublicPointLen};
 }
 
 // Runs the point gate on `point`: 1 if it accepted the point, 0 if it
@@ -252,7 +242,7 @@ std::wstring PickNarrowGroup() {
     for (const wchar_t* candidate : {L"Performance Log Users", L"Administrators"}) {
         DWORD sidSize = 0;
         DWORD domainSize = 0;
-        SID_NAME_USE type;
+        SID_NAME_USE type = SidTypeUnknown;
         LookupAccountNameW(nullptr, candidate, nullptr, &sidSize, nullptr, &domainSize, &type);
         if (sidSize != 0) {
             return candidate;
@@ -278,7 +268,7 @@ bool HasTpmProvider() {
 template <typename F>
 int32_t CodeOf(F&& f) {
     try {
-        f();
+        std::forward<F>(f)();
         return HKDFGUARD_OK;
     } catch (const hkdfguard::HkdfGuardError& e) {
         return e.code();
@@ -419,7 +409,7 @@ std::string Base64Of(const std::vector<uint8_t>& bytes, bool url_safe, bool pad)
     return out;
 }
 
-std::vector<uint8_t> BytesOf(const std::string& s) { return std::vector<uint8_t>(s.begin(), s.end()); }
+std::vector<uint8_t> BytesOf(const std::string& s) { return {s.begin(), s.end()}; }
 
 // This process's user SID as an SDDL string, for section 24d's descriptors.
 std::wstring CurrentUserSidString() {
@@ -435,57 +425,6 @@ std::wstring CurrentUserSidString() {
     LocalFree(text);
     return sid;
 }
-
-// Sets a REG_DWORD under HKLM\Software\Policies\HkdfGuard for as long as
-// the object lives - or until restore() - and then puts back whatever was
-// there: the old value, or nothing. HkdfGuard.dll reads the real registry,
-// so this is how a section pins the security model it tests (see
-// SecurityModel in policy.h). Needs elevation; active() says whether it
-// took effect.
-class ScopedMachinePolicyDword {
-public:
-    ScopedMachinePolicyDword(const wchar_t* name, DWORD value) : name_(name) {
-        if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, L"Software\\Policies\\HkdfGuard", 0, nullptr, 0,
-                            KEY_QUERY_VALUE | KEY_SET_VALUE | KEY_WOW64_64KEY, nullptr, &key_, nullptr) != ERROR_SUCCESS) {
-            key_ = nullptr;
-            return;
-        }
-        DWORD size = 0;
-        if (RegQueryValueExW(key_, name_, nullptr, &old_type_, nullptr, &size) == ERROR_SUCCESS) {
-            old_.resize(size);
-            had_old_ = RegQueryValueExW(key_, name_, nullptr, &old_type_, old_.data(), &size) == ERROR_SUCCESS;
-        }
-        active_ = RegSetValueExW(key_, name_, 0, REG_DWORD, reinterpret_cast<const BYTE*>(&value), sizeof(value)) ==
-                  ERROR_SUCCESS;
-    }
-    ~ScopedMachinePolicyDword() { restore(); }
-    ScopedMachinePolicyDword(const ScopedMachinePolicyDword&) = delete;
-    ScopedMachinePolicyDword& operator=(const ScopedMachinePolicyDword&) = delete;
-
-    bool active() const { return active_; }
-
-    void restore() {
-        if (key_ == nullptr) return;
-        if (active_) {
-            if (had_old_) {
-                RegSetValueExW(key_, name_, 0, old_type_, old_.data(), static_cast<DWORD>(old_.size()));
-            } else {
-                RegDeleteValueW(key_, name_);
-            }
-        }
-        RegCloseKey(key_);
-        key_ = nullptr;
-        active_ = false;
-    }
-
-private:
-    const wchar_t* name_;
-    HKEY key_ = nullptr;
-    bool active_ = false;
-    bool had_old_ = false;
-    DWORD old_type_ = 0;
-    std::vector<BYTE> old_;
-};
 
 // What HkdfGuard.dll itself reports through hkdfguard_security_model.
 struct SecurityModelState {
@@ -783,7 +722,7 @@ bool IndependentWrappingKey(const std::vector<uint8_t>& salt, const std::vector<
     }
     // BCRYPT_KDF_RAW_SECRET is little-endian; the construction uses the
     // conventional big-endian X coordinate.
-    std::reverse(z.begin(), z.end());
+    std::ranges::reverse(z);
 
     const std::vector<uint8_t> authenticated = IndependentAuthenticated(providerType, salt, kekPub);
     if (authenticated.empty()) return false;
@@ -900,7 +839,8 @@ bool ImportGoldenKek() {
     }
     if (ok) {
         DWORD usage = NCRYPT_ALLOW_KEY_AGREEMENT_FLAG;
-        NCryptSetProperty(key, NCRYPT_KEY_USAGE_PROPERTY, reinterpret_cast<PBYTE>(&usage), sizeof(usage), 0);
+        // Best-effort, as in kek_store.cpp: some TPM KSPs refuse it.
+        (void)NCryptSetProperty(key, NCRYPT_KEY_USAGE_PROPERTY, reinterpret_cast<PBYTE>(&usage), sizeof(usage), 0);
         ok = NCryptFinalizeKey(key, NCRYPT_SILENT_FLAG) == ERROR_SUCCESS;
     }
     if (key) NCryptFreeObject(key);
@@ -909,12 +849,13 @@ bool ImportGoldenKek() {
     return ok;
 }
 
-} // namespace
-
-int main() {
+// C6262 (stack use over 16 KB): RunTests() runs every section in sequence
+// and its locals add up to ~22 KB, well inside the default 1 MB stack.
+#pragma warning(suppress : 6262)
+int RunTests() {
     g_elevated = IsElevated();
     std::vector<uint8_t> dek = MakeDek();
-    int32_t rc;
+    int32_t rc = 0;
 
     // Everything here tests payload version 1 (the ECDH construction), which
     // HkdfGuard.dll uses only while ClassicalMode is 1 - so the run pins it
@@ -1037,7 +978,7 @@ int main() {
         }
     }
 
-#if defined(_MSC_VER)
+#ifdef _MSC_VER
     // ---- -1. The DLL carries the event log message table. ----
     // The MSI registers HkdfGuard.dll as the event source's
     // EventMessageFile, so Event Viewer renders each event by looking its ID
@@ -1427,6 +1368,7 @@ int main() {
     try {
         use_groups_exists_after_rejects = hkdfguard::KekExists(kServiceUseGroupsWide);
     } catch (...) {
+        // best-effort: the flag keeps its failing default, so the Check below reports it.
     }
     Check(!use_groups_exists_after_rejects, "rejected key-use group policies create no KEK");
 
@@ -1458,6 +1400,7 @@ int main() {
         hkdfguard::ValidateKeyUseGroups(hkdfguard::LoadKeyUseGroupsPolicy());
         qualified_local_validates = true;
     } catch (...) {
+        // best-effort: the flag keeps its failing default, so the Check below reports it.
     }
     Check(qualified_local_validates, "a BUILTIN-qualified local group validates");
 
@@ -1481,6 +1424,7 @@ int main() {
         hkdfguard::ValidateKeyUseGroups(hkdfguard::LoadKeyUseGroupsPolicy());
         trimmed_entry_validates = true;
     } catch (...) {
+        // best-effort: the flag keeps its failing default, so the Check below reports it.
     }
     Check(trimmed_entry_validates, "key-use policy entry with surrounding whitespace is trimmed and validates as a real group");
 
@@ -2012,7 +1956,7 @@ int main() {
                                   buf.data(), &negative);
         Check(rc == HKDFGUARD_ERR_INVALID_ARGUMENT && negative == -1,
               "unwrap: a negative capacity is an argument error, out_len unchanged");
-        Check(std::all_of(buf.begin(), buf.end(), [](uint8_t v) { return v == 0xAA; }),
+        Check(std::ranges::all_of(buf, [](uint8_t v) { return v == 0xAA; }),
               "...and with no valid capacity declared, nothing of `out` is written");
 
         int32_t one_byte = 1;
@@ -2092,7 +2036,7 @@ int main() {
         std::vector<std::vector<uint8_t>> seen;
         for (int i = 0; i < 32; ++i) {
             std::vector<uint8_t> salt(hkdfguard::kSaltLen);
-            BCryptGenRandom(nullptr, salt.data(), static_cast<ULONG>(salt.size()), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+            FillRandom(salt.data(), salt.size());
             std::vector<uint8_t> point(hkdfguard::kPublicPointLen);
             if (CodeOf([&] { hkdfguard::PayloadEcdhPoint(salt.data(), point.data()); }) != HKDFGUARD_OK ||
                 PointGateResult(point) != 1) {
@@ -2139,7 +2083,7 @@ int main() {
         std::vector<uint8_t> kek_pub;
         std::vector<uint8_t> genuine_key;
         std::vector<uint8_t> salt(hkdfguard::kSaltLen);
-        BCryptGenRandom(nullptr, salt.data(), static_cast<ULONG>(salt.size()), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+        FillRandom(salt.data(), salt.size());
         // The provider kService's KEK actually lives on (TPM on a machine
         // with one, software otherwise), as a genuine payload records it -
         // part of the authenticated bytes the key is derived over.
@@ -2176,8 +2120,7 @@ int main() {
             bool all_rejected = true;
             for (int attempt = 0; attempt < 3; ++attempt) {
                 std::vector<uint8_t> forged_salt(hkdfguard::kSaltLen), forged_key, forged;
-                BCryptGenRandom(nullptr, forged_salt.data(), static_cast<ULONG>(forged_salt.size()),
-                                BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+                FillRandom(forged_salt.data(), forged_salt.size());
                 // Z from the public key only: ECDH(random e, KEK public).
                 bool built = IndependentWrappingKey(forged_salt, {}, kek_pub, nullptr, kService, provider, forged_key) &&
                              SealPayloadIndependently(forged_key, forged_salt, nonce, kek_pub,
@@ -2333,7 +2276,7 @@ int main() {
         // exactly one line ending.
         {
             std::vector<uint8_t> raw_dek(HKDFGUARD_DEK_LEN);
-            BCryptGenRandom(nullptr, raw_dek.data(), static_cast<ULONG>(raw_dek.size()), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+            FillRandom(raw_dek.data(), raw_dek.size());
             auto with = [](std::vector<uint8_t> key, std::initializer_list<uint8_t> tail) {
                 key.insert(key.end(), tail);
                 return key;
@@ -3219,8 +3162,7 @@ int main() {
         // 32 raw bytes and one line ending, by length and trailing bytes only.
         {
             std::string raw(HKDFGUARD_DEK_LEN, '\0');
-            BCryptGenRandom(nullptr, reinterpret_cast<PUCHAR>(raw.data()), static_cast<ULONG>(raw.size()),
-                            BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+            FillRandom(raw.data(), raw.size());
             std::string ends_lf = raw, ends_space = raw;
             ends_lf.back() = '\n';
             ends_space.back() = ' ';
@@ -3405,6 +3347,7 @@ int main() {
     } catch (const hkdfguard::HkdfGuardError &e) {
         kek_exists_rejects_invalid_policy = (e.code() == HKDFGUARD_ERR_POLICY_INVALID);
     } catch (...) {
+        // best-effort: the flag keeps its failing default, so the Check below reports it.
     }
     Check(kek_exists_rejects_invalid_policy, "KekExists fails closed with POLICY_INVALID for an unrecognized policy value");
 
@@ -3418,6 +3361,7 @@ int main() {
     } catch (const hkdfguard::HkdfGuardError &e) {
         wrap_rejects_invalid_policy = (e.code() == HKDFGUARD_ERR_POLICY_INVALID);
     } catch (...) {
+        // best-effort: the flag keeps its failing default, so the Check below reports it.
     }
     Check(wrap_rejects_invalid_policy, "wrap fails closed with POLICY_INVALID for an unrecognized policy value");
 
@@ -3446,6 +3390,7 @@ int main() {
     } catch (const hkdfguard::HkdfGuardError &e) {
         std::printf("    (KekExists threw code %d: %s)\n", e.code(), e.what());
     } catch (...) {
+        // best-effort: the flag keeps its failing default, so the Check below reports it.
     }
     Check(no_tpm_exists_is_false, "PreferTpm with no TPM: KekExists falls through to software and reports false (not PROVIDER_ERROR)");
 
@@ -3470,6 +3415,7 @@ int main() {
     } catch (const hkdfguard::HkdfGuardError &e) {
         require_tpm_no_tpm_fails_closed = (e.code() == HKDFGUARD_ERR_PROVIDER_ERROR);
     } catch (...) {
+        // best-effort: the flag keeps its failing default, so the Check below reports it.
     }
     Check(require_tpm_no_tpm_fails_closed, "RequireTpm with no TPM: KekExists fails closed with PROVIDER_ERROR, never answers from software");
 
@@ -3572,6 +3518,7 @@ int main() {
         try {
             hkdfguard::DeleteKek(kServiceAclWidenedWide, hkdfguard::kProviderTypeSoftware, hkdfguard::kCurrentKeyId);
         } catch (...) {
+            // best-effort: cleanup of this scenario's KEK; it is not what the test checks.
         }
     }
     hkdfguard::SetTestPolicyOverride(std::nullopt);
@@ -3861,10 +3808,7 @@ int main() {
                 HKDFGUARD_ERR_FILE_ACCESS_DENIED, HKDFGUARD_ERR_FILE_IO, HKDFGUARD_ERR_FILE_TOO_SHORT,
                 HKDFGUARD_ERR_FILE_TOO_LONG, HKDFGUARD_ERR_FILE_PLAINTEXT_KEY, HKDFGUARD_ERR_FILE_MALFORMED,
                 HKDFGUARD_ERR_FILE_UNTRUSTED, HKDFGUARD_ERR_WIN_GROUP_INVALID};
-            for (int32_t c : kCodes) {
-                if (c == code) return true;
-            }
-            return false;
+            return std::ranges::any_of(kCodes, [code](int32_t c) { return c == code; });
         };
         static constexpr uint8_t kCanary = 0xA5;
         static constexpr size_t kPad = 64;
@@ -4029,7 +3973,7 @@ int main() {
             const char* const names[] = {nullptr, "", too_long.c_str(), "caf\xC3\xA9", ".a", "a..b", "a-b", "a b", "a/b", "\t"};
             int bad = 0;
             for (const char* name : names) {
-                int32_t exists = -1, len;
+                int32_t exists = -1, len = 0;
                 auto out = canary_buffer(HKDFGUARD_WRAPPED_MAX_LEN);
                 if (hkdfguard_kek_exists(name, &exists) != HKDFGUARD_ERR_INVALID_SERVICE_NAME || exists != -1) ++bad;
                 len = HKDFGUARD_KEK_FINGERPRINT_LEN;
@@ -4126,7 +4070,14 @@ int main() {
             const SIZE_T grew_second = grew(bytes_mid, bytes_after);
             const SIZE_T grew_third = grew(bytes_after, bytes_last);
             Check(handles_after <= handles_before + 8, "leak probe: 4500 rounds of failing ABI calls leave the handle count where it was");
+#ifdef __SANITIZE_ADDRESS__
+            // AddressSanitizer quarantines freed memory (to catch use after
+            // free), so private bytes grow without any leak; ASan does its
+            // own memory checking in this build.
+            std::printf("[SKIP] leak probe: private-memory growth (AddressSanitizer build)\n");
+#else
             Check(grew_third <= (512u << 10), "leak probe: the last 1500 rounds grow private memory by under 512 KB (no per-call leak)");
+#endif
             std::printf("    (handles %lu -> %lu -> %lu; private bytes grew %zu KB, %zu KB, then %zu KB)\n", handles_before,
                         handles_mid, handles_after, static_cast<size_t>(grew_first >> 10),
                         static_cast<size_t>(grew_second >> 10), static_cast<size_t>(grew_third >> 10));
@@ -4137,6 +4088,7 @@ int main() {
                 std::atomic<int> undocumented{0};
                 std::atomic<int> overran{0};
                 std::vector<std::thread> threads;
+                threads.reserve(8);
                 for (int t = 0; t < 8; ++t) {
                     threads.emplace_back([&, t]() {
                         for (int i = 0; i < 100; ++i) {
@@ -4164,6 +4116,7 @@ int main() {
             if (primary_wrap_ok) {
                 std::atomic<int> wrong{0};
                 std::vector<std::thread> threads;
+                threads.reserve(4);
                 for (int t = 0; t < 4; ++t) {
                     threads.emplace_back([&, t]() {
                         std::vector<uint8_t> my_dek(HKDFGUARD_DEK_LEN);
@@ -4222,4 +4175,18 @@ int main() {
     }
     std::printf("\n%d check(s) failed.\n", g_failures);
     return 1;
+}
+
+} // namespace
+
+int main() {
+    try {
+        return RunTests();
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "unhandled exception: %s\n", e.what());
+        return 1;
+    } catch (...) {
+        std::fprintf(stderr, "unhandled exception\n");
+        return 1;
+    }
 }

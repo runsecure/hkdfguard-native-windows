@@ -5,7 +5,7 @@
 #include "key_file.h"
 
 #include "../include/hkdfguard.h"
-#include "errors.h"
+#include "hkdf_errors.h"
 #include "event_log.h"   // LogDeveloperModeKeyFile
 #include "key_acl.h"     // ResolveDeployerPrincipals
 #include "policy.h"      // LoadSecurityModel, LoadDeployerGroupsPolicy
@@ -13,9 +13,11 @@
 
 #include "secure_buffer.h" // SecureBuffer - holds a small file's bytes while they're inspected
 #include "no_follow_open.h" // OpenFolderChain / OpenRelative - the path walk that never follows a link
+#include "dacl_walk.h"      // WalkAllowAces - the ACEs the owner/DACL check judges
 
 #include <windows.h>
 #include <aclapi.h> // GetSecurityInfo
+#include <algorithm> // std::ranges::any_of
 #include <bit>     // std::bit_cast - LARGE_INTEGER to LONGLONG
 #include <cstring>
 #include <string>
@@ -27,7 +29,7 @@ namespace hkdfguard {
         // bytes: the Win32 limit of 32,767 UTF-16 code units, each at most three
         // UTF-8 bytes. Bounds the strnlen below the same way kMaxServiceLen does
         // for a service name.
-        constexpr size_t kMaxPathBytes = 32767 * 3;
+        constexpr size_t kMaxPathBytes = size_t{32767} * 3;
 
         // UTF-8 path -> UTF-16 for CreateFileW. Unlike a service name, a path may
         // legitimately contain any Unicode character, so it is converted rather
@@ -71,10 +73,10 @@ namespace hkdfguard {
         // prefixed form GetFinalPathNameByHandle always returns both compare
         // against the plain spelling.
         std::wstring StripExtendedPrefix(std::wstring p) {
-            if (p.rfind(L"\\\\?\\UNC\\", 0) == 0) {
+            if (p.starts_with(L"\\\\?\\UNC\\")) {
                 return L"\\\\" + p.substr(8);
             }
-            if (p.rfind(L"\\\\?\\", 0) == 0) {
+            if (p.starts_with(L"\\\\?\\")) {
                 return p.substr(4);
             }
             return p;
@@ -195,7 +197,11 @@ namespace hkdfguard {
 
             TrustedInstallerSid &operator=(const TrustedInstallerSid &) = delete;
 
-            PSID get() const { return sid_; }
+            TrustedInstallerSid(TrustedInstallerSid &&) = delete;
+
+            TrustedInstallerSid &operator=(TrustedInstallerSid &&) = delete;
+
+            [[nodiscard]] PSID get() const { return sid_; }
 
         private:
             PSID sid_ = nullptr;
@@ -214,7 +220,7 @@ namespace hkdfguard {
             PSID sid = which == TokenOwner ? reinterpret_cast<const TOKEN_OWNER *>(info.data())->Owner
                                            : reinterpret_cast<const TOKEN_USER *>(info.data())->User.Sid;
             const auto *bytes = static_cast<const BYTE *>(sid);
-            return std::vector<BYTE>(bytes, bytes + GetLengthSid(sid));
+            return {bytes, bytes + GetLengthSid(sid)};
         }
 
         // The principals a key file and its folders may be owned by, and
@@ -254,19 +260,16 @@ namespace hkdfguard {
                 }
             }
 
-            SecurityModel model() const { return model_; }
+            [[nodiscard]] SecurityModel model() const { return model_; }
 
             bool MayOwn(PSID sid) const {
                 if (IsWellKnownSid(sid, WinLocalSystemSid) || IsWellKnownSid(sid, WinBuiltinAdministratorsSid) ||
                     EqualSid(sid, trusted_installer_.get())) {
                     return true;
                 }
-                for (const std::vector<BYTE> &extra: extra_) {
-                    if (EqualSid(sid, const_cast<BYTE *>(extra.data()))) {
-                        return true;
-                    }
-                }
-                return false;
+                return std::ranges::any_of(extra_, [sid](const std::vector<BYTE> &extra) {
+                    return EqualSid(sid, const_cast<BYTE *>(extra.data())) != FALSE;
+                });
             }
 
             bool MayWrite(PSID sid) const {
@@ -276,7 +279,7 @@ namespace hkdfguard {
 
             // Who, besides SYSTEM, Administrators and TrustedInstaller, is
             // trusted - for error messages.
-            const char *Others() const {
+            [[nodiscard]] const char *Others() const {
                 return model_ == SecurityModel::Developer ? "this account" : "a deployer group or its member";
             }
 
@@ -300,57 +303,35 @@ namespace hkdfguard {
                 throw HkdfGuardError(HKDFGUARD_ERR_FILE_UNTRUSTED,
                                      (std::string(what) + " has no DACL, so everyone has full access to it").c_str());
             }
-            for (DWORD i = 0; i < dacl->AceCount; ++i) {
-                void *ace = nullptr;
-                if (!GetAce(dacl, i, &ace)) {
+            const DaclWalkResult walk = WalkAllowAces(dacl, [&](PSID sid, ACCESS_MASK mask, BYTE) {
+                const ACCESS_MASK granted = mask & forbidden;
+                if (granted != 0 && !trusted.MayWrite(sid)) {
+                    // Only create rights - a folder below the drive root
+                    // that, like C:\ProgramData, lets others add entries -
+                    // gets its own message, so the fix (remove those rights)
+                    // is obvious. (On the file itself the same bits are
+                    // write access, reported as such.)
+                    const bool create_only = forbidden == kFolderRights && (granted & ~kFolderCreateRights) == 0;
+                    throw HkdfGuardError(
+                        HKDFGUARD_ERR_FILE_UNTRUSTED,
+                        (std::string(what) +
+                         (create_only
+                              ? " lets an account other than SYSTEM, Administrators, TrustedInstaller or "
+                              : " grants write, delete or ownership rights to an account other than SYSTEM, "
+                                "Administrators, TrustedInstaller or ") +
+                         trusted.Others() + (create_only ? " create files or folders in it" : "")).c_str());
+                }
+            });
+            switch (walk) {
+                case DaclWalkResult::Complete:
+                    return;
+                case DaclWalkResult::UnreadableAce:
                     throw HkdfGuardError(HKDFGUARD_ERR_FILE_UNTRUSTED, (std::string(what) + ": GetAce failed").c_str());
-                }
-                const ACE_HEADER *header = static_cast<const ACE_HEADER *>(ace);
-                if (header->AceFlags & INHERIT_ONLY_ACE) {
-                    continue; // applies only to children, which are checked on their own
-                }
-                switch (header->AceType) {
-                    case ACCESS_DENIED_ACE_TYPE:
-                    case ACCESS_DENIED_OBJECT_ACE_TYPE:
-                    case ACCESS_DENIED_CALLBACK_ACE_TYPE:
-                    case ACCESS_DENIED_CALLBACK_OBJECT_ACE_TYPE:
-                        continue; // a deny only ever takes access away
-                    case ACCESS_ALLOWED_ACE_TYPE:
-                    case ACCESS_ALLOWED_CALLBACK_ACE_TYPE: {
-                        // The same layout up to the SID: header, mask, SID.
-                        // A callback (conditional) ACE is judged as if its
-                        // condition held, since it may.
-                        const ACCESS_ALLOWED_ACE *allowed = static_cast<const ACCESS_ALLOWED_ACE *>(ace);
-                        PSID sid = const_cast<DWORD *>(&allowed->SidStart);
-                        const ACCESS_MASK granted = allowed->Mask & forbidden;
-                        if (granted != 0 && !trusted.MayWrite(sid)) {
-                            // Only create rights - a folder below the drive
-                            // root that, like C:\ProgramData, lets others
-                            // add entries - gets its own message, so the
-                            // fix (remove those rights) is obvious.
-                            // (On the file itself the same bits are write
-                            // access, reported as such.)
-                            const bool create_only =
-                                    forbidden == kFolderRights && (granted & ~kFolderCreateRights) == 0;
-                            throw HkdfGuardError(
-                                HKDFGUARD_ERR_FILE_UNTRUSTED,
-                                (std::string(what) +
-                                 (create_only
-                                      ? " lets an account other than SYSTEM, Administrators, TrustedInstaller or "
-                                      : " grants write, delete or ownership rights to an account other than SYSTEM, "
-                                        "Administrators, TrustedInstaller or ") +
-                                 trusted.Others() + (create_only ? " create files or folders in it" : "")).c_str());
-                        }
-                        continue;
-                    }
-                    default:
-                        // Object and compound allow ACEs never belong on a
-                        // file system object; one that can't be read can't
-                        // be vouched for.
-                        throw HkdfGuardError(HKDFGUARD_ERR_FILE_UNTRUSTED,
-                                             (std::string(what) + " has an access-allowed ACE of an unexpected type").c_str());
-                }
+                case DaclWalkResult::UnexpectedAce:
+                    break;
             }
+            throw HkdfGuardError(HKDFGUARD_ERR_FILE_UNTRUSTED,
+                                 (std::string(what) + " has an access-allowed ACE of an unexpected type").c_str());
         }
 
         // CheckOwnerAndDacl on an open handle's live security descriptor.
