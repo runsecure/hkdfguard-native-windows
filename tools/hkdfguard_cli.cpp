@@ -102,7 +102,7 @@
 #include "dacl_walk.h"      // WalkAllowAces - the ACE walk shared with hkdfguard_open_file's trust checks
 // The library's version 2 key code, compiled into this tool for retire and
 // status only (see "Payload version 2 KEKs" below, and tools/CMakeLists.txt).
-#include "errors.h"  // hkdfguard::HkdfGuardError
+#include "hkdf_errors.h"  // hkdfguard::HkdfGuardError
 #include "kek_v2.h"  // InspectV2Kek, DeleteV2Kek
 #include "key_acl.h" // IsOverBroadSid, IsHostLocalAccountDomain - the --group check
 #include "policy.h"  // LoadPayloadVersionPolicy
@@ -157,7 +157,7 @@ namespace {
     constexpr size_t kSecureOverwritePassCount = 8;
 
     // This tool's operational-error type. Not the DLL's HkdfGuardError
-    // (src/errors.h): apart from the version 2 key code compiled in for
+    // (src/hkdf_errors.h): apart from the version 2 key code compiled in for
     // retire and status, whose HkdfGuardErrors are turned into CliErrors
     // where they are caught, this tool depends only on the public C ABI. The
     // message is narrow, so every fprintf of it uses %s, never %ls.

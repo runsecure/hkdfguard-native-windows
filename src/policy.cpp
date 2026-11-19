@@ -47,7 +47,7 @@ namespace hkdfguard {
         constexpr KeyStoragePolicy kDefaultPolicy =
             KeyStoragePolicy::PreferTpm;
 
-#if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
+#ifdef HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE
         // See SetTestPolicyOverride in policy.h. Empty by default, so a test
         // binary that never sets it still reads the registry.
         std::optional<KeyStoragePolicy> g_testPolicyOverride;
@@ -115,7 +115,7 @@ namespace hkdfguard {
 
     } // namespace
 
-#if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
+#ifdef HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE
     void SetTestKeyUseGroupsOverride(std::optional<std::vector<std::wstring>> groups)
     {
         g_testKeyUseGroupsOverride = std::move(groups);
@@ -257,7 +257,7 @@ namespace hkdfguard {
 
     std::vector<std::wstring> LoadKeyUseGroupsPolicy()
     {
-#if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
+#ifdef HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE
         if (g_testKeyUseGroupsOverride.has_value())
         {
             return NormalizeEntries(*g_testKeyUseGroupsOverride);
@@ -268,7 +268,7 @@ namespace hkdfguard {
 
     std::vector<std::wstring> LoadDeployerGroupsPolicy()
     {
-#if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
+#ifdef HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE
         if (g_testDeployerGroupsOverride.has_value())
         {
             return NormalizeEntries(*g_testDeployerGroupsOverride);
@@ -304,7 +304,7 @@ namespace hkdfguard {
 
     SecurityModel LoadSecurityModel() noexcept
     {
-#if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
+#ifdef HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE
         if (g_testSecurityModelOverride.has_value())
         {
             return *g_testSecurityModelOverride;
@@ -325,7 +325,7 @@ namespace hkdfguard {
         return ParseSecurityModel(true, read.type, read.value);
     }
 
-#if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
+#ifdef HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE
     void SetTestSecurityModelOverride(std::optional<SecurityModel> model) noexcept
     {
         g_testSecurityModelOverride = model;
@@ -387,7 +387,7 @@ namespace hkdfguard {
         return ParseSetupMinDelayMs(true, read.type, read.value);
     }
 
-#if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
+#ifdef HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE
     void SetTestPolicyOverride(std::optional<KeyStoragePolicy> policy) noexcept
     {
         g_testPolicyOverride = policy;
@@ -396,7 +396,7 @@ namespace hkdfguard {
 
     KeyStoragePolicy LoadEffectivePolicy() noexcept
     {
-#if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
+#ifdef HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE
         if (g_testPolicyOverride.has_value())
         {
             return *g_testPolicyOverride;
@@ -472,7 +472,7 @@ namespace hkdfguard {
 
     PayloadVersionPolicy LoadPayloadVersionPolicy() noexcept
     {
-#if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
+#ifdef HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE
         if (g_testPayloadVersionOverride.has_value())
         {
             return *g_testPayloadVersionOverride;
@@ -502,7 +502,7 @@ namespace hkdfguard {
         return ParsePayloadVersionPolicy(true, read.type, read.value);
     }
 
-#if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
+#ifdef HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE
     void SetTestPayloadVersionOverride(std::optional<PayloadVersionPolicy> version) noexcept
     {
         g_testPayloadVersionOverride = version;

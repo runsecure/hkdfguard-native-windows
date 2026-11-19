@@ -1,5 +1,5 @@
 #include "hash_to_curve.h"
-#include "errors.h"
+#include "hkdf_errors.h"
 
 #include <windows.h>
 #include <bcrypt.h>

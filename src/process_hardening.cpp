@@ -1,6 +1,6 @@
 #include "process_hardening.h"
 #include "../include/hkdfguard.h"
-#include "errors.h"
+#include "hkdf_errors.h"
 
 #include <aclapi.h>   // SetSecurityInfo
 #include <sddl.h>     // ConvertStringSecurityDescriptorToSecurityDescriptorW, ConvertSidToStringSidW

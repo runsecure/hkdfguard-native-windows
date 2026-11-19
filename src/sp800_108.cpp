@@ -1,5 +1,5 @@
 #include "sp800_108.h"
-#include "errors.h"
+#include "hkdf_errors.h"
 
 #include <cstring> // strlen
 

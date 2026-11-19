@@ -19,7 +19,7 @@
 //
 // Seeds: tests/fuzz/corpus/fuzz_v2_kdf.
 #include "fuzz_common.h"
-#include "errors.h"
+#include "hkdf_errors.h"
 #include "sp800_108.h"
 #include "wire_format.h"   // kHeaderLen
 

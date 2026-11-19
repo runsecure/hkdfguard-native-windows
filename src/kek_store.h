@@ -21,7 +21,7 @@ namespace hkdfguard {
     // HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE is defined (tests/CMakeLists.txt,
     // for test_roundtrip's own copy of kek_store.cpp), never in
     // HkdfGuard.dll; not thread-safe.
-#if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
+#ifdef HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE
     void SetTestTpmProviderNameOverride(std::optional<std::wstring> providerName);
 
     // Test-only fault injection for the TPM provider, so PreferTpm's

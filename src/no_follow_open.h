@@ -31,7 +31,7 @@
 #include <utility>
 #include <vector>
 
-#if defined(_MSC_VER)
+#ifdef _MSC_VER
 #pragma comment(lib, "ntdll.lib")
 #endif
 

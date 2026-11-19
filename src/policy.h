@@ -67,7 +67,7 @@ namespace hkdfguard {
 // file. HkdfGuard.dll's build never defines it, so neither this function
 // nor its state exists in the shipped DLL. Not thread-safe: a
 // single-threaded test process is the only intended caller.
-#if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
+#ifdef HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE
     void SetTestPolicyOverride(std::optional<KeyStoragePolicy> policy) noexcept;
 #endif
 
@@ -124,7 +124,7 @@ namespace hkdfguard {
     // Test-only seam for LoadKeyUseGroupsPolicy(), with the same scope and
     // caveats as SetTestPolicyOverride: absent from HkdfGuard.dll.
     // std::nullopt clears it.
-#if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
+#ifdef HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE
     void SetTestKeyUseGroupsOverride(std::optional<std::vector<std::wstring>> groups);
 #endif
 
@@ -172,7 +172,7 @@ namespace hkdfguard {
     // a deployer must be able to wrap.
     std::vector<std::wstring> LoadDeployerGroupsPolicy();
 
-#if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
+#ifdef HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE
     // Test-only seams for the two above, with the same scope and caveats as
     // SetTestPolicyOverride. std::nullopt clears each.
     void SetTestSecurityModelOverride(std::optional<SecurityModel> model) noexcept;
@@ -209,7 +209,7 @@ namespace hkdfguard {
     // on every call that depends on it. Never throws.
     PayloadVersionPolicy LoadPayloadVersionPolicy() noexcept;
 
-#if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
+#ifdef HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE
     // Test-only seam for LoadPayloadVersionPolicy, with the same scope and
     // caveats as SetTestPolicyOverride. std::nullopt clears it.
     void SetTestPayloadVersionOverride(std::optional<PayloadVersionPolicy> version) noexcept;

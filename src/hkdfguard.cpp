@@ -6,7 +6,7 @@
 
 #include "aes_gcm.h"
 #include "ecdh_hkdf.h"
-#include "errors.h"
+#include "hkdf_errors.h"
 #include "event_log.h"
 #include "policy.h" // LoadAuditUnwrapSuccess, LoadPayloadVersionPolicy, SecurityModel
 #include "process_hardening.h" // HardenProcess - hkdfguard_harden_process's implementation

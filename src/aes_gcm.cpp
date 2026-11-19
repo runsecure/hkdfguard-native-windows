@@ -1,5 +1,5 @@
 #include "aes_gcm.h"
-#include "errors.h"
+#include "hkdf_errors.h"
 #include "handle_traits.h" // ScopedBCryptAlg, ScopedBCryptKey
 #include <windows.h>
 #include <bcrypt.h>

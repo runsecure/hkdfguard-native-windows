@@ -5,7 +5,7 @@
 #include "key_file.h"
 
 #include "../include/hkdfguard.h"
-#include "errors.h"
+#include "hkdf_errors.h"
 #include "event_log.h"   // LogDeveloperModeKeyFile
 #include "key_acl.h"     // ResolveDeployerPrincipals
 #include "policy.h"      // LoadSecurityModel, LoadDeployerGroupsPolicy

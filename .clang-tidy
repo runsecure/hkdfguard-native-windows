@@ -31,6 +31,9 @@
 #   cppcoreguidelines-non-private-member-variables-in-classes
 #                                                 Alias of the misc- check below.
 #   performance-enum-size                         An enum's storage size is not a cost here.
+#   portability-avoid-pragma-once                 (clang-tidy 21+) The project is Windows/MSVC-only and
+#                                                 each header has one path; #pragma once is supported
+#                                                 by every compiler involved.
 #   misc-const-correctness                        Stylistic; hundreds of locals, no defect class behind it.
 #   misc-include-cleaner                          Does not understand windows.h's umbrella headers.
 #   misc-non-private-member-variables-in-classes  Plain structs (e.g. ParsedWrappedDek) are intended.
@@ -86,6 +89,7 @@ Checks: >
   -modernize-use-designated-initializers,
   -modernize-use-trailing-return-type,
   -performance-enum-size,
+  -portability-avoid-pragma-once,
   -readability-avoid-nested-conditional-operator,
   -readability-braces-around-statements,
   -readability-function-cognitive-complexity,

@@ -1,5 +1,5 @@
 #include "kek_v2.h"
-#include "errors.h"
+#include "hkdf_errors.h"
 #include "event_log.h"     // LogKekCreated, LogVersion2Unavailable
 #include "handle_traits.h" // ScopedNCryptProv, ScopedNCryptKey
 #include "key_acl.h"       // ApplyKeyAcl, ValidateKeyUseGroups, VerifyExistingKeyAcl, VerifyKeyAcl
@@ -24,7 +24,7 @@ namespace hkdfguard {
         // process it isn't repeated; a failure is retried on the next call.
         std::atomic<bool> g_kdf_known_answer_passed{false};
 
-#if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
+#ifdef HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE
         std::optional<std::string> g_test_tpm_unusable;
 #endif
 
@@ -105,7 +105,7 @@ namespace hkdfguard {
 
         void OpenProvider(uint8_t provider_type, ScopedNCryptProv &provider) {
             if (IsTpm(provider_type)) {
-#if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
+#ifdef HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE
                 if (g_test_tpm_unusable) {
                     throw V2TpmUnusable(*g_test_tpm_unusable);
                 }
@@ -722,7 +722,7 @@ namespace hkdfguard {
         // Absent is definite; so are a key that fails a check of its own
         // (Invalid) and one that fails only on its ACL (AccessControlInvalid,
         // checked first: it is KEK_INVALID too, but must never be reported
-        // as corrupt - errors.h). So is a TPM that can't be used for version
+        // as corrupt - hkdf_errors.h). So is a TPM that can't be used for version
         // 2 at all - the Platform Crypto Provider can't be opened, or there
         // is no TPM device: it holds no KEK, as CreateV2Kek's fallback and
         // version 1's OpenKekDirect assume, so it is Absent. Anything else -
@@ -757,7 +757,7 @@ namespace hkdfguard {
         return result;
     }
 
-#if defined(HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE)
+#ifdef HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE
     void SetTestV2TpmUnusable(std::optional<std::string> reason) {
         g_test_tpm_unusable = std::move(reason);
     }

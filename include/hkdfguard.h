@@ -26,8 +26,8 @@
 // defined only by this project's own build (see CMakeLists.txt); nobody
 // #include-ing this header from outside the project defines it, so they
 // automatically get the "import" branch.
-#if defined(_WIN32)
-#  if defined(HKDFGUARD_EXPORTS)
+#ifdef _WIN32
+#  ifdef HKDFGUARD_EXPORTS
 #    define HKDFGUARD_API __declspec(dllexport)
 #  else
 #    define HKDFGUARD_API __declspec(dllimport)

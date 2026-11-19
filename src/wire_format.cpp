@@ -1,5 +1,5 @@
 #include "wire_format.h"
-#include "errors.h"
+#include "hkdf_errors.h"
 #include <cstring> // memcpy
 
 namespace hkdfguard {

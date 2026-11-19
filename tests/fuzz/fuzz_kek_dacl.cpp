@@ -16,7 +16,7 @@
 //
 // Seeds: tests/fuzz/corpus/fuzz_kek_dacl.
 #include "fuzz_common.h"
-#include "errors.h"
+#include "hkdf_errors.h"
 #include "key_acl.h"
 
 #include <windows.h>

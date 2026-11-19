@@ -26,7 +26,7 @@
 // Unelevated:
 //   7. Creating a version 2 KEK is refused (KEK_ACCESS_DENIED).
 #include "hkdfguard.h"
-#include "errors.h"
+#include "hkdf_errors.h"
 #include "kek_v2.h"
 #include "policy.h"
 #include "sp800_108.h"

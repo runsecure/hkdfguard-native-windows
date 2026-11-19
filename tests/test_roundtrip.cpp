@@ -8,7 +8,7 @@
 #include "ecdh_hkdf.h"  // IsValidP256Point, DeriveWrappingKey - the point gate and the derivation, tested directly below
 #include "hash_to_curve.h" // HashToCurveP256, PayloadEcdhPoint - checked against RFC 9380's vectors below
 #include "key_file.h"   // ReadWrappedKeyFile - hkdfguard_open_file's implementation, called directly in section 24c
-#include "errors.h"     // HkdfGuardError - caught by PointGateResult and CodeOf below to read error codes
+#include "hkdf_errors.h" // HkdfGuardError - caught by PointGateResult and CodeOf below to read error codes
 #include "key_acl.h"    // ValidateKeyUseGroups - vets the key-use policy list without touching any key
 #include "no_follow_open.h" // IsLocalDrivePath / IsLocalVolumeDeviceTarget - section -2d
 #include "test_support.h" // IsElevated, ScopedMachinePolicyDword
@@ -978,7 +978,7 @@ int RunTests() {
         }
     }
 
-#if defined(_MSC_VER)
+#ifdef _MSC_VER
     // ---- -1. The DLL carries the event log message table. ----
     // The MSI registers HkdfGuard.dll as the event source's
     // EventMessageFile, so Event Viewer renders each event by looking its ID
