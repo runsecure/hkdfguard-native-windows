@@ -64,6 +64,7 @@
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -461,9 +462,29 @@ void OpenFileSection(bool elevated) {
 // ---------------------------------------------------------------------------
 // 3. Through HkdfGuard.dll, with a KEK
 
+// The payload version and provider a set of rows must be measuring.
+struct ExpectedKek {
+    uint8_t version;       // kFormatVersion1 or kFormatVersion2
+    uint8_t provider_type; // kProviderTypeSoftware or kProviderTypeTpm
+};
+
+// Whether `wrapped` was written by the expected payload version and
+// provider, read from the payload's own header - so a row can't pass while
+// measuring some other configuration. Two byte compares: negligible inside a
+// timed call. With no expectation (an existing KEK under the machine's
+// policy), any payload passes.
+bool WrittenBy(const std::optional<ExpectedKek>& expected, const uint8_t* wrapped, int len) {
+    if (!expected) return true;
+    return len > static_cast<int>(hkdfguard::kProviderTypeOffset) &&
+           wrapped[hkdfguard::kVersionOffset] == expected->version &&
+           wrapped[hkdfguard::kProviderTypeOffset] == expected->provider_type;
+}
+
 // Measures the public hot path against `service`'s existing KEK. `label`
-// prefixes every row name, e.g. "v2 software".
-void DllRows(const char* service, const std::string& label, int iterations) {
+// prefixes every row name, e.g. "v2 software". With `expected`, every payload
+// a row writes must carry that version and provider, or the row fails.
+void DllRows(const char* service, const std::string& label, int iterations,
+             const std::optional<ExpectedKek>& expected = std::nullopt) {
     uint8_t dek[HKDFGUARD_DEK_LEN];
     Random(dek, sizeof(dek));
     uint8_t wrapped[HKDFGUARD_WRAPPED_MAX_LEN];
@@ -474,11 +495,20 @@ void DllRows(const char* service, const std::string& label, int iterations) {
         std::printf("  [fail] %s: the first wrap returned %d; nothing measured\n", label.c_str(), first);
         return;
     }
+    if (expected.has_value() && !WrittenBy(expected, wrapped, wrapped_len)) {
+        ++g_failures;
+        std::printf("  [fail] %s: the first wrap wrote payload version %u on provider %u, not version %u on "
+                    "provider %u; nothing measured\n",
+                    label.c_str(), wrapped[hkdfguard::kVersionOffset], wrapped[hkdfguard::kProviderTypeOffset],
+                    expected->version, expected->provider_type);
+        return;
+    }
 
     Bench(label + " wrap_dek", iterations, [&] {
         uint8_t out[HKDFGUARD_WRAPPED_MAX_LEN];
         int len = sizeof(out);
-        return hkdfguard_wrap_dek(service, dek, HKDFGUARD_DEK_LEN, out, &len) == HKDFGUARD_OK;
+        return hkdfguard_wrap_dek(service, dek, HKDFGUARD_DEK_LEN, out, &len) == HKDFGUARD_OK &&
+               WrittenBy(expected, out, len);
     });
     Bench(label + " unwrap_dek", iterations, [&] {
         uint8_t out[HKDFGUARD_DEK_LEN];
@@ -489,7 +519,7 @@ void DllRows(const char* service, const std::string& label, int iterations) {
     Bench(label + " generate_and_wrap_dek", iterations, [&] {
         uint8_t out[HKDFGUARD_WRAPPED_MAX_LEN];
         int len = sizeof(out);
-        return hkdfguard_generate_and_wrap_dek(service, out, &len) == HKDFGUARD_OK;
+        return hkdfguard_generate_and_wrap_dek(service, out, &len) == HKDFGUARD_OK && WrittenBy(expected, out, len);
     });
     Bench(label + " kek_fingerprint", iterations, [&] {
         uint8_t out[HKDFGUARD_KEK_FINGERPRINT_LEN];
@@ -502,10 +532,11 @@ void DllRows(const char* service, const std::string& label, int iterations) {
     const std::vector<uint8_t> wrapped_copy(wrapped, wrapped + wrapped_len);
     for (int threads : Opt().threads) {
         BenchThreads(label + " wrap_dek (threads)", threads, iterations, [&] {
-            return std::function<bool()>([service, dek_copy = std::vector<uint8_t>(dek, dek + sizeof(dek))] {
+            return std::function<bool()>([service, expected, dek_copy = std::vector<uint8_t>(dek, dek + sizeof(dek))] {
                 uint8_t out[HKDFGUARD_WRAPPED_MAX_LEN];
                 int len = sizeof(out);
-                return hkdfguard_wrap_dek(service, dek_copy.data(), HKDFGUARD_DEK_LEN, out, &len) == HKDFGUARD_OK;
+                return hkdfguard_wrap_dek(service, dek_copy.data(), HKDFGUARD_DEK_LEN, out, &len) == HKDFGUARD_OK &&
+                       WrittenBy(expected, out, len);
             });
         });
     }
@@ -592,7 +623,8 @@ void ElevatedDllSection() {
             continue;
         }
         const int n = Opt().quick ? 5 : (tpm ? Opt().tpm_iterations : (Opt().iterations > 0 ? Opt().iterations : 500));
-        DllRows(c.service, c.label, n);
+        const uint8_t version = c.version == 1 ? hkdfguard::kFormatVersion1 : hkdfguard::kFormatVersion2;
+        DllRows(c.service, c.label, n, ExpectedKek{version, c.provider});
         DeleteBenchKek(service_w, c.version, c.provider);
     }
 }
