@@ -1,0 +1,114 @@
+# Nightly fuzzing: every target in tests/fuzz for a fixed time, each on its
+# own runner, starting from the corpus the nights before left and the seeds
+# tests/fuzz/Make-AbiSeeds.ps1 writes. See tests/fuzz/README.md. The
+# counterpart of hkdfguard-native-linux's fuzz workflow.
+#
+# Where the results go:
+#   - the run's summary page: one table per target (executions, corpus
+#     size, whether there was a finding), written by
+#     tests/fuzz/Run-Campaign.ps1;
+#   - a failed run, when any target has a finding or no longer builds -
+#     which GitHub mails to whoever last edited the schedule below, and
+#     shows on the Actions tab;
+#   - for a finding, a code scanning alert (Security tab, tool
+#     "hkdfguard-fuzz", on the branch that was fuzzed): what failed, the
+#     input that did it, and the end of the fuzzer's log.
+#
+# A run's log, summary and artifacts are readable by everyone who can read
+# the repository; a finding's input is a reproducer for whatever it found.
+# So the first two say only *that* a target failed, no artifact is kept,
+# and everything else goes into the alert, which only people with write
+# access can read. The alert is the only copy.
+#
+# A scheduled workflow runs from the default branch's copy of this file,
+# and fuzzes the branch named below.
+name: Fuzz
+
+on:
+  schedule:
+    - cron: "37 8 * * *" # 08:37 UTC, daily
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Seconds of fuzzing per target
+        default: "900"
+      ref:
+        description: Branch, tag or commit to fuzz
+        default: main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz
+  cancel-in-progress: false
+
+# Third-party actions are pinned to full commit SHAs; see release.yml.
+
+jobs:
+  fuzz:
+    name: ${{ matrix.target }}
+    # x64: MSVC has no ARM64 AddressSanitizer runtime. The hosted runner's
+    # token is elevated, which creating the targets' throwaway KEKs needs.
+    runs-on: windows-2022
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      security-events: write # to upload a finding as a code scanning alert
+    strategy:
+      fail-fast: false
+      matrix:
+        # Every libFuzzer target in tests/CMakeLists.txt.
+        target:
+          - fuzz_unwrap_dek
+          - fuzz_wrap_round_trip
+          - fuzz_open_file
+          - fuzz_string_bounds
+          - fuzz_api_threads
+          - fuzz_kek_dacl
+          - fuzz_v2_kdf
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ inputs.ref || 'main' }}
+          persist-credentials: false
+
+      # What earlier nights found interesting. Saved under a new key every
+      # run (a cache entry is never overwritten) and restored from the
+      # newest one for this target.
+      - name: Restore the corpus
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: build-fuzz/campaign-corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+
+      - name: Fuzz
+        id: fuzz
+        shell: powershell
+        env:
+          TARGET: ${{ matrix.target }}
+          SECONDS_PER_TARGET: ${{ inputs.seconds || '900' }}
+        run: |
+          # The alert is filed against what was fuzzed, not against the
+          # branch this workflow file was read from.
+          $sha = git rev-parse HEAD
+          $ref = git symbolic-ref -q HEAD
+          if (-not $ref) { $ref = $env:GITHUB_REF }
+          [IO.File]::AppendAllText($env:GITHUB_OUTPUT, "sha=$sha`nref=$ref`n")
+          .\tests\fuzz\Run-Campaign.ps1 -Target $env:TARGET -Seconds ([int]$env:SECONDS_PER_TARGET)
+          exit $LASTEXITCODE
+
+      # A finding: its details, to the Security tab and nowhere else. One
+      # category per distinct finding (Run-Campaign.ps1), so an alert is
+      # never closed or replaced by a later upload: a person dismisses it,
+      # once the input no longer reproduces.
+      - name: Report the finding to code scanning
+        if: failure() && steps.fuzz.outputs.sarif != ''
+        uses: github/codeql-action/upload-sarif@1bd86f2fdb4b86187fa4059f16f31a3202acc9ea # v4.39.4
+        with:
+          sarif_file: ${{ steps.fuzz.outputs.sarif }}
+          category: ${{ steps.fuzz.outputs.category }}
+          ref: ${{ steps.fuzz.outputs.ref }}
+          sha: ${{ steps.fuzz.outputs.sha }}

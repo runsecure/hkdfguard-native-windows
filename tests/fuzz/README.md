@@ -121,6 +121,46 @@ a seed for every finding, named for it.
 `Make-Seeds.ps1` writes the few checked-in seeds of `fuzz_kek_dacl` and
 `fuzz_v2_kdf` (`corpus\`).
 
+## Nightly campaigns
+
+`.github/workflows/fuzz.yml` runs every target each night (and on demand,
+from the Actions tab, for any branch and time budget): 15 minutes each, on
+its own runner, through `Run-Campaign.ps1`, which is the same thing run by
+hand:
+
+```powershell
+.\tests\fuzz\Run-Campaign.ps1 -Target fuzz_unwrap_dek -Seconds 900
+```
+
+It builds the target into `build-fuzz\` (Debug, AddressSanitizer), runs it,
+and exits 0 with no findings, 1 on a finding, 2 if the target doesn't
+build. Each night starts from the corpus the nights before built up (kept
+in the Actions cache, per target) and from the seeds. The results:
+
+- the run's **summary page**: a table per target - executions, corpus
+  size, and whether there was a finding;
+- a **failed run** when a target has a finding or no longer builds, which
+  GitHub mails to whoever last edited the workflow's schedule;
+- for a finding, a **code scanning alert**: Security tab, tool
+  `hkdfguard-fuzz`, on the branch that was fuzzed. It says what failed and
+  holds the input (base64, with the commands that replay it) and the end of
+  the fuzzer's log.
+
+A run's log, summary and artifacts can be read by everyone who can read the
+repository, and a finding's input reproduces whatever it found. So in CI
+those say only *that* a target failed, no artifact is kept, and the alert -
+which only people with write access can read - is the only copy of the
+rest. An alert is never closed by a later night: replay its input against
+the fix, dismiss it by hand, and add the input to `Make-AbiSeeds.ps1`. The
+same failure found again updates its alert; a different one opens another.
+
+By hand, `Run-Campaign.ps1` prints the finding itself, writes the same
+report to `build-fuzz\campaign-<target>.sarif`, and leaves the input in
+`build-fuzz\campaign-artifacts\<target>\`.
+
+A scheduled workflow runs from the default branch's copy of the file and
+fuzzes `main`.
+
 ## What this does not cover yet
 
 Compared with `hkdfguard-native-linux/fuzz`:
