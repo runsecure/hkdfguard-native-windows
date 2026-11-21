@@ -12,7 +12,8 @@
 
 #include <atomic>
 #include <cstdio>  // snprintf
-#include <cstring> // memcmp, strlen
+#include <cstring> // memcmp
+#include <string_view>
 
 #ifndef TBS_E_TPM_NOT_FOUND
 #define TBS_E_TPM_NOT_FOUND ((SECURITY_STATUS)0x8028400FL)
@@ -216,10 +217,10 @@ namespace hkdfguard {
         // `label` and `context` (none for the fingerprint, which the KSP
         // frames exactly as an empty one). The KSP builds the block
         // sp800_108.h describes and returns HMAC-SHA-256 of it under the key.
-        void KspDerive(NCRYPT_KEY_HANDLE key, const char *label, const std::vector<uint8_t> &context, uint8_t out[kPrfLen]) {
+        void KspDerive(NCRYPT_KEY_HANDLE key, std::string_view label, const std::vector<uint8_t> &context, uint8_t out[kPrfLen]) {
             BCryptBuffer buffers[3] = {};
             ULONG count = 0;
-            buffers[count++] = {static_cast<ULONG>(std::strlen(label)), KDF_LABEL, const_cast<char *>(label)};
+            buffers[count++] = {static_cast<ULONG>(label.size()), KDF_LABEL, const_cast<char *>(label.data())};
             if (!context.empty()) {
                 buffers[count++] = {static_cast<ULONG>(context.size()), KDF_CONTEXT, const_cast<uint8_t *>(context.data())};
             }

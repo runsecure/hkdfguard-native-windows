@@ -27,6 +27,7 @@
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <string_view>
 #include <vector>
 
 using namespace hkdfguard;
@@ -55,13 +56,13 @@ namespace {
         return true;
     }
 
-    void CheckLayout(const std::vector<uint8_t> &block, uint32_t counter, const char *label) {
-        const size_t label_len = std::strlen(label);
+    void CheckLayout(const std::vector<uint8_t> &block, uint32_t counter, std::string_view label) {
+        const size_t label_len = label.size();
         FUZZ_REQUIRE(block.size() >= 4 + label_len + 1 + 4, "a block holds its fixed fields");
         FUZZ_REQUIRE(block[0] == (counter >> 24) && block[1] == ((counter >> 16) & 0xFF) &&
                          block[2] == ((counter >> 8) & 0xFF) && block[3] == (counter & 0xFF),
                      "a block starts with its big-endian counter");
-        FUZZ_REQUIRE(std::memcmp(block.data() + 4, label, label_len) == 0 && block[4 + label_len] == 0x00,
+        FUZZ_REQUIRE(std::memcmp(block.data() + 4, label.data(), label_len) == 0 && block[4 + label_len] == 0x00,
                      "the counter is followed by the label and its 0x00");
         const uint8_t l256[4] = {0x00, 0x00, 0x01, 0x00};
         FUZZ_REQUIRE(std::memcmp(block.data() + block.size() - 4, l256, 4) == 0, "a block ends with [256]_32");

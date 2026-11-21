@@ -43,6 +43,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -139,8 +140,8 @@ private:
 
 // ---- The SP 800-108 block, built by hand ----
 
-constexpr char kWrapLabel[] = "hkdfguard-wrap-v1";
-constexpr char kFingerprintLabel[] = "hkdfguard-kek-fingerprint-v1";
+constexpr std::string_view kWrapLabel = "hkdfguard-wrap-v1";
+constexpr std::string_view kFingerprintLabel = "hkdfguard-kek-fingerprint-v1";
 constexpr size_t kHeaderLen = 40;
 
 // u16_le(len(service)) || service || a 40-byte header of `seed`, seed+1, ...
@@ -152,9 +153,9 @@ Bytes Context(size_t service_len, uint8_t seed = 0) {
 }
 
 // [1]_32 || Label || 0x00 || Context || [256]_32
-Bytes Block(const char* label, const Bytes& context) {
+Bytes Block(std::string_view label, const Bytes& context) {
     Bytes m = {0, 0, 0, 1};
-    m.insert(m.end(), label, label + std::strlen(label));
+    m.insert(m.end(), label.begin(), label.end());
     m.push_back(0);
     m.insert(m.end(), context.begin(), context.end());
     m.insert(m.end(), {0, 0, 1, 0});
@@ -183,11 +184,11 @@ Bytes Sha256(const Bytes& message) {
 
 // The Software KSP's derivation: 32 bytes for `label` and `context` (none
 // when empty, as the library passes the fingerprint's).
-SECURITY_STATUS Derive(NCRYPT_KEY_HANDLE key, const char* label, const Bytes& context, Bytes& out,
+SECURITY_STATUS Derive(NCRYPT_KEY_HANDLE key, std::string_view label, const Bytes& context, Bytes& out,
                        DWORD flags = NCRYPT_SILENT_FLAG) {
     BCryptBuffer buffers[3] = {};
     ULONG count = 0;
-    buffers[count++] = {static_cast<ULONG>(std::strlen(label)), KDF_LABEL, const_cast<char*>(label)};
+    buffers[count++] = {static_cast<ULONG>(label.size()), KDF_LABEL, const_cast<char*>(label.data())};
     if (!context.empty()) {
         buffers[count++] = {static_cast<ULONG>(context.size()), KDF_CONTEXT, const_cast<uint8_t*>(context.data())};
     }

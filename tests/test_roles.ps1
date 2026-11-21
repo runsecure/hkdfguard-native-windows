@@ -195,7 +195,7 @@ function Set-ProtectedAcl([string]$Path, [string]$Sddl) {
 # A key file's owner SID and content hash, read as $Credential's account:
 # the CLI's key file DACL admits only its owner and the -g group, so this
 # script's own (admin) account can't open it.
-function Get-KeyFileAs($Credential, [string]$Path) {
+function Get-KeyFileAs([System.Management.Automation.PSCredential]$Credential, [string]$Path) {
     $r = Invoke-As $Credential $probe @("inspect", $Path)
     if ($r.StdOut -match "inspect=0 owner=(\S+) sha256=([0-9a-f]{64})") {
         return [pscustomobject]@{ Owner = $Matches[1]; Sha256 = $Matches[2] }

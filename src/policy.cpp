@@ -2,6 +2,8 @@
 
 #include <windows.h>
 
+#include <algorithm> // std::find
+
 namespace hkdfguard {
 
     namespace {
@@ -246,9 +248,20 @@ namespace hkdfguard {
                 return result;
             }
 
-            for (const wchar_t* p = buffer.data(); *p != L'\0'; p += wcslen(p) + 1)
+            // Each entry runs to its NUL; an empty entry ends the list. Every
+            // search is bounded by the buffer's end, so the walk can't leave
+            // the buffer whatever the value holds - the padding above only
+            // makes the final entry's terminator certain.
+            const wchar_t* const end = buffer.data() + buffer.size();
+            for (const wchar_t* p = buffer.data(); p != end && *p != L'\0';)
             {
-                result.emplace_back(p);
+                const wchar_t* const nul = std::find(p, end, L'\0');
+                result.emplace_back(p, nul);
+                if (nul == end)
+                {
+                    break;
+                }
+                p = nul + 1;
             }
 
             return NormalizeEntries(result);
