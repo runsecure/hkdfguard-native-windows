@@ -27,6 +27,7 @@
 #include <stdexcept> // std::exception, caught in CleanupKek and CheckPolicyCreatesKek
 #include <vector>
 #include <string>
+#include <string_view>
 #include <utility>   // std::forward - CodeOf
 
 namespace {
@@ -373,6 +374,46 @@ bool WriteTestFile(const std::wstring& path, const std::vector<uint8_t>& bytes) 
     return ok;
 }
 
+// Creates a key file holding `bytes` directly in `folder`, a folder other
+// accounts can create entries in (C:\Windows\Temp, C:\ProgramData), and
+// returns its path - empty if it couldn't be created. Section 24c needs a
+// file there to show the library refuses it; this test may run elevated, so
+// the file is made the way a shared folder requires:
+//   - an unguessable name, so no one can have put anything at it first;
+//   - CREATE_NEW, which fails rather than opens whatever already has the
+//     name - a planted file or link is never written through;
+//   - the protected DACL `dacl_aces` (SDDL ACEs) applied as the file is
+//     created, not to the path afterwards.
+std::wstring WriteTestFileInSharedFolder(const std::wstring& folder, const std::vector<uint8_t>& bytes,
+                                         const std::wstring& dacl_aces) {
+    uint8_t random[16] = {};
+    FillRandom(random, sizeof(random));
+    std::wstring path = folder + L"\\hkdfguard-openfile-";
+    for (const uint8_t b : random) {
+        path += L"0123456789abcdef"[b >> 4];
+        path += L"0123456789abcdef"[b & 0x0F];
+    }
+    path += L".key";
+
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW((L"D:P" + dacl_aces).c_str(), SDDL_REVISION_1, &sd, nullptr)) {
+        return {};
+    }
+    SECURITY_ATTRIBUTES attributes{sizeof(attributes), sd, FALSE};
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, &attributes, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+    LocalFree(sd);
+    if (file == INVALID_HANDLE_VALUE) return {};
+    DWORD written = 0;
+    const bool ok = WriteFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &written, nullptr) &&
+                    written == bytes.size();
+    CloseHandle(file);
+    if (!ok) {
+        DeleteFileW(path.c_str());
+        return {};
+    }
+    return path;
+}
+
 // Text forms of a DEK, for section 24c's plaintext-key checks - written
 // here independently of src/key_file.cpp's detector.
 std::string HexOf(const std::vector<uint8_t>& bytes, bool upper) {
@@ -684,7 +725,7 @@ std::vector<uint8_t> IndependentAuthenticated(uint8_t providerType, const std::v
 // public key can compute.
 bool IndependentWrappingKey(const std::vector<uint8_t>& salt, const std::vector<uint8_t>& point,
                             const std::vector<uint8_t>& kekPub, const std::vector<uint8_t>* kekD,
-                            const char* service, uint8_t providerType, std::vector<uint8_t>& aesKey) {
+                            std::string_view service, uint8_t providerType, std::vector<uint8_t>& aesKey) {
     BCRYPT_ALG_HANDLE ecdh = BCRYPT_ECDH_P256_ALG_HANDLE;
     hkdfguard::ScopedBCryptKey priv, pub;
     if (kekD != nullptr) {
@@ -727,11 +768,11 @@ bool IndependentWrappingKey(const std::vector<uint8_t>& salt, const std::vector<
     const std::vector<uint8_t> authenticated = IndependentAuthenticated(providerType, salt, kekPub);
     if (authenticated.empty()) return false;
     const char prefix[] = "hkdfguard-wrap-v1:";
-    const size_t serviceLen = std::strlen(service);
+    const size_t serviceLen = service.size();
     std::vector<uint8_t> info(prefix, prefix + sizeof(prefix) - 1);
     info.push_back(static_cast<uint8_t>(serviceLen & 0xFF));
     info.push_back(static_cast<uint8_t>(serviceLen >> 8));
-    info.insert(info.end(), service, service + serviceLen);
+    info.insert(info.end(), service.begin(), service.end());
     info.insert(info.end(), authenticated.begin(), authenticated.end());
 
     std::vector<uint8_t> prk, t1;
@@ -2486,15 +2527,14 @@ int RunTests() {
         {
             wchar_t windows[MAX_PATH + 1] = {};
             const UINT windows_len = GetSystemWindowsDirectoryW(windows, MAX_PATH + 1);
+            // Only this account, SYSTEM and Administrators may touch the file
+            // itself, so the refusal is the folder's doing.
             const std::wstring windows_temp_key =
-                std::wstring(windows, windows_len) + L"\\Temp\\hkdfguard-openfile-" +
-                std::to_wstring(GetCurrentProcessId()) + L".key";
-            if (windows_len > 0 && windows_len <= MAX_PATH &&
-                WriteTestFile(windows_temp_key, FromHex(kGoldenPayloadHex))) {
-                const std::wstring me = CurrentUserSidString();
-                Check(SetProtectedDacl(windows_temp_key,
-                                       L"D:(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;" + me + L")"),
-                      "test setup: protect the key file in C:\\Windows\\Temp");
+                (windows_len > 0 && windows_len <= MAX_PATH)
+                    ? WriteTestFileInSharedFolder(std::wstring(windows, windows_len) + L"\\Temp", FromHex(kGoldenPayloadHex),
+                                                  L"(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;" + CurrentUserSidString() + L")")
+                    : std::wstring();
+            if (!windows_temp_key.empty()) {
                 expectFailure(ToUtf8(windows_temp_key), HKDFGUARD_ERR_FILE_UNTRUSTED,
                               "a key file in C:\\Windows\\Temp (Users may create entries there) is untrusted");
                 std::string message;
@@ -2532,12 +2572,12 @@ int RunTests() {
         {
             wchar_t program_data[MAX_PATH + 1] = {};
             const DWORD pd_len = GetEnvironmentVariableW(L"ProgramData", program_data, MAX_PATH + 1);
-            const std::wstring pd_key = std::wstring(program_data, pd_len > MAX_PATH ? 0 : pd_len) +
-                                        L"\\hkdfguard-openfile-" + std::to_wstring(GetCurrentProcessId()) + L".key";
-            if (pd_len > 0 && pd_len <= MAX_PATH && WriteTestFile(pd_key, FromHex(kGoldenPayloadHex))) {
-                const std::wstring me = CurrentUserSidString();
-                Check(SetProtectedDacl(pd_key, L"D:(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;" + me + L")"),
-                      "test setup: protect the key file in C:\\ProgramData");
+            const std::wstring pd_key =
+                (pd_len > 0 && pd_len <= MAX_PATH)
+                    ? WriteTestFileInSharedFolder(std::wstring(program_data, pd_len), FromHex(kGoldenPayloadHex),
+                                                  L"(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;" + CurrentUserSidString() + L")")
+                    : std::wstring();
+            if (!pd_key.empty()) {
                 expectFailure(ToUtf8(pd_key), HKDFGUARD_ERR_FILE_UNTRUSTED,
                               "a key file in C:\\ProgramData (Users may create entries there) is untrusted");
                 std::string message;
@@ -3723,7 +3763,7 @@ int RunTests() {
         std::vector<uint8_t> independent;
         bool built = BuildGoldenPayloadIndependently(independent);
         Check(built, "golden payload: the documented construction can be computed independently");
-        if (std::strlen(kGoldenPayloadHex) == 0) {
+        if (std::string_view(kGoldenPayloadHex).empty()) {
             std::printf("    (golden payload not frozen yet; computed: %s)\n", ToHex(independent).c_str());
             Check(false, "golden payload: kGoldenPayloadHex is frozen in the test source");
         } else {

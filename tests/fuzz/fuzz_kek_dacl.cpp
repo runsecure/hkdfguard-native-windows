@@ -14,7 +14,7 @@
 //   - Each either accepts or throws HkdfGuardError: VerifyExistingKekDacl
 //     only KEK_INVALID.
 //
-// Seeds: tests/fuzz/corpus/fuzz_kek_dacl.
+// Seeds: tests/fuzz/corpus/fuzz_kek_dacl (Make-Seeds.ps1).
 #include "fuzz_common.h"
 #include "hkdf_errors.h"
 #include "key_acl.h"
