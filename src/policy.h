@@ -121,6 +121,14 @@ namespace hkdfguard {
     // registry I/O, so it can be tested directly.
     unsigned long ParseSetupMinDelayMs(bool found, unsigned long type, unsigned long value) noexcept;
 
+    // Test-only seam for LoadSetupMinDelayMs(), with the same scope and
+    // caveats as SetTestPolicyOverride: absent from HkdfGuard.dll. Lets the
+    // fuzz harnesses (tests/fuzz) make thousands of setup calls without
+    // changing the machine's policy. std::nullopt clears it.
+#ifdef HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE
+    void SetTestSetupMinDelayMsOverride(std::optional<unsigned long> floor_ms) noexcept;
+#endif
+
     // Test-only seam for LoadKeyUseGroupsPolicy(), with the same scope and
     // caveats as SetTestPolicyOverride: absent from HkdfGuard.dll.
     // std::nullopt clears it.

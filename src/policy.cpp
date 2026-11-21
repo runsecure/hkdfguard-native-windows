@@ -62,6 +62,8 @@ namespace hkdfguard {
         std::optional<std::vector<std::wstring>> g_testDeployerGroupsOverride;
         // Same, for LoadPayloadVersionPolicy.
         std::optional<PayloadVersionPolicy> g_testPayloadVersionOverride;
+        // Same, for LoadSetupMinDelayMs.
+        std::optional<unsigned long> g_testSetupMinDelayMsOverride;
 #endif
 
         std::wstring TrimW(const std::wstring& s)
@@ -385,8 +387,22 @@ namespace hkdfguard {
         return kDefaultSetupMinDelayMs;
     }
 
+#ifdef HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE
+    void SetTestSetupMinDelayMsOverride(std::optional<unsigned long> floor_ms) noexcept
+    {
+        g_testSetupMinDelayMsOverride = floor_ms;
+    }
+#endif
+
     unsigned long LoadSetupMinDelayMs() noexcept
     {
+#ifdef HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE
+        if (g_testSetupMinDelayMsOverride.has_value())
+        {
+            return *g_testSetupMinDelayMsOverride;
+        }
+#endif
+
         const PolicyDword read = ReadPolicyDword(kSetupMinDelayMsValue);
 
         // An unopenable key, a value too large for a DWORD (ERROR_MORE_DATA)

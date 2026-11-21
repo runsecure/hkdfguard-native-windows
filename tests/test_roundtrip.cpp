@@ -24,7 +24,6 @@
 #include <thread>    // std::thread - section 0c2 checks setup calls are serialized
 #include <cstdio>
 #include <cstring>
-#include <iterator>  // std::size
 #include <stdexcept> // std::exception, caught in CleanupKek and CheckPolicyCreatesKek
 #include <vector>
 #include <string>
@@ -3764,7 +3763,7 @@ int RunTests() {
         std::vector<uint8_t> independent;
         bool built = BuildGoldenPayloadIndependently(independent);
         Check(built, "golden payload: the documented construction can be computed independently");
-        if (std::size(kGoldenPayloadHex) == 1) { // just the terminator
+        if (std::string_view(kGoldenPayloadHex).empty()) {
             std::printf("    (golden payload not frozen yet; computed: %s)\n", ToHex(independent).c_str());
             Check(false, "golden payload: kGoldenPayloadHex is frozen in the test source");
         } else {

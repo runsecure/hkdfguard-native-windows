@@ -17,7 +17,7 @@
 //     (kek_v2.cpp's KspDerive) - so the TPM's HMAC over WrapBlock and the
 //     KSP's derivation see the same block.
 //
-// Seeds: tests/fuzz/corpus/fuzz_v2_kdf.
+// Seeds: tests/fuzz/corpus/fuzz_v2_kdf (Make-Seeds.ps1).
 #include "fuzz_common.h"
 #include "hkdf_errors.h"
 #include "sp800_108.h"
