@@ -483,6 +483,9 @@ $Acls = @('owner-only', 'users-read', 'users-full', 'everyone-write', 'authentic
 # name. None is a key file; several must not even be opened.
 $Paths = @(
     , @('empty', (B ''))
+    # Valid UTF-8 that Windows can't resolve to a full path: INVALID_ARGUMENT.
+    , @('one-space', (B ' '))
+    , @('only-spaces-and-dots', (B ' . . '))
     , @('drive-root', (B 'C:\\'))
     , @('drive-only', (B 'C:'))
     , @('drive-relative', (B 'C:key.bin'))

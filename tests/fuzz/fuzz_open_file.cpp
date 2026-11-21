@@ -142,8 +142,9 @@ void Path(In& in) {
     // by now, and anything else on the machine would have to be 132 bytes
     // that parse, in a folder chain only trusted accounts can change.
     FUZZ_CHECK(ret.rc != HKDFGUARD_OK, "open_file: an arbitrary path opened as a key file");
-    FUZZ_CHECK(ret.rc != HKDFGUARD_ERR_INVALID_ARGUMENT && ret.rc != HKDFGUARD_ERR_BUFFER_TOO_SMALL,
-               "open_file: well-formed arguments were refused with %d", ret.rc);
+    // INVALID_ARGUMENT is still a possible answer: text that is valid UTF-8
+    // but that Windows can't resolve to a full path (" ", for one).
+    FUZZ_CHECK(ret.rc != HKDFGUARD_ERR_BUFFER_TOO_SMALL, "open_file: a %d-byte buffer was called too small", call.cap);
 }
 
 } // namespace

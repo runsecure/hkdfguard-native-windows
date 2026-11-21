@@ -62,7 +62,7 @@ namespace fuzz {
     std::vfprintf(stderr, format, args);
     va_end(args);
     std::fprintf(stderr, "\n");
-    std::abort();
+    FuzzAbort();
 }
 
 #define FUZZ_CHECK(condition, ...)              \
@@ -125,7 +125,7 @@ public:
         DWORD old = 0;
         if (base_ == nullptr || VirtualProtect(base_ + data_len, page, PAGE_NOACCESS, &old) == 0) {
             std::fprintf(stderr, "harness: could not map a guarded buffer (error %lu)\n", GetLastError());
-            std::abort();
+            FuzzAbort();
         }
         start_ = base_ + data_len - size;
         if (size != 0) std::memset(start_, fill, size);

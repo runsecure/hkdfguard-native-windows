@@ -104,6 +104,21 @@ if(HKDFGUARD_BUILD_FUZZERS AND MSVC)
     # the system libraries those use. Each is registered as a ctest smoke
     # run over its seed corpus (fuzz/corpus/<target>, read only: new inputs
     # libFuzzer finds go to a scratch folder in the build tree).
+    # A fuzzer always links AddressSanitizer, whose runtime DLL must be the
+    # one from the toolset that built it: another Visual Studio's copy on
+    # PATH fails at load ("entry point __asan_... could not be located").
+    # Each fuzzer gets the matching DLL beside it, so it runs from any shell.
+    get_filename_component(_hkdfguard_fuzz_asan_dir "${CMAKE_CXX_COMPILER}" DIRECTORY)
+    set(HKDFGUARD_FUZZ_ASAN_RUNTIME "${_hkdfguard_fuzz_asan_dir}/clang_rt.asan_dynamic-x86_64.dll")
+    if(NOT EXISTS "${HKDFGUARD_FUZZ_ASAN_RUNTIME}")
+        message(FATAL_ERROR "ASan runtime not found at ${HKDFGUARD_FUZZ_ASAN_RUNTIME}")
+    endif()
+    function(hkdfguard_stage_asan_runtime target)
+        add_custom_command(TARGET ${target} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different "${HKDFGUARD_FUZZ_ASAN_RUNTIME}" "$<TARGET_FILE_DIR:${target}>"
+            VERBATIM)
+    endfunction()
+
     function(hkdfguard_add_fuzzer name runs max_len)
         cmake_parse_arguments(FUZZ "" "" "SOURCES;LIBS" ${ARGN})
         set(sources fuzz/${name}.cpp)
@@ -111,6 +126,7 @@ if(HKDFGUARD_BUILD_FUZZERS AND MSVC)
             list(APPEND sources ${CMAKE_CURRENT_SOURCE_DIR}/../src/${src})
         endforeach()
         add_executable(${name} ${sources})
+        hkdfguard_stage_asan_runtime(${name})
         target_include_directories(${name} PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/../include
             ${CMAKE_CURRENT_SOURCE_DIR}/../src
@@ -201,6 +217,7 @@ if(HKDFGUARD_BUILD_FUZZERS AND MSVC)
     # for `runs` more inputs.
     function(hkdfguard_add_abi_fuzzer name runs)
         add_executable(${name} fuzz/${name}.cpp)
+        hkdfguard_stage_asan_runtime(${name})
         target_link_libraries(${name} PRIVATE hkdfguard_fuzz_abi)
         target_link_options(${name} PRIVATE /INCREMENTAL:NO)
         hkdfguard_apply_warnings(${name})
