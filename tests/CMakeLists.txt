@@ -104,6 +104,21 @@ if(HKDFGUARD_BUILD_FUZZERS AND MSVC)
     # the system libraries those use. Each is registered as a ctest smoke
     # run over its seed corpus (fuzz/corpus/<target>, read only: new inputs
     # libFuzzer finds go to a scratch folder in the build tree).
+    # A fuzzer always links AddressSanitizer, whose runtime DLL must be the
+    # one from the toolset that built it: another Visual Studio's copy on
+    # PATH fails at load ("entry point __asan_... could not be located").
+    # Each fuzzer gets the matching DLL beside it, so it runs from any shell.
+    get_filename_component(_hkdfguard_fuzz_asan_dir "${CMAKE_CXX_COMPILER}" DIRECTORY)
+    set(HKDFGUARD_FUZZ_ASAN_RUNTIME "${_hkdfguard_fuzz_asan_dir}/clang_rt.asan_dynamic-x86_64.dll")
+    if(NOT EXISTS "${HKDFGUARD_FUZZ_ASAN_RUNTIME}")
+        message(FATAL_ERROR "ASan runtime not found at ${HKDFGUARD_FUZZ_ASAN_RUNTIME}")
+    endif()
+    function(hkdfguard_stage_asan_runtime target)
+        add_custom_command(TARGET ${target} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different "${HKDFGUARD_FUZZ_ASAN_RUNTIME}" "$<TARGET_FILE_DIR:${target}>"
+            VERBATIM)
+    endfunction()
+
     function(hkdfguard_add_fuzzer name runs max_len)
         cmake_parse_arguments(FUZZ "" "" "SOURCES;LIBS" ${ARGN})
         set(sources fuzz/${name}.cpp)
@@ -111,6 +126,7 @@ if(HKDFGUARD_BUILD_FUZZERS AND MSVC)
             list(APPEND sources ${CMAKE_CURRENT_SOURCE_DIR}/../src/${src})
         endforeach()
         add_executable(${name} ${sources})
+        hkdfguard_stage_asan_runtime(${name})
         target_include_directories(${name} PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/../include
             ${CMAKE_CURRENT_SOURCE_DIR}/../src
@@ -124,9 +140,11 @@ if(HKDFGUARD_BUILD_FUZZERS AND MSVC)
             target_link_libraries(${name} PRIVATE ${FUZZ_LIBS})
         endif()
         set(found ${CMAKE_CURRENT_BINARY_DIR}/fuzz-found/${name})
-        file(MAKE_DIRECTORY ${found})
+        # An input that fails is saved here, apart from the corpus.
+        set(crashes ${CMAKE_CURRENT_BINARY_DIR}/fuzz-crashes/${name})
+        file(MAKE_DIRECTORY ${found} ${crashes})
         add_test(NAME ${name}
-                 COMMAND ${name} -runs=${runs} -max_len=${max_len} ${found}
+                 COMMAND ${name} -runs=${runs} -max_len=${max_len} -artifact_prefix=${crashes}/ ${found}
                          ${CMAKE_CURRENT_SOURCE_DIR}/fuzz/corpus/${name})
     endfunction()
 
@@ -140,6 +158,89 @@ if(HKDFGUARD_BUILD_FUZZERS AND MSVC)
     # The SP 800-108 framing's injectivity.
     hkdfguard_add_fuzzer(fuzz_v2_kdf 100000 1025
         SOURCES sp800_108.cpp)
+
+    # ---- The C ABI under attack (fuzz/fuzz_abi.h) ----
+    #
+    # Five targets that call the exported functions the way a hostile or
+    # careless caller does: wrong capacities, NULLs, truncated and corrupted
+    # payloads, unterminated strings, four threads at once. They link the
+    # library's own sources, compiled once here with libFuzzer's coverage
+    # and AddressSanitizer - not HkdfGuard.dll - so the fuzzer sees into the
+    # code and every out-of-bounds access is a finding. Two differences from
+    # the DLL, neither in shipped code: policy.h's test seams are compiled in
+    # (HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE), and the event log is a stub
+    # (fuzz/event_log_stub.cpp) so millions of refused calls aren't logged.
+    add_library(hkdfguard_fuzz_abi STATIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/hkdfguard.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/wire_format.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/kek_store.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/ecdh_hkdf.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/aes_gcm.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/policy.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/key_acl.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/key_file.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/hash_to_curve.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/process_hardening.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/kek_v2.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/sp800_108.cpp
+        fuzz/event_log_stub.cpp
+    )
+    target_include_directories(hkdfguard_fuzz_abi PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/../include
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src
+        ${CMAKE_CURRENT_SOURCE_DIR}/fuzz
+    )
+    # HKDFGUARD_EXPORTS: the functions are defined in this binary, not
+    # imported from the DLL.
+    target_compile_definitions(hkdfguard_fuzz_abi PUBLIC
+        HKDFGUARD_EXPORTS HKDFGUARD_ENABLE_TEST_POLICY_OVERRIDE UNICODE _UNICODE)
+    target_compile_options(hkdfguard_fuzz_abi PUBLIC /fsanitize=fuzzer /fsanitize=address /Zi)
+    target_link_libraries(hkdfguard_fuzz_abi PUBLIC ${HKDFGUARD_FUZZ_WIN_LIBS} wer.lib)
+    hkdfguard_apply_warnings(hkdfguard_fuzz_abi)
+
+    # The seeds - the memory attacks a caller tries first, written down - are
+    # generated, not checked in: fuzz/Make-AbiSeeds.ps1 is their source. It
+    # runs under the Windows PowerShell every Windows machine has.
+    set(HKDFGUARD_FUZZ_SEEDS ${CMAKE_CURRENT_BINARY_DIR}/fuzz-seeds)
+    find_program(HKDFGUARD_POWERSHELL NAMES powershell pwsh REQUIRED)
+    execute_process(
+        COMMAND ${HKDFGUARD_POWERSHELL} -NoProfile -ExecutionPolicy Bypass
+                -File ${CMAKE_CURRENT_SOURCE_DIR}/fuzz/Make-AbiSeeds.ps1 -OutDir ${HKDFGUARD_FUZZ_SEEDS}
+        RESULT_VARIABLE HKDFGUARD_FUZZ_SEEDS_RESULT)
+    if(NOT HKDFGUARD_FUZZ_SEEDS_RESULT EQUAL 0)
+        message(FATAL_ERROR "tests/fuzz/Make-AbiSeeds.ps1 failed")
+    endif()
+    # Reconfigure, and so regenerate the seeds, when the script changes.
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/fuzz/Make-AbiSeeds.ps1)
+
+    # One C ABI target. Its ctest run (fuzz/RunSmoke.cmake) starts from a
+    # fresh corpus: every seed once, then up to `runs` inputs in all, or
+    # `max_time` seconds, whichever comes first. The time matters elevated,
+    # where there is a real KEK and each wrap or unwrap is a key storage
+    # provider round trip.
+    function(hkdfguard_add_abi_fuzzer name runs max_time)
+        add_executable(${name} fuzz/${name}.cpp)
+        hkdfguard_stage_asan_runtime(${name})
+        target_link_libraries(${name} PRIVATE hkdfguard_fuzz_abi)
+        target_link_options(${name} PRIVATE /INCREMENTAL:NO)
+        hkdfguard_apply_warnings(${name})
+        file(MAKE_DIRECTORY ${HKDFGUARD_FUZZ_SEEDS}/${name})
+        add_test(NAME ${name}
+                 COMMAND ${CMAKE_COMMAND}
+                         -DFUZZER=$<TARGET_FILE:${name}>
+                         -DSEEDS=${HKDFGUARD_FUZZ_SEEDS}/${name}
+                         -DFOUND=${CMAKE_CURRENT_BINARY_DIR}/fuzz-found/${name}
+                         -DCRASHES=${CMAKE_CURRENT_BINARY_DIR}/fuzz-crashes/${name}
+                         -DRUNS=${runs} -DMAX_TIME=${max_time}
+                         -P ${CMAKE_CURRENT_SOURCE_DIR}/fuzz/RunSmoke.cmake)
+        set_tests_properties(${name} PROPERTIES TIMEOUT 900)
+    endfunction()
+
+    hkdfguard_add_abi_fuzzer(fuzz_unwrap_dek 5000 240)
+    hkdfguard_add_abi_fuzzer(fuzz_wrap_round_trip 3000 240)
+    hkdfguard_add_abi_fuzzer(fuzz_open_file 3000 240)
+    hkdfguard_add_abi_fuzzer(fuzz_string_bounds 2000 240)
+    hkdfguard_add_abi_fuzzer(fuzz_api_threads 200 240)
 endif()
 
 # bench_hkdfguard: latency and throughput benchmarks, built only on request:

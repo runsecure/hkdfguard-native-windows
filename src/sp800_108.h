@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 
 // The version 2 key derivation (docs/adr/0001-post-quantum-payload-version-2.md,
@@ -26,12 +27,14 @@
 // this one too; "-v1" in the labels names that construction, not the
 // Windows payload version. Nothing here is secret.
 namespace hkdfguard {
-    constexpr char kWrapLabel[] = "hkdfguard-wrap-v1";
-    constexpr char kFingerprintLabel[] = "hkdfguard-kek-fingerprint-v1";
+    // string_views, so every use takes the length from the constant itself
+    // rather than measuring memory for a terminator.
+    constexpr std::string_view kWrapLabel = "hkdfguard-wrap-v1";
+    constexpr std::string_view kFingerprintLabel = "hkdfguard-kek-fingerprint-v1";
     constexpr uint32_t kKdfOutputBits = 256; // [L]_32: every output is 32 bytes
 
     // One SP 800-108 counter-mode block for `label` and `context`.
-    std::vector<uint8_t> Sp800108Block(uint32_t counter, const char *label, const uint8_t *context, size_t context_len);
+    std::vector<uint8_t> Sp800108Block(uint32_t counter, std::string_view label, const uint8_t *context, size_t context_len);
 
     // The fingerprint's block: the fingerprint label, an empty Context.
     std::vector<uint8_t> FingerprintBlock(uint32_t counter);

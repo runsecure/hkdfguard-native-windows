@@ -1,8 +1,6 @@
 #include "sp800_108.h"
 #include "hkdf_errors.h"
 
-#include <cstring> // strlen
-
 namespace hkdfguard {
     namespace {
         void AppendU32BigEndian(std::vector<uint8_t> &out, uint32_t v) {
@@ -13,12 +11,11 @@ namespace hkdfguard {
         }
     } // namespace
 
-    std::vector<uint8_t> Sp800108Block(uint32_t counter, const char *label, const uint8_t *context, size_t context_len) {
-        const size_t label_len = std::strlen(label);
+    std::vector<uint8_t> Sp800108Block(uint32_t counter, std::string_view label, const uint8_t *context, size_t context_len) {
         std::vector<uint8_t> block;
-        block.reserve(4 + label_len + 1 + context_len + 4);
+        block.reserve(4 + label.size() + 1 + context_len + 4);
         AppendU32BigEndian(block, counter);            // [i]_32
-        block.insert(block.end(), label, label + label_len);
+        block.insert(block.end(), label.begin(), label.end());
         block.push_back(0x00);                         // separates Label from Context
         if (context_len != 0) {
             block.insert(block.end(), context, context + context_len);
