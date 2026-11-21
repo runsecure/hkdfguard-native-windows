@@ -124,9 +124,11 @@ if(HKDFGUARD_BUILD_FUZZERS AND MSVC)
             target_link_libraries(${name} PRIVATE ${FUZZ_LIBS})
         endif()
         set(found ${CMAKE_CURRENT_BINARY_DIR}/fuzz-found/${name})
-        file(MAKE_DIRECTORY ${found})
+        # An input that fails is saved here, apart from the corpus.
+        set(crashes ${CMAKE_CURRENT_BINARY_DIR}/fuzz-crashes/${name})
+        file(MAKE_DIRECTORY ${found} ${crashes})
         add_test(NAME ${name}
-                 COMMAND ${name} -runs=${runs} -max_len=${max_len} ${found}
+                 COMMAND ${name} -runs=${runs} -max_len=${max_len} -artifact_prefix=${crashes}/ ${found}
                          ${CMAKE_CURRENT_SOURCE_DIR}/fuzz/corpus/${name})
     endfunction()
 
@@ -203,9 +205,11 @@ if(HKDFGUARD_BUILD_FUZZERS AND MSVC)
         target_link_options(${name} PRIVATE /INCREMENTAL:NO)
         hkdfguard_apply_warnings(${name})
         set(found ${CMAKE_CURRENT_BINARY_DIR}/fuzz-found/${name})
-        file(MAKE_DIRECTORY ${found} ${HKDFGUARD_FUZZ_SEEDS}/${name})
+        set(crashes ${CMAKE_CURRENT_BINARY_DIR}/fuzz-crashes/${name})
+        file(MAKE_DIRECTORY ${found} ${crashes} ${HKDFGUARD_FUZZ_SEEDS}/${name})
         add_test(NAME ${name}
-                 COMMAND ${name} -runs=${runs} -max_len=4096 -timeout=60 ${found} ${HKDFGUARD_FUZZ_SEEDS}/${name})
+                 COMMAND ${name} -runs=${runs} -max_len=4096 -timeout=60 -artifact_prefix=${crashes}/
+                         ${found} ${HKDFGUARD_FUZZ_SEEDS}/${name})
         set_tests_properties(${name} PROPERTIES TIMEOUT 900)
     endfunction()
 

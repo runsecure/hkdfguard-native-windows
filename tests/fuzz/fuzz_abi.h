@@ -124,8 +124,7 @@ public:
         base_ = static_cast<uint8_t*>(VirtualAlloc(nullptr, data_len + page, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
         DWORD old = 0;
         if (base_ == nullptr || VirtualProtect(base_ + data_len, page, PAGE_NOACCESS, &old) == 0) {
-            std::fprintf(stderr, "harness: could not map a guarded buffer (error %lu)
-", GetLastError());
+            std::fprintf(stderr, "harness: could not map a guarded buffer (error %lu)\n", GetLastError());
             std::abort();
         }
         start_ = base_ + data_len - size;
