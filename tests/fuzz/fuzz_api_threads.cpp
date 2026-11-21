@@ -78,7 +78,14 @@ void Run(const Op& op, int version) {
     switch (op.kind) {
         case 0: {
             const int rc = hkdfguard_create_kek(w.service.c_str());
-            FUZZ_CHECK((rc == HKDFGUARD_OK) == kek, "threads: create_kek returned %d", rc);
+            // Elevated, it succeeds exactly when the KEK could be made. Not
+            // elevated, whether an existing KEK may be re-verified is the
+            // key's own access control's business: only a clean answer.
+            if (w.elevated) {
+                FUZZ_CHECK((rc == HKDFGUARD_OK) == kek, "threads: create_kek returned %d", rc);
+            } else {
+                FUZZ_CHECK(rc <= 0 && rc != HKDFGUARD_ERR_INTERNAL_ERROR, "threads: create_kek returned %d", rc);
+            }
             break;
         }
         case 1: {
@@ -191,7 +198,9 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     const size_t thread_count = 1 + in.u8() % 4;
     std::vector<std::vector<Op>> plans(thread_count);
     for (auto& plan : plans) {
-        const size_t ops = in.u8() % 17;
+        // At most eight operations a thread: with a real KEK each is a key
+        // storage provider round trip, and an input must stay a few seconds.
+        const size_t ops = in.u8() % 9;
         for (size_t i = 0; i < ops; ++i) plan.push_back(ReadOp(in));
     }
 

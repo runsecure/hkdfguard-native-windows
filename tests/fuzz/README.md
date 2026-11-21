@@ -41,9 +41,14 @@ the library's own heap and stack.
 A KEK can only be created elevated. Elevated (as in CI), a target's setup
 creates a throwaway Software KSP KEK per payload version, wraps a known DEK
 under each ("the genuine payload"), and deletes them at exit. Not elevated,
-there is no KEK: every buffer, string, length and path attack still runs,
-and everything that needs the KEK must fail cleanly. The line each target
-prints at startup says which mode it is in.
+there is normally no KEK: every buffer, string, length and path attack still
+runs, and everything that needs the KEK must fail cleanly. The line each
+target prints at startup says whether it found a KEK.
+
+A run that is killed (a timeout, Ctrl+C) can't delete its KEKs, named
+`hkdfguardwin.fuzz.<target>`. They are harmless and the target's next
+elevated run removes them; until then a run that isn't elevated, by an
+account allowed to use them, finds them and runs with them.
 
 Policy is pinned inside the process (Software KSP only, the developer
 security model, no floor on setup calls); the registry is never written.
@@ -56,15 +61,24 @@ cmake --build build-analysis
 ctest --test-dir build-analysis -R fuzz_      # every seed once, then a few thousand inputs each
 ```
 
-(`scripts\Build-Analysis.ps1` does all of that, with clang-tidy.) For a real
-campaign, run a target directly from a Visual Studio developer shell:
+(`scripts\Build-Analysis.ps1` does all of that, with clang-tidy.)
+
+A ctest run of a C ABI target starts from a fresh corpus every time
+(`RunSmoke.cmake`): every seed once, then a few thousand inputs or four
+minutes, whichever comes first. With a KEK it is much slower per input than
+without: each wrap or unwrap is a key storage provider round trip.
+
+For a real campaign, run a target directly, from any shell:
 
 ```powershell
 cd build-analysis\tests
-.\fuzz_unwrap_dek.exe -max_total_time=900 -timeout=60 -artifact_prefix=fuzz-crashes/fuzz_unwrap_dek/ fuzz-found\fuzz_unwrap_dek fuzz-seeds\fuzz_unwrap_dek
+mkdir my-corpus\fuzz_unwrap_dek
+.\fuzz_unwrap_dek.exe -max_total_time=900 -timeout=60 -artifact_prefix=fuzz-crashes/fuzz_unwrap_dek/ my-corpus\fuzz_unwrap_dek fuzz-seeds\fuzz_unwrap_dek
 ```
 
-libFuzzer reads both folders and writes new inputs only to the first. An
+libFuzzer reads both folders and writes new inputs only to the first. Keep a
+campaign's corpus in a folder of your own, as above: `fuzz-found\` belongs
+to the ctest runs, which empty it. An
 input that fails is saved under `fuzz-crashes\<target>\`; pass that file as
 the only argument to replay it.
 

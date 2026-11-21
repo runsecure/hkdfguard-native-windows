@@ -337,30 +337,37 @@ inline void Setup(const char* tag) {
         Fail("harness: could not protect %ls", w.dir.c_str());
     }
 
-    if (w.elevated) DeleteWorldKeks(); // a crashed run's leftovers
+    if (w.elevated) DeleteWorldKeks(); // a killed run's leftovers
     for (const int version : kVersions) {
         UseVersion(version);
         w.genuine[version] = StandInPayload(version);
-        if (!w.elevated) continue;
-        const int created = hkdfguard_create_kek(w.service.c_str());
-        if (created != HKDFGUARD_OK) {
-            // Version 2 needs a Software KSP with SP 800-108 keys; version 1
-            // works wherever the library does.
-            FUZZ_CHECK(version == 2, "harness: hkdfguard_create_kek (version %d) returned %d", version, created);
-            std::fprintf(stderr, "fuzz setup: no version 2 KEK on this machine (create_kek returned %d)\n", created);
-            continue;
+        if (w.elevated) {
+            const int created = hkdfguard_create_kek(w.service.c_str());
+            if (created != HKDFGUARD_OK) {
+                // Version 2 needs a Software KSP with SP 800-108 keys;
+                // version 1 works wherever the library does.
+                FUZZ_CHECK(version == 2, "harness: hkdfguard_create_kek (version %d) returned %d", version, created);
+                std::fprintf(stderr, "fuzz setup: no version 2 KEK on this machine (create_kek returned %d)\n", created);
+                continue;
+            }
         }
+        // Whether there is a KEK is found out, not assumed: a run that was
+        // killed (a timeout) leaves its KEK behind, and an account that may
+        // use it gets the full harness even when it can't create one.
         std::vector<uint8_t> payload(HKDFGUARD_WRAPPED_MAX_LEN);
         int len = HKDFGUARD_WRAPPED_MAX_LEN;
         const int wrapped = hkdfguard_wrap_dek(w.service.c_str(), w.dek, HKDFGUARD_DEK_LEN, payload.data(), &len);
-        FUZZ_CHECK(wrapped == HKDFGUARD_OK && len == HKDFGUARD_WRAPPED_MAX_LEN,
-                   "harness: hkdfguard_wrap_dek (version %d) returned %d, length %d", version, wrapped, len);
+        if (w.elevated) {
+            FUZZ_CHECK(wrapped == HKDFGUARD_OK && len == HKDFGUARD_WRAPPED_MAX_LEN,
+                       "harness: hkdfguard_wrap_dek (version %d) returned %d, length %d", version, wrapped, len);
+        }
+        if (wrapped != HKDFGUARD_OK) continue;
         w.genuine[version] = payload;
         w.have_kek[version] = true;
     }
-    std::fprintf(stderr, "fuzz setup: %s, version 1 KEK: %s, version 2 KEK: %s\n",
-                 w.elevated ? "elevated" : "not elevated (no KEK: KEK-dependent paths must fail cleanly)",
-                 w.have_kek[1] ? "yes" : "no", w.have_kek[2] ? "yes" : "no");
+    std::fprintf(stderr, "fuzz setup: %s, version 1 KEK: %s, version 2 KEK: %s%s\n", w.elevated ? "elevated" : "not elevated",
+                 w.have_kek[1] ? "yes" : "no", w.have_kek[2] ? "yes" : "no",
+                 (w.have_kek[1] || w.have_kek[2]) ? "" : " (KEK-dependent paths must fail cleanly)");
 
     std::atexit([] {
         if (TheWorld().elevated) DeleteWorldKeks();

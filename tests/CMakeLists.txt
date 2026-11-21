@@ -213,28 +213,34 @@ if(HKDFGUARD_BUILD_FUZZERS AND MSVC)
     # Reconfigure, and so regenerate the seeds, when the script changes.
     set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/fuzz/Make-AbiSeeds.ps1)
 
-    # One C ABI target. Its ctest run replays every seed once, then fuzzes
-    # for `runs` more inputs.
-    function(hkdfguard_add_abi_fuzzer name runs)
+    # One C ABI target. Its ctest run (fuzz/RunSmoke.cmake) starts from a
+    # fresh corpus: every seed once, then up to `runs` inputs in all, or
+    # `max_time` seconds, whichever comes first. The time matters elevated,
+    # where there is a real KEK and each wrap or unwrap is a key storage
+    # provider round trip.
+    function(hkdfguard_add_abi_fuzzer name runs max_time)
         add_executable(${name} fuzz/${name}.cpp)
         hkdfguard_stage_asan_runtime(${name})
         target_link_libraries(${name} PRIVATE hkdfguard_fuzz_abi)
         target_link_options(${name} PRIVATE /INCREMENTAL:NO)
         hkdfguard_apply_warnings(${name})
-        set(found ${CMAKE_CURRENT_BINARY_DIR}/fuzz-found/${name})
-        set(crashes ${CMAKE_CURRENT_BINARY_DIR}/fuzz-crashes/${name})
-        file(MAKE_DIRECTORY ${found} ${crashes} ${HKDFGUARD_FUZZ_SEEDS}/${name})
+        file(MAKE_DIRECTORY ${HKDFGUARD_FUZZ_SEEDS}/${name})
         add_test(NAME ${name}
-                 COMMAND ${name} -runs=${runs} -max_len=4096 -timeout=60 -artifact_prefix=${crashes}/
-                         ${found} ${HKDFGUARD_FUZZ_SEEDS}/${name})
+                 COMMAND ${CMAKE_COMMAND}
+                         -DFUZZER=$<TARGET_FILE:${name}>
+                         -DSEEDS=${HKDFGUARD_FUZZ_SEEDS}/${name}
+                         -DFOUND=${CMAKE_CURRENT_BINARY_DIR}/fuzz-found/${name}
+                         -DCRASHES=${CMAKE_CURRENT_BINARY_DIR}/fuzz-crashes/${name}
+                         -DRUNS=${runs} -DMAX_TIME=${max_time}
+                         -P ${CMAKE_CURRENT_SOURCE_DIR}/fuzz/RunSmoke.cmake)
         set_tests_properties(${name} PROPERTIES TIMEOUT 900)
     endfunction()
 
-    hkdfguard_add_abi_fuzzer(fuzz_unwrap_dek 5000)
-    hkdfguard_add_abi_fuzzer(fuzz_wrap_round_trip 3000)
-    hkdfguard_add_abi_fuzzer(fuzz_open_file 3000)
-    hkdfguard_add_abi_fuzzer(fuzz_string_bounds 2000)
-    hkdfguard_add_abi_fuzzer(fuzz_api_threads 300)
+    hkdfguard_add_abi_fuzzer(fuzz_unwrap_dek 5000 240)
+    hkdfguard_add_abi_fuzzer(fuzz_wrap_round_trip 3000 240)
+    hkdfguard_add_abi_fuzzer(fuzz_open_file 3000 240)
+    hkdfguard_add_abi_fuzzer(fuzz_string_bounds 2000 240)
+    hkdfguard_add_abi_fuzzer(fuzz_api_threads 200 240)
 endif()
 
 # bench_hkdfguard: latency and throughput benchmarks, built only on request:

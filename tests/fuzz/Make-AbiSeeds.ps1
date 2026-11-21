@@ -641,14 +641,17 @@ function Seeds-ApiThreads {
     $wrapOther = U8 8
     $principal = U8 9
 
-    # $Plans: one list of operations per thread.
+    # $Plans: one list of operations per thread. At most eight operations
+    # each (fuzz_api_threads.cpp's limit): with a real KEK every wrap, unwrap
+    # and KEK lookup is a key storage provider round trip, a quarter of a
+    # second under AddressSanitizer, and the threads don't shorten it.
     function Threads($Plans) {
         $Plans = @($Plans)
         if ($Plans.Count -lt 1 -or $Plans.Count -gt 4) { throw "Threads: $($Plans.Count) threads" }
         $out = U8 ($Plans.Count - 1)
         foreach ($plan in $Plans) {
             $plan = @($plan)
-            if ($plan.Count -gt 16) { throw "Threads: $($plan.Count) operations" }
+            if ($plan.Count -gt 8) { throw "Threads: $($plan.Count) operations" }
             $out = Join $out (U8 $plan.Count)
             foreach ($op in $plan) { $out = Join $out $op }
         }
@@ -662,38 +665,40 @@ function Seeds-ApiThreads {
     }
     function Ops { return , @($args) }
 
+    # Every operation once, over four threads.
     $everything = Ops $create (Exists $false) (Exists $true) $fingerprint (WrapUnwrap 1) (WrapUnwrap 2 $true) $generate `
         (UnwrapGenuine 32) (UnwrapGenuine 31) (UnwrapPatched 60 1) (OpenFile 1024) (OpenFile 16) $wrapOther $principal (UnwrapGenuine -1)
     $reversed = @($everything); [Array]::Reverse($reversed)
-    $rotated = @($everything[5..14]) + @($everything[0..4])
-    $everyOther = @(); for ($i = 0; $i -lt $everything.Count; $i += 2) { $everyOther += , $everything[$i] }
 
     $seeds = [ordered]@{}
-    $seeds['every-op-on-four-threads'] = Threads @($everything, $reversed, $rotated, $everyOther)
-    $seeds['create-kek-on-four-threads'] = Threads @((Repeat (Ops $create) 12), (Repeat (Ops $create) 12), (Repeat (Ops $create) 12),
-        (Repeat (Ops $create) 12))
-    $seeds['create-kek-against-wrap'] = Threads @((Repeat (Ops $create) 12), (Repeat (Ops (WrapUnwrap 3)) 12),
-        (Repeat (Ops $create $generate) 6), (Repeat (Ops (WrapUnwrap 4 $true)) 12))
-    $seeds['distinct-deks-on-four-threads'] = Threads @((Repeat (Ops (WrapUnwrap 0x11)) 16), (Repeat (Ops (WrapUnwrap 0x22)) 16),
-        (Repeat (Ops (WrapUnwrap 0x33)) 16), (Repeat (Ops (WrapUnwrap 0x44)) 16))
-    $corruptHeader = @(); foreach ($o in 0..15) { $corruptHeader += , (UnwrapPatched $o 0xFF) }
-    $seeds['unwrap-genuine-against-corrupt'] = Threads @((Repeat (Ops (UnwrapGenuine 32)) 16), $corruptHeader,
-        (Repeat (Ops (UnwrapGenuine 0) (UnwrapGenuine -1)) 8))
+    $seeds['every-op-on-four-threads'] = Threads @(@($everything[0..3]), @($everything[4..7]), @($everything[8..11]), @($everything[12..14]))
+    $seeds['every-op-on-four-threads-reversed'] = Threads @(@($reversed[0..3]), @($reversed[4..7]), @($reversed[8..11]), @($reversed[12..14]))
+    $seeds['create-kek-on-four-threads'] = Threads @((Repeat (Ops $create) 3), (Repeat (Ops $create) 3), (Repeat (Ops $create) 3),
+        (Repeat (Ops $create) 3))
+    $seeds['create-kek-against-wrap'] = Threads @((Repeat (Ops $create) 3), (Repeat (Ops (WrapUnwrap 3)) 2),
+        (Repeat (Ops $create $generate) 2), (Repeat (Ops (WrapUnwrap 4 $true)) 2))
+    $seeds['distinct-deks-on-four-threads'] = Threads @((Repeat (Ops (WrapUnwrap 0x11)) 3), (Repeat (Ops (WrapUnwrap 0x22)) 3),
+        (Repeat (Ops (WrapUnwrap 0x33)) 3), (Repeat (Ops (WrapUnwrap 0x44)) 3))
+    # A corrupted header is refused before any key is opened: these are cheap.
+    $corruptHeader = @(); foreach ($o in 0..7) { $corruptHeader += , (UnwrapPatched $o 0xFF) }
+    $seeds['unwrap-genuine-against-corrupt'] = Threads @((Repeat (Ops (UnwrapGenuine 32)) 4), $corruptHeader,
+        (Repeat (Ops (UnwrapGenuine 0) (UnwrapGenuine -1)) 4))
+    # One byte of every field, header to fingerprint: the later ones reach the KEK.
     $everyField = @()
     foreach ($t in 0..3) {
-        $plan = @(); for ($o = 0; $o -lt 128; $o += 8) { $plan += , (UnwrapPatched ($o + $t) 0x80) }
+        $plan = @(); foreach ($o in @(0, 8, 40, 52, 84, 100)) { $plan += , (UnwrapPatched ($o + $t) 0x80) }
         $everyField += , $plan
     }
     $seeds['corrupt-every-field-on-four-threads'] = Threads $everyField
     $small = @()
-    foreach ($c in @(0, 1, 31, -1)) { $small += , (Repeat (Ops (UnwrapGenuine $c) (OpenFile $c)) 8) }
+    foreach ($c in @(0, 1, 31, -1)) { $small += , (Repeat (Ops (UnwrapGenuine $c) (OpenFile $c)) 4) }
     $seeds['small-buffers-on-four-threads'] = Threads $small
-    $seeds['open-file-against-wrap'] = Threads @((Repeat (Ops (OpenFile 1024)) 16), (Repeat (Ops (WrapUnwrap 5)) 16),
-        (Repeat (Ops (OpenFile 131) (OpenFile 132)) 8))
-    $seeds['fingerprint-and-exists-against-generate'] = Threads @((Repeat (Ops $fingerprint (Exists $false) (Exists $true)) 5),
-        (Repeat (Ops $generate) 16), (Repeat (Ops $wrapOther) 16))
-    $seeds['two-threads'] = Threads @((Repeat (Ops (WrapUnwrap 6)) 8), (Repeat (Ops (WrapUnwrap 7)) 8))
-    $seeds['one-thread'] = Threads @(, $everything)
+    $seeds['open-file-against-wrap'] = Threads @((Repeat (Ops (OpenFile 1024)) 8), (Repeat (Ops (WrapUnwrap 5)) 3),
+        (Repeat (Ops (OpenFile 131) (OpenFile 132)) 4))
+    $seeds['fingerprint-and-exists-against-generate'] = Threads @((Ops $fingerprint (Exists $false) (Exists $true)),
+        (Repeat (Ops $generate) 3), (Repeat (Ops $wrapOther) 3))
+    $seeds['two-threads'] = Threads @((Repeat (Ops (WrapUnwrap 6)) 3), (Repeat (Ops (WrapUnwrap 7)) 3))
+    $seeds['one-thread'] = Threads @(, @($everything[0..7]))
     return BothVersions $seeds
 }
 
